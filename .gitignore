@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Data and temporary outputs
+data/
+results/
+tmp/
+*.bam
+*.bai
+*.cram
+*.crai
+*.sam
+*.fastq
+*.fq
+*.vcf
+*.vcf.gz
+*.tbi

@@ -1,0 +1,41 @@
+name: rtm-miner
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+
+  # Core BAM/CRAM and interval tooling
+  - samtools>=1.20
+  - bcftools>=1.20
+  - bedtools>=2.31
+  - htslib>=1.20
+
+  # Fast sequence alignment for remapping candidate reads
+  - minimap2>=2.28
+
+  # Utilities for large-file workflows
+  - pigz
+  - pbzip2
+  - parallel
+  - tabix
+
+  # Python data and genomics stack
+  - pysam>=0.22
+  - pyfaidx>=0.8
+  - biopython>=1.84
+  - pandas>=2.2
+  - pyarrow>=16
+  - numpy>=1.26
+  - click>=8.1
+  - pyyaml>=6.0
+  - intervaltree>=3.1
+  - rich>=13.7
+
+  # Optional direct AWS reads (useful for dev/testing flows)
+  - s3fs>=2024.6.0
+
+  - pip:
+      - typer>=0.12
