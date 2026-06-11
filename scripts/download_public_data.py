@@ -6,6 +6,7 @@ import csv
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,7 @@ class Dataset:
 
 
 BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
+DFAM_CURATED_CONSENSUS_0_URL = "https://www.dfam.org/releases/current/families/FamDB/dfam40.curated.consensus.0.h5.gz"
 
 
 def _load_config(config_path: Path) -> list[Dataset]:
@@ -344,6 +346,113 @@ def _liftover_bed(in_bed: Path, chain_gz: Path, out_bed: Path, out_unmapped: Pat
     return {"status": "lifted", "ok": ok, "message": msg, "path": str(out_bed), "unmapped_path": str(out_unmapped)}
 
 
+def _ensure_famdb_repo(famdb_tools_dir: Path, timeout_sec: int) -> tuple[str | None, str]:
+    famdb_py = famdb_tools_dir / "famdb.py"
+    if famdb_py.exists():
+        return str(famdb_py), "existing_repo"
+
+    famdb_tools_dir.parent.mkdir(parents=True, exist_ok=True)
+    ok, msg = _run_cmd(
+        ["git", "clone", "https://github.com/Dfam-consortium/FamDB.git", str(famdb_tools_dir)],
+        required=False,
+    )
+    if ok and famdb_py.exists():
+        return str(famdb_py), "cloned_repo"
+
+    system_famdb = shutil.which("famdb.py")
+    if system_famdb:
+        return system_famdb, "system_path"
+    return None, f"missing_famdb_tool ({msg})"
+
+
+def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dict[str, Any]:
+    header_re = re.compile(r"#SINE/Alu|#LINE/L1|(^|[^A-Za-z])SVA([^A-Za-z]|$)", re.IGNORECASE)
+    kept = 0
+    in_families = 0
+    keep_seq = False
+    with curated_fasta.open("r", encoding="utf-8") as in_handle, mei_subset_fasta.open("w", encoding="utf-8") as out_handle:
+        for line in in_handle:
+            if line.startswith(">"):
+                in_families += 1
+                keep_seq = bool(header_re.search(line))
+                if keep_seq:
+                    kept += 1
+                    out_handle.write(line)
+            elif keep_seq:
+                out_handle.write(line)
+    return {
+        "input_families": in_families,
+        "mei_families": kept,
+        "output_path": str(mei_subset_fasta),
+        "bytes": mei_subset_fasta.stat().st_size if mei_subset_fasta.exists() else 0,
+    }
+
+
+def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_sec: int, force: bool) -> dict[str, Any]:
+    ds = ds_map.get("dfam_human_families_embl")
+    if not ds:
+        return {"status": "skipped_missing_dataset", "reason": "dfam_human_families_embl not in config"}
+
+    archive_path = outdir / ds.target_path
+    if not archive_path.exists():
+        return {"status": "skipped_missing_archive", "path": str(archive_path)}
+
+    decompressed_h5 = archive_path.with_suffix("")
+    if decompressed_h5.suffix != ".h5":
+        decompressed_h5 = archive_path.with_name("dfam40.0.h5")
+    if archive_path.suffix == ".gz":
+        _decompress_gzip(archive_path, decompressed_h5, force=force)
+
+    dfam_dir = archive_path.parent
+    db_dir = dfam_dir / "db"
+    db_dir.mkdir(parents=True, exist_ok=True)
+
+    db_base_h5 = db_dir / "dfam40.0.h5"
+    if force or not db_base_h5.exists():
+        shutil.copy2(decompressed_h5, db_base_h5)
+
+    curated_consensus_h5 = db_dir / "dfam40.curated.consensus.0.h5"
+    _download_file(DFAM_CURATED_CONSENSUS_0_URL, curated_consensus_h5.with_suffix(".h5.gz"), timeout_sec=timeout_sec, force=force)
+    _decompress_gzip(curated_consensus_h5.with_suffix(".h5.gz"), curated_consensus_h5, force=force)
+
+    famdb_tools_dir = dfam_dir / "tools" / "FamDB"
+    famdb_py, tool_status = _ensure_famdb_repo(famdb_tools_dir, timeout_sec=timeout_sec)
+    if famdb_py is None:
+        return {"status": "failed", "error": tool_status, "db_dir": str(db_dir)}
+
+    curated_fasta = dfam_dir / "dfam_human_curated.fasta"
+    if force or not curated_fasta.exists():
+        cmd = [
+            sys.executable,
+            famdb_py,
+            "-i",
+            str(db_dir),
+            "families",
+            "-f",
+            "fasta_name",
+            "--include-class-in-name",
+            "-ad",
+            "--curated",
+            "9606",
+        ]
+        with curated_fasta.open("w", encoding="utf-8") as out_handle:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"famdb export failed: {' '.join(cmd)}\n{proc.stderr}")
+            out_handle.write(proc.stdout)
+
+    mei_subset_fasta = dfam_dir / "dfam_human_mei_l1_alu_sva.fasta"
+    subset_stats = _export_human_mei_subset(curated_fasta, mei_subset_fasta)
+    return {
+        "status": "prepared",
+        "famdb_tool": tool_status,
+        "db_dir": str(db_dir),
+        "curated_fasta": str(curated_fasta),
+        "curated_fasta_bytes": curated_fasta.stat().st_size if curated_fasta.exists() else 0,
+        **subset_stats,
+    }
+
+
 def _postprocess(
     outdir: Path,
     datasets: list[Dataset],
@@ -451,6 +560,12 @@ def _postprocess(
                 bed_in, chain_hg38_to_hs1, out_bed, out_unmapped, force=force
             ),
         )
+
+    # 5) Prepare Dfam-derived MEI FASTA library (human curated + LINE1/Alu/SVA subset).
+    run_step(
+        "dfam_prepare_human_mei_fasta",
+        lambda: _prepare_dfam_mei_library(outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force),
+    )
 
     return steps
 

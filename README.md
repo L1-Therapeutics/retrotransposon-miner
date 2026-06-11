@@ -159,6 +159,9 @@ This initial dataset pack includes:
 - gnomAD SV polymorphism track (includes MEI classes)
 - hg38<->hs1 liftOver chains
 - Dfam FamDB archive (required; extract human families with `famdb.py`)
+- Dfam-derived MEI FASTA library outputs:
+  - `retrotransposon_db/dfam/dfam_human_curated.fasta`
+  - `retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta`
 - Public SEQC2 tumor/normal test BAMs (downloaded as chr22 slices)
 
 Post-download processing is automatic and includes:
@@ -167,6 +170,8 @@ Post-download processing is automatic and includes:
 - extracting MEI-focused BED rows from gnomAD SV track
 - lifting hg38 BED resources to hs1/T2T via `liftOver`
 - downloading prebuilt BWA index files for hg38 and hs1 from AWS sources when available (fallback: local build)
+- cloning `Dfam-consortium/FamDB` (if needed), exporting curated human Dfam FASTA,
+  and generating a focused LINE1/Alu/SVA MEI FASTA subset
 
 Storage planning:
 - Full whole-genome tumor+normal BAM remapping workflows can require ~300GB free disk.
@@ -261,6 +266,14 @@ runs:
 samtools view -b INPUT.bam chr22 > subset.chr22.bam
 samtools index subset.chr22.bam
 ```
+
+## Proof-of-signal runbook
+
+For reproducible end-to-end prototype execution (split/discordant extraction,
+candidate loci generation, and MEI support annotation), see:
+
+- `docs/proof_of_signal_runbook.md`
+- `scripts/run_proof_of_signal.sh`
 
 ## Project layout
 
