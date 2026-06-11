@@ -1,0 +1,212 @@
+# Public datasets for retrotransposon-miner.
+# Keep this file under version control to preserve data provenance.
+#
+# Notes:
+# - URLs are intentionally explicit and versioned where possible.
+# - Add/replace datasets as needed; downloader is generic.
+
+datasets:
+  - id: hg38_reference_fasta
+    category: reference
+    description: Broad hg38 reference FASTA (AWS Open Data)
+    source: Broad/AWS
+    url: https://broad-references.s3.amazonaws.com/hg38/v0/Homo_sapiens_assembly38.fasta
+    target_path: reference/hg38/Homo_sapiens_assembly38.fasta
+    required: true
+
+  - id: hs1_t2t_reference_fasta
+    category: reference
+    description: T2T CHM13 analysis-set FASTA with prebuilt BWA indexes (AWS Open Data)
+    source: T2T/AWS
+    url: https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/CHM13/assemblies/analysis_set/masked_DJ_rDNA_PHR_5S_wi_rCRS/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa
+    target_path: reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa
+    required: true
+
+  - id: gencode_v46_gtf
+    category: annotation
+    description: GENCODE v46 comprehensive annotation (GRCh38)
+    source: GENCODE
+    url: https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.annotation.gtf.gz
+    target_path: annotation/hg38/gencode/gencode.v46.annotation.gtf.gz
+    required: true
+
+  - id: hg38_repeatmasker_rmsk
+    category: annotation
+    description: UCSC hg38 RepeatMasker table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/rmsk.txt.gz
+    target_path: annotation/hg38/repeats/rmsk.txt.gz
+    required: true
+
+  - id: hg38_segmental_duplications
+    category: annotation
+    description: UCSC hg38 genomicSuperDups table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/genomicSuperDups.txt.gz
+    target_path: annotation/hg38/segdup/genomicSuperDups.txt.gz
+    required: true
+
+  - id: hg38_mappability_100bp_bw
+    category: annotation
+    description: UCSC 100bp Umap multi-read mappability bigWig (hg38)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/gbdb/hg38/hoffmanMappability/k100.Umap.MultiTrackMappability.bw
+    target_path: annotation/hg38/mappability/k100.Umap.MultiTrackMappability.bw
+    required: true
+
+  - id: gnomad_v41_sv_non_neuro_bb
+    category: mei_polymorphism
+    description: gnomAD v4.1 structural variants (non-neuro controls), includes MEI classes
+    source: UCSC/gnomAD
+    url: https://hgdownload.soe.ucsc.edu/gbdb/hg38/gnomAD/v4/structuralVariants/gnomad.v4.1.sv.non_neuro_controls.sites.bb
+    target_path: polymorphism/hg38/gnomad/gnomad.v4.1.sv.non_neuro_controls.sites.bb
+    required: true
+
+  - id: hg38_to_hs1_chain
+    category: liftover
+    description: liftOver chain hg38 -> hs1 (T2T)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/liftOver/hg38ToHs1.over.chain.gz
+    target_path: liftover/hg38ToHs1.over.chain.gz
+    required: true
+
+  - id: hs1_to_hg38_chain
+    category: liftover
+    description: liftOver chain hs1 (T2T) -> hg38
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hs1/liftOver/hs1ToHg38.over.chain.gz
+    target_path: liftover/hs1ToHg38.over.chain.gz
+    required: true
+
+  - id: dfam_human_families_embl
+    category: retrotransposon_db
+    description: Dfam FamDB archive (extract human ME families to EMBL/FASTA with famdb.py)
+    source: Dfam
+    url: https://www.dfam.org/releases/current/families/FamDB/dfam40.0.h5.gz
+    target_path: retrotransposon_db/dfam/dfam40.0.h5.gz
+    required: true
+
+  # -------------------------------------------------------------------------
+  # Extended candidate resources (optional for now)
+  # -------------------------------------------------------------------------
+  - id: hs1_repeatmasker_out
+    category: annotation_hs1
+    description: hs1/T2T RepeatMasker annotations (.out)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.repeatMasker.out.gz
+    target_path: annotation/hs1/repeats/hs1.repeatMasker.out.gz
+    required: true
+
+  - id: hs1_mappability_100bp_bw
+    category: annotation_hs1
+    description: UCSC hs1 100bp Umap multi-read mappability bigWig
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/gbdb/hs1/hoffmanMappability/k100.Umap.MultiTrackMappability.bw
+    target_path: annotation/hs1/mappability/k100.Umap.MultiTrackMappability.bw
+    required: true
+
+  - id: hprc_hg38_decomposed_vcf
+    category: pangenome_hprc
+    description: HPRC decomposed variant calls on hg38
+    source: UCSC/HPRC
+    url: https://hgdownload.soe.ucsc.edu/gbdb/hg38/hprc/decomposed.vcf.gz
+    target_path: pangenome/hprc/hg38/decomposed.vcf.gz
+    required: true
+
+  - id: hprc_hg38_decomposed_vcf_tbi
+    category: pangenome_hprc
+    description: HPRC decomposed hg38 VCF index
+    source: UCSC/HPRC
+    url: https://hgdownload.soe.ucsc.edu/gbdb/hg38/hprc/decomposed.vcf.gz.tbi
+    target_path: pangenome/hprc/hg38/decomposed.vcf.gz.tbi
+    required: true
+
+  - id: onekg_highcov_phased_readme
+    category: polymorphism_1kg
+    description: 1000G high-coverage phased SNV/INDEL/SV release README
+    source: 1000 Genomes
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/working/20220422_3202_phased_SNV_INDEL_SV/README_1kGP_phased_panel_110722.pdf
+    target_path: polymorphism/hg38/1kg/README_1kGP_phased_panel_110722.pdf
+    required: true
+
+  - id: melt_1kg_mei_nstd144_vcf
+    category: mei_polymorphism
+    description: MELT-based 1000G MEI callset (dbVar nstd144, GRCh38)
+    source: NCBI dbVar
+    url: https://ftp.ncbi.nlm.nih.gov/pub/dbVar/data/Homo_sapiens/by_study/vcf/nstd144.GRCh38.variant_call.vcf.gz
+    target_path: polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz
+    required: true
+
+  - id: melt_1kg_mei_nstd144_vcf_tbi
+    category: mei_polymorphism
+    description: MELT-based 1000G MEI callset index (dbVar nstd144, GRCh38)
+    source: NCBI dbVar
+    url: https://ftp.ncbi.nlm.nih.gov/pub/dbVar/data/Homo_sapiens/by_study/vcf/nstd144.GRCh38.variant_call.vcf.gz.tbi
+    target_path: polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz.tbi
+    required: true
+
+  - id: giab_stratifications_v35_readme
+    category: benchmark
+    description: GIAB stratifications v3.5 documentation and release index
+    source: GIAB/NIST
+    url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/genome-stratifications/v3.5/README.md
+    target_path: benchmark/giab/v3.5/README.md
+    required: true
+
+  - id: encode_blacklist_grch38
+    category: annotation
+    description: ENCODE unified blacklist (GRCh38)
+    source: ENCODE
+    url: https://www.encodeproject.org/files/ENCFF356LFX/@@download/ENCFF356LFX.bed.gz
+    target_path: annotation/hg38/blacklist/ENCFF356LFX.bed.gz
+    required: true
+
+  - id: hg38_simplerepeat
+    category: annotation
+    description: UCSC simpleRepeat table dump (TRF-based)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/simpleRepeat.txt.gz
+    target_path: annotation/hg38/repeats/simpleRepeat.txt.gz
+    required: true
+
+  - id: hg38_gap
+    category: annotation
+    description: UCSC gap table dump (includes centromere/telomere gap types)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/gap.txt.gz
+    target_path: annotation/hg38/masks/gap.txt.gz
+    required: true
+
+  - id: mane_grch38_refseq_gtf
+    category: annotation
+    description: MANE RefSeq GTF (GRCh38)
+    source: NCBI MANE
+    url: https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/MANE.GRCh38.v1.5.refseq_genomic.gtf.gz
+    target_path: annotation/hg38/mane/MANE.GRCh38.v1.5.refseq_genomic.gtf.gz
+    required: true
+
+  - id: mane_grch38_ensembl_gtf
+    category: annotation
+    description: MANE Ensembl/GENCODE GTF (GRCh38)
+    source: NCBI MANE
+    url: https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/MANE.GRCh38.v1.5.ensembl_genomic.gtf.gz
+    target_path: annotation/hg38/mane/MANE.GRCh38.v1.5.ensembl_genomic.gtf.gz
+    required: true
+
+  - id: seqc2_tumor_bam
+    category: test_bam
+    description: SEQC2 tumor WGS BAM sliced to chr22 during download
+    source: NCBI SEQC2
+    url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_T_1.bwa.dedup.bam
+    target_path: test_data/seqc2/chr22/tumor.chr22.hg38.bam
+    region: chr22
+    required: true
+
+  - id: seqc2_normal_bam
+    category: test_bam
+    description: SEQC2 normal WGS BAM sliced to chr22 during download
+    source: NCBI SEQC2
+    url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_N_1.bwa.dedup.bam
+    target_path: test_data/seqc2/chr22/normal.chr22.hg38.bam
+    region: chr22
+    required: true

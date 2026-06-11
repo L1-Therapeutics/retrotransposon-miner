@@ -15,7 +15,7 @@ install_with_pkg_manager() {
   local installer="$1"
   echo "Attempting UCSC install via ${installer} into env ${ENV_NAME}..."
   "${installer}" install -y -n "${ENV_NAME}" -c bioconda -c conda-forge \
-    ucsc-liftover ucsc-twobittofa ucsc-fatotwobit
+    ucsc-liftover ucsc-twobittofa ucsc-fatotwobit ucsc-bigbedtobed ucsc-bigwigtobedgraph
 }
 
 if command -v micromamba >/dev/null 2>&1; then
@@ -43,7 +43,7 @@ echo "Note: some Linux images emit a libcurl warning for standalone liftOver."
 
 mkdir -p "${INSTALL_DIR}"
 
-for tool in liftOver twoBitToFa faToTwoBit; do
+for tool in liftOver twoBitToFa faToTwoBit bigBedToBed bigWigToBedGraph; do
   echo "Installing ${tool} -> ${INSTALL_DIR}"
   curl -fsSL "${BASE_URL}/${tool}" -o "${INSTALL_DIR}/${tool}"
   chmod +x "${INSTALL_DIR}/${tool}"
