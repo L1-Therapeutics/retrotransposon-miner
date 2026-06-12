@@ -289,12 +289,23 @@ def _aggregate_split_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
                 f"{prefix}_clip_len_mean",
                 f"{prefix}_clip_len_max",
                 f"{prefix}_sa_fraction",
+                f"{prefix}_poly_tail_rescued_rows",
+                f"{prefix}_poly_tail_rescued_unique_reads",
+                f"{prefix}_poly_tail_at_fraction_mean",
+                f"{prefix}_poly_tail_at_run_max",
             ]
         )
     tmp = df.copy()
     if "nm" not in tmp.columns:
         tmp["nm"] = -1
+    if "poly_tail_rescued" not in tmp.columns:
+        tmp["poly_tail_rescued"] = False
+    if "clip_poly_at_fraction" not in tmp.columns:
+        tmp["clip_poly_at_fraction"] = 0.0
+    if "clip_poly_at_run" not in tmp.columns:
+        tmp["clip_poly_at_run"] = 0
     tmp["has_sa_int"] = tmp["has_sa"].astype(bool).astype(int)
+    tmp["poly_tail_rescued_int"] = tmp["poly_tail_rescued"].astype(bool).astype(int)
     grouped = (
         tmp.groupby(["chrom", "window_start", "window_end"], as_index=False)
         .agg(
@@ -308,9 +319,22 @@ def _aggregate_split_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
                 f"{prefix}_sa_fraction": ("has_sa_int", "mean"),
                 f"{prefix}_nm_mean": ("nm", "mean"),
                 f"{prefix}_nm_max": ("nm", "max"),
+                f"{prefix}_poly_tail_rescued_rows": ("poly_tail_rescued_int", "sum"),
+                f"{prefix}_poly_tail_at_fraction_mean": ("clip_poly_at_fraction", "mean"),
+                f"{prefix}_poly_tail_at_run_max": ("clip_poly_at_run", "max"),
             }
         )
         .sort_values(["chrom", "window_start"], kind="mergesort")
+    )
+    rescued_unique = (
+        tmp.loc[tmp["poly_tail_rescued_int"] == 1]
+        .groupby(["chrom", "window_start", "window_end"], as_index=False)["read_name"]
+        .nunique()
+        .rename(columns={"read_name": f"{prefix}_poly_tail_rescued_unique_reads"})
+    )
+    grouped = grouped.merge(rescued_unique, on=["chrom", "window_start", "window_end"], how="left")
+    grouped[f"{prefix}_poly_tail_rescued_unique_reads"] = (
+        grouped[f"{prefix}_poly_tail_rescued_unique_reads"].fillna(0).astype(int)
     )
     return grouped
 
@@ -330,15 +354,26 @@ def _aggregate_discordant_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame
                 f"{prefix}_mate_unmapped_fraction",
                 f"{prefix}_interchrom_fraction",
                 f"{prefix}_large_insert_fraction",
+                f"{prefix}_poly_tail_rescued_rows",
+                f"{prefix}_poly_tail_rescued_unique_reads",
+                f"{prefix}_poly_tail_at_fraction_mean",
+                f"{prefix}_poly_tail_at_run_max",
             ]
         )
     tmp = df.copy()
     if "nm" not in tmp.columns:
         tmp["nm"] = -1
+    if "poly_tail_anchor_rescued" not in tmp.columns:
+        tmp["poly_tail_anchor_rescued"] = False
+    if "anchor_poly_at_fraction" not in tmp.columns:
+        tmp["anchor_poly_at_fraction"] = 0.0
+    if "anchor_poly_at_run" not in tmp.columns:
+        tmp["anchor_poly_at_run"] = 0
     reason_col = tmp["discordant_reasons"].fillna("").astype(str)
     tmp["reason_mate_unmapped"] = reason_col.str.contains("mate_unmapped", regex=False).astype(int)
     tmp["reason_interchrom"] = reason_col.str.contains("interchrom", regex=False).astype(int)
     tmp["reason_large_insert"] = reason_col.str.contains("large_insert", regex=False).astype(int)
+    tmp["poly_tail_anchor_rescued_int"] = tmp["poly_tail_anchor_rescued"].astype(bool).astype(int)
     tmp["abs_tlen"] = tmp["template_len"].abs()
     grouped = (
         tmp.groupby(["chrom", "window_start", "window_end"], as_index=False)
@@ -354,9 +389,22 @@ def _aggregate_discordant_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame
                 f"{prefix}_large_insert_fraction": ("reason_large_insert", "mean"),
                 f"{prefix}_nm_mean": ("nm", "mean"),
                 f"{prefix}_nm_max": ("nm", "max"),
+                f"{prefix}_poly_tail_rescued_rows": ("poly_tail_anchor_rescued_int", "sum"),
+                f"{prefix}_poly_tail_at_fraction_mean": ("anchor_poly_at_fraction", "mean"),
+                f"{prefix}_poly_tail_at_run_max": ("anchor_poly_at_run", "max"),
             }
         )
         .sort_values(["chrom", "window_start"], kind="mergesort")
+    )
+    rescued_unique = (
+        tmp.loc[tmp["poly_tail_anchor_rescued_int"] == 1]
+        .groupby(["chrom", "window_start", "window_end"], as_index=False)["read_name"]
+        .nunique()
+        .rename(columns={"read_name": f"{prefix}_poly_tail_rescued_unique_reads"})
+    )
+    grouped = grouped.merge(rescued_unique, on=["chrom", "window_start", "window_end"], how="left")
+    grouped[f"{prefix}_poly_tail_rescued_unique_reads"] = (
+        grouped[f"{prefix}_poly_tail_rescued_unique_reads"].fillna(0).astype(int)
     )
     return grouped
 
@@ -692,6 +740,7 @@ def build_candidate_loci(
         or c.endswith("_unique_reads")
         or c.endswith("_mapq_min")
         or c.endswith("_clip_len_max")
+        or c.endswith("_run_max")
         or c.endswith("_nm_max")
     ]
     for col in int_cols:

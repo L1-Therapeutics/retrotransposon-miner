@@ -12,6 +12,7 @@ set -euo pipefail
 TUMOR_BAM=""
 NORMAL_BAM=""
 MEI_FASTA=""
+REFERENCE_FASTA=""
 OUTDIR="results/mei_step1_hg38_chr22"
 REGION="chr22"
 WINDOW_SIZE="200"
@@ -35,6 +36,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mei-fasta)
       MEI_FASTA="$2"
+      shift 2
+      ;;
+    --reference-fasta)
+      REFERENCE_FASTA="$2"
       shift 2
       ;;
     --outdir)
@@ -64,6 +69,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  if [[ "${PYTHON_BIN}" == "python" ]] && command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    echo "ERROR: python executable not found: ${PYTHON_BIN}" >&2
+    exit 1
+  fi
+fi
+
 for required in "${TUMOR_BAM}" "${NORMAL_BAM}" "${MEI_FASTA}"; do
   if [[ -z "${required}" ]]; then
     echo "ERROR: missing required args: --tumor-bam, --normal-bam, --mei-fasta" >&2
@@ -77,6 +91,10 @@ for f in "${TUMOR_BAM}" "${NORMAL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MAPPA
     exit 1
   fi
 done
+if [[ -n "${REFERENCE_FASTA}" ]] && [[ ! -f "${REFERENCE_FASTA}" ]]; then
+  echo "ERROR: reference FASTA not found: ${REFERENCE_FASTA}" >&2
+  exit 1
+fi
 
 mkdir -p "${OUTDIR}"
 
@@ -115,11 +133,19 @@ run_cli build-candidate-loci \
   --encode-blacklist-min-fraction 0.1
 
 echo "[proof-of-signal] stage=annotate-mei-support"
-run_cli annotate-mei-support \
-  --evidence-dir "${OUTDIR}" \
-  --candidate-loci "${OUTDIR}/candidate_loci.tsv" \
-  --mei-fasta "${MEI_FASTA}" \
-  --out-tsv "${OUTDIR}/candidate_loci.mei.tsv"
+annotate_cmd=(
+  annotate-mei-support
+  --evidence-dir "${OUTDIR}"
+  --candidate-loci "${OUTDIR}/candidate_loci.tsv"
+  --mei-fasta "${MEI_FASTA}"
+  --tumor-bam-depth "${TUMOR_BAM}"
+  --normal-bam-depth "${NORMAL_BAM}"
+)
+if [[ -n "${REFERENCE_FASTA}" ]]; then
+  annotate_cmd+=(--reference-fasta "${REFERENCE_FASTA}")
+fi
+annotate_cmd+=(--out-tsv "${OUTDIR}/candidate_loci.mei.tsv")
+run_cli "${annotate_cmd[@]}"
 
 echo "[proof-of-signal] done"
 echo "  ${OUTDIR}/split_evidence.summary.tsv"

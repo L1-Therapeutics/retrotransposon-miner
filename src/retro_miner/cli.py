@@ -45,6 +45,27 @@ def check_env() -> None:
 )
 @click.option("--min-clip-len", default=20, show_default=True, type=int, help="Minimum soft-clip length.")
 @click.option(
+    "--poly-tail-rescue-min-clip-len",
+    default=8,
+    show_default=True,
+    type=int,
+    help="Minimum soft-clip length to rescue reads with strong polyA/polyT tails at breakpoint.",
+)
+@click.option(
+    "--poly-tail-rescue-min-run",
+    default=8,
+    show_default=True,
+    type=int,
+    help="Minimum longest homopolymer run of A/T in clip sequence for poly-tail rescue.",
+)
+@click.option(
+    "--poly-tail-rescue-min-frac",
+    default=0.8,
+    show_default=True,
+    type=float,
+    help="Minimum A/T fraction in clip sequence for poly-tail rescue.",
+)
+@click.option(
     "--with-discordant/--no-discordant",
     default=True,
     show_default=True,
@@ -64,6 +85,34 @@ def check_env() -> None:
     type=int,
     help="Minimum absolute template length allowed for large-insert discordant evidence.",
 )
+@click.option(
+    "--discordant-poly-tail-rescue-window-bases",
+    default=25,
+    show_default=True,
+    type=int,
+    help="Number of terminal bases to scan on each read end for discordant-anchor polyA/polyT rescue.",
+)
+@click.option(
+    "--discordant-poly-tail-rescue-min-run",
+    default=10,
+    show_default=True,
+    type=int,
+    help="Minimum A/T homopolymer run in breakpoint-proximal discordant-anchor sequence.",
+)
+@click.option(
+    "--discordant-poly-tail-rescue-min-frac",
+    default=0.8,
+    show_default=True,
+    type=float,
+    help="Minimum A/T fraction in breakpoint-proximal discordant-anchor sequence.",
+)
+@click.option(
+    "--discordant-poly-tail-rescue-min-abs-tlen",
+    default=500,
+    show_default=True,
+    type=int,
+    help="Minimum |TLEN| structural context for discordant-anchor polyA/polyT rescue.",
+)
 def extract_split_evidence_cmd(
     tumor_bam: Path,
     normal_bam: Path,
@@ -73,9 +122,16 @@ def extract_split_evidence_cmd(
     min_mapq: int,
     min_mapq_discordant: int,
     min_clip_len: int,
+    poly_tail_rescue_min_clip_len: int,
+    poly_tail_rescue_min_run: int,
+    poly_tail_rescue_min_frac: float,
     with_discordant: bool,
     discordant_quantile: float,
     discordant_min_abs_tlen: int,
+    discordant_poly_tail_rescue_window_bases: int,
+    discordant_poly_tail_rescue_min_run: int,
+    discordant_poly_tail_rescue_min_frac: float,
+    discordant_poly_tail_rescue_min_abs_tlen: int,
 ) -> None:
     """Extract split-read MEI evidence and optional discordant evidence."""
     outdir.mkdir(parents=True, exist_ok=True)
@@ -95,6 +151,9 @@ def extract_split_evidence_cmd(
             regions=region_list,
             min_mapq=min_mapq,
             min_clip_len=min_clip_len,
+            poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+            poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+            poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
         )
         split_summaries.append(split_summary)
         click.echo(
@@ -111,6 +170,10 @@ def extract_split_evidence_cmd(
                 min_mapq=min_mapq_discordant,
                 insert_quantile=discordant_quantile,
                 min_abs_tlen=discordant_min_abs_tlen,
+                poly_tail_rescue_window_bases=discordant_poly_tail_rescue_window_bases,
+                poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
+                poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
+                poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
             )
             discordant_summaries[sample] = discordant_summary
             click.echo(
@@ -310,21 +373,39 @@ def build_candidate_loci_cmd(
     default=None,
     help="Optional reference FASTA for TSD sequence extraction and breakpoint-context annotation.",
 )
+@click.option(
+    "--tumor-bam-depth",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional tumor BAM path for local BAM-depth normalization on consistent/junk-clean loci.",
+)
+@click.option(
+    "--normal-bam-depth",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional normal BAM path for local BAM-depth normalization on consistent/junk-clean loci.",
+)
 def annotate_mei_support_cmd(
     evidence_dir: Path,
     candidate_loci: Path,
     mei_fasta: Path,
     out_tsv: Path,
     reference_fasta: Path | None,
+    tumor_bam_depth: Path | None,
+    normal_bam_depth: Path | None,
 ) -> None:
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
     click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
+    if (tumor_bam_depth is None) ^ (normal_bam_depth is None):
+        raise click.ClickException("Provide both --tumor-bam-depth and --normal-bam-depth, or neither.")
     out_path = annotate_candidate_loci_with_mei(
         evidence_dir=evidence_dir,
         candidate_loci_path=candidate_loci,
         mei_fasta=mei_fasta,
         out_path=out_tsv,
         reference_fasta=reference_fasta,
+        tumor_bam_path=tumor_bam_depth,
+        normal_bam_path=normal_bam_depth,
     )
     click.echo(f"[mei-annotate] done {out_path}")
 

@@ -50,6 +50,49 @@ def _collect_soft_clips(read: pysam.AlignedSegment, min_clip_len: int) -> list[t
     return clips
 
 
+def _poly_at_stats(seq: str) -> tuple[int, float, str]:
+    s = (seq or "").upper()
+    if not s:
+        return (0, 0.0, "")
+    best = 0
+    best_base = ""
+    cur = 0
+    prev = ""
+    at_bases = 0
+    for ch in s:
+        if ch in {"A", "T"}:
+            at_bases += 1
+            if ch == prev:
+                cur += 1
+            else:
+                cur = 1
+                prev = ch
+            if cur > best:
+                best = cur
+                best_base = ch
+        else:
+            cur = 0
+            prev = ""
+    return (best, float(at_bases) / float(len(s)), best_base)
+
+
+def _poly_at_breakpoint_proximal_stats(
+    read_seq: str,
+    window_bases: int,
+) -> tuple[int, float, str, str]:
+    seq = (read_seq or "").upper()
+    if not seq:
+        return (0, 0.0, "", "")
+    win = max(1, int(window_bases))
+    left = seq[:win]
+    right = seq[-win:]
+    l_run, l_frac, l_base = _poly_at_stats(left)
+    r_run, r_frac, r_base = _poly_at_stats(right)
+    if (l_run, l_frac) >= (r_run, r_frac):
+        return (int(l_run), float(l_frac), l_base, "L")
+    return (int(r_run), float(r_frac), r_base, "R")
+
+
 def extract_split_evidence(
     bam_path: Path,
     sample_name: str,
@@ -57,6 +100,9 @@ def extract_split_evidence(
     regions: list[str] | str,
     min_mapq: int = 20,
     min_clip_len: int = 20,
+    poly_tail_rescue_min_clip_len: int = 8,
+    poly_tail_rescue_min_run: int = 8,
+    poly_tail_rescue_min_frac: float = 0.8,
 ) -> ExtractionSummary:
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -78,7 +124,8 @@ def extract_split_evidence(
                 continue
 
             passing_reads += 1
-            clips = _collect_soft_clips(read, min_clip_len=min_clip_len)
+            collect_clip_len = min(int(min_clip_len), max(1, int(poly_tail_rescue_min_clip_len)))
+            clips = _collect_soft_clips(read, min_clip_len=collect_clip_len)
             if not clips:
                 continue
 
@@ -101,6 +148,15 @@ def extract_split_evidence(
                         clip_seq = query_seq[:clip_len]
                     else:
                         clip_seq = query_seq[-clip_len:]
+                poly_run, poly_frac, poly_base = _poly_at_stats(clip_seq)
+                poly_tail_rescued = (
+                    clip_len < min_clip_len
+                    and clip_len >= max(1, int(poly_tail_rescue_min_clip_len))
+                    and poly_run >= max(1, int(poly_tail_rescue_min_run))
+                    and poly_frac >= float(poly_tail_rescue_min_frac)
+                )
+                if clip_len < min_clip_len and not poly_tail_rescued:
+                    continue
                 rows.append(
                     {
                         "sample": sample_name,
@@ -115,6 +171,10 @@ def extract_split_evidence(
                         "sa_raw": sa_raw,
                         "clip_seq": clip_seq,
                         "nm": nm,
+                        "clip_poly_at_run": int(poly_run),
+                        "clip_poly_at_fraction": float(poly_frac),
+                        "clip_poly_base": poly_base,
+                        "poly_tail_rescued": bool(poly_tail_rescued),
                     }
                 )
 
@@ -136,6 +196,10 @@ def extract_split_evidence(
                 "sa_raw",
                 "clip_seq",
                 "nm",
+                "clip_poly_at_run",
+                "clip_poly_at_fraction",
+                "clip_poly_base",
+                "poly_tail_rescued",
             ]
         )
 
@@ -192,6 +256,10 @@ def extract_discordant_evidence(
     min_mapq: int = 20,
     insert_quantile: float = 0.995,
     min_abs_tlen: int = 1000,
+    poly_tail_rescue_window_bases: int = 25,
+    poly_tail_rescue_min_run: int = 10,
+    poly_tail_rescue_min_frac: float = 0.8,
+    poly_tail_rescue_min_abs_tlen: int = 500,
 ) -> ExtractionSummary:
     outdir.mkdir(parents=True, exist_ok=True)
     insert_threshold = _estimate_insert_size_threshold(
@@ -228,12 +296,12 @@ def extract_discordant_evidence(
                 mate_chrom = bam.get_reference_name(read.next_reference_id)
                 mate_pos_1based = read.next_reference_start + 1
 
+            abs_tlen = abs(read.template_length)
             if read.mate_is_unmapped:
                 reasons.append("mate_unmapped")
             elif read.reference_id != read.next_reference_id:
                 reasons.append("interchrom")
             else:
-                abs_tlen = abs(read.template_length)
                 if abs_tlen >= insert_threshold:
                     reasons.append("large_insert")
 
@@ -242,6 +310,26 @@ def extract_discordant_evidence(
                 reasons.append("same_strand")
             if not read.is_proper_pair:
                 reasons.append("improper_pair")
+
+            read_seq = read.query_sequence or ""
+            poly_run, poly_frac, poly_base, poly_side = _poly_at_breakpoint_proximal_stats(
+                read_seq,
+                window_bases=poly_tail_rescue_window_bases,
+            )
+            has_structural_context = (
+                read.mate_is_unmapped
+                or (read.reference_id != read.next_reference_id)
+                or (abs_tlen >= max(1, int(poly_tail_rescue_min_abs_tlen)))
+                or (read.is_reverse == read.mate_is_reverse)
+                or (not read.is_proper_pair)
+            )
+            poly_tail_anchor_rescued = (
+                poly_run >= max(1, int(poly_tail_rescue_min_run))
+                and poly_frac >= float(poly_tail_rescue_min_frac)
+                and has_structural_context
+            )
+            if poly_tail_anchor_rescued:
+                reasons.append("poly_tail_anchor_rescue")
 
             if not reasons:
                 continue
@@ -264,7 +352,12 @@ def extract_discordant_evidence(
                     "read_name": read.query_name,
                     "discordant_reasons": ",".join(sorted(set(reasons))),
                     "nm": int(read.get_tag("NM")) if read.has_tag("NM") else -1,
-                    "read_seq": (read.query_sequence or ""),
+                    "read_seq": read_seq,
+                    "anchor_poly_at_run": int(poly_run),
+                    "anchor_poly_at_fraction": float(poly_frac),
+                    "anchor_poly_base": poly_base,
+                    "anchor_poly_side": poly_side,
+                    "poly_tail_anchor_rescued": bool(poly_tail_anchor_rescued),
                 }
             )
 
@@ -289,6 +382,11 @@ def extract_discordant_evidence(
                 "discordant_reasons",
                 "nm",
                 "read_seq",
+                "anchor_poly_at_run",
+                "anchor_poly_at_fraction",
+                "anchor_poly_base",
+                "anchor_poly_side",
+                "poly_tail_anchor_rescued",
             ]
         )
 
