@@ -30,7 +30,19 @@ def check_env() -> None:
 @click.option("--normal-bam", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--outdir", type=click.Path(file_okay=False, path_type=Path), required=True)
 @click.option("--region", default="chr22", show_default=True, help="Region to scan, e.g. chr22 or chr1:1-1000000.")
-@click.option("--min-mapq", default=20, show_default=True, type=int, help="Minimum read mapping quality.")
+@click.option(
+    "--regions",
+    default=None,
+    help="Optional comma-separated region/chromosome list (overrides --region), e.g. chr15,chr16,chr17.",
+)
+@click.option("--min-mapq", default=20, show_default=True, type=int, help="Minimum split-read anchor mapping quality.")
+@click.option(
+    "--min-mapq-discordant",
+    default=0,
+    show_default=True,
+    type=int,
+    help="Minimum discordant-read anchor mapping quality.",
+)
 @click.option("--min-clip-len", default=20, show_default=True, type=int, help="Minimum soft-clip length.")
 @click.option(
     "--with-discordant/--no-discordant",
@@ -57,7 +69,9 @@ def extract_split_evidence_cmd(
     normal_bam: Path,
     outdir: Path,
     region: str,
+    regions: str | None,
     min_mapq: int,
+    min_mapq_discordant: int,
     min_clip_len: int,
     with_discordant: bool,
     discordant_quantile: float,
@@ -65,16 +79,20 @@ def extract_split_evidence_cmd(
 ) -> None:
     """Extract split-read MEI evidence and optional discordant evidence."""
     outdir.mkdir(parents=True, exist_ok=True)
+    region_list = [r.strip() for r in regions.split(",")] if regions else [region]
+    region_list = [r for r in region_list if r]
+    if not region_list:
+        raise click.ClickException("No valid regions provided via --region/--regions.")
 
     split_summaries: list[ExtractionSummary] = []
     discordant_summaries: dict[str, ExtractionSummary] = {}
     for sample, bam in (("tumor", tumor_bam), ("normal", normal_bam)):
-        click.echo(f"[extract] sample={sample} bam={bam} region={region}")
+        click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
         split_summary = extract_split_evidence(
             bam_path=bam,
             sample_name=sample,
             outdir=outdir,
-            region=region,
+            regions=region_list,
             min_mapq=min_mapq,
             min_clip_len=min_clip_len,
         )
@@ -84,13 +102,13 @@ def extract_split_evidence_cmd(
             f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows}"
         )
         if with_discordant:
-            click.echo(f"[extract-discordant] sample={sample} region={region}")
+            click.echo(f"[extract-discordant] sample={sample} regions={','.join(region_list)}")
             discordant_summary = extract_discordant_evidence(
                 bam_path=bam,
                 sample_name=sample,
                 outdir=outdir,
-                region=region,
-                min_mapq=min_mapq,
+                regions=region_list,
+                min_mapq=min_mapq_discordant,
                 insert_quantile=discordant_quantile,
                 min_abs_tlen=discordant_min_abs_tlen,
             )
@@ -131,6 +149,27 @@ def extract_split_evidence_cmd(
     help="Output directory for candidate loci table (defaults to evidence-dir).",
 )
 @click.option("--window-size", type=int, default=200, show_default=True, help="Window size in bp for locus binning.")
+@click.option(
+    "--split-cluster-bp",
+    type=int,
+    default=30,
+    show_default=True,
+    help="Breakpoint clustering distance for split-read evidence (bp).",
+)
+@click.option(
+    "--discordant-cluster-bp",
+    type=int,
+    default=400,
+    show_default=True,
+    help="Breakpoint clustering distance for discordant evidence (bp).",
+)
+@click.option(
+    "--max-locus-span-bp",
+    type=int,
+    default=2000,
+    show_default=True,
+    help="Maximum merged locus span to prevent over-merging chained discordant intervals.",
+)
 @click.option("--pseudocount", type=float, default=1.0, show_default=True, help="Pseudocount for enrichment ratio.")
 @click.option(
     "--segdup-bed",
@@ -201,6 +240,9 @@ def build_candidate_loci_cmd(
     evidence_dir: Path,
     outdir: Path | None,
     window_size: int,
+    split_cluster_bp: int,
+    discordant_cluster_bp: int,
+    max_locus_span_bp: int,
     pseudocount: float,
     segdup_bed: Path | None,
     segdup_min_fraction: float,
@@ -219,6 +261,9 @@ def build_candidate_loci_cmd(
         evidence_dir=evidence_dir,
         outdir=target_outdir,
         window_size=window_size,
+        split_cluster_bp=split_cluster_bp,
+        discordant_cluster_bp=discordant_cluster_bp,
+        max_locus_span_bp=max_locus_span_bp,
         pseudocount=pseudocount,
         segdup_bed=segdup_bed,
         segdup_min_fraction=segdup_min_fraction,
@@ -259,11 +304,18 @@ def build_candidate_loci_cmd(
     required=True,
     help="Output TSV path for candidate loci with MEI support annotation.",
 )
+@click.option(
+    "--reference-fasta",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional reference FASTA for TSD sequence extraction and breakpoint-context annotation.",
+)
 def annotate_mei_support_cmd(
     evidence_dir: Path,
     candidate_loci: Path,
     mei_fasta: Path,
     out_tsv: Path,
+    reference_fasta: Path | None,
 ) -> None:
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
     click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
@@ -272,6 +324,7 @@ def annotate_mei_support_cmd(
         candidate_loci_path=candidate_loci,
         mei_fasta=mei_fasta,
         out_path=out_tsv,
+        reference_fasta=reference_fasta,
     )
     click.echo(f"[mei-annotate] done {out_path}")
 

@@ -96,6 +96,7 @@ run_cli extract-split-evidence \
   --outdir "${OUTDIR}" \
   --region "${REGION}" \
   --min-mapq 20 \
+  --min-mapq-discordant 0 \
   --min-clip-len 20
 
 echo "[proof-of-signal] stage=build-candidate-loci window_size=${WINDOW_SIZE}"

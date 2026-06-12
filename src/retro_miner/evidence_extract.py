@@ -19,6 +19,21 @@ class ExtractionSummary:
     insert_size_threshold: int = 0
 
 
+def _normalize_regions(regions: list[str] | str) -> list[str]:
+    if isinstance(regions, str):
+        return [regions]
+    clean = [r.strip() for r in regions if r and r.strip()]
+    if not clean:
+        raise ValueError("No valid regions provided.")
+    return clean
+
+
+def _iter_reads_for_regions(bam: pysam.AlignmentFile, regions: list[str]):
+    for region in regions:
+        for read in bam.fetch(region=region):
+            yield read
+
+
 def _collect_soft_clips(read: pysam.AlignedSegment, min_clip_len: int) -> list[tuple[str, int]]:
     if read.cigartuples is None:
         return []
@@ -39,7 +54,7 @@ def extract_split_evidence(
     bam_path: Path,
     sample_name: str,
     outdir: Path,
-    region: str,
+    regions: list[str] | str,
     min_mapq: int = 20,
     min_clip_len: int = 20,
 ) -> ExtractionSummary:
@@ -48,10 +63,11 @@ def extract_split_evidence(
     rows: list[dict[str, Any]] = []
     total_reads_scanned = 0
     passing_reads = 0
+    region_list = _normalize_regions(regions)
 
     with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-        # fetch with explicit region keeps this step focused on chr22-sized runs.
-        for read in bam.fetch(region=region):
+        # Fetch explicit regions to support targeted chromosome subsets.
+        for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
 
             if read.is_unmapped:
@@ -68,9 +84,16 @@ def extract_split_evidence(
 
             has_sa = read.has_tag("SA")
             sa_raw = read.get_tag("SA") if has_sa else ""
+            nm = int(read.get_tag("NM")) if read.has_tag("NM") else -1
             chrom = bam.get_reference_name(read.reference_id)
-            pos_1based = read.reference_start + 1
             for clip_side, clip_len in clips:
+                # Breakpoint coordinate should depend on clipping side:
+                # - Left clip: mapped segment starts at breakpoint (reference_start + 1)
+                # - Right clip: mapped segment ends at breakpoint (reference_end)
+                if clip_side == "L":
+                    pos_1based = read.reference_start + 1
+                else:
+                    pos_1based = read.reference_end
                 query_seq = read.query_sequence or ""
                 clip_seq = ""
                 if query_seq:
@@ -91,6 +114,7 @@ def extract_split_evidence(
                         "has_sa": bool(has_sa),
                         "sa_raw": sa_raw,
                         "clip_seq": clip_seq,
+                        "nm": nm,
                     }
                 )
 
@@ -111,6 +135,7 @@ def extract_split_evidence(
                 "has_sa",
                 "sa_raw",
                 "clip_seq",
+                "nm",
             ]
         )
 
@@ -129,14 +154,15 @@ def extract_split_evidence(
 
 def _estimate_insert_size_threshold(
     bam_path: Path,
-    region: str,
+    regions: list[str] | str,
     min_mapq: int,
     quantile: float,
     fallback_threshold: int,
 ) -> int:
     insert_sizes: list[int] = []
+    region_list = _normalize_regions(regions)
     with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-        for read in bam.fetch(region=region):
+        for read in _iter_reads_for_regions(bam, region_list):
             if not read.is_paired or not read.is_read1:
                 continue
             if read.is_unmapped or read.mate_is_unmapped:
@@ -162,7 +188,7 @@ def extract_discordant_evidence(
     bam_path: Path,
     sample_name: str,
     outdir: Path,
-    region: str,
+    regions: list[str] | str,
     min_mapq: int = 20,
     insert_quantile: float = 0.995,
     min_abs_tlen: int = 1000,
@@ -170,7 +196,7 @@ def extract_discordant_evidence(
     outdir.mkdir(parents=True, exist_ok=True)
     insert_threshold = _estimate_insert_size_threshold(
         bam_path=bam_path,
-        region=region,
+        regions=regions,
         min_mapq=min_mapq,
         quantile=insert_quantile,
         fallback_threshold=min_abs_tlen,
@@ -179,12 +205,13 @@ def extract_discordant_evidence(
     rows: list[dict[str, Any]] = []
     total_reads_scanned = 0
     passing_reads = 0
+    region_list = _normalize_regions(regions)
 
     with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-        for read in bam.fetch(region=region):
+        for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
 
-            if not read.is_paired or not read.is_read1:
+            if not read.is_paired:
                 continue
             if read.is_unmapped:
                 continue
@@ -233,8 +260,11 @@ def extract_discordant_evidence(
                     "is_reverse": bool(read.is_reverse),
                     "mate_is_reverse": bool(read.mate_is_reverse),
                     "is_proper_pair": bool(read.is_proper_pair),
+                    "is_read1": bool(read.is_read1),
                     "read_name": read.query_name,
                     "discordant_reasons": ",".join(sorted(set(reasons))),
+                    "nm": int(read.get_tag("NM")) if read.has_tag("NM") else -1,
+                    "read_seq": (read.query_sequence or ""),
                 }
             )
 
@@ -254,8 +284,11 @@ def extract_discordant_evidence(
                 "is_reverse",
                 "mate_is_reverse",
                 "is_proper_pair",
+                "is_read1",
                 "read_name",
                 "discordant_reasons",
+                "nm",
+                "read_seq",
             ]
         )
 
