@@ -137,6 +137,62 @@ For chr15, replace the input path with:
 
 `results/mei_step1_hg38_chr15/candidate_loci.mei.tsv`
 
+## Strict somatic-only DPE shortlist
+
+Use this to keep only loci with bilateral tumor DPE support (1+ each side),
+perfect tumor DPE family/strand consistency, no junk flag, and **zero** normal
+MEI support (split or DPE):
+
+```bash
+awk -F'\t' '
+NR==1{
+  for(i=1;i<=NF;i++) c[$i]=i
+  print "chrom","window_start","window_end","sample_status","tier", \
+        "tumor_split_total","normal_split_total","tumor_dpe_total","normal_dpe_total", \
+        "tumor_dpe_left","tumor_dpe_right","normal_dpe_left","normal_dpe_right", \
+        "tumor_dpe_family","tumor_dpe_subfamily","tumor_dpe_strand", \
+        "tumor_dpe_family_purity","tumor_dpe_strand_purity", \
+        "tumor_anchor_mapq_mean","tumor_anchor_mapq_min","normal_anchor_mapq_mean","normal_anchor_mapq_min"
+  next
+}
+{
+  tSplit = ($c["tumor_L_mei_supported_reads"]+0) + ($c["tumor_R_mei_supported_reads"]+0)
+  nSplit = ($c["normal_L_mei_supported_reads"]+0) + ($c["normal_R_mei_supported_reads"]+0)
+  tDpe = $c["tumor_discordant_mei_supported_reads"]+0
+  nDpe = $c["normal_discordant_mei_supported_reads"]+0
+  if (
+    ($c["junk_flag_count"]+0)==0 &&
+    ($c["tumor_discordant_mei_left_supported_reads"]+0)>=1 &&
+    ($c["tumor_discordant_mei_right_supported_reads"]+0)>=1 &&
+    ($c["tumor_discordant_mei_family_purity"]+0)==1.0 &&
+    ($c["tumor_discordant_mei_strand_purity"]+0)==1.0 &&
+    nSplit==0 &&
+    nDpe==0
+  ) {
+    print $c["chrom"],$c["window_start"],$c["window_end"],$c["sample_status_label"],$c["insertion_call_tier"], \
+          tSplit,nSplit,tDpe,nDpe, \
+          $c["tumor_discordant_mei_left_supported_reads"],$c["tumor_discordant_mei_right_supported_reads"], \
+          $c["normal_discordant_mei_left_supported_reads"],$c["normal_discordant_mei_right_supported_reads"], \
+          $c["tumor_discordant_mei_family"],$c["tumor_discordant_mei_subfamily"],$c["tumor_discordant_mei_strand"], \
+          $c["tumor_discordant_mei_family_purity"],$c["tumor_discordant_mei_strand_purity"], \
+          $c["discordant_tumor_mapq_mean"],$c["discordant_tumor_mapq_min"],$c["discordant_normal_mapq_mean"],$c["discordant_normal_mapq_min"]
+  }
+}
+' OFS='\t' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv | sort -t$'\t' -k1,1 -k2,2n
+```
+
+## Symmetric DPE shortlist (keep shared, drop contradictory labels)
+
+Use this to keep high-consistency bilateral DPE loci in clean regions while
+removing contradictory single-sample labels:
+- drop `somatic_only`/`tumor_only` if any normal support exists
+- drop `germline_only` if any tumor support exists
+- keep `shared`
+
+```bash
+awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) c[$i]=i; print "chrom","window_start","window_end","sample_status","tier","tumor_dpe_total","tumor_dpe_left","tumor_dpe_right","normal_dpe_total","normal_dpe_left","normal_dpe_right","tumor_dpe_family","normal_dpe_family","tumor_dpe_subfamily","normal_dpe_subfamily","tumor_dpe_strand","normal_dpe_strand","tumor_dpe_family_purity","normal_dpe_family_purity","tumor_dpe_strand_purity","normal_dpe_strand_purity"; next} {tSplit=($c["tumor_L_mei_supported_reads"]+0)+($c["tumor_R_mei_supported_reads"]+0); nSplit=($c["normal_L_mei_supported_reads"]+0)+($c["normal_R_mei_supported_reads"]+0); tDpe=$c["tumor_discordant_mei_supported_reads"]+0; nDpe=$c["normal_discordant_mei_supported_reads"]+0; tAny=(tSplit+tDpe); nAny=(nSplit+nDpe); status=$c["sample_status_label"]; bilateral=((($c["tumor_discordant_mei_left_supported_reads"]+0)>=1 && ($c["tumor_discordant_mei_right_supported_reads"]+0)>=1 && ($c["tumor_discordant_mei_family_purity"]+0)==1.0 && ($c["tumor_discordant_mei_strand_purity"]+0)==1.0) || (($c["normal_discordant_mei_left_supported_reads"]+0)>=1 && ($c["normal_discordant_mei_right_supported_reads"]+0)>=1 && ($c["normal_discordant_mei_family_purity"]+0)==1.0 && ($c["normal_discordant_mei_strand_purity"]+0)==1.0)); drop_false_somatic=((status=="somatic_only" || status=="tumor_only") && nAny>=1); drop_false_germline=((status=="germline_only") && tAny>=1); if((($c["junk_flag_count"]+0)==0) && bilateral && !drop_false_somatic && !drop_false_germline){print $c["chrom"],$c["window_start"],$c["window_end"],status,$c["insertion_call_tier"],tDpe,$c["tumor_discordant_mei_left_supported_reads"],$c["tumor_discordant_mei_right_supported_reads"],nDpe,$c["normal_discordant_mei_left_supported_reads"],$c["normal_discordant_mei_right_supported_reads"],$c["tumor_discordant_mei_family"],$c["normal_discordant_mei_family"],$c["tumor_discordant_mei_subfamily"],$c["normal_discordant_mei_subfamily"],$c["tumor_discordant_mei_strand"],$c["normal_discordant_mei_strand"],$c["tumor_discordant_mei_family_purity"],$c["normal_discordant_mei_family_purity"],$c["tumor_discordant_mei_strand_purity"],$c["normal_discordant_mei_strand_purity"]}}' OFS='\t' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv | sort -t$'\t' -k4,4 -k1,1 -k2,2n
+```
+
 ## Notes
 
 - This prototype intentionally avoids hard filtering in core pipeline stages.
