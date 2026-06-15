@@ -385,6 +385,46 @@ def build_candidate_loci_cmd(
     default=None,
     help="Optional normal BAM path for local BAM-depth normalization on consistent/junk-clean loci.",
 )
+@click.option(
+    "--g1k-mei-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional 1000G/MELT MEI BED for polymorphism overlap annotation via bedtools intersect.",
+)
+@click.option(
+    "--g1k-mei-vcf",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional 1000G/MELT MEI VCF(.gz) for overlap + population-frequency annotation.",
+)
+@click.option(
+    "--g1k-split-padding-bp",
+    type=int,
+    default=200,
+    show_default=True,
+    help="Padding for split-resolved breakpoint-centered overlap queries (bp).",
+)
+@click.option(
+    "--g1k-dpe-padding-min-bp",
+    type=int,
+    default=200,
+    show_default=True,
+    help="Minimum padding for discordant-dominant overlap queries (bp).",
+)
+@click.option(
+    "--g1k-dpe-padding-max-bp",
+    type=int,
+    default=200,
+    show_default=True,
+    help="Maximum padding cap for discordant-dominant overlap queries (bp).",
+)
+@click.option(
+    "--g1k-dpe-padding-tlen-factor",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Scale factor applied to discordant TLEN mean when deriving discordant-dominant query padding.",
+)
 def annotate_mei_support_cmd(
     evidence_dir: Path,
     candidate_loci: Path,
@@ -393,11 +433,19 @@ def annotate_mei_support_cmd(
     reference_fasta: Path | None,
     tumor_bam_depth: Path | None,
     normal_bam_depth: Path | None,
+    g1k_mei_bed: Path | None,
+    g1k_mei_vcf: Path | None,
+    g1k_split_padding_bp: int,
+    g1k_dpe_padding_min_bp: int,
+    g1k_dpe_padding_max_bp: int,
+    g1k_dpe_padding_tlen_factor: float,
 ) -> None:
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
     click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
     if (tumor_bam_depth is None) ^ (normal_bam_depth is None):
         raise click.ClickException("Provide both --tumor-bam-depth and --normal-bam-depth, or neither.")
+    if g1k_mei_bed is not None and g1k_mei_vcf is not None:
+        raise click.ClickException("Provide only one of --g1k-mei-bed or --g1k-mei-vcf.")
     out_path = annotate_candidate_loci_with_mei(
         evidence_dir=evidence_dir,
         candidate_loci_path=candidate_loci,
@@ -406,6 +454,12 @@ def annotate_mei_support_cmd(
         reference_fasta=reference_fasta,
         tumor_bam_path=tumor_bam_depth,
         normal_bam_path=normal_bam_depth,
+        g1k_mei_bed=g1k_mei_bed,
+        g1k_mei_vcf=g1k_mei_vcf,
+        g1k_split_padding_bp=g1k_split_padding_bp,
+        g1k_dpe_padding_min_bp=g1k_dpe_padding_min_bp,
+        g1k_dpe_padding_max_bp=g1k_dpe_padding_max_bp,
+        g1k_dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
     )
     click.echo(f"[mei-annotate] done {out_path}")
 

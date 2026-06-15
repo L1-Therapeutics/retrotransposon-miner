@@ -13,9 +13,15 @@ TUMOR_BAM=""
 NORMAL_BAM=""
 MEI_FASTA=""
 REFERENCE_FASTA=""
+G1K_MEI_BED=""
+G1K_MEI_VCF=""
 OUTDIR="results/mei_step1_hg38_chr22"
 REGION="chr22"
 WINDOW_SIZE="200"
+G1K_SPLIT_PADDING_BP="200"
+G1K_DPE_PADDING_MIN_BP="200"
+G1K_DPE_PADDING_MAX_BP="200"
+G1K_DPE_PADDING_TLEN_FACTOR="0"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
@@ -46,12 +52,36 @@ while [[ $# -gt 0 ]]; do
       OUTDIR="$2"
       shift 2
       ;;
+    --g1k-mei-bed)
+      G1K_MEI_BED="$2"
+      shift 2
+      ;;
+    --g1k-mei-vcf)
+      G1K_MEI_VCF="$2"
+      shift 2
+      ;;
     --region)
       REGION="$2"
       shift 2
       ;;
     --window-size)
       WINDOW_SIZE="$2"
+      shift 2
+      ;;
+    --g1k-split-padding-bp)
+      G1K_SPLIT_PADDING_BP="$2"
+      shift 2
+      ;;
+    --g1k-dpe-padding-min-bp)
+      G1K_DPE_PADDING_MIN_BP="$2"
+      shift 2
+      ;;
+    --g1k-dpe-padding-max-bp)
+      G1K_DPE_PADDING_MAX_BP="$2"
+      shift 2
+      ;;
+    --g1k-dpe-padding-tlen-factor)
+      G1K_DPE_PADDING_TLEN_FACTOR="$2"
       shift 2
       ;;
     --python-bin)
@@ -93,6 +123,18 @@ for f in "${TUMOR_BAM}" "${NORMAL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MAPPA
 done
 if [[ -n "${REFERENCE_FASTA}" ]] && [[ ! -f "${REFERENCE_FASTA}" ]]; then
   echo "ERROR: reference FASTA not found: ${REFERENCE_FASTA}" >&2
+  exit 1
+fi
+if [[ -n "${G1K_MEI_BED}" ]] && [[ ! -f "${G1K_MEI_BED}" ]]; then
+  echo "ERROR: 1000G/MELT MEI BED not found: ${G1K_MEI_BED}" >&2
+  exit 1
+fi
+if [[ -n "${G1K_MEI_VCF}" ]] && [[ ! -f "${G1K_MEI_VCF}" ]]; then
+  echo "ERROR: 1000G/MELT MEI VCF not found: ${G1K_MEI_VCF}" >&2
+  exit 1
+fi
+if [[ -n "${G1K_MEI_BED}" ]] && [[ -n "${G1K_MEI_VCF}" ]]; then
+  echo "ERROR: provide only one of --g1k-mei-bed or --g1k-mei-vcf" >&2
   exit 1
 fi
 
@@ -143,6 +185,24 @@ annotate_cmd=(
 )
 if [[ -n "${REFERENCE_FASTA}" ]]; then
   annotate_cmd+=(--reference-fasta "${REFERENCE_FASTA}")
+fi
+if [[ -n "${G1K_MEI_BED}" ]]; then
+  annotate_cmd+=(
+    --g1k-mei-bed "${G1K_MEI_BED}"
+    --g1k-split-padding-bp "${G1K_SPLIT_PADDING_BP}"
+    --g1k-dpe-padding-min-bp "${G1K_DPE_PADDING_MIN_BP}"
+    --g1k-dpe-padding-max-bp "${G1K_DPE_PADDING_MAX_BP}"
+    --g1k-dpe-padding-tlen-factor "${G1K_DPE_PADDING_TLEN_FACTOR}"
+  )
+fi
+if [[ -n "${G1K_MEI_VCF}" ]]; then
+  annotate_cmd+=(
+    --g1k-mei-vcf "${G1K_MEI_VCF}"
+    --g1k-split-padding-bp "${G1K_SPLIT_PADDING_BP}"
+    --g1k-dpe-padding-min-bp "${G1K_DPE_PADDING_MIN_BP}"
+    --g1k-dpe-padding-max-bp "${G1K_DPE_PADDING_MAX_BP}"
+    --g1k-dpe-padding-tlen-factor "${G1K_DPE_PADDING_TLEN_FACTOR}"
+  )
 fi
 annotate_cmd+=(--out-tsv "${OUTDIR}/candidate_loci.mei.tsv")
 run_cli "${annotate_cmd[@]}"

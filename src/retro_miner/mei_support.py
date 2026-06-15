@@ -596,6 +596,12 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
         "tumor_R_mei_end",
         "tumor_L_mei_breakpoint_mode",
         "tumor_R_mei_breakpoint_mode",
+        "normal_L_mei_breakpoint_mode",
+        "normal_R_mei_breakpoint_mode",
+        "tumor_L_mei_supported_reads",
+        "tumor_R_mei_supported_reads",
+        "normal_L_mei_supported_reads",
+        "normal_R_mei_supported_reads",
     ]:
         if col not in out.columns:
             out[col] = 0
@@ -622,15 +628,73 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
         return "mixed"
 
     out["tumor_insertion_orientation"] = out.apply(orient, axis=1)
-    left_mode = out["tumor_L_mei_breakpoint_mode"].astype(int)
-    right_mode = out["tumor_R_mei_breakpoint_mode"].astype(int)
-    tsd_len = (right_mode - left_mode + 1).where((left_mode > 0) & (right_mode > 0), 0)
-    out["tsd_len_estimate"] = tsd_len.where((tsd_len >= 2) & (tsd_len <= 30), 0).astype(int)
-    out["tsd_detected"] = out["tsd_len_estimate"] > 0
+
+    def _pick_tsd_pair(row: pd.Series) -> tuple[int, int, int]:
+        # Prefer strict bilateral pairs from either tumor or normal.
+        # If strict length is invalid, allow a small ±2 bp breakpoint rescue.
+        candidates: list[tuple[int, int, int, int]] = []
+        t_l = int(row.get("tumor_L_mei_breakpoint_mode", 0))
+        t_r = int(row.get("tumor_R_mei_breakpoint_mode", 0))
+        t_support = int(row.get("tumor_L_mei_supported_reads", 0)) + int(row.get("tumor_R_mei_supported_reads", 0))
+        if t_l > 0 and t_r > 0:
+            candidates.append((t_l, t_r, t_support, 0))
+        n_l = int(row.get("normal_L_mei_breakpoint_mode", 0))
+        n_r = int(row.get("normal_R_mei_breakpoint_mode", 0))
+        n_support = int(row.get("normal_L_mei_supported_reads", 0)) + int(row.get("normal_R_mei_supported_reads", 0))
+        if n_l > 0 and n_r > 0:
+            candidates.append((n_l, n_r, n_support, 1))
+        if not candidates:
+            return (0, 0, 0)
+
+        # Try strict first (no coordinate adjustment).
+        strict_ok: list[tuple[int, int, int]] = []
+        for l, r, support, _sample_priority in candidates:
+            tsd_len = int(r - l + 1)
+            if 2 <= tsd_len <= 30:
+                strict_ok.append((support, l, r))
+        if strict_ok:
+            strict_ok.sort(key=lambda x: (x[0], x[2] - x[1]), reverse=True)
+            _support, best_l, best_r = strict_ok[0]
+            return (best_l, best_r, int(best_r - best_l + 1))
+
+        # Rescue with ±2 bp shift when strict pairing misses by a few bases.
+        rescue: list[tuple[int, int, int, int, int]] = []
+        for l, r, support, sample_priority in candidates:
+            for dl in (-2, -1, 0, 1, 2):
+                for dr in (-2, -1, 0, 1, 2):
+                    ll = int(l + dl)
+                    rr = int(r + dr)
+                    if ll <= 0 or rr <= 0 or rr < ll:
+                        continue
+                    tsd_len = int(rr - ll + 1)
+                    if 2 <= tsd_len <= 30:
+                        shift_penalty = abs(dl) + abs(dr)
+                        rescue.append((shift_penalty, -support, sample_priority, ll, rr))
+        if not rescue:
+            return (0, 0, 0)
+        rescue.sort()
+        _shift_penalty, _neg_support, _sample_priority, best_l, best_r = rescue[0]
+        return (best_l, best_r, int(best_r - best_l + 1))
+
+    tsd_pairs = out.apply(_pick_tsd_pair, axis=1, result_type="expand")
+    tsd_pairs.columns = ["tsd_left_breakpoint", "tsd_right_breakpoint", "tsd_len_estimate"]
+    out["tsd_left_breakpoint"] = tsd_pairs["tsd_left_breakpoint"].astype(int)
+    out["tsd_right_breakpoint"] = tsd_pairs["tsd_right_breakpoint"].astype(int)
+    out["tsd_len_estimate"] = tsd_pairs["tsd_len_estimate"].astype(int)
+    # Strict TSD evidence threshold: 4 bp or longer.
+    out["tsd_detected"] = out["tsd_len_estimate"] >= 4
 
     def _breakpoint_pos(row: pd.Series) -> int:
+        l = int(row.get("tsd_left_breakpoint", 0))
+        r = int(row.get("tsd_right_breakpoint", 0))
+        if l > 0 and r > 0:
+            return int((l + r) // 2)
         l = int(row.get("tumor_L_mei_breakpoint_mode", 0))
         r = int(row.get("tumor_R_mei_breakpoint_mode", 0))
+        if l > 0 and r > 0:
+            return int((l + r) // 2)
+        l = int(row.get("normal_L_mei_breakpoint_mode", 0))
+        r = int(row.get("normal_R_mei_breakpoint_mode", 0))
         if l > 0 and r > 0:
             return int((l + r) // 2)
         if l > 0:
@@ -691,8 +755,8 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
                     seqs.append("")
                 else:
                     chrom = str(row.chrom)
-                    start0 = int(row.tumor_L_mei_breakpoint_mode) - 1
-                    end0 = int(row.tumor_R_mei_breakpoint_mode)
+                    start0 = int(getattr(row, "tsd_left_breakpoint", 0)) - 1
+                    end0 = int(getattr(row, "tsd_right_breakpoint", 0))
                     try:
                         seqs.append(ref.fetch(chrom, start0, end0).upper())
                     except Exception:
@@ -1049,6 +1113,27 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out["tumor_strand_agreement"] = [
         _agreement_flag(a, b) for a, b in zip(out["tumor_L_mei_strand"], out["tumor_R_mei_strand"])
     ]
+    out["normal_family_agreement"] = [
+        _agreement_flag(a, b)
+        for a, b in zip(
+            out.get("normal_L_mei_family", "").fillna("").astype(str),
+            out.get("normal_R_mei_family", "").fillna("").astype(str),
+        )
+    ]
+    out["normal_subfamily_agreement"] = [
+        _agreement_flag(a, b)
+        for a, b in zip(
+            out.get("normal_L_mei_subfamily", "").fillna("").astype(str),
+            out.get("normal_R_mei_subfamily", "").fillna("").astype(str),
+        )
+    ]
+    out["normal_strand_agreement"] = [
+        _agreement_flag(a, b)
+        for a, b in zip(
+            out.get("normal_L_mei_strand", "").fillna("").astype(str),
+            out.get("normal_R_mei_strand", "").fillna("").astype(str),
+        )
+    ]
 
     tumor_mei_reads = out.get("tumor_mei_supported_reads", 0).astype(float)
     normal_mei_reads = out.get("normal_mei_supported_reads", 0).astype(float)
@@ -1057,17 +1142,71 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     mei_enrichment_scaled = (mei_enrichment / (mei_enrichment + 1.0)).clip(lower=0.0, upper=1.0)
     mei_read_fraction = (tumor_mei_reads / total_rows).clip(lower=0.0, upper=1.0)
 
+    # Event-centric confidence score: do not bias to tumor-only support.
+    event_subfamily_purity = pd.concat(
+        [
+            out.get("tumor_subfamily_purity_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("normal_subfamily_purity_weighted", 0.0).astype(float).fillna(0.0),
+        ],
+        axis=1,
+    ).max(axis=1)
+    event_breakpoint_consistency = pd.concat(
+        [
+            out.get("tumor_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("normal_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
+        ],
+        axis=1,
+    ).max(axis=1)
+    event_family_agreement = pd.concat(
+        [out["tumor_family_agreement"].astype(float), out["normal_family_agreement"].astype(float)],
+        axis=1,
+    ).max(axis=1)
+    event_subfamily_agreement = pd.concat(
+        [out["tumor_subfamily_agreement"].astype(float), out["normal_subfamily_agreement"].astype(float)],
+        axis=1,
+    ).max(axis=1)
+    event_strand_agreement = pd.concat(
+        [out["tumor_strand_agreement"].astype(float), out["normal_strand_agreement"].astype(float)],
+        axis=1,
+    ).max(axis=1)
+    normal_mei_fraction = (
+        normal_mei_reads / out.get("normal_total_rows", 0).astype(float).replace(0, 1.0)
+    ).clip(lower=0.0, upper=1.0)
+    event_mei_fraction = pd.concat([mei_read_fraction.fillna(0.0), normal_mei_fraction.fillna(0.0)], axis=1).max(axis=1)
+    mapq_event = pd.concat(
+        [
+            (out.get("split_tumor_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0),
+            (out.get("split_normal_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    tsd_boost = out.get("tsd_detected", False).fillna(False).astype(bool).astype(float)
+    polyA_event = pd.concat(
+        [
+            out.get("tumor_poly_at_fraction_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("normal_poly_at_fraction_weighted", 0.0).astype(float).fillna(0.0),
+        ],
+        axis=1,
+    ).max(axis=1).clip(lower=0.0, upper=1.0)
+    motif_boost = out.get("tumor_breakpoint_l1_en_motif_like", False).fillna(False).astype(bool).astype(float)
+    motif_logodds = out.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0).astype(float).fillna(0.0)
+    motif_logodds_scaled = (motif_logodds / 6.0).clip(lower=0.0, upper=1.0)
+
     base_score = (
-        0.24 * out.get("tumor_subfamily_purity_weighted", 0.0).astype(float).fillna(0.0)
-        + 0.18 * out.get("tumor_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0)
-        + 0.20 * mei_enrichment_scaled.fillna(0.0)
-        + 0.12 * mei_read_fraction.fillna(0.0)
-        + 0.15 * out["tumor_family_agreement"].astype(float)
-        # Subfamily agreement is informative but noisy with short-read clips:
-        # keep as a small positive boost only (no explicit penalty on mismatch).
-        + 0.03 * out["tumor_subfamily_agreement"].astype(float)
-        + 0.08 * out["tumor_strand_agreement"].astype(float)
+        0.20 * event_subfamily_purity
+        + 0.16 * event_breakpoint_consistency
+        + 0.15 * mei_enrichment_scaled.fillna(0.0)
+        + 0.10 * event_mei_fraction
+        + 0.12 * event_family_agreement
+        + 0.04 * event_subfamily_agreement
+        + 0.06 * event_strand_agreement
+        + 0.07 * tsd_boost
+        + 0.05 * polyA_event
+        + 0.03 * motif_boost
+        + 0.02 * motif_logodds_scaled
     )
+    base_score = (base_score + 0.05 * mapq_event).clip(lower=0.0, upper=1.0)
 
     # Track complex SV-like companion signatures without suppressing MEI detection.
     large_insert_fraction = out.get("discordant_tumor_large_insert_fraction", 0.0).astype(float).fillna(0.0)
@@ -1125,6 +1264,19 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out["tumor_discordant_mei_consistent_support"] = (
         out["tumor_discordant_mei_two_sided_support"] & (dpe_family_purity >= 0.60) & (dpe_strand_purity >= 0.60)
     )
+    normal_left_reads = out.get("normal_L_mei_supported_reads", 0).astype(float)
+    normal_right_reads = out.get("normal_R_mei_supported_reads", 0).astype(float)
+    out["normal_two_sided_support"] = (normal_left_reads >= 1) & (normal_right_reads >= 1)
+    normal_dpe_left = out.get("normal_discordant_mei_left_supported_reads", 0).astype(float)
+    normal_dpe_right = out.get("normal_discordant_mei_right_supported_reads", 0).astype(float)
+    normal_dpe_family_purity = out.get("normal_discordant_mei_family_purity", 0.0).astype(float).fillna(0.0)
+    normal_dpe_strand_purity = out.get("normal_discordant_mei_strand_purity", 0.0).astype(float).fillna(0.0)
+    out["normal_discordant_mei_consistent_support"] = (
+        (normal_dpe_left >= 1)
+        & (normal_dpe_right >= 1)
+        & (normal_dpe_family_purity >= 0.60)
+        & (normal_dpe_strand_purity >= 0.60)
+    )
     out["tumor_two_sided_like_support"] = out["tumor_two_sided_strong_support"] | (
         out["tumor_one_sided_split_support"] & out["tumor_discordant_mei_strong_support"]
     ) | out["tumor_discordant_mei_consistent_support"]
@@ -1134,20 +1286,48 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out["tumor_two_sided_subfamily_consistent"] = out["tumor_two_sided_support"] & (
         out["tumor_subfamily_agreement"] == 1
     )
+    out["event_two_sided_like_support"] = (
+        out["tumor_two_sided_like_support"]
+        | out["normal_two_sided_support"]
+        | out["normal_discordant_mei_consistent_support"]
+    )
+    out["event_family_consistent"] = (out["tumor_family_agreement"] == 1) | (out["normal_family_agreement"] == 1)
+    out["event_strand_consistent"] = (out["tumor_strand_agreement"] == 1) | (out["normal_strand_agreement"] == 1)
+    out["event_side_breakpoint_consistency"] = pd.concat(
+        [
+            out["tumor_side_breakpoint_consistency"].astype(float).fillna(0.0),
+            out.get("normal_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
+        ],
+        axis=1,
+    ).max(axis=1)
+    out["event_polyA_or_tsd_or_motif"] = (
+        (tsd_boost >= 1.0) | (polyA_event >= 0.20) | (motif_boost >= 1.0) | (motif_logodds_scaled >= 0.25)
+    )
+    out["event_quality_clean"] = (
+        (out.get("junk_flag_count", 0).fillna(0).astype(int) == 0)
+        & (mapq_event >= 0.30)
+    )
 
-    # Structural confidence gates (sample-status agnostic).
+    # Structural confidence gates (sample-status agnostic, no explicit minimum read-count gate).
     high_conf_pass = (
         (out["insertion_model_score"] >= 0.60)
-        & (tumor_mei_reads >= 4)
-        & out["tumor_two_sided_like_support"]
-        & out["tumor_two_sided_family_consistent"]
-        & (out["tumor_side_breakpoint_consistency"] >= 0.60)
+        & out["event_two_sided_like_support"]
+        & out["event_family_consistent"]
+        & out["event_strand_consistent"]
+        & (out["event_side_breakpoint_consistency"] >= 0.55)
+        & out["event_quality_clean"]
+        & out["event_polyA_or_tsd_or_motif"]
         & (out.get("coherence_score", 0.0).astype(float) >= 0.55)
     )
     provisional_one_sided = (
         (~high_conf_pass)
         & (out["insertion_model_score"] >= 0.55)
-        & (tumor_mei_reads >= 2)
+        & (
+            out["event_two_sided_like_support"]
+            | ((tumor_mei_reads + normal_mei_reads) >= 1)
+            | ((discordant_mei_reads + out.get("normal_discordant_mei_supported_reads", 0).astype(float)) >= 1)
+        )
+        & out["event_family_consistent"]
         & (out.get("coherence_score", 0.0).astype(float) >= 0.50)
     )
 
@@ -1291,6 +1471,324 @@ def _add_local_depth_normalized_support(candidates: pd.DataFrame) -> pd.DataFram
     return out
 
 
+def _infer_mei_family_from_fields(hit_id: str, family_hint: str, extra_hint: str) -> str:
+    txt = " ".join([hit_id or "", family_hint or "", extra_hint or ""]).upper()
+    if "ALU" in txt:
+        return "ALU"
+    if "SVA" in txt:
+        return "SVA"
+    if "LINE1" in txt or "L1" in txt:
+        return "LINE1"
+    if "HERV" in txt or "ERV" in txt:
+        return "ERV"
+    return "OTHER"
+
+
+def _extract_float_from_info(value: object, default: float = -1.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, tuple):
+        vals = [v for v in value if v is not None]
+        if not vals:
+            return default
+        try:
+            return float(max(vals))
+        except Exception:
+            return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _extract_int_from_info(value: object, default: int = -1) -> int:
+    if value is None:
+        return default
+    if isinstance(value, tuple):
+        vals = [v for v in value if v is not None]
+        if not vals:
+            return default
+        try:
+            return int(max(vals))
+        except Exception:
+            return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _is_mei_like_variant(vid: str, alt_txt: str, svtype: str, meinfo: str) -> bool:
+    txt = " ".join([vid or "", alt_txt or "", svtype or "", meinfo or ""]).upper()
+    markers = ("ALU", "SVA", "LINE", "L1", "MEI", "INS:ME")
+    return any(m in txt for m in markers)
+
+
+def _first_info_str(info: object) -> str:
+    if info is None:
+        return ""
+    if isinstance(info, tuple):
+        vals = [str(v) for v in info if v is not None]
+        return vals[0] if vals else ""
+    return str(info)
+
+
+def _safe_info_get(info_map: object, key: str, default: object = None) -> object:
+    # pysam raises ValueError for INFO keys absent from header definitions.
+    if not hasattr(info_map, "get"):
+        return default
+    try:
+        return info_map.get(key, default)
+    except (KeyError, ValueError):
+        return default
+
+
+def _infer_subfamily_from_alt_meinfo(alt_txt: str, meinfo: str) -> str:
+    # Prefer explicit MEINFO first token (e.g. "SVA,48,1315,-"), then ALT tags.
+    me_first = (meinfo.split(",")[0] if meinfo else "").strip()
+    if me_first:
+        return me_first
+    alt = (alt_txt or "").upper()
+    for token in alt.replace("<", "").replace(">", "").split(":"):
+        t = token.strip()
+        if t and t not in {"INS", "ME"}:
+            return t
+    return ""
+
+
+def _infer_tsd_from_info(info_map: object) -> str:
+    # MELT/dbVar exports vary; TSD may appear as dedicated INFO or embedded in DESC.
+    if hasattr(info_map, "get"):
+        tsd = _first_info_str(_safe_info_get(info_map, "TSD", ""))
+        if tsd:
+            return tsd
+        desc = _first_info_str(_safe_info_get(info_map, "DESC", ""))
+        m = re.search(r"TSD(?:=|%3D)([A-Za-z]+)", desc)
+        if m:
+            return m.group(1).upper()
+    return ""
+
+
+def _build_g1k_mei_bed_from_vcf(vcf_path: Path, out_bed_path: Path) -> int:
+    kept = 0
+    with pysam.VariantFile(str(vcf_path)) as vf, out_bed_path.open("w", encoding="utf-8") as oh:
+        for rec in vf:
+            chrom = str(rec.contig or "")
+            if not chrom:
+                continue
+            pos1 = int(rec.pos)
+            ref = str(rec.ref or "")
+            rid = str(rec.id or "")
+            alts = [str(a) for a in (rec.alts or ())]
+            alt_txt = ",".join(alts)
+            info = rec.info
+            svtype = _first_info_str(_safe_info_get(info, "SVTYPE", "")).upper()
+            meinfo = _first_info_str(_safe_info_get(info, "MEINFO", ""))
+            # Restrict to insertion MEI records only.
+            is_insertion = svtype == "INS" or "INS:ME" in alt_txt.upper()
+            if not is_insertion:
+                continue
+            if not _is_mei_like_variant(vid=rid, alt_txt=alt_txt, svtype=svtype, meinfo=meinfo):
+                continue
+
+            end1 = _extract_int_from_info(_safe_info_get(info, "END", None), default=pos1 + max(1, len(ref)) - 1)
+            end1 = max(end1, pos1)
+            start0 = max(0, pos1 - 1)
+            end0 = max(start0 + 1, end1)
+
+            melt_ins_type = "INS"
+            melt_ins_subfamily = _infer_subfamily_from_alt_meinfo(alt_txt=alt_txt, meinfo=meinfo)
+            melt_ins_len = abs(_extract_int_from_info(_safe_info_get(info, "SVLEN", None), default=-1))
+            melt_tsd = _infer_tsd_from_info(info_map=info)
+            melt_region_id = _first_info_str(_safe_info_get(info, "REGIONID", ""))
+            rec_id = rid if rid and rid != "." else f"{chrom}:{pos1}:INS"
+            # Keep a strict minimal schema to avoid downstream column drift.
+            oh.write(
+                f"{chrom}\t{start0}\t{end0}\t{rec_id}\t{melt_ins_type}\t"
+                f"{melt_ins_subfamily}\t{melt_ins_len}\t{melt_tsd}\t{melt_region_id}\n"
+            )
+            kept += 1
+    return kept
+
+
+def _normalize_bed_chrom_style(input_bed: Path, output_bed: Path, target_has_chr_prefix: bool) -> None:
+    with input_bed.open("r", encoding="utf-8") as ih, output_bed.open("w", encoding="utf-8") as oh:
+        for line in ih:
+            if not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            chrom = parts[0]
+            if target_has_chr_prefix:
+                if not chrom.startswith("chr"):
+                    chrom = f"chr{chrom}"
+            else:
+                if chrom.startswith("chr"):
+                    chrom = chrom[3:]
+            parts[0] = chrom
+            oh.write("\t".join(parts) + "\n")
+
+
+def _g1k_query_interval_for_row(
+    row: pd.Series,
+    split_padding_bp: int,
+    dpe_padding_min_bp: int,
+    dpe_padding_max_bp: int,
+    dpe_padding_tlen_factor: float,
+) -> tuple[int, int]:
+    window_start = int(row.get("window_start", 1))
+    window_end = int(row.get("window_end", window_start))
+    midpoint = (window_start + window_end) // 2
+    breakpoint_pos = int(row.get("tumor_insertion_breakpoint_pos", 0))
+    if breakpoint_pos <= 0:
+        breakpoint_pos = midpoint
+
+    left_split = int(row.get("tumor_L_mei_supported_reads", 0))
+    right_split = int(row.get("tumor_R_mei_supported_reads", 0))
+    split_total = int(row.get("tumor_split_mei_supported_reads", 0))
+    split_resolved = (split_total >= 2) or ((left_split >= 1) and (right_split >= 1))
+
+    tumor_dpe = int(row.get("tumor_discordant_mei_supported_reads", 0))
+    normal_dpe = int(row.get("normal_discordant_mei_supported_reads", 0))
+    dpe_present = (tumor_dpe + normal_dpe) > 0
+    dpe_tlen_mean = max(
+        float(row.get("discordant_tumor_abs_tlen_mean", 0.0) or 0.0),
+        float(row.get("discordant_normal_abs_tlen_mean", 0.0) or 0.0),
+    )
+
+    if split_resolved:
+        pad = max(1, int(split_padding_bp))
+        center = int(breakpoint_pos)
+    elif dpe_present:
+        dynamic_pad = max(int(dpe_padding_min_bp), int(round(dpe_tlen_mean * float(dpe_padding_tlen_factor))))
+        pad = max(1, min(int(dpe_padding_max_bp), dynamic_pad))
+        center = int(breakpoint_pos if breakpoint_pos > 0 else midpoint)
+    else:
+        pad = max(1, int(split_padding_bp) * 2)
+        center = int(midpoint)
+
+    start_1based = max(1, center - pad)
+    end_1based = max(start_1based, center + pad)
+    return start_1based, end_1based
+
+
+def _annotate_g1k_mei_overlap(
+    candidates: pd.DataFrame,
+    g1k_mei_bed: Path | None,
+    g1k_mei_vcf: Path | None,
+    split_padding_bp: int,
+    dpe_padding_min_bp: int,
+    dpe_padding_max_bp: int,
+    dpe_padding_tlen_factor: float,
+) -> pd.DataFrame:
+    if g1k_mei_bed is not None and g1k_mei_vcf is not None:
+        raise ValueError("Provide only one of g1k_mei_bed or g1k_mei_vcf.")
+    if g1k_mei_bed is None and g1k_mei_vcf is None:
+        return candidates.copy()
+
+    out = candidates.copy().reset_index(drop=True)
+    out["g1k_melt_id"] = ""
+    out["g1k_melt_insertion_type"] = ""
+    out["g1k_melt_insertion_subfamily"] = ""
+    out["g1k_melt_insertion_length"] = -1
+    out["g1k_melt_tsd"] = ""
+    out["g1k_melt_region_id"] = ""
+    if out.empty:
+        return out
+
+    out["row_id"] = out.index.astype(int)
+    best_hits: dict[int, dict[str, object]] = {}
+
+    with tempfile.TemporaryDirectory(prefix="rtm_g1k_mei_") as tmpdir:
+        tmp = Path(tmpdir)
+        source_bed = g1k_mei_bed
+        if g1k_mei_vcf is not None:
+            source_bed = tmp / "g1k_mei_from_vcf.bed"
+            kept = _build_g1k_mei_bed_from_vcf(g1k_mei_vcf, source_bed)
+            print(f"[mei-annotate] parsed g1k MEI VCF records kept={kept} path={g1k_mei_vcf}")
+        assert source_bed is not None
+
+        query_bed = tmp / "candidate_g1k_query.bed"
+        with query_bed.open("w", encoding="utf-8") as handle:
+            for row in out.itertuples(index=False):
+                start_1based, end_1based = _g1k_query_interval_for_row(
+                    pd.Series(row._asdict()),
+                    split_padding_bp=split_padding_bp,
+                    dpe_padding_min_bp=dpe_padding_min_bp,
+                    dpe_padding_max_bp=dpe_padding_max_bp,
+                    dpe_padding_tlen_factor=dpe_padding_tlen_factor,
+                )
+                start0 = max(0, int(start_1based) - 1)
+                end0 = max(start0 + 1, int(end_1based))
+                handle.write(f"{row.chrom}\t{start0}\t{end0}\t{row.row_id}\n")
+
+        query_has_chr_prefix = out["chrom"].astype(str).str.startswith("chr").any()
+        source_bed_norm = tmp / "g1k_mei.chromnorm.bed"
+        _normalize_bed_chrom_style(
+            input_bed=source_bed,
+            output_bed=source_bed_norm,
+            target_has_chr_prefix=bool(query_has_chr_prefix),
+        )
+
+        intersect_cmd = ["bedtools", "intersect", "-a", str(query_bed), "-b", str(source_bed_norm), "-wa", "-wb"]
+        proc = subprocess.run(intersect_cmd, check=True, capture_output=True, text=True)
+        for line in proc.stdout.splitlines():
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 13:
+                continue
+            try:
+                row_id = int(parts[3])
+            except ValueError:
+                continue
+            b_cols = parts[4:]
+            hit_id = b_cols[3] if len(b_cols) >= 4 and b_cols[3] not in {"", "."} else ""
+            if not hit_id and len(b_cols) >= 3:
+                hit_id = f"{b_cols[0]}:{b_cols[1]}-{b_cols[2]}"
+            ins_type_s = b_cols[4] if len(b_cols) >= 5 else ""
+            subfamily_s = b_cols[5] if len(b_cols) >= 6 else ""
+            ins_len_i = -1
+            if len(b_cols) >= 7:
+                try:
+                    ins_len_i = int(float(b_cols[6]))
+                except ValueError:
+                    ins_len_i = -1
+            tsd_s = b_cols[7] if len(b_cols) >= 8 else ""
+            region_s = b_cols[8] if len(b_cols) >= 9 else ""
+            try:
+                a_start0 = int(parts[1])
+                a_end0 = int(parts[2])
+                b_start0 = int(b_cols[1])
+                b_end0 = int(b_cols[2])
+                overlap_bp = max(0, min(a_end0, b_end0) - max(a_start0, b_start0))
+            except (ValueError, IndexError):
+                overlap_bp = 0
+            current = best_hits.get(row_id)
+            if (current is None) or (int(current.get("overlap_bp", -1)) < overlap_bp):
+                best_hits[row_id] = {
+                    "overlap_bp": overlap_bp,
+                    "id": hit_id,
+                    "ins_type": ins_type_s,
+                    "subfamily": subfamily_s,
+                    "ins_len": ins_len_i,
+                    "tsd": tsd_s,
+                    "region_id": region_s,
+                }
+
+    if best_hits:
+        out["g1k_melt_id"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("id", "")))
+        out["g1k_melt_insertion_type"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("ins_type", "")))
+        out["g1k_melt_insertion_subfamily"] = out["row_id"].map(
+            lambda i: str(best_hits.get(i, {}).get("subfamily", ""))
+        )
+        out["g1k_melt_insertion_length"] = (
+            out["row_id"].map(lambda i: int(best_hits.get(i, {}).get("ins_len", -1))).fillna(-1).astype(int)
+        )
+        out["g1k_melt_tsd"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("tsd", "")))
+        out["g1k_melt_region_id"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("region_id", "")))
+    return out.drop(columns=["row_id"])
+
+
 def annotate_candidate_loci_with_mei(
     evidence_dir: Path,
     candidate_loci_path: Path,
@@ -1299,6 +1797,12 @@ def annotate_candidate_loci_with_mei(
     reference_fasta: Path | None = None,
     tumor_bam_path: Path | None = None,
     normal_bam_path: Path | None = None,
+    g1k_mei_bed: Path | None = None,
+    g1k_mei_vcf: Path | None = None,
+    g1k_split_padding_bp: int = 200,
+    g1k_dpe_padding_min_bp: int = 200,
+    g1k_dpe_padding_max_bp: int = 200,
+    g1k_dpe_padding_tlen_factor: float = 0.0,
     progress_every: int = 20000,
 ) -> Path:
     candidate = pd.read_csv(candidate_loci_path, sep="\t")
@@ -1392,6 +1896,17 @@ def annotate_candidate_loci_with_mei(
     candidate = _add_local_depth_normalized_support(candidate)
     candidate = _infer_tumor_insertion_metrics(candidate, reference_fasta=reference_fasta)
     candidate = _compute_insertion_model_scores(candidate)
+    if g1k_mei_bed is not None or g1k_mei_vcf is not None:
+        candidate = _annotate_g1k_mei_overlap(
+            candidate,
+            g1k_mei_bed=g1k_mei_bed,
+            g1k_mei_vcf=g1k_mei_vcf,
+            split_padding_bp=g1k_split_padding_bp,
+            dpe_padding_min_bp=g1k_dpe_padding_min_bp,
+            dpe_padding_max_bp=g1k_dpe_padding_max_bp,
+            dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
+        )
+        print("[mei-annotate] added 1000G/MELT polymorphism overlap fields")
     if tumor_bam_path is not None and normal_bam_path is not None:
         candidate = _annotate_bam_depth_for_consistent_loci(
             candidate,
