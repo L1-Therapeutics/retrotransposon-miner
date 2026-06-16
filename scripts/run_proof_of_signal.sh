@@ -13,7 +13,7 @@ TUMOR_BAM=""
 NORMAL_BAM=""
 MEI_FASTA=""
 REFERENCE_FASTA=""
-G1K_MEI_BED=""
+RMSK_TABLE="data/public/annotation/hg38/repeats/rmsk.txt.gz"
 G1K_MEI_VCF=""
 OUTDIR="results/mei_step1_hg38_chr22"
 REGION="chr22"
@@ -52,8 +52,8 @@ while [[ $# -gt 0 ]]; do
       OUTDIR="$2"
       shift 2
       ;;
-    --g1k-mei-bed)
-      G1K_MEI_BED="$2"
+    --rmsk-table)
+      RMSK_TABLE="$2"
       shift 2
       ;;
     --g1k-mei-vcf)
@@ -125,16 +125,12 @@ if [[ -n "${REFERENCE_FASTA}" ]] && [[ ! -f "${REFERENCE_FASTA}" ]]; then
   echo "ERROR: reference FASTA not found: ${REFERENCE_FASTA}" >&2
   exit 1
 fi
-if [[ -n "${G1K_MEI_BED}" ]] && [[ ! -f "${G1K_MEI_BED}" ]]; then
-  echo "ERROR: 1000G/MELT MEI BED not found: ${G1K_MEI_BED}" >&2
+if [[ -n "${RMSK_TABLE}" ]] && [[ ! -f "${RMSK_TABLE}" ]]; then
+  echo "ERROR: RepeatMasker table not found: ${RMSK_TABLE}" >&2
   exit 1
 fi
 if [[ -n "${G1K_MEI_VCF}" ]] && [[ ! -f "${G1K_MEI_VCF}" ]]; then
   echo "ERROR: 1000G/MELT MEI VCF not found: ${G1K_MEI_VCF}" >&2
-  exit 1
-fi
-if [[ -n "${G1K_MEI_BED}" ]] && [[ -n "${G1K_MEI_VCF}" ]]; then
-  echo "ERROR: provide only one of --g1k-mei-bed or --g1k-mei-vcf" >&2
   exit 1
 fi
 
@@ -156,7 +152,7 @@ run_cli extract-split-evidence \
   --outdir "${OUTDIR}" \
   --region "${REGION}" \
   --min-mapq 20 \
-  --min-mapq-discordant 0 \
+  --min-mapq-discordant 20 \
   --min-clip-len 20
 
 echo "[proof-of-signal] stage=build-candidate-loci window_size=${WINDOW_SIZE}"
@@ -186,14 +182,8 @@ annotate_cmd=(
 if [[ -n "${REFERENCE_FASTA}" ]]; then
   annotate_cmd+=(--reference-fasta "${REFERENCE_FASTA}")
 fi
-if [[ -n "${G1K_MEI_BED}" ]]; then
-  annotate_cmd+=(
-    --g1k-mei-bed "${G1K_MEI_BED}"
-    --g1k-split-padding-bp "${G1K_SPLIT_PADDING_BP}"
-    --g1k-dpe-padding-min-bp "${G1K_DPE_PADDING_MIN_BP}"
-    --g1k-dpe-padding-max-bp "${G1K_DPE_PADDING_MAX_BP}"
-    --g1k-dpe-padding-tlen-factor "${G1K_DPE_PADDING_TLEN_FACTOR}"
-  )
+if [[ -n "${RMSK_TABLE}" ]]; then
+  annotate_cmd+=(--rmsk-table "${RMSK_TABLE}")
 fi
 if [[ -n "${G1K_MEI_VCF}" ]]; then
   annotate_cmd+=(

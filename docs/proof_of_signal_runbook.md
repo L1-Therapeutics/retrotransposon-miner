@@ -12,10 +12,10 @@ MEI signal discovery on chr22-style test data.
 - Reference genome FASTA (optional but recommended for TSD sequence and breakpoint
   context annotation), e.g.:
   - `data/public/reference/hg38/Homo_sapiens_assembly38.fasta`
-- 1000G/MELT polymorphism BED (optional; for overlap annotation), e.g.:
-  - `data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.mei.bed`
 - 1000G/MELT polymorphism VCF (optional; overlap + population frequency), e.g.:
   - `data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz`
+- RepeatMasker table (optional; nested insertion annotation), e.g.:
+  - `data/public/annotation/hg38/repeats/rmsk.txt.gz`
 
 ## Prerequisites
 
@@ -45,69 +45,7 @@ bash scripts/run_proof_of_signal.sh \
 
 ### Add 1000G/MELT overlap annotation
 
-If you have the MELT VCF from the downloader and need a BED for overlap:
-
-```bash
-python - <<'PY'
-import gzip
-from pathlib import Path
-
-vcf = Path("data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz")
-bed = Path("data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.mei.bed")
-bed.parent.mkdir(parents=True, exist_ok=True)
-
-def infer_family(*parts):
-    s = " ".join(p for p in parts if p).upper()
-    if "ALU" in s:
-        return "ALU"
-    if "SVA" in s:
-        return "SVA"
-    if "LINE1" in s or "L1" in s:
-        return "LINE1"
-    if "HERV" in s or "ERV" in s:
-        return "ERV"
-    return "OTHER"
-
-with gzip.open(vcf, "rt", encoding="utf-8") as ih, bed.open("w", encoding="utf-8") as oh:
-    for line in ih:
-        if not line or line.startswith("#"):
-            continue
-        chrom, pos, vid, ref, alt, _qual, _flt, info = line.rstrip("\n").split("\t", 8)[:8]
-        info_map = {}
-        for kv in info.split(";"):
-            if "=" in kv:
-                k, v = kv.split("=", 1)
-                info_map[k] = v
-        svtype = info_map.get("SVTYPE", "")
-        meinfo = info_map.get("MEINFO", "")
-        hit_text = " ".join([svtype, meinfo, alt, vid]).upper()
-        if not any(x in hit_text for x in ("ALU", "SVA", "LINE", "L1", "MEI", "INS:ME")):
-            continue
-        pos1 = int(pos)
-        end1 = int(info_map.get("END", pos1 + max(1, len(ref)) - 1))
-        start0 = max(0, pos1 - 1)
-        end0 = max(start0 + 1, end1)
-        family = infer_family(svtype, meinfo, alt, vid)
-        rec_id = vid if vid and vid != "." else f"{chrom}:{pos1}:{family}"
-        oh.write(f"{chrom}\t{start0}\t{end0}\t{rec_id}\t{family}\t{svtype}\n")
-PY
-```
-
-Then run the pipeline with 1000G overlap fields enabled:
-
-```bash
-bash scripts/run_proof_of_signal.sh \
-  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
-  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
-  --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
-  --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
-  --g1k-mei-bed data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.mei.bed \
-  --outdir results/mei_step1_hg38_chr22_g1k \
-  --region chr22 \
-  --window-size 200
-```
-
-Or pass VCF directly (recommended). This is the preferred EC2 form using
+Pass VCF directly (recommended). This is the preferred EC2 form using
 repo-relative paths:
 
 ```bash
@@ -170,6 +108,12 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
 - `results/mei_step1_hg38_chr22/split_evidence.summary.tsv`
 - `results/mei_step1_hg38_chr22/candidate_loci.tsv`
 - `results/mei_step1_hg38_chr22/candidate_loci.mei.tsv`
+
+Nested insertion columns in `candidate_loci.mei.tsv`:
+- `nested_repeat_overlap`
+- `nested_repeat_name`, `nested_repeat_class`, `nested_repeat_family`, `nested_repeat_strand`
+- `nested_mei_family`, `nested_insertion_orientation`
+- `nested_same_class`, `nested_same_orientation`, `nested_same_class_orientation`
 
 ## Runtime Note (EC2)
 

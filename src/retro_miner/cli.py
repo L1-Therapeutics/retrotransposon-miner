@@ -386,16 +386,16 @@ def build_candidate_loci_cmd(
     help="Optional normal BAM path for local BAM-depth normalization on consistent/junk-clean loci.",
 )
 @click.option(
-    "--g1k-mei-bed",
+    "--rmsk-table",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Optional 1000G/MELT MEI BED for polymorphism overlap annotation via bedtools intersect.",
+    help="Optional UCSC RepeatMasker rmsk table (e.g. rmsk.txt.gz) for nested-insertion annotation.",
 )
 @click.option(
     "--g1k-mei-vcf",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Optional 1000G/MELT MEI VCF(.gz) for overlap + population-frequency annotation.",
+    help="Optional 1000G/MELT MEI VCF(.gz) for overlap annotation.",
 )
 @click.option(
     "--g1k-split-padding-bp",
@@ -433,7 +433,7 @@ def annotate_mei_support_cmd(
     reference_fasta: Path | None,
     tumor_bam_depth: Path | None,
     normal_bam_depth: Path | None,
-    g1k_mei_bed: Path | None,
+    rmsk_table: Path | None,
     g1k_mei_vcf: Path | None,
     g1k_split_padding_bp: int,
     g1k_dpe_padding_min_bp: int,
@@ -444,8 +444,6 @@ def annotate_mei_support_cmd(
     click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
     if (tumor_bam_depth is None) ^ (normal_bam_depth is None):
         raise click.ClickException("Provide both --tumor-bam-depth and --normal-bam-depth, or neither.")
-    if g1k_mei_bed is not None and g1k_mei_vcf is not None:
-        raise click.ClickException("Provide only one of --g1k-mei-bed or --g1k-mei-vcf.")
     out_path = annotate_candidate_loci_with_mei(
         evidence_dir=evidence_dir,
         candidate_loci_path=candidate_loci,
@@ -454,7 +452,7 @@ def annotate_mei_support_cmd(
         reference_fasta=reference_fasta,
         tumor_bam_path=tumor_bam_depth,
         normal_bam_path=normal_bam_depth,
-        g1k_mei_bed=g1k_mei_bed,
+        rmsk_table_path=rmsk_table,
         g1k_mei_vcf=g1k_mei_vcf,
         g1k_split_padding_bp=g1k_split_padding_bp,
         g1k_dpe_padding_min_bp=g1k_dpe_padding_min_bp,

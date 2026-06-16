@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import math
 import re
 import subprocess
@@ -426,6 +427,30 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
                 f"{sample_prefix}_discordant_mei_strand_purity",
                 f"{sample_prefix}_discordant_mei_left_supported_reads",
                 f"{sample_prefix}_discordant_mei_right_supported_reads",
+                f"{sample_prefix}_discordant_mei_left_target_pos_median",
+                f"{sample_prefix}_discordant_mei_right_target_pos_median",
+                f"{sample_prefix}_discordant_mei_insertion_span_estimate",
+                f"{sample_prefix}_discordant_mei_orientation_order_consistent",
+                f"{sample_prefix}_discordant_mei_geometry_consistent",
+                f"{sample_prefix}_discordant_mei_left_subfamily",
+                f"{sample_prefix}_discordant_mei_right_subfamily",
+                f"{sample_prefix}_discordant_mei_side_subfamily_consistent",
+                f"{sample_prefix}_discordant_mei_left_anchor_bin_mode_fraction",
+                f"{sample_prefix}_discordant_mei_right_anchor_bin_mode_fraction",
+                f"{sample_prefix}_discordant_mei_left_target_bin_mode_fraction",
+                f"{sample_prefix}_discordant_mei_right_target_bin_mode_fraction",
+                f"{sample_prefix}_discordant_mei_left_side_coherence",
+                f"{sample_prefix}_discordant_mei_right_side_coherence",
+                f"{sample_prefix}_discordant_mei_side_coherence_min",
+                f"{sample_prefix}_discordant_mei_left_anchor_target_spearman_abs",
+                f"{sample_prefix}_discordant_mei_right_anchor_target_spearman_abs",
+                f"{sample_prefix}_discordant_mei_anchor_target_spearman_abs_min",
+                f"{sample_prefix}_discordant_mei_left_local_jump_violation",
+                f"{sample_prefix}_discordant_mei_right_local_jump_violation",
+                f"{sample_prefix}_discordant_mei_any_local_jump_violation",
+                f"{sample_prefix}_discordant_mei_insert_sd_proxy",
+                f"{sample_prefix}_discordant_mei_max_pair_swing",
+                f"{sample_prefix}_discordant_mei_self_consistent",
             ]
         )
 
@@ -434,6 +459,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         lambda r: "L" if int(r["pos"]) <= int(r["locus_midpoint"]) else "R",
         axis=1,
     )
+    mei_df["anchor_bin_10bp"] = (mei_df["pos"].astype(int) // 10).astype(int)
 
     family_top = (
         mei_df.groupby(["chrom", "window_start", "window_end", "family"], as_index=False)["mei_score"]
@@ -511,6 +537,288 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         }
     )
 
+    mei_df["target_mid"] = ((mei_df["target_start"].astype(int) + mei_df["target_end"].astype(int)) // 2).astype(int)
+    mei_df["target_bin_25bp"] = (mei_df["target_mid"].astype(int) // 25).astype(int)
+    side_target_mid = (
+        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)["target_mid"]
+        .median()
+        .rename(columns={"target_mid": "target_mid_median"})
+    )
+    side_mid_pivot = (
+        side_target_mid.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values="target_mid_median",
+            aggfunc="first",
+        )
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    if "L" not in side_mid_pivot.columns:
+        side_mid_pivot["L"] = 0
+    if "R" not in side_mid_pivot.columns:
+        side_mid_pivot["R"] = 0
+    side_mid_pivot = side_mid_pivot.rename(
+        columns={
+            "L": f"{sample_prefix}_discordant_mei_left_target_pos_median",
+            "R": f"{sample_prefix}_discordant_mei_right_target_pos_median",
+        }
+    )
+
+    side_subfamily_top = (
+        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side", "target"], as_index=False)["mei_score"]
+        .sum()
+        .sort_values(
+            ["chrom", "window_start", "window_end", "anchor_side", "mei_score"],
+            ascending=[True, True, True, True, False],
+        )
+        .drop_duplicates(["chrom", "window_start", "window_end", "anchor_side"], keep="first")
+        .rename(columns={"target": "side_top_subfamily"})
+    )
+    side_subfamily_pivot = (
+        side_subfamily_top.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values="side_top_subfamily",
+            aggfunc="first",
+        )
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    if "L" not in side_subfamily_pivot.columns:
+        side_subfamily_pivot["L"] = ""
+    if "R" not in side_subfamily_pivot.columns:
+        side_subfamily_pivot["R"] = ""
+    side_subfamily_pivot = side_subfamily_pivot.rename(
+        columns={
+            "L": f"{sample_prefix}_discordant_mei_left_subfamily",
+            "R": f"{sample_prefix}_discordant_mei_right_subfamily",
+        }
+    )
+
+    def _side_bin_mode_fraction(
+        data: pd.DataFrame,
+        key_col: str,
+        out_col: str,
+    ) -> pd.DataFrame:
+        counts = (
+            data.groupby(["chrom", "window_start", "window_end", "anchor_side", key_col], as_index=False)["read_name"]
+            .nunique()
+            .rename(columns={"read_name": "n_reads"})
+        )
+        top = (
+            counts.sort_values(
+                ["chrom", "window_start", "window_end", "anchor_side", "n_reads"],
+                ascending=[True, True, True, True, False],
+            )
+            .drop_duplicates(["chrom", "window_start", "window_end", "anchor_side"], keep="first")
+            .rename(columns={"n_reads": "n_reads_mode"})
+        )
+        totals = (
+            data.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)["read_name"]
+            .nunique()
+            .rename(columns={"read_name": "n_reads_total"})
+        )
+        merged = top.merge(
+            totals,
+            on=["chrom", "window_start", "window_end", "anchor_side"],
+            how="inner",
+        )
+        merged[out_col] = (merged["n_reads_mode"] / merged["n_reads_total"]).fillna(0.0).astype(float)
+        return merged[["chrom", "window_start", "window_end", "anchor_side", out_col]]
+
+    side_anchor_mode_frac = _side_bin_mode_fraction(
+        data=mei_df,
+        key_col="anchor_bin_10bp",
+        out_col="side_anchor_bin_mode_fraction",
+    )
+    side_target_mode_frac = _side_bin_mode_fraction(
+        data=mei_df,
+        key_col="target_bin_25bp",
+        out_col="side_target_bin_mode_fraction",
+    )
+    side_mode_frac = side_anchor_mode_frac.merge(
+        side_target_mode_frac,
+        on=["chrom", "window_start", "window_end", "anchor_side"],
+        how="outer",
+    ).fillna(0.0)
+    side_mode_frac["side_coherence"] = side_mode_frac[
+        ["side_anchor_bin_mode_fraction", "side_target_bin_mode_fraction"]
+    ].min(axis=1)
+    # Side-wise monotonicity between genomic anchor position and MEI target position.
+    # This captures insert-size-driven spread (including inverse ordering) better than
+    # strict local bin concentration alone.
+    side_spearman = (
+        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)
+        .apply(
+            lambda g: pd.Series(
+                {
+                    "side_anchor_target_spearman_abs": abs(
+                        float(
+                            g.loc[:, ["pos", "target_mid"]]
+                            .corr(method="spearman")
+                            .iloc[0, 1]
+                        )
+                    )
+                    if len(g) >= 3
+                    else 1.0
+                }
+            )
+        )
+        .reset_index(drop=True)
+    )
+    side_mode_frac = side_mode_frac.merge(
+        side_spearman,
+        on=["chrom", "window_start", "window_end", "anchor_side"],
+        how="left",
+    )
+    side_mode_frac["side_anchor_target_spearman_abs"] = (
+        side_mode_frac["side_anchor_target_spearman_abs"].fillna(0.0).astype(float)
+    )
+    side_mode_pivot = (
+        side_mode_frac.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values=[
+                "side_anchor_bin_mode_fraction",
+                "side_target_bin_mode_fraction",
+                "side_coherence",
+                "side_anchor_target_spearman_abs",
+            ],
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    side_mode_pivot.columns = [
+        (
+            col
+            if isinstance(col, str)
+            else col[0]
+            if len(col) > 1 and col[1] in {"", None}
+            else f"{col[0]}_{col[1]}"
+        )
+        for col in side_mode_pivot.columns
+    ]
+    side_mode_pivot = side_mode_pivot.rename(
+        columns={
+            "side_anchor_bin_mode_fraction_L": f"{sample_prefix}_discordant_mei_left_anchor_bin_mode_fraction",
+            "side_anchor_bin_mode_fraction_R": f"{sample_prefix}_discordant_mei_right_anchor_bin_mode_fraction",
+            "side_target_bin_mode_fraction_L": f"{sample_prefix}_discordant_mei_left_target_bin_mode_fraction",
+            "side_target_bin_mode_fraction_R": f"{sample_prefix}_discordant_mei_right_target_bin_mode_fraction",
+            "side_coherence_L": f"{sample_prefix}_discordant_mei_left_side_coherence",
+            "side_coherence_R": f"{sample_prefix}_discordant_mei_right_side_coherence",
+            "side_anchor_target_spearman_abs_L": f"{sample_prefix}_discordant_mei_left_anchor_target_spearman_abs",
+            "side_anchor_target_spearman_abs_R": f"{sample_prefix}_discordant_mei_right_anchor_target_spearman_abs",
+        }
+    )
+    for col in [
+        f"{sample_prefix}_discordant_mei_left_anchor_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_right_anchor_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_left_target_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_right_target_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_left_side_coherence",
+        f"{sample_prefix}_discordant_mei_right_side_coherence",
+        f"{sample_prefix}_discordant_mei_left_anchor_target_spearman_abs",
+        f"{sample_prefix}_discordant_mei_right_anchor_target_spearman_abs",
+    ]:
+        if col not in side_mode_pivot.columns:
+            side_mode_pivot[col] = 0.0
+
+    # Proxy for expected fragment-size variation. Prefer sample-observed spread;
+    # clamp to a sensible lower bound so very small estimates do not over-penalize.
+    insert_sd_proxy = float(mei_df["template_len"].abs().astype(float).std(ddof=0))
+    if not math.isfinite(insert_sd_proxy):
+        insert_sd_proxy = 100.0
+    insert_sd_proxy = max(50.0, insert_sd_proxy)
+    swing_sigma_cutoff = 3.0 * insert_sd_proxy
+
+    def _side_local_jump_violation(data: pd.DataFrame) -> pd.DataFrame:
+        # Side-internal mapping incoherence test based on relative-position swing.
+        #
+        # For adjacent reads sorted by genomic anchor:
+        #   d_anchor = pos_i - pos_{i-1}
+        #   d_target = target_i - target_{i-1}
+        #
+        # Expected consistent behavior can look direct (d_target ~= d_anchor)
+        # or inverse (d_target ~= -d_anchor), depending on orientation/mapping frame.
+        # We therefore use:
+        #   swing = min(|d_target - d_anchor|, |d_target + d_anchor|)
+        #
+        # Flag violation if any adjacent pair exceeds 3*insert_sd_proxy.
+        rows: list[dict[str, object]] = []
+        key_cols = ["chrom", "window_start", "window_end", "anchor_side"]
+        for key, g in data.groupby(key_cols, sort=False):
+            gg = g.loc[:, ["pos", "target_mid"]].copy()
+            gg["pos"] = gg["pos"].astype(int)
+            gg["target_mid"] = gg["target_mid"].astype(int)
+            gg = gg.sort_values("pos", kind="mergesort").drop_duplicates()
+            violated = False
+            max_pair_swing = 0.0
+            if len(gg) >= 2:
+                pos_vals = gg["pos"].tolist()
+                tgt_vals = gg["target_mid"].tolist()
+                for i in range(1, len(pos_vals)):
+                    d_anchor_signed = float(int(pos_vals[i]) - int(pos_vals[i - 1]))
+                    d_target_signed = float(int(tgt_vals[i]) - int(tgt_vals[i - 1]))
+                    swing_direct = abs(d_target_signed - d_anchor_signed)
+                    swing_inverse = abs(d_target_signed + d_anchor_signed)
+                    pair_swing = min(swing_direct, swing_inverse)
+                    if pair_swing > max_pair_swing:
+                        max_pair_swing = float(pair_swing)
+                    if pair_swing > swing_sigma_cutoff:
+                        violated = True
+                        break
+            rows.append(
+                {
+                    "chrom": key[0],
+                    "window_start": key[1],
+                    "window_end": key[2],
+                    "anchor_side": key[3],
+                    "side_local_jump_violation": bool(violated),
+                    "side_max_pair_swing": float(max_pair_swing),
+                }
+            )
+        if not rows:
+            return pd.DataFrame(columns=key_cols + ["side_local_jump_violation", "side_max_pair_swing"])
+        return pd.DataFrame(rows)
+
+    side_jump_violation = _side_local_jump_violation(mei_df)
+    side_jump_pivot = (
+        side_jump_violation.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values=["side_local_jump_violation", "side_max_pair_swing"],
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    side_jump_pivot.columns = [
+        (
+            col
+            if isinstance(col, str)
+            else col[0]
+            if len(col) > 1 and col[1] in {"", None}
+            else f"{col[0]}_{col[1]}"
+        )
+        for col in side_jump_pivot.columns
+    ]
+    side_jump_pivot = side_jump_pivot.rename(
+        columns={
+            "side_local_jump_violation_L": f"{sample_prefix}_discordant_mei_left_local_jump_violation",
+            "side_local_jump_violation_R": f"{sample_prefix}_discordant_mei_right_local_jump_violation",
+            "side_max_pair_swing_L": f"{sample_prefix}_discordant_mei_left_max_pair_swing",
+            "side_max_pair_swing_R": f"{sample_prefix}_discordant_mei_right_max_pair_swing",
+        }
+    )
+    for col, default in [
+        (f"{sample_prefix}_discordant_mei_left_local_jump_violation", False),
+        (f"{sample_prefix}_discordant_mei_right_local_jump_violation", False),
+        (f"{sample_prefix}_discordant_mei_left_max_pair_swing", 0.0),
+        (f"{sample_prefix}_discordant_mei_right_max_pair_swing", 0.0),
+    ]:
+        if col not in side_jump_pivot.columns:
+            side_jump_pivot[col] = default
+
     agg = (
         mei_df.groupby(["chrom", "window_start", "window_end"], as_index=False)
         .agg(
@@ -571,6 +879,66 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
             on=["chrom", "window_start", "window_end"],
             how="left",
         )
+        .merge(
+            side_mid_pivot[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_target_pos_median",
+                    f"{sample_prefix}_discordant_mei_right_target_pos_median",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        .merge(
+            side_subfamily_pivot[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_subfamily",
+                    f"{sample_prefix}_discordant_mei_right_subfamily",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        .merge(
+            side_mode_pivot[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_anchor_bin_mode_fraction",
+                    f"{sample_prefix}_discordant_mei_right_anchor_bin_mode_fraction",
+                    f"{sample_prefix}_discordant_mei_left_target_bin_mode_fraction",
+                    f"{sample_prefix}_discordant_mei_right_target_bin_mode_fraction",
+                    f"{sample_prefix}_discordant_mei_left_side_coherence",
+                    f"{sample_prefix}_discordant_mei_right_side_coherence",
+                    f"{sample_prefix}_discordant_mei_left_anchor_target_spearman_abs",
+                    f"{sample_prefix}_discordant_mei_right_anchor_target_spearman_abs",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        .merge(
+            side_jump_pivot[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_local_jump_violation",
+                    f"{sample_prefix}_discordant_mei_right_local_jump_violation",
+                    f"{sample_prefix}_discordant_mei_left_max_pair_swing",
+                    f"{sample_prefix}_discordant_mei_right_max_pair_swing",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
     )
     agg[f"{sample_prefix}_discordant_mei_left_supported_reads"] = (
         agg[f"{sample_prefix}_discordant_mei_left_supported_reads"].fillna(0).astype(int)
@@ -584,7 +952,222 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     agg[f"{sample_prefix}_discordant_mei_strand_purity"] = (
         agg[f"{sample_prefix}_discordant_mei_strand_purity"].fillna(0.0).astype(float)
     )
+
+    agg[f"{sample_prefix}_discordant_mei_left_target_pos_median"] = (
+        agg[f"{sample_prefix}_discordant_mei_left_target_pos_median"].fillna(0).astype(float)
+    )
+    agg[f"{sample_prefix}_discordant_mei_right_target_pos_median"] = (
+        agg[f"{sample_prefix}_discordant_mei_right_target_pos_median"].fillna(0).astype(float)
+    )
+    agg[f"{sample_prefix}_discordant_mei_left_subfamily"] = (
+        agg[f"{sample_prefix}_discordant_mei_left_subfamily"].fillna("").astype(str)
+    )
+    agg[f"{sample_prefix}_discordant_mei_right_subfamily"] = (
+        agg[f"{sample_prefix}_discordant_mei_right_subfamily"].fillna("").astype(str)
+    )
+    agg[f"{sample_prefix}_discordant_mei_side_subfamily_consistent"] = (
+        (agg[f"{sample_prefix}_discordant_mei_left_subfamily"] != "")
+        & (agg[f"{sample_prefix}_discordant_mei_right_subfamily"] != "")
+        & (agg[f"{sample_prefix}_discordant_mei_left_subfamily"] == agg[f"{sample_prefix}_discordant_mei_right_subfamily"])
+    )
+    for col in [
+        f"{sample_prefix}_discordant_mei_left_anchor_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_right_anchor_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_left_target_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_right_target_bin_mode_fraction",
+        f"{sample_prefix}_discordant_mei_left_side_coherence",
+        f"{sample_prefix}_discordant_mei_right_side_coherence",
+        f"{sample_prefix}_discordant_mei_left_anchor_target_spearman_abs",
+        f"{sample_prefix}_discordant_mei_right_anchor_target_spearman_abs",
+    ]:
+        agg[col] = agg[col].fillna(0.0).astype(float)
+    agg[f"{sample_prefix}_discordant_mei_side_coherence_min"] = agg[
+        [
+            f"{sample_prefix}_discordant_mei_left_side_coherence",
+            f"{sample_prefix}_discordant_mei_right_side_coherence",
+        ]
+    ].min(axis=1)
+    agg[f"{sample_prefix}_discordant_mei_anchor_target_spearman_abs_min"] = agg[
+        [
+            f"{sample_prefix}_discordant_mei_left_anchor_target_spearman_abs",
+            f"{sample_prefix}_discordant_mei_right_anchor_target_spearman_abs",
+        ]
+    ].min(axis=1)
+    agg[f"{sample_prefix}_discordant_mei_left_local_jump_violation"] = (
+        agg[f"{sample_prefix}_discordant_mei_left_local_jump_violation"].fillna(False).astype(bool)
+    )
+    agg[f"{sample_prefix}_discordant_mei_right_local_jump_violation"] = (
+        agg[f"{sample_prefix}_discordant_mei_right_local_jump_violation"].fillna(False).astype(bool)
+    )
+    agg[f"{sample_prefix}_discordant_mei_left_max_pair_swing"] = (
+        agg[f"{sample_prefix}_discordant_mei_left_max_pair_swing"].fillna(0.0).astype(float)
+    )
+    agg[f"{sample_prefix}_discordant_mei_right_max_pair_swing"] = (
+        agg[f"{sample_prefix}_discordant_mei_right_max_pair_swing"].fillna(0.0).astype(float)
+    )
+    agg[f"{sample_prefix}_discordant_mei_insert_sd_proxy"] = float(insert_sd_proxy)
+    agg[f"{sample_prefix}_discordant_mei_max_pair_swing"] = agg[
+        [
+            f"{sample_prefix}_discordant_mei_left_max_pair_swing",
+            f"{sample_prefix}_discordant_mei_right_max_pair_swing",
+        ]
+    ].max(axis=1)
+    agg[f"{sample_prefix}_discordant_mei_any_local_jump_violation"] = (
+        agg[f"{sample_prefix}_discordant_mei_left_local_jump_violation"]
+        | agg[f"{sample_prefix}_discordant_mei_right_local_jump_violation"]
+    )
+    left_mid = agg[f"{sample_prefix}_discordant_mei_left_target_pos_median"]
+    right_mid = agg[f"{sample_prefix}_discordant_mei_right_target_pos_median"]
+    span = (right_mid - left_mid).abs() + 1.0
+    agg[f"{sample_prefix}_discordant_mei_insertion_span_estimate"] = span
+    dominant_strand = agg[f"{sample_prefix}_discordant_mei_strand"].fillna("").astype(str)
+    order_consistent = (
+        ((dominant_strand == "+") & (right_mid >= left_mid))
+        | ((dominant_strand == "-") & (left_mid >= right_mid))
+    )
+    agg[f"{sample_prefix}_discordant_mei_orientation_order_consistent"] = order_consistent
+    # Geometry-consistent DPE insertion footprint:
+    # - bilateral support
+    # - expected left/right order by orientation
+    # - plausible insertion span on consensus (exclude tiny/noise and huge artifacts)
+    agg[f"{sample_prefix}_discordant_mei_geometry_consistent"] = (
+        (agg[f"{sample_prefix}_discordant_mei_left_supported_reads"] >= 1)
+        & (agg[f"{sample_prefix}_discordant_mei_right_supported_reads"] >= 1)
+        & agg[f"{sample_prefix}_discordant_mei_orientation_order_consistent"]
+        & (agg[f"{sample_prefix}_discordant_mei_insertion_span_estimate"] >= 30.0)
+        & (agg[f"{sample_prefix}_discordant_mei_insertion_span_estimate"] <= 8000.0)
+    )
+    side_reads_min = agg[
+        [
+            f"{sample_prefix}_discordant_mei_left_supported_reads",
+            f"{sample_prefix}_discordant_mei_right_supported_reads",
+        ]
+    ].min(axis=1)
+    # Position coherence on each side:
+    # - concentration in local bins (good for tight clusters), OR
+    # - strong monotonic anchor<->target relationship (good for broader insert-size spread,
+    #   including inverse ordering).
+    # For low-support sides (<3 reads), avoid over-penalizing by treating coherence as pass.
+    agg[f"{sample_prefix}_discordant_mei_self_consistent"] = (
+        (~agg[f"{sample_prefix}_discordant_mei_any_local_jump_violation"])
+        & (
+            (side_reads_min < 3)
+            | (agg[f"{sample_prefix}_discordant_mei_side_coherence_min"] >= 0.5)
+            | (agg[f"{sample_prefix}_discordant_mei_anchor_target_spearman_abs_min"] >= 0.6)
+        )
+    )
     return agg
+
+
+def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "chrom",
+                "window_start",
+                "window_end",
+                f"{sample_prefix}_discordant_anchor_left_unique_reads",
+                f"{sample_prefix}_discordant_anchor_right_unique_reads",
+                f"{sample_prefix}_discordant_anchor_left_complex_reason_max_fraction",
+                f"{sample_prefix}_discordant_anchor_right_complex_reason_max_fraction",
+                f"{sample_prefix}_discordant_anchor_left_mapq_mean",
+                f"{sample_prefix}_discordant_anchor_right_mapq_mean",
+            ]
+        )
+
+    tmp = df.copy()
+    tmp["locus_midpoint"] = (tmp["window_start"].astype(int) + tmp["window_end"].astype(int)) // 2
+    tmp["anchor_side"] = tmp.apply(
+        lambda r: "L" if int(r["pos"]) <= int(r["locus_midpoint"]) else "R",
+        axis=1,
+    )
+    reason_col = tmp["discordant_reasons"].fillna("").astype(str)
+    tmp["reason_interchrom"] = reason_col.str.contains("interchrom", regex=False).astype(int)
+    tmp["reason_mate_unmapped"] = reason_col.str.contains("mate_unmapped", regex=False).astype(int)
+    tmp["reason_large_insert"] = reason_col.str.contains("large_insert", regex=False).astype(int)
+    tmp["reason_complex_any"] = (
+        (tmp["reason_interchrom"] == 1)
+        | (tmp["reason_mate_unmapped"] == 1)
+        | (tmp["reason_large_insert"] == 1)
+    ).astype(int)
+    tmp["mapq"] = tmp["mapq"].astype(float)
+
+    side = (
+        tmp.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)
+        .agg(
+            side_unique_reads=("read_name", "nunique"),
+            side_mapq_mean=("mapq", "mean"),
+            side_interchrom_fraction=("reason_interchrom", "mean"),
+            side_mate_unmapped_fraction=("reason_mate_unmapped", "mean"),
+            side_large_insert_fraction=("reason_large_insert", "mean"),
+            side_complex_any_fraction=("reason_complex_any", "mean"),
+        )
+        .sort_values(["chrom", "window_start", "window_end", "anchor_side"], kind="mergesort")
+    )
+    side["side_complex_reason_max_fraction"] = side[
+        [
+            "side_interchrom_fraction",
+            "side_mate_unmapped_fraction",
+            "side_large_insert_fraction",
+            "side_complex_any_fraction",
+        ]
+    ].max(axis=1)
+
+    pivot = (
+        side.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values=["side_unique_reads", "side_complex_reason_max_fraction", "side_mapq_mean"],
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    pivot.columns = [
+        (
+            col
+            if isinstance(col, str)
+            else col[0]
+            if len(col) > 1 and col[1] in {"", None}
+            else f"{col[0]}_{col[1]}"
+        )
+        for col in pivot.columns
+    ]
+    pivot = pivot.rename(
+        columns={
+            "side_unique_reads_L": f"{sample_prefix}_discordant_anchor_left_unique_reads",
+            "side_unique_reads_R": f"{sample_prefix}_discordant_anchor_right_unique_reads",
+            "side_complex_reason_max_fraction_L": f"{sample_prefix}_discordant_anchor_left_complex_reason_max_fraction",
+            "side_complex_reason_max_fraction_R": f"{sample_prefix}_discordant_anchor_right_complex_reason_max_fraction",
+            "side_mapq_mean_L": f"{sample_prefix}_discordant_anchor_left_mapq_mean",
+            "side_mapq_mean_R": f"{sample_prefix}_discordant_anchor_right_mapq_mean",
+        }
+    )
+
+    defaults: list[tuple[str, float | int]] = [
+        (f"{sample_prefix}_discordant_anchor_left_unique_reads", 0),
+        (f"{sample_prefix}_discordant_anchor_right_unique_reads", 0),
+        (f"{sample_prefix}_discordant_anchor_left_complex_reason_max_fraction", 0.0),
+        (f"{sample_prefix}_discordant_anchor_right_complex_reason_max_fraction", 0.0),
+        (f"{sample_prefix}_discordant_anchor_left_mapq_mean", 0.0),
+        (f"{sample_prefix}_discordant_anchor_right_mapq_mean", 0.0),
+    ]
+    for col, default in defaults:
+        if col not in pivot.columns:
+            pivot[col] = default
+    pivot[f"{sample_prefix}_discordant_anchor_left_unique_reads"] = (
+        pivot[f"{sample_prefix}_discordant_anchor_left_unique_reads"].fillna(0).astype(int)
+    )
+    pivot[f"{sample_prefix}_discordant_anchor_right_unique_reads"] = (
+        pivot[f"{sample_prefix}_discordant_anchor_right_unique_reads"].fillna(0).astype(int)
+    )
+    for col in [
+        f"{sample_prefix}_discordant_anchor_left_complex_reason_max_fraction",
+        f"{sample_prefix}_discordant_anchor_right_complex_reason_max_fraction",
+        f"{sample_prefix}_discordant_anchor_left_mapq_mean",
+        f"{sample_prefix}_discordant_anchor_right_mapq_mean",
+    ]:
+        pivot[col] = pivot[col].fillna(0.0).astype(float)
+    return pivot
 
 
 def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Path | None = None) -> pd.DataFrame:
@@ -1260,9 +1843,19 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     dpe_right = out.get("tumor_discordant_mei_right_supported_reads", 0).astype(float)
     dpe_family_purity = out.get("tumor_discordant_mei_family_purity", 0.0).astype(float).fillna(0.0)
     dpe_strand_purity = out.get("tumor_discordant_mei_strand_purity", 0.0).astype(float).fillna(0.0)
+    dpe_geometry_consistent = (
+        out.get("tumor_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+    )
+    dpe_self_consistent = (
+        out.get("tumor_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    )
     out["tumor_discordant_mei_two_sided_support"] = (dpe_left >= 1) & (dpe_right >= 1)
     out["tumor_discordant_mei_consistent_support"] = (
-        out["tumor_discordant_mei_two_sided_support"] & (dpe_family_purity >= 0.60) & (dpe_strand_purity >= 0.60)
+        out["tumor_discordant_mei_two_sided_support"]
+        & (dpe_family_purity >= 0.60)
+        & (dpe_strand_purity >= 0.60)
+        & dpe_geometry_consistent
+        & dpe_self_consistent
     )
     normal_left_reads = out.get("normal_L_mei_supported_reads", 0).astype(float)
     normal_right_reads = out.get("normal_R_mei_supported_reads", 0).astype(float)
@@ -1271,11 +1864,88 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     normal_dpe_right = out.get("normal_discordant_mei_right_supported_reads", 0).astype(float)
     normal_dpe_family_purity = out.get("normal_discordant_mei_family_purity", 0.0).astype(float).fillna(0.0)
     normal_dpe_strand_purity = out.get("normal_discordant_mei_strand_purity", 0.0).astype(float).fillna(0.0)
+    normal_dpe_geometry_consistent = (
+        out.get("normal_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+    )
+    normal_dpe_self_consistent = (
+        out.get("normal_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    )
     out["normal_discordant_mei_consistent_support"] = (
         (normal_dpe_left >= 1)
         & (normal_dpe_right >= 1)
         & (normal_dpe_family_purity >= 0.60)
         & (normal_dpe_strand_purity >= 0.60)
+        & normal_dpe_geometry_consistent
+        & normal_dpe_self_consistent
+    )
+    tumor_left_mei_consistent = (
+        (left_reads >= 2)
+        & (out.get("tumor_L_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
+        & (out.get("tumor_L_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    )
+    tumor_right_mei_consistent = (
+        (right_reads >= 2)
+        & (out.get("tumor_R_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
+        & (out.get("tumor_R_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    )
+    tumor_left_anchor_complex = (
+        (out.get("tumor_discordant_anchor_left_unique_reads", 0).astype(float) >= 2)
+        & (
+            out.get("tumor_discordant_anchor_left_complex_reason_max_fraction", 0.0)
+            .astype(float)
+            .fillna(0.0)
+            >= 0.60
+        )
+        & (out.get("tumor_discordant_mei_left_supported_reads", 0).astype(float) <= 1)
+    )
+    tumor_right_anchor_complex = (
+        (out.get("tumor_discordant_anchor_right_unique_reads", 0).astype(float) >= 2)
+        & (
+            out.get("tumor_discordant_anchor_right_complex_reason_max_fraction", 0.0)
+            .astype(float)
+            .fillna(0.0)
+            >= 0.60
+        )
+        & (out.get("tumor_discordant_mei_right_supported_reads", 0).astype(float) <= 1)
+    )
+    out["tumor_mei_with_complex_sidepair"] = (
+        (tumor_left_mei_consistent & tumor_right_anchor_complex)
+        | (tumor_right_mei_consistent & tumor_left_anchor_complex)
+    )
+
+    normal_left_mei_consistent = (
+        (normal_left_reads >= 2)
+        & (out.get("normal_L_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
+        & (out.get("normal_L_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    )
+    normal_right_mei_consistent = (
+        (normal_right_reads >= 2)
+        & (out.get("normal_R_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
+        & (out.get("normal_R_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    )
+    normal_left_anchor_complex = (
+        (out.get("normal_discordant_anchor_left_unique_reads", 0).astype(float) >= 2)
+        & (
+            out.get("normal_discordant_anchor_left_complex_reason_max_fraction", 0.0)
+            .astype(float)
+            .fillna(0.0)
+            >= 0.60
+        )
+        & (out.get("normal_discordant_mei_left_supported_reads", 0).astype(float) <= 1)
+    )
+    normal_right_anchor_complex = (
+        (out.get("normal_discordant_anchor_right_unique_reads", 0).astype(float) >= 2)
+        & (
+            out.get("normal_discordant_anchor_right_complex_reason_max_fraction", 0.0)
+            .astype(float)
+            .fillna(0.0)
+            >= 0.60
+        )
+        & (out.get("normal_discordant_mei_right_supported_reads", 0).astype(float) <= 1)
+    )
+    out["normal_mei_with_complex_sidepair"] = (
+        (normal_left_mei_consistent & normal_right_anchor_complex)
+        | (normal_right_mei_consistent & normal_left_anchor_complex)
     )
     out["tumor_two_sided_like_support"] = out["tumor_two_sided_strong_support"] | (
         out["tumor_one_sided_split_support"] & out["tumor_discordant_mei_strong_support"]
@@ -1330,10 +2000,30 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         & out["event_family_consistent"]
         & (out.get("coherence_score", 0.0).astype(float) >= 0.50)
     )
+    complex_sidepair_pass = (
+        (~high_conf_pass)
+        & (~provisional_one_sided)
+        & (
+            out["tumor_mei_with_complex_sidepair"]
+            | out["normal_mei_with_complex_sidepair"]
+        )
+        & out["event_family_consistent"]
+        & out["event_strand_consistent"]
+        & out["event_quality_clean"]
+        & (out["insertion_model_score"] >= 0.50)
+        & (out.get("coherence_score", 0.0).astype(float) >= 0.45)
+    )
+    out["mei_with_complex_sv_signature"] = (
+        out["mei_with_complex_sv_signature"]
+        | out["tumor_mei_with_complex_sidepair"]
+        | out["normal_mei_with_complex_sidepair"]
+    )
 
     out["passes_insertion_model"] = high_conf_pass
     out["passes_insertion_model_provisional"] = provisional_one_sided
+    out["passes_insertion_model_complex"] = complex_sidepair_pass
     out["insertion_call_tier"] = "none"
+    out.loc[complex_sidepair_pass, "insertion_call_tier"] = "mei_with_complex"
     out.loc[provisional_one_sided, "insertion_call_tier"] = "provisional_one_sided"
     out.loc[high_conf_pass, "insertion_call_tier"] = "high_conf_two_sided"
 
@@ -1675,16 +2365,13 @@ def _g1k_query_interval_for_row(
 
 def _annotate_g1k_mei_overlap(
     candidates: pd.DataFrame,
-    g1k_mei_bed: Path | None,
     g1k_mei_vcf: Path | None,
     split_padding_bp: int,
     dpe_padding_min_bp: int,
     dpe_padding_max_bp: int,
     dpe_padding_tlen_factor: float,
 ) -> pd.DataFrame:
-    if g1k_mei_bed is not None and g1k_mei_vcf is not None:
-        raise ValueError("Provide only one of g1k_mei_bed or g1k_mei_vcf.")
-    if g1k_mei_bed is None and g1k_mei_vcf is None:
+    if g1k_mei_vcf is None:
         return candidates.copy()
 
     out = candidates.copy().reset_index(drop=True)
@@ -1702,12 +2389,9 @@ def _annotate_g1k_mei_overlap(
 
     with tempfile.TemporaryDirectory(prefix="rtm_g1k_mei_") as tmpdir:
         tmp = Path(tmpdir)
-        source_bed = g1k_mei_bed
-        if g1k_mei_vcf is not None:
-            source_bed = tmp / "g1k_mei_from_vcf.bed"
-            kept = _build_g1k_mei_bed_from_vcf(g1k_mei_vcf, source_bed)
-            print(f"[mei-annotate] parsed g1k MEI VCF records kept={kept} path={g1k_mei_vcf}")
-        assert source_bed is not None
+        source_bed = tmp / "g1k_mei_from_vcf.bed"
+        kept = _build_g1k_mei_bed_from_vcf(g1k_mei_vcf, source_bed)
+        print(f"[mei-annotate] parsed g1k MEI VCF records kept={kept} path={g1k_mei_vcf}")
 
         query_bed = tmp / "candidate_g1k_query.bed"
         with query_bed.open("w", encoding="utf-8") as handle:
@@ -1789,6 +2473,197 @@ def _annotate_g1k_mei_overlap(
     return out.drop(columns=["row_id"])
 
 
+def _normalize_mei_family_token(token: str) -> str:
+    t = (token or "").upper()
+    if "ALU" in t:
+        return "ALU"
+    if "SVA" in t:
+        return "SVA"
+    if "LINE1" in t or "L1" in t:
+        return "LINE1"
+    return ""
+
+
+def _choose_event_family(row: pd.Series) -> str:
+    candidates = [
+        str(row.get("tumor_discordant_mei_family", "")),
+        str(row.get("tumor_L_mei_family", "")),
+        str(row.get("tumor_R_mei_family", "")),
+        str(row.get("normal_discordant_mei_family", "")),
+        str(row.get("normal_L_mei_family", "")),
+        str(row.get("normal_R_mei_family", "")),
+        str(row.get("tumor_discordant_mei_subfamily", "")),
+        str(row.get("tumor_L_mei_subfamily", "")),
+        str(row.get("tumor_R_mei_subfamily", "")),
+        str(row.get("normal_discordant_mei_subfamily", "")),
+        str(row.get("normal_L_mei_subfamily", "")),
+        str(row.get("normal_R_mei_subfamily", "")),
+    ]
+    for c in candidates:
+        fam = _normalize_mei_family_token(c)
+        if fam:
+            return fam
+    return ""
+
+
+def _choose_event_orientation(row: pd.Series) -> str:
+    candidates = [
+        str(row.get("tumor_insertion_orientation", "")),
+        str(row.get("tumor_discordant_mei_strand", "")),
+        str(row.get("tumor_L_mei_strand", "")),
+        str(row.get("tumor_R_mei_strand", "")),
+        str(row.get("normal_discordant_mei_strand", "")),
+        str(row.get("normal_L_mei_strand", "")),
+        str(row.get("normal_R_mei_strand", "")),
+    ]
+    for c in candidates:
+        cc = (c or "").strip()
+        if cc in {"+", "-"}:
+            return cc
+    return ""
+
+
+def _load_rmsk_interval_trees(rmsk_table_path: Path) -> dict[str, IntervalTree]:
+    trees: dict[str, IntervalTree] = {}
+    opener = gzip.open if str(rmsk_table_path).endswith(".gz") else open
+    with opener(rmsk_table_path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            chrom = ""
+            start0 = -1
+            end0 = -1
+            strand = ""
+            rep_name = ""
+            rep_class = ""
+            rep_family = ""
+            try:
+                # UCSC rmsk table with leading bin.
+                if len(parts) >= 13 and parts[5].startswith("chr"):
+                    chrom = parts[5]
+                    start0 = int(parts[6])
+                    end0 = int(parts[7])
+                    strand = parts[9]
+                    rep_name = parts[10]
+                    rep_class = parts[11]
+                    rep_family = parts[12]
+                # BED-like fallback: chrom start end ... strand repName repClass repFamily
+                elif len(parts) >= 8 and parts[0].startswith("chr"):
+                    chrom = parts[0]
+                    start0 = int(parts[1])
+                    end0 = int(parts[2])
+                    strand = parts[5]
+                    rep_name = parts[6]
+                    rep_class = parts[7]
+                    rep_family = parts[8] if len(parts) > 8 else ""
+                else:
+                    continue
+            except (ValueError, IndexError):
+                continue
+            if end0 <= start0:
+                continue
+            tree = trees.setdefault(chrom, IntervalTree())
+            tree.addi(
+                int(start0),
+                int(end0),
+                {
+                    "rep_name": rep_name,
+                    "rep_class": rep_class,
+                    "rep_family": rep_family,
+                    "strand": strand,
+                },
+            )
+    return trees
+
+
+def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: Path) -> pd.DataFrame:
+    out = candidates.copy()
+    out["nested_repeat_overlap"] = False
+    out["nested_repeat_name"] = ""
+    out["nested_repeat_class"] = ""
+    out["nested_repeat_family"] = ""
+    out["nested_repeat_strand"] = ""
+    out["nested_mei_family"] = ""
+    out["nested_insertion_orientation"] = ""
+    out["nested_same_class"] = False
+    out["nested_same_orientation"] = False
+    out["nested_same_class_orientation"] = "unnested"
+    if out.empty:
+        return out
+
+    trees = _load_rmsk_interval_trees(rmsk_table_path)
+    selected: list[dict[str, object]] = []
+    for row in out.itertuples(index=False):
+        as_row = pd.Series(row._asdict())
+        chrom = str(getattr(row, "chrom"))
+        pos_1based = int(getattr(row, "tumor_insertion_breakpoint_pos", 0))
+        if pos_1based <= 0:
+            pos_1based = int((int(getattr(row, "window_start", 1)) + int(getattr(row, "window_end", 1))) // 2)
+        pos0 = max(0, pos_1based - 1)
+        event_family = _choose_event_family(as_row)
+        event_orientation = _choose_event_orientation(as_row)
+        tree = trees.get(chrom)
+        overlaps = list(tree.at(pos0)) if tree is not None else []
+        if not overlaps:
+            selected.append({})
+            continue
+
+        def score(iv) -> tuple[int, int]:
+            d = iv.data
+            rep_family = _normalize_mei_family_token(
+                f"{d.get('rep_name','')} {d.get('rep_class','')} {d.get('rep_family','')}"
+            )
+            same_class = int(bool(event_family) and (rep_family == event_family))
+            same_orient = int(
+                bool(event_orientation)
+                and str(d.get("strand", "")).strip() in {"+", "-"}
+                and (str(d.get("strand", "")).strip() == event_orientation)
+            )
+            return (same_class * 2 + same_orient, int(iv.end - iv.begin))
+
+        best = max(overlaps, key=score)
+        d = best.data
+        rep_family_norm = _normalize_mei_family_token(
+            f"{d.get('rep_name','')} {d.get('rep_class','')} {d.get('rep_family','')}"
+        )
+        rep_strand = str(d.get("strand", "")).strip()
+        same_class = bool(event_family) and (rep_family_norm == event_family)
+        same_orient = bool(event_orientation) and rep_strand in {"+", "-"} and (rep_strand == event_orientation)
+        selected.append(
+            {
+                "nested_repeat_overlap": True,
+                "nested_repeat_name": str(d.get("rep_name", "")),
+                "nested_repeat_class": str(d.get("rep_class", "")),
+                "nested_repeat_family": str(d.get("rep_family", "")),
+                "nested_repeat_strand": rep_strand,
+                "nested_mei_family": event_family,
+                "nested_insertion_orientation": event_orientation,
+                "nested_same_class": same_class,
+                "nested_same_orientation": same_orient,
+                "nested_same_class_orientation": "nested" if (same_class and same_orient) else "unnested",
+            }
+        )
+
+    sel_df = pd.DataFrame(selected)
+    if not sel_df.empty:
+        for col in [
+            "nested_repeat_overlap",
+            "nested_repeat_name",
+            "nested_repeat_class",
+            "nested_repeat_family",
+            "nested_repeat_strand",
+            "nested_mei_family",
+            "nested_insertion_orientation",
+            "nested_same_class",
+            "nested_same_orientation",
+            "nested_same_class_orientation",
+        ]:
+            if col in sel_df.columns:
+                out[col] = sel_df[col].where(sel_df[col].notna(), out[col])
+    return out
+
+
 def annotate_candidate_loci_with_mei(
     evidence_dir: Path,
     candidate_loci_path: Path,
@@ -1797,7 +2672,7 @@ def annotate_candidate_loci_with_mei(
     reference_fasta: Path | None = None,
     tumor_bam_path: Path | None = None,
     normal_bam_path: Path | None = None,
-    g1k_mei_bed: Path | None = None,
+    rmsk_table_path: Path | None = None,
     g1k_mei_vcf: Path | None = None,
     g1k_split_padding_bp: int = 200,
     g1k_dpe_padding_min_bp: int = 200,
@@ -1846,10 +2721,16 @@ def annotate_candidate_loci_with_mei(
 
     disc_t = _aggregate_discordant_mei_metrics(tumor_disc_hits, sample_prefix="tumor")
     disc_n = _aggregate_discordant_mei_metrics(normal_disc_hits, sample_prefix="normal")
+    disc_anchor_t = _aggregate_discordant_anchor_side_metrics(discordant_tumor, sample_prefix="tumor")
+    disc_anchor_n = _aggregate_discordant_anchor_side_metrics(discordant_normal, sample_prefix="normal")
     if not disc_t.empty:
         candidate = candidate.merge(disc_t, on=["chrom", "window_start", "window_end"], how="left")
     if not disc_n.empty:
         candidate = candidate.merge(disc_n, on=["chrom", "window_start", "window_end"], how="left")
+    if not disc_anchor_t.empty:
+        candidate = candidate.merge(disc_anchor_t, on=["chrom", "window_start", "window_end"], how="left")
+    if not disc_anchor_n.empty:
+        candidate = candidate.merge(disc_anchor_n, on=["chrom", "window_start", "window_end"], how="left")
     print("[mei-annotate] merged discordant MEI support metrics")
 
     for col in candidate.columns:
@@ -1863,6 +2744,9 @@ def annotate_candidate_loci_with_mei(
             candidate[col] = candidate[col].fillna(0.0).astype(float)
         if re.search(r"_mei_family$|_mei_subfamily$|_mei_strand$", col):
             candidate[col] = candidate[col].fillna("")
+
+    # De-fragment frame before adding many derived columns to avoid pandas PerformanceWarning.
+    candidate = candidate.copy()
 
     candidate["tumor_split_mei_score_sum"] = candidate.get("tumor_L_mei_score_sum", 0.0) + candidate.get(
         "tumor_R_mei_score_sum", 0.0
@@ -1896,10 +2780,9 @@ def annotate_candidate_loci_with_mei(
     candidate = _add_local_depth_normalized_support(candidate)
     candidate = _infer_tumor_insertion_metrics(candidate, reference_fasta=reference_fasta)
     candidate = _compute_insertion_model_scores(candidate)
-    if g1k_mei_bed is not None or g1k_mei_vcf is not None:
+    if g1k_mei_vcf is not None:
         candidate = _annotate_g1k_mei_overlap(
             candidate,
-            g1k_mei_bed=g1k_mei_bed,
             g1k_mei_vcf=g1k_mei_vcf,
             split_padding_bp=g1k_split_padding_bp,
             dpe_padding_min_bp=g1k_dpe_padding_min_bp,
@@ -1907,6 +2790,9 @@ def annotate_candidate_loci_with_mei(
             dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
         )
         print("[mei-annotate] added 1000G/MELT polymorphism overlap fields")
+    if rmsk_table_path is not None:
+        candidate = _annotate_nested_retrotransposon(candidate, rmsk_table_path=rmsk_table_path)
+        print("[mei-annotate] added nested-retrotransposon overlap annotation")
     if tumor_bam_path is not None and normal_bam_path is not None:
         candidate = _annotate_bam_depth_for_consistent_loci(
             candidate,
