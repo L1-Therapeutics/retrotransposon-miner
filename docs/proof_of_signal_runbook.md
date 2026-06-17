@@ -60,6 +60,34 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --window-size 200
 ```
 
+### EC2 command with empirical context scoring (N=1000)
+
+Use this runbook command to include random-window empirical depth/read-quality
+scoring during `annotate-mei-support`:
+
+```bash
+RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
+  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
+  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
+  --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
+  --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
+  --g1k-mei-vcf data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz \
+  --outdir results/mei_step1_hg38_chr22_empirical \
+  --region chr22 \
+  --window-size 200
+```
+
+Defaults in the wrapper are:
+- `empirical_random_windows=1000`
+- `empirical_random_seed=13`
+- `empirical_random_scope=chromosome`
+- with `scope=chromosome`, this means `1000` random windows per chromosome in
+  the run (for `scope=genome`, it is `1000` total)
+
+Random windows are sampled outside candidate loci and outside the same junk
+tracks used in candidate construction (segdup, low mappability, gap, ENCODE
+blacklist), so no extra BED is required for the default flow.
+
 Quick file check before running:
 
 ```bash

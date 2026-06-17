@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import click
 
@@ -113,6 +114,16 @@ def check_env() -> None:
     type=int,
     help="Minimum |TLEN| structural context for discordant-anchor polyA/polyT rescue.",
 )
+@click.option(
+    "--require-strong-discordant-reason/--allow-weak-discordant-only",
+    default=True,
+    show_default=True,
+    help=(
+        "Require at least one strong discordant reason "
+        "(mate_unmapped/interchrom/large_insert/poly_tail_anchor_rescue). "
+        "Weak-only same_strand/improper_pair reads are filtered by default."
+    ),
+)
 def extract_split_evidence_cmd(
     tumor_bam: Path,
     normal_bam: Path,
@@ -132,8 +143,10 @@ def extract_split_evidence_cmd(
     discordant_poly_tail_rescue_min_run: int,
     discordant_poly_tail_rescue_min_frac: float,
     discordant_poly_tail_rescue_min_abs_tlen: int,
+    require_strong_discordant_reason: bool,
 ) -> None:
     """Extract split-read MEI evidence and optional discordant evidence."""
+    cmd_t0 = time.monotonic()
     outdir.mkdir(parents=True, exist_ok=True)
     region_list = [r.strip() for r in regions.split(",")] if regions else [region]
     region_list = [r for r in region_list if r]
@@ -143,6 +156,7 @@ def extract_split_evidence_cmd(
     split_summaries: list[ExtractionSummary] = []
     discordant_summaries: dict[str, ExtractionSummary] = {}
     for sample, bam in (("tumor", tumor_bam), ("normal", normal_bam)):
+        sample_t0 = time.monotonic()
         click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
         split_summary = extract_split_evidence(
             bam_path=bam,
@@ -158,9 +172,11 @@ def extract_split_evidence_cmd(
         split_summaries.append(split_summary)
         click.echo(
             f"[done] sample={sample} scanned={split_summary.total_reads_scanned} "
-            f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows}"
+            f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows} "
+            f"elapsed={time.monotonic() - sample_t0:.1f}s"
         )
         if with_discordant:
+            disc_t0 = time.monotonic()
             click.echo(f"[extract-discordant] sample={sample} regions={','.join(region_list)}")
             discordant_summary = extract_discordant_evidence(
                 bam_path=bam,
@@ -174,28 +190,33 @@ def extract_split_evidence_cmd(
                 poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
                 poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
                 poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
+                require_strong_discordant_reason=require_strong_discordant_reason,
             )
             discordant_summaries[sample] = discordant_summary
             click.echo(
                 f"[done-discordant] sample={sample} scanned={discordant_summary.total_reads_scanned} "
                 f"passing={discordant_summary.passing_reads} discordant_rows={discordant_summary.discordant_evidence_rows} "
-                f"insert_threshold={discordant_summary.insert_size_threshold}"
+                f"insert_threshold={discordant_summary.insert_size_threshold} "
+                f"weak_only_filtered={discordant_summary.weak_only_discordant_filtered_rows} "
+                f"elapsed={time.monotonic() - disc_t0:.1f}s"
             )
 
     summary_path = outdir / "split_evidence.summary.tsv"
     with summary_path.open("w", encoding="utf-8") as handle:
         handle.write(
-            "sample\ttotal_reads_scanned\tpassing_reads\tsplit_evidence_rows\tdiscordant_evidence_rows\tinsert_size_threshold\n"
+            "sample\ttotal_reads_scanned\tpassing_reads\tsplit_evidence_rows\tdiscordant_evidence_rows\tinsert_size_threshold\tweak_only_discordant_filtered_rows\n"
         )
         for s in split_summaries:
             d = discordant_summaries.get(s.sample)
             discordant_rows = d.discordant_evidence_rows if d else 0
             insert_threshold = d.insert_size_threshold if d else 0
+            weak_only_filtered = d.weak_only_discordant_filtered_rows if d else 0
             handle.write(
                 f"{s.sample}\t{s.total_reads_scanned}\t{s.passing_reads}\t{s.split_evidence_rows}\t"
-                f"{discordant_rows}\t{insert_threshold}\n"
+                f"{discordant_rows}\t{insert_threshold}\t{weak_only_filtered}\n"
             )
     click.echo(f"[summary] {summary_path}")
+    click.echo(f"[extract] total_elapsed={time.monotonic() - cmd_t0:.1f}s")
 
 
 @cli.command("build-candidate-loci")
@@ -319,6 +340,7 @@ def build_candidate_loci_cmd(
     encode_blacklist_min_fraction: float,
 ) -> None:
     """Aggregate split/discordant evidence into tumor-vs-normal candidate loci."""
+    t0 = time.monotonic()
     target_outdir = outdir if outdir is not None else evidence_dir
     tsv_path = build_candidate_loci(
         evidence_dir=evidence_dir,
@@ -339,7 +361,7 @@ def build_candidate_loci_cmd(
         encode_blacklist_bed=encode_blacklist_bed,
         encode_blacklist_min_fraction=encode_blacklist_min_fraction,
     )
-    click.echo(f"[candidate-loci] {tsv_path}")
+    click.echo(f"[candidate-loci] {tsv_path} elapsed={time.monotonic() - t0:.1f}s")
 
 
 @cli.command("annotate-mei-support")
@@ -425,6 +447,81 @@ def build_candidate_loci_cmd(
     show_default=True,
     help="Scale factor applied to discordant TLEN mean when deriving discordant-dominant query padding.",
 )
+@click.option(
+    "--empirical-random-windows",
+    type=int,
+    default=1000,
+    show_default=True,
+    help="Number of random windows sampled per chromosome when scope=chromosome (or total when scope=genome).",
+)
+@click.option(
+    "--empirical-random-scope",
+    type=click.Choice(["chromosome", "genome"], case_sensitive=False),
+    default="chromosome",
+    show_default=True,
+    help="Scope for random-window sampling used in empirical context scoring.",
+)
+@click.option(
+    "--empirical-random-seed",
+    type=int,
+    default=13,
+    show_default=True,
+    help="Random seed for reproducible empirical window sampling.",
+)
+@click.option(
+    "--empirical-highconf-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional BED restricting empirical random windows to high-confidence intervals.",
+)
+@click.option(
+    "--empirical-exclude-merged-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("data/public/annotation/hg38/junk/junk_exclusion_merged.bed"),
+    show_default=True,
+    help="Pre-merged junk exclusion BED for empirical random-window sampling.",
+)
+@click.option(
+    "--empirical-exclude-segdup-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("data/public/annotation/hg38/segdup/genomicSuperDups.bed"),
+    show_default=True,
+    help="Optional segdup BED to exclude from empirical random-window sampling.",
+)
+@click.option(
+    "--empirical-exclude-mappability-bedgraph",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("data/public/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"),
+    show_default=True,
+    help="Optional low-mappability mask (BED preferred; bedGraph also accepted) for empirical sampling exclusion.",
+)
+@click.option(
+    "--empirical-exclude-mappability-threshold",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Mappability scores below this threshold are excluded from empirical sampling.",
+)
+@click.option(
+    "--empirical-exclude-gap-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("data/public/annotation/hg38/masks/gap.txt.gz"),
+    show_default=True,
+    help="Optional gap BED to exclude from empirical random-window sampling.",
+)
+@click.option(
+    "--empirical-exclude-blacklist-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("data/public/annotation/hg38/blacklist/ENCFF356LFX.bed.gz"),
+    show_default=True,
+    help="Optional blacklist BED to exclude from empirical random-window sampling.",
+)
+@click.option(
+    "--empirical-cache-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Optional cache directory for empirical random-window metrics (defaults to out-tsv directory/empirical_cache).",
+)
 def annotate_mei_support_cmd(
     evidence_dir: Path,
     candidate_loci: Path,
@@ -439,8 +536,20 @@ def annotate_mei_support_cmd(
     g1k_dpe_padding_min_bp: int,
     g1k_dpe_padding_max_bp: int,
     g1k_dpe_padding_tlen_factor: float,
+    empirical_random_windows: int,
+    empirical_random_scope: str,
+    empirical_random_seed: int,
+    empirical_highconf_bed: Path | None,
+    empirical_exclude_merged_bed: Path | None,
+    empirical_exclude_segdup_bed: Path | None,
+    empirical_exclude_mappability_bedgraph: Path | None,
+    empirical_exclude_mappability_threshold: float,
+    empirical_exclude_gap_bed: Path | None,
+    empirical_exclude_blacklist_bed: Path | None,
+    empirical_cache_dir: Path | None,
 ) -> None:
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
+    t0 = time.monotonic()
     click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
     if (tumor_bam_depth is None) ^ (normal_bam_depth is None):
         raise click.ClickException("Provide both --tumor-bam-depth and --normal-bam-depth, or neither.")
@@ -458,8 +567,19 @@ def annotate_mei_support_cmd(
         g1k_dpe_padding_min_bp=g1k_dpe_padding_min_bp,
         g1k_dpe_padding_max_bp=g1k_dpe_padding_max_bp,
         g1k_dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
+        empirical_random_windows=empirical_random_windows,
+        empirical_random_scope=empirical_random_scope.lower(),
+        empirical_random_seed=empirical_random_seed,
+        empirical_highconf_bed=empirical_highconf_bed,
+        empirical_exclude_merged_bed=empirical_exclude_merged_bed,
+        empirical_exclude_segdup_bed=empirical_exclude_segdup_bed,
+        empirical_exclude_mappability_bedgraph=empirical_exclude_mappability_bedgraph,
+        empirical_exclude_mappability_threshold=empirical_exclude_mappability_threshold,
+        empirical_exclude_gap_bed=empirical_exclude_gap_bed,
+        empirical_exclude_blacklist_bed=empirical_exclude_blacklist_bed,
+        empirical_cache_dir=empirical_cache_dir,
     )
-    click.echo(f"[mei-annotate] done {out_path}")
+    click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 
 
 if __name__ == "__main__":

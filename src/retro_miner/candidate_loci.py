@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import time
 from collections.abc import Iterable
 from pathlib import Path
 import subprocess
@@ -10,8 +11,14 @@ import pandas as pd
 from intervaltree import IntervalTree
 
 
+_RUN_T0: float | None = None
+
+
 def _progress(msg: str) -> None:
-    print(f"[candidate-loci] {msg}", flush=True)
+    if _RUN_T0 is None:
+        print(f"[candidate-loci] {msg}", flush=True)
+    else:
+        print(f"[candidate-loci] +{(time.monotonic() - _RUN_T0):.1f}s {msg}", flush=True)
 
 
 def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
@@ -354,6 +361,8 @@ def _aggregate_discordant_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame
                 f"{prefix}_mate_unmapped_fraction",
                 f"{prefix}_interchrom_fraction",
                 f"{prefix}_large_insert_fraction",
+                f"{prefix}_same_strand_fraction",
+                f"{prefix}_improper_pair_fraction",
                 f"{prefix}_poly_tail_rescued_rows",
                 f"{prefix}_poly_tail_rescued_unique_reads",
                 f"{prefix}_poly_tail_at_fraction_mean",
@@ -373,6 +382,8 @@ def _aggregate_discordant_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame
     tmp["reason_mate_unmapped"] = reason_col.str.contains("mate_unmapped", regex=False).astype(int)
     tmp["reason_interchrom"] = reason_col.str.contains("interchrom", regex=False).astype(int)
     tmp["reason_large_insert"] = reason_col.str.contains("large_insert", regex=False).astype(int)
+    tmp["reason_same_strand"] = reason_col.str.contains("same_strand", regex=False).astype(int)
+    tmp["reason_improper_pair"] = reason_col.str.contains("improper_pair", regex=False).astype(int)
     tmp["poly_tail_anchor_rescued_int"] = tmp["poly_tail_anchor_rescued"].astype(bool).astype(int)
     tmp["abs_tlen"] = tmp["template_len"].abs()
     grouped = (
@@ -387,6 +398,8 @@ def _aggregate_discordant_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame
                 f"{prefix}_mate_unmapped_fraction": ("reason_mate_unmapped", "mean"),
                 f"{prefix}_interchrom_fraction": ("reason_interchrom", "mean"),
                 f"{prefix}_large_insert_fraction": ("reason_large_insert", "mean"),
+                f"{prefix}_same_strand_fraction": ("reason_same_strand", "mean"),
+                f"{prefix}_improper_pair_fraction": ("reason_improper_pair", "mean"),
                 f"{prefix}_nm_mean": ("nm", "mean"),
                 f"{prefix}_nm_max": ("nm", "max"),
                 f"{prefix}_poly_tail_rescued_rows": ("poly_tail_anchor_rescued_int", "sum"),
@@ -683,23 +696,26 @@ def build_candidate_loci(
     encode_blacklist_bed: Path | None = None,
     encode_blacklist_min_fraction: float = 0.1,
 ) -> Path:
-    _progress(f"start build_candidate_loci evidence_dir={evidence_dir} outdir={outdir}")
-    outdir.mkdir(parents=True, exist_ok=True)
-    _progress("reading split evidence summary")
-    passing_counts = _read_passing_counts(evidence_dir / "split_evidence.summary.tsv")
+    global _RUN_T0
+    _RUN_T0 = time.monotonic()
+    try:
+        _progress(f"start build_candidate_loci evidence_dir={evidence_dir} outdir={outdir}")
+        outdir.mkdir(parents=True, exist_ok=True)
+        _progress("reading split evidence summary")
+        passing_counts = _read_passing_counts(evidence_dir / "split_evidence.summary.tsv")
 
-    _progress("loading split/discordant evidence tables")
-    split_tumor_raw = _load_evidence_table(evidence_dir, "split_evidence", "tumor")
-    split_normal_raw = _load_evidence_table(evidence_dir, "split_evidence", "normal")
-    discordant_tumor_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "tumor")
-    discordant_normal_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "normal")
-    _progress(
-        "loaded evidence rows "
-        f"split_tumor={len(split_tumor_raw)}, split_normal={len(split_normal_raw)}, "
-        f"discordant_tumor={len(discordant_tumor_raw)}, discordant_normal={len(discordant_normal_raw)}"
-    )
+        _progress("loading split/discordant evidence tables")
+        split_tumor_raw = _load_evidence_table(evidence_dir, "split_evidence", "tumor")
+        split_normal_raw = _load_evidence_table(evidence_dir, "split_evidence", "normal")
+        discordant_tumor_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "tumor")
+        discordant_normal_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "normal")
+        _progress(
+            "loaded evidence rows "
+            f"split_tumor={len(split_tumor_raw)}, split_normal={len(split_normal_raw)}, "
+            f"discordant_tumor={len(discordant_tumor_raw)}, discordant_normal={len(discordant_normal_raw)}"
+        )
 
-    loci = _build_loci_from_evidence(
+        loci = _build_loci_from_evidence(
         split_tumor=split_tumor_raw,
         split_normal=split_normal_raw,
         discordant_tumor=discordant_tumor_raw,
@@ -708,32 +724,32 @@ def build_candidate_loci(
         discordant_cluster_bp=discordant_cluster_bp,
         max_locus_span_bp=max_locus_span_bp,
     )
-    _progress(f"locus assignment target count={len(loci)}")
+        _progress(f"locus assignment target count={len(loci)}")
 
-    _progress("assigning evidence rows to loci")
-    split_tumor = _assign_rows_to_loci(split_tumor_raw, loci)
-    split_normal = _assign_rows_to_loci(split_normal_raw, loci)
-    discordant_tumor = _assign_rows_to_loci(discordant_tumor_raw, loci)
-    discordant_normal = _assign_rows_to_loci(discordant_normal_raw, loci)
-    _progress(
-        "assigned rows "
-        f"split_tumor={len(split_tumor)}, split_normal={len(split_normal)}, "
-        f"discordant_tumor={len(discordant_tumor)}, discordant_normal={len(discordant_normal)}"
-    )
+        _progress("assigning evidence rows to loci")
+        split_tumor = _assign_rows_to_loci(split_tumor_raw, loci)
+        split_normal = _assign_rows_to_loci(split_normal_raw, loci)
+        discordant_tumor = _assign_rows_to_loci(discordant_tumor_raw, loci)
+        discordant_normal = _assign_rows_to_loci(discordant_normal_raw, loci)
+        _progress(
+            "assigned rows "
+            f"split_tumor={len(split_tumor)}, split_normal={len(split_normal)}, "
+            f"discordant_tumor={len(discordant_tumor)}, discordant_normal={len(discordant_normal)}"
+        )
 
-    _progress("aggregating split/discordant metrics per locus")
-    split_t = _aggregate_split_metrics(split_tumor, "split_tumor")
-    split_n = _aggregate_split_metrics(split_normal, "split_normal")
-    disc_t = _aggregate_discordant_metrics(discordant_tumor, "discordant_tumor")
-    disc_n = _aggregate_discordant_metrics(discordant_normal, "discordant_normal")
+        _progress("aggregating split/discordant metrics per locus")
+        split_t = _aggregate_split_metrics(split_tumor, "split_tumor")
+        split_n = _aggregate_split_metrics(split_normal, "split_normal")
+        disc_t = _aggregate_discordant_metrics(discordant_tumor, "discordant_tumor")
+        disc_n = _aggregate_discordant_metrics(discordant_normal, "discordant_normal")
 
-    _progress("merging per-sample locus metrics")
-    merged = split_t.merge(split_n, on=["chrom", "window_start", "window_end"], how="outer")
-    merged = merged.merge(disc_t, on=["chrom", "window_start", "window_end"], how="outer")
-    merged = merged.merge(disc_n, on=["chrom", "window_start", "window_end"], how="outer")
-    merged = merged.fillna(0)
+        _progress("merging per-sample locus metrics")
+        merged = split_t.merge(split_n, on=["chrom", "window_start", "window_end"], how="outer")
+        merged = merged.merge(disc_t, on=["chrom", "window_start", "window_end"], how="outer")
+        merged = merged.merge(disc_n, on=["chrom", "window_start", "window_end"], how="outer")
+        merged = merged.fillna(0)
 
-    int_cols = [
+        int_cols = [
         c
         for c in merged.columns
         if c.endswith("_rows")
@@ -743,24 +759,24 @@ def build_candidate_loci(
         or c.endswith("_run_max")
         or c.endswith("_nm_max")
     ]
-    for col in int_cols:
-        merged[col] = merged[col].astype(int)
+        for col in int_cols:
+            merged[col] = merged[col].astype(int)
 
-    merged["tumor_total_rows"] = merged["split_tumor_rows"] + merged["discordant_tumor_rows"]
-    merged["normal_total_rows"] = merged["split_normal_rows"] + merged["discordant_normal_rows"]
+        merged["tumor_total_rows"] = merged["split_tumor_rows"] + merged["discordant_tumor_rows"]
+        merged["normal_total_rows"] = merged["split_normal_rows"] + merged["discordant_normal_rows"]
 
-    tumor_den = passing_counts.get("tumor", 0)
-    normal_den = passing_counts.get("normal", 0)
-    merged["tumor_total_cpm"] = _safe_cpm(merged["tumor_total_rows"], tumor_den)
-    merged["normal_total_cpm"] = _safe_cpm(merged["normal_total_rows"], normal_den)
+        tumor_den = passing_counts.get("tumor", 0)
+        normal_den = passing_counts.get("normal", 0)
+        merged["tumor_total_cpm"] = _safe_cpm(merged["tumor_total_rows"], tumor_den)
+        merged["normal_total_cpm"] = _safe_cpm(merged["normal_total_rows"], normal_den)
 
-    merged["enrichment_ratio"] = (merged["tumor_total_cpm"] + pseudocount) / (
-        merged["normal_total_cpm"] + pseudocount
-    )
-    merged["delta_cpm"] = merged["tumor_total_cpm"] - merged["normal_total_cpm"]
+        merged["enrichment_ratio"] = (merged["tumor_total_cpm"] + pseudocount) / (
+            merged["normal_total_cpm"] + pseudocount
+        )
+        merged["delta_cpm"] = merged["tumor_total_cpm"] - merged["normal_total_cpm"]
 
-    _progress("computing junk-region flags")
-    merged = _annotate_junk_flags(
+        _progress("computing junk-region flags")
+        merged = _annotate_junk_flags(
         loci=merged,
         discordant_tumor=discordant_tumor,
         discordant_normal=discordant_normal,
@@ -776,13 +792,15 @@ def build_candidate_loci(
         encode_blacklist_min_fraction=encode_blacklist_min_fraction,
     )
 
-    _progress("sorting final candidate loci")
-    merged = merged.sort_values(["enrichment_ratio", "tumor_total_rows"], ascending=[False, False], kind="mergesort")
+        _progress("sorting final candidate loci")
+        merged = merged.sort_values(["enrichment_ratio", "tumor_total_rows"], ascending=[False, False], kind="mergesort")
 
-    out_tsv = outdir / "candidate_loci.tsv"
-    out_parquet = outdir / "candidate_loci.parquet"
-    _progress(f"writing outputs tsv={out_tsv} parquet={out_parquet}")
-    merged.to_csv(out_tsv, sep="\t", index=False)
-    merged.to_parquet(out_parquet, index=False)
-    _progress(f"done build_candidate_loci rows={len(merged)}")
-    return out_tsv
+        out_tsv = outdir / "candidate_loci.tsv"
+        out_parquet = outdir / "candidate_loci.parquet"
+        _progress(f"writing outputs tsv={out_tsv} parquet={out_parquet}")
+        merged.to_csv(out_tsv, sep="\t", index=False)
+        merged.to_parquet(out_parquet, index=False)
+        _progress(f"done build_candidate_loci rows={len(merged)}")
+        return out_tsv
+    finally:
+        _RUN_T0 = None

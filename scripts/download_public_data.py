@@ -333,6 +333,146 @@ def _filter_mei_bed(src_bed: Path, dst_bed: Path, force: bool) -> dict[str, Any]
     return {"status": "filtered", "path": str(dst_bed), "rows": kept}
 
 
+def _derive_low_mappability_bed(
+    src_bedgraph: Path,
+    dst_bed: Path,
+    threshold: float,
+    force: bool,
+) -> dict[str, Any]:
+    if dst_bed.exists() and not force:
+        return {"status": "skipped_exists", "path": str(dst_bed), "bytes": dst_bed.stat().st_size}
+
+    dst_bed.parent.mkdir(parents=True, exist_ok=True)
+    kept = 0
+    with src_bedgraph.open("r", encoding="utf-8") as in_handle, dst_bed.open("w", encoding="utf-8") as out_handle:
+        for line in in_handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 4:
+                continue
+            try:
+                score = float(parts[3])
+            except ValueError:
+                continue
+            if score >= float(threshold):
+                continue
+            chrom = parts[0]
+            start = parts[1]
+            end = parts[2]
+            out_handle.write(f"{chrom}\t{start}\t{end}\n")
+            kept += 1
+    return {"status": "derived", "path": str(dst_bed), "rows": kept, "threshold": float(threshold)}
+
+
+def _open_textmaybe_gz(path: Path):
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
+
+
+def _collect_intervals_for_merge(path: Path) -> dict[str, list[tuple[int, int]]]:
+    intervals: dict[str, list[tuple[int, int]]] = {}
+    with _open_textmaybe_gz(path) as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            chrom = ""
+            start0 = -1
+            end0 = -1
+            try:
+                # BED-like
+                if len(parts) >= 3 and parts[0].startswith("chr"):
+                    chrom = parts[0]
+                    start0 = int(parts[1])
+                    end0 = int(parts[2])
+                # UCSC table with leading bin
+                elif len(parts) >= 4 and parts[1].startswith("chr"):
+                    chrom = parts[1]
+                    start0 = int(parts[2])
+                    end0 = int(parts[3])
+            except ValueError:
+                continue
+            if not chrom or end0 <= start0:
+                continue
+            intervals.setdefault(chrom, []).append((start0, end0))
+    return intervals
+
+
+def _merge_junk_exclusion_bed(
+    segdup_bed: Path,
+    low_map_bed: Path,
+    gap_bed_like: Path,
+    blacklist_bed_like: Path,
+    out_merged_bed: Path,
+    out_gap_bed: Path,
+    out_blacklist_bed: Path,
+    force: bool,
+) -> dict[str, Any]:
+    if out_merged_bed.exists() and out_gap_bed.exists() and out_blacklist_bed.exists() and not force:
+        return {"status": "skipped_exists", "path": str(out_merged_bed), "bytes": out_merged_bed.stat().st_size}
+
+    # Normalize gap and blacklist to plain BED for easier downstream reuse.
+    out_gap_bed.parent.mkdir(parents=True, exist_ok=True)
+    out_blacklist_bed.parent.mkdir(parents=True, exist_ok=True)
+    with _open_textmaybe_gz(gap_bed_like) as in_handle, out_gap_bed.open("w", encoding="utf-8") as out_handle:
+        for line in in_handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3 and parts[0].startswith("chr"):
+                chrom, start, end = parts[0], parts[1], parts[2]
+            elif len(parts) >= 4 and parts[1].startswith("chr"):
+                chrom, start, end = parts[1], parts[2], parts[3]
+            else:
+                continue
+            out_handle.write(f"{chrom}\t{start}\t{end}\n")
+    with _open_textmaybe_gz(blacklist_bed_like) as in_handle, out_blacklist_bed.open("w", encoding="utf-8") as out_handle:
+        for line in in_handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            if parts[0].startswith("chr"):
+                out_handle.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\n")
+
+    merged: dict[str, list[tuple[int, int]]] = {}
+    for src in (segdup_bed, low_map_bed, out_gap_bed, out_blacklist_bed):
+        for chrom, rows in _collect_intervals_for_merge(src).items():
+            merged.setdefault(chrom, []).extend(rows)
+    out_merged_bed.parent.mkdir(parents=True, exist_ok=True)
+    total_intervals = 0
+    with out_merged_bed.open("w", encoding="utf-8") as handle:
+        for chrom in sorted(merged):
+            rows = sorted(merged[chrom], key=lambda x: (x[0], x[1]))
+            cur_s = -1
+            cur_e = -1
+            for s, e in rows:
+                if cur_s < 0:
+                    cur_s, cur_e = s, e
+                    continue
+                if s <= cur_e:
+                    if e > cur_e:
+                        cur_e = e
+                else:
+                    handle.write(f"{chrom}\t{cur_s}\t{cur_e}\n")
+                    total_intervals += 1
+                    cur_s, cur_e = s, e
+            if cur_s >= 0:
+                handle.write(f"{chrom}\t{cur_s}\t{cur_e}\n")
+                total_intervals += 1
+    return {
+        "status": "merged",
+        "path": str(out_merged_bed),
+        "rows": total_intervals,
+        "bytes": out_merged_bed.stat().st_size if out_merged_bed.exists() else 0,
+        "gap_bed_path": str(out_gap_bed),
+        "blacklist_bed_path": str(out_blacklist_bed),
+    }
+
+
 def _liftover_bed(in_bed: Path, chain_gz: Path, out_bed: Path, out_unmapped: Path, force: bool) -> dict[str, Any]:
     if out_bed.exists() and out_unmapped.exists() and not force:
         return {"status": "skipped_exists", "path": str(out_bed), "unmapped_path": str(out_unmapped)}
@@ -529,6 +669,34 @@ def _postprocess(
     else:
         steps.append({"step": "mappability_bw_to_bedgraph", "status": "skipped_exists", "path": str(mappability_bedgraph)})
         print("[postprocess:done] mappability_bw_to_bedgraph status=skipped_exists", file=sys.stderr)
+    low_map_bed = outdir / "annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+    run_step(
+        "mappability_low_to_bed",
+        lambda: _derive_low_mappability_bed(
+            src_bedgraph=mappability_bedgraph,
+            dst_bed=low_map_bed,
+            threshold=0.5,
+            force=force,
+        ),
+    )
+    gap_src = outdir / "annotation/hg38/masks/gap.txt.gz"
+    blacklist_src = outdir / "annotation/hg38/blacklist/ENCFF356LFX.bed.gz"
+    gap_bed = outdir / "annotation/hg38/masks/gap.bed"
+    blacklist_bed = outdir / "annotation/hg38/blacklist/ENCFF356LFX.bed"
+    merged_junk_bed = outdir / "annotation/hg38/junk/junk_exclusion_merged.bed"
+    run_step(
+        "merge_junk_exclusion_bed",
+        lambda: _merge_junk_exclusion_bed(
+            segdup_bed=segdup_bed,
+            low_map_bed=low_map_bed,
+            gap_bed_like=gap_src,
+            blacklist_bed_like=blacklist_src,
+            out_merged_bed=merged_junk_bed,
+            out_gap_bed=gap_bed,
+            out_blacklist_bed=blacklist_bed,
+            force=force,
+        ),
+    )
 
     gnomad_bb = outdir / ds_map["gnomad_v41_sv_non_neuro_bb"].target_path
     gnomad_bed = outdir / "polymorphism/hg38/gnomad/gnomad.v4.1.sv.non_neuro_controls.sites.bed"

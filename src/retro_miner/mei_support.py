@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
+import json
 import math
+import random
 import re
 import subprocess
 import tempfile
+import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1085,10 +1090,14 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
     tmp["reason_interchrom"] = reason_col.str.contains("interchrom", regex=False).astype(int)
     tmp["reason_mate_unmapped"] = reason_col.str.contains("mate_unmapped", regex=False).astype(int)
     tmp["reason_large_insert"] = reason_col.str.contains("large_insert", regex=False).astype(int)
+    tmp["reason_same_strand"] = reason_col.str.contains("same_strand", regex=False).astype(int)
+    tmp["reason_improper_pair"] = reason_col.str.contains("improper_pair", regex=False).astype(int)
     tmp["reason_complex_any"] = (
         (tmp["reason_interchrom"] == 1)
         | (tmp["reason_mate_unmapped"] == 1)
         | (tmp["reason_large_insert"] == 1)
+        | (tmp["reason_same_strand"] == 1)
+        | (tmp["reason_improper_pair"] == 1)
     ).astype(int)
     tmp["mapq"] = tmp["mapq"].astype(float)
 
@@ -1100,6 +1109,8 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
             side_interchrom_fraction=("reason_interchrom", "mean"),
             side_mate_unmapped_fraction=("reason_mate_unmapped", "mean"),
             side_large_insert_fraction=("reason_large_insert", "mean"),
+            side_same_strand_fraction=("reason_same_strand", "mean"),
+            side_improper_pair_fraction=("reason_improper_pair", "mean"),
             side_complex_any_fraction=("reason_complex_any", "mean"),
         )
         .sort_values(["chrom", "window_start", "window_end", "anchor_side"], kind="mergesort")
@@ -1109,6 +1120,8 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
             "side_interchrom_fraction",
             "side_mate_unmapped_fraction",
             "side_large_insert_fraction",
+            "side_same_strand_fraction",
+            "side_improper_pair_fraction",
             "side_complex_any_fraction",
         ]
     ].max(axis=1)
@@ -1509,6 +1522,174 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
         + out.get("normal_R_poly_at_fraction", 0.0).fillna(0.0).astype(float)
         * out.get("normal_R_mei_supported_reads", 0)
     ) / out.get("normal_mei_supported_reads", 0).replace(0, 1)
+
+    normal_metrics = out.apply(
+        lambda r: _sample_insertion_span_and_orientation(r, "normal"),
+        axis=1,
+        result_type="expand",
+    )
+    normal_metrics.columns = [
+        "normal_insertion_mei_start",
+        "normal_insertion_mei_end",
+        "normal_insertion_mei_span",
+        "normal_insertion_orientation",
+    ]
+    for col in normal_metrics.columns:
+        out[col] = normal_metrics[col]
+    out["insertion_orientation"] = out.apply(_choose_consolidated_insertion_orientation, axis=1)
+    out["insertion_mei_span"] = out.apply(_choose_consolidated_insertion_mei_span, axis=1).astype(int)
+    return out
+
+
+def _row_int(row: pd.Series, key: str, default: int = 0) -> int:
+    val = row.get(key, default)
+    if pd.isna(val):
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _sample_insertion_span_and_orientation(row: pd.Series, prefix: str) -> tuple[int, int, int, str]:
+    l_start = _row_int(row, f"{prefix}_L_mei_start")
+    r_start = _row_int(row, f"{prefix}_R_mei_start")
+    l_end = _row_int(row, f"{prefix}_L_mei_end")
+    r_end = _row_int(row, f"{prefix}_R_mei_end")
+    starts = [x for x in [l_start, r_start] if x > 0]
+    ends = [x for x in [l_end, r_end] if x > 0]
+    start = min(starts) if starts else 0
+    end = max(ends) if ends else 0
+    span = (end - start + 1) if start > 0 and end >= start else 0
+    strands = [
+        s
+        for s in [row.get(f"{prefix}_L_mei_strand", ""), row.get(f"{prefix}_R_mei_strand", "")]
+        if s in {"+", "-"}
+    ]
+    if not strands:
+        orient = ""
+    elif len(set(strands)) == 1:
+        orient = strands[0]
+    else:
+        orient = "mixed"
+
+    if span <= 0:
+        l_target = _row_int(row, f"{prefix}_discordant_mei_left_target_pos_median")
+        r_target = _row_int(row, f"{prefix}_discordant_mei_right_target_pos_median")
+        if l_target > 0 and r_target > 0:
+            start = min(l_target, r_target)
+            end = max(l_target, r_target)
+            span = end - start + 1
+
+    if orient not in {"+", "-"}:
+        discordant_strand = str(row.get(f"{prefix}_discordant_mei_strand", "") or "").strip()
+        if discordant_strand in {"+", "-"}:
+            orient = discordant_strand
+    return start, end, span, orient
+
+
+def _sample_has_bilateral_split_support(row: pd.Series, prefix: str) -> bool:
+    left = _row_int(row, f"{prefix}_L_mei_supported_reads")
+    right = _row_int(row, f"{prefix}_R_mei_supported_reads")
+    return left >= 1 and right >= 1
+
+
+def _sample_has_bilateral_discordant_support(row: pd.Series, prefix: str) -> bool:
+    left = _row_int(row, f"{prefix}_discordant_mei_left_supported_reads")
+    right = _row_int(row, f"{prefix}_discordant_mei_right_supported_reads")
+    return left >= 1 and right >= 1
+
+
+def _choose_consolidated_insertion_orientation(row: pd.Series) -> str:
+    tumor_orient = str(row.get("tumor_insertion_orientation", "") or "").strip()
+    normal_orient = str(row.get("normal_insertion_orientation", "") or "").strip()
+    tumor_bilateral = _sample_has_bilateral_split_support(row, "tumor") or _sample_has_bilateral_discordant_support(
+        row, "tumor"
+    )
+    normal_bilateral = _sample_has_bilateral_split_support(row, "normal") or _sample_has_bilateral_discordant_support(
+        row, "normal"
+    )
+    if tumor_bilateral and tumor_orient in {"+", "-"}:
+        return tumor_orient
+    if normal_bilateral and normal_orient in {"+", "-"}:
+        return normal_orient
+    if tumor_orient in {"+", "-"}:
+        return tumor_orient
+    if normal_orient in {"+", "-"}:
+        return normal_orient
+    return _choose_event_orientation(row)
+
+
+def _choose_consolidated_insertion_mei_span(row: pd.Series) -> int:
+    tumor_span = _row_int(row, "tumor_insertion_mei_span")
+    normal_span = _row_int(row, "normal_insertion_mei_span")
+    tumor_bilateral = _sample_has_bilateral_split_support(row, "tumor") or _sample_has_bilateral_discordant_support(
+        row, "tumor"
+    )
+    normal_bilateral = _sample_has_bilateral_split_support(row, "normal") or _sample_has_bilateral_discordant_support(
+        row, "normal"
+    )
+    if tumor_bilateral and tumor_span > 0:
+        return tumor_span
+    if normal_bilateral and normal_span > 0:
+        return normal_span
+    if tumor_span > 0 and normal_span > 0:
+        tumor_reads = _row_int(row, "tumor_mei_supported_reads")
+        normal_reads = _row_int(row, "normal_mei_supported_reads")
+        return tumor_span if tumor_reads >= normal_reads else normal_span
+    return max(tumor_span, normal_span)
+
+
+def _broaden_poly_at_fields(candidates: pd.DataFrame) -> pd.DataFrame:
+    out = candidates.copy()
+
+    def _col_int(col: str) -> pd.Series:
+        if col in out.columns:
+            return out[col].fillna(0).astype(int)
+        return pd.Series(0, index=out.index, dtype=int)
+
+    def _max_int_series(*cols: str) -> pd.Series:
+        parts = [_col_int(col) for col in cols]
+        if not parts:
+            return pd.Series(0, index=out.index, dtype=int)
+        return pd.concat(parts, axis=1).max(axis=1).astype(int)
+
+    for prefix in ("tumor", "normal"):
+        out[f"{prefix}_poly_at_max_run"] = _max_int_series(
+            f"{prefix}_poly_at_max_run",
+            f"split_{prefix}_poly_tail_at_run_max",
+            f"discordant_{prefix}_poly_tail_at_run_max",
+        )
+        mei_poly_reads = _col_int(f"{prefix}_poly_at_reads")
+        split_poly_reads = _col_int(f"split_{prefix}_poly_tail_rescued_unique_reads")
+        discordant_poly_reads = _col_int(f"discordant_{prefix}_poly_tail_rescued_unique_reads")
+        out[f"{prefix}_poly_at_reads"] = (
+            pd.concat([mei_poly_reads, split_poly_reads], axis=1).max(axis=1).astype(int)
+            + discordant_poly_reads
+        )
+
+    out["poly_at_max_run"] = _max_int_series("tumor_poly_at_max_run", "normal_poly_at_max_run")
+    out["poly_at_reads"] = _col_int("tumor_poly_at_reads") + _col_int("normal_poly_at_reads")
+    return out
+
+
+def _add_consolidated_event_fields(candidates: pd.DataFrame) -> pd.DataFrame:
+    out = candidates.copy()
+    for prefix in ("tumor", "normal"):
+        out[f"{prefix}_left_supported_reads"] = (
+            out.get(f"{prefix}_L_mei_supported_reads", 0).fillna(0).astype(int)
+            + out.get(f"{prefix}_discordant_mei_left_supported_reads", 0).fillna(0).astype(int)
+        )
+        out[f"{prefix}_right_supported_reads"] = (
+            out.get(f"{prefix}_R_mei_supported_reads", 0).fillna(0).astype(int)
+            + out.get(f"{prefix}_discordant_mei_right_supported_reads", 0).fillna(0).astype(int)
+        )
+    out["mei_subfamily"] = out.apply(_choose_event_subfamily, axis=1)
+    out["mei_family"] = out.apply(_choose_event_family, axis=1)
+    empty_family = out["mei_family"].fillna("").astype(str) == ""
+    out.loc[empty_family, "mei_family"] = (
+        out.loc[empty_family, "mei_subfamily"].fillna("").astype(str).map(_normalize_mei_family_token)
+    )
     return out
 
 
@@ -1521,6 +1702,75 @@ def _agreement_flag(a: str, b: str) -> int:
         # One-sided support can still be valid for low-support/subclonal events.
         return 1
     return 1 if a == b else 0
+
+
+_COMPLEX_ANCHOR_MIN_UNIQUE_READS = 2
+_COMPLEX_ANCHOR_MIN_FRACTION = 0.60
+_COMPLEX_SPLIT_MIN_READS = 2
+_COMPLEX_SPLIT_MIN_PURITY = 0.70
+_COMPLEX_SPLIT_MIN_MODE_FRAC = 0.50
+_COMPLEX_LOCUS_STRONG_MIN_FRACTION = 0.60
+_COMPLEX_LOCUS_WEAK_MIN_FRACTION = 0.50
+
+
+def _discordant_anchor_side_is_complex(
+    unique_reads: pd.Series,
+    complex_frac: pd.Series,
+    mei_supported_on_side: pd.Series,
+) -> pd.Series:
+    return (
+        (unique_reads.fillna(0).astype(float) >= _COMPLEX_ANCHOR_MIN_UNIQUE_READS)
+        & (complex_frac.fillna(0.0).astype(float) >= _COMPLEX_ANCHOR_MIN_FRACTION)
+        & (mei_supported_on_side.fillna(0).astype(float) <= 1)
+    )
+
+
+def _split_side_mei_for_complex(reads: pd.Series, purity: pd.Series, mode_frac: pd.Series) -> pd.Series:
+    return (
+        (reads.fillna(0).astype(float) >= _COMPLEX_SPLIT_MIN_READS)
+        & (purity.fillna(0.0).astype(float) >= _COMPLEX_SPLIT_MIN_PURITY)
+        & (mode_frac.fillna(0.0).astype(float) >= _COMPLEX_SPLIT_MIN_MODE_FRAC)
+    )
+
+
+def _df_col_float(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if col in df.columns:
+        return df[col].astype(float).fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _complex_locus_companion_fraction(df: pd.DataFrame) -> pd.Series:
+    fraction_cols = [
+        "discordant_tumor_large_insert_fraction",
+        "discordant_tumor_interchrom_fraction",
+        "discordant_tumor_mate_unmapped_fraction",
+        "discordant_tumor_same_strand_fraction",
+        "discordant_tumor_improper_pair_fraction",
+        "discordant_normal_large_insert_fraction",
+        "discordant_normal_interchrom_fraction",
+        "discordant_normal_mate_unmapped_fraction",
+        "discordant_normal_same_strand_fraction",
+        "discordant_normal_improper_pair_fraction",
+    ]
+    parts = [_df_col_float(df, col) for col in fraction_cols if col in df.columns]
+    if not parts:
+        return pd.Series(0.0, index=df.index)
+    return pd.concat(parts, axis=1).max(axis=1)
+
+
+def _complex_locus_strong_companion_fraction(df: pd.DataFrame) -> pd.Series:
+    fraction_cols = [
+        "discordant_tumor_large_insert_fraction",
+        "discordant_tumor_interchrom_fraction",
+        "discordant_tumor_mate_unmapped_fraction",
+        "discordant_normal_large_insert_fraction",
+        "discordant_normal_interchrom_fraction",
+        "discordant_normal_mate_unmapped_fraction",
+    ]
+    parts = [_df_col_float(df, col) for col in fraction_cols if col in df.columns]
+    if not parts:
+        return pd.Series(0.0, index=df.index)
+    return pd.concat(parts, axis=1).max(axis=1)
 
 
 def _revcomp(seq: str) -> str:
@@ -1792,21 +2042,17 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     base_score = (base_score + 0.05 * mapq_event).clip(lower=0.0, upper=1.0)
 
     # Track complex SV-like companion signatures without suppressing MEI detection.
-    large_insert_fraction = out.get("discordant_tumor_large_insert_fraction", 0.0).astype(float).fillna(0.0)
-    interchrom_fraction = out.get("discordant_tumor_interchrom_fraction", 0.0).astype(float).fillna(0.0)
-    mate_unmapped_fraction = out.get("discordant_tumor_mate_unmapped_fraction", 0.0).astype(float).fillna(0.0)
+    complex_companion_fraction = _complex_locus_companion_fraction(out)
+    complex_strong_companion_fraction = _complex_locus_strong_companion_fraction(out)
+    large_insert_fraction = _df_col_float(out, "discordant_tumor_large_insert_fraction")
+    interchrom_fraction = _df_col_float(out, "discordant_tumor_interchrom_fraction")
+    mate_unmapped_fraction = _df_col_float(out, "discordant_tumor_mate_unmapped_fraction")
 
-    out["complex_sv_large_insert_flag"] = large_insert_fraction >= 0.60
-    out["complex_sv_interchrom_flag"] = interchrom_fraction >= 0.60
-    out["complex_sv_mate_unmapped_flag"] = mate_unmapped_fraction >= 0.60
-    out["complex_sv_companion_signal"] = (
-        out["complex_sv_large_insert_flag"]
-        | out["complex_sv_interchrom_flag"]
-        | out["complex_sv_mate_unmapped_flag"]
-    )
-    out["complex_sv_signal_score"] = (
-        pd.concat([large_insert_fraction, interchrom_fraction, mate_unmapped_fraction], axis=1).max(axis=1)
-    )
+    out["complex_sv_large_insert_flag"] = large_insert_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
+    out["complex_sv_interchrom_flag"] = interchrom_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
+    out["complex_sv_mate_unmapped_flag"] = mate_unmapped_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
+    out["complex_sv_companion_signal"] = complex_strong_companion_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
+    out["complex_sv_signal_score"] = complex_companion_fraction
     out["mei_with_complex_sv_signature"] = out["complex_sv_companion_signal"] & (tumor_mei_reads >= 2)
     out["complex_sv_signature_label"] = "none"
     out.loc[out["complex_sv_large_insert_flag"], "complex_sv_signature_label"] = "large_insert"
@@ -1823,6 +2069,16 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         out["complex_sv_mate_unmapped_flag"] & (out["complex_sv_signature_label"] != "none"),
         "complex_sv_signature_label",
     ] = out["complex_sv_signature_label"] + "+mate_unmapped"
+    same_strand_fraction = _df_col_float(out, "discordant_tumor_same_strand_fraction")
+    improper_pair_fraction = _df_col_float(out, "discordant_tumor_improper_pair_fraction")
+    out.loc[
+        (same_strand_fraction >= _COMPLEX_LOCUS_WEAK_MIN_FRACTION) & (out["complex_sv_signature_label"] == "none"),
+        "complex_sv_signature_label",
+    ] = "same_strand"
+    out.loc[
+        (improper_pair_fraction >= _COMPLEX_LOCUS_WEAK_MIN_FRACTION) & (out["complex_sv_signature_label"] == "none"),
+        "complex_sv_signature_label",
+    ] = "improper_pair"
 
     score = base_score.clip(lower=0.0, upper=1.0)
     out["insertion_model_score"] = score
@@ -1878,71 +2134,55 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         & normal_dpe_geometry_consistent
         & normal_dpe_self_consistent
     )
-    tumor_left_mei_consistent = (
-        (left_reads >= 2)
-        & (out.get("tumor_L_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
-        & (out.get("tumor_L_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    tumor_left_mei_consistent = _split_side_mei_for_complex(
+        left_reads,
+        out.get("tumor_L_mei_subfamily_purity", 0.0).astype(float),
+        out.get("tumor_L_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    tumor_right_mei_consistent = (
-        (right_reads >= 2)
-        & (out.get("tumor_R_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
-        & (out.get("tumor_R_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    tumor_right_mei_consistent = _split_side_mei_for_complex(
+        right_reads,
+        out.get("tumor_R_mei_subfamily_purity", 0.0).astype(float),
+        out.get("tumor_R_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    tumor_left_anchor_complex = (
-        (out.get("tumor_discordant_anchor_left_unique_reads", 0).astype(float) >= 2)
-        & (
-            out.get("tumor_discordant_anchor_left_complex_reason_max_fraction", 0.0)
-            .astype(float)
-            .fillna(0.0)
-            >= 0.60
-        )
-        & (out.get("tumor_discordant_mei_left_supported_reads", 0).astype(float) <= 1)
+    tumor_left_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("tumor_discordant_anchor_left_unique_reads", 0).astype(float),
+        out.get("tumor_discordant_anchor_left_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("tumor_discordant_mei_left_supported_reads", 0).astype(float),
     )
-    tumor_right_anchor_complex = (
-        (out.get("tumor_discordant_anchor_right_unique_reads", 0).astype(float) >= 2)
-        & (
-            out.get("tumor_discordant_anchor_right_complex_reason_max_fraction", 0.0)
-            .astype(float)
-            .fillna(0.0)
-            >= 0.60
-        )
-        & (out.get("tumor_discordant_mei_right_supported_reads", 0).astype(float) <= 1)
+    tumor_right_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("tumor_discordant_anchor_right_unique_reads", 0).astype(float),
+        out.get("tumor_discordant_anchor_right_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("tumor_discordant_mei_right_supported_reads", 0).astype(float),
     )
+    out["tumor_discordant_anchor_left_complex_side"] = tumor_left_anchor_complex
+    out["tumor_discordant_anchor_right_complex_side"] = tumor_right_anchor_complex
     out["tumor_mei_with_complex_sidepair"] = (
         (tumor_left_mei_consistent & tumor_right_anchor_complex)
         | (tumor_right_mei_consistent & tumor_left_anchor_complex)
     )
 
-    normal_left_mei_consistent = (
-        (normal_left_reads >= 2)
-        & (out.get("normal_L_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
-        & (out.get("normal_L_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    normal_left_mei_consistent = _split_side_mei_for_complex(
+        normal_left_reads,
+        out.get("normal_L_mei_subfamily_purity", 0.0).astype(float),
+        out.get("normal_L_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    normal_right_mei_consistent = (
-        (normal_right_reads >= 2)
-        & (out.get("normal_R_mei_subfamily_purity", 0.0).astype(float).fillna(0.0) >= 0.70)
-        & (out.get("normal_R_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0) >= 0.50)
+    normal_right_mei_consistent = _split_side_mei_for_complex(
+        normal_right_reads,
+        out.get("normal_R_mei_subfamily_purity", 0.0).astype(float),
+        out.get("normal_R_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    normal_left_anchor_complex = (
-        (out.get("normal_discordant_anchor_left_unique_reads", 0).astype(float) >= 2)
-        & (
-            out.get("normal_discordant_anchor_left_complex_reason_max_fraction", 0.0)
-            .astype(float)
-            .fillna(0.0)
-            >= 0.60
-        )
-        & (out.get("normal_discordant_mei_left_supported_reads", 0).astype(float) <= 1)
+    normal_left_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("normal_discordant_anchor_left_unique_reads", 0).astype(float),
+        out.get("normal_discordant_anchor_left_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("normal_discordant_mei_left_supported_reads", 0).astype(float),
     )
-    normal_right_anchor_complex = (
-        (out.get("normal_discordant_anchor_right_unique_reads", 0).astype(float) >= 2)
-        & (
-            out.get("normal_discordant_anchor_right_complex_reason_max_fraction", 0.0)
-            .astype(float)
-            .fillna(0.0)
-            >= 0.60
-        )
-        & (out.get("normal_discordant_mei_right_supported_reads", 0).astype(float) <= 1)
+    normal_right_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("normal_discordant_anchor_right_unique_reads", 0).astype(float),
+        out.get("normal_discordant_anchor_right_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("normal_discordant_mei_right_supported_reads", 0).astype(float),
     )
+    out["normal_discordant_anchor_left_complex_side"] = normal_left_anchor_complex
+    out["normal_discordant_anchor_right_complex_side"] = normal_right_anchor_complex
     out["normal_mei_with_complex_sidepair"] = (
         (normal_left_mei_consistent & normal_right_anchor_complex)
         | (normal_right_mei_consistent & normal_left_anchor_complex)
@@ -2000,40 +2240,33 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         & out["event_family_consistent"]
         & (out.get("coherence_score", 0.0).astype(float) >= 0.50)
     )
+    complex_sidepair_event = (
+        out["tumor_mei_with_complex_sidepair"] | out["normal_mei_with_complex_sidepair"]
+    )
     complex_sidepair_pass = (
         (~high_conf_pass)
         & (~provisional_one_sided)
-        & (
-            out["tumor_mei_with_complex_sidepair"]
-            | out["normal_mei_with_complex_sidepair"]
-        )
+        & complex_sidepair_event
         & out["event_family_consistent"]
         & out["event_strand_consistent"]
         & out["event_quality_clean"]
         & (out["insertion_model_score"] >= 0.50)
         & (out.get("coherence_score", 0.0).astype(float) >= 0.45)
     )
-    out["mei_with_complex_sv_signature"] = (
-        out["mei_with_complex_sv_signature"]
-        | out["tumor_mei_with_complex_sidepair"]
-        | out["normal_mei_with_complex_sidepair"]
-    )
-
+    out["complex_mei_event"] = complex_sidepair_event | out["mei_with_complex_sv_signature"]
     out["passes_insertion_model"] = high_conf_pass
     out["passes_insertion_model_provisional"] = provisional_one_sided
     out["passes_insertion_model_complex"] = complex_sidepair_pass
     out["insertion_call_tier"] = "none"
-    out.loc[complex_sidepair_pass, "insertion_call_tier"] = "mei_with_complex"
     out.loc[provisional_one_sided, "insertion_call_tier"] = "provisional_one_sided"
+    out.loc[complex_sidepair_event, "insertion_call_tier"] = "mei_with_complex"
     out.loc[high_conf_pass, "insertion_call_tier"] = "high_conf_two_sided"
 
-    # Separate sample-status label from structural confidence.
-    # We allow +/-1 read slack to avoid overcalling "shared" or "germline-only"
-    # from minor depth/mapping fluctuations.
+    # Sample presence: shared when both tumor and normal have MEI support (>=1 read each).
     out["sample_status_label"] = "low_support"
-    out.loc[(tumor_mei_reads >= 2) & (normal_mei_reads <= 1), "sample_status_label"] = "somatic_only"
-    out.loc[(tumor_mei_reads >= 2) & (normal_mei_reads >= 2), "sample_status_label"] = "shared"
-    out.loc[(tumor_mei_reads <= 1) & (normal_mei_reads >= 2), "sample_status_label"] = "germline_only"
+    out.loc[(tumor_mei_reads >= 1) & (normal_mei_reads >= 1), "sample_status_label"] = "shared"
+    out.loc[(tumor_mei_reads >= 1) & (normal_mei_reads == 0), "sample_status_label"] = "somatic_only"
+    out.loc[(tumor_mei_reads == 0) & (normal_mei_reads >= 1), "sample_status_label"] = "germline_only"
 
     # Explicit convenience flag for downstream filtering.
     out["likely_false_positive_germline_only"] = out["sample_status_label"] == "germline_only"
@@ -2082,16 +2315,592 @@ def _mean_depth_for_interval(
     return float(total_depth) / float(span)
 
 
+def _has_long_soft_clip(read: pysam.AlignedSegment, min_softclip: int = 20) -> bool:
+    cigar = read.cigartuples
+    if not cigar:
+        return False
+    first_op, first_len = cigar[0]
+    if first_op == 4 and int(first_len) >= int(min_softclip):
+        return True
+    last_op, last_len = cigar[-1]
+    return last_op == 4 and int(last_len) >= int(min_softclip)
+
+
+def _is_non_sv_context_read(
+    read: pysam.AlignedSegment,
+    min_softclip: int = 20,
+    discordant_abs_tlen_threshold: int = 1000,
+) -> bool:
+    if read.is_unmapped:
+        return False
+    if read.is_qcfail or read.is_duplicate or read.is_secondary or read.is_supplementary:
+        return False
+    if _has_long_soft_clip(read, min_softclip=min_softclip):
+        return False
+    if read.has_tag("SA"):
+        return False
+
+    if read.is_paired:
+        if read.mate_is_unmapped:
+            return False
+        if read.reference_id != read.next_reference_id:
+            return False
+        if abs(int(read.template_length)) >= int(discordant_abs_tlen_threshold):
+            return False
+        if not read.is_proper_pair:
+            return False
+    return True
+
+
+def _context_quality_metrics_for_interval(
+    bam: pysam.AlignmentFile,
+    chrom: str,
+    start_1based: int,
+    end_1based: int,
+) -> dict[str, float]:
+    start0 = max(0, int(start_1based) - 1)
+    end0 = max(start0 + 1, int(end_1based))
+    mapqs: list[int] = []
+    nm_per_100bp: list[float] = []
+
+    try:
+        iterator = bam.fetch(chrom, start0, end0)
+    except ValueError:
+        return {
+            "local_bam_mean_depth": 0.0,
+            "context_non_sv_reads": 0.0,
+            "context_mapq_mean": 0.0,
+            "context_mapq_lt20_fraction": 0.0,
+            "context_nm_per_100bp_mean": 0.0,
+            "context_nm_per_100bp_p90": 0.0,
+        }
+
+    for read in iterator:
+        if not _is_non_sv_context_read(read):
+            continue
+        mapq = int(read.mapping_quality)
+        mapqs.append(mapq)
+        if read.has_tag("NM"):
+            nm = int(read.get_tag("NM"))
+            aligned_len = int(read.query_alignment_length or 0)
+            if aligned_len > 0:
+                nm_per_100bp.append((100.0 * float(nm)) / float(aligned_len))
+
+    mapq_mean = float(sum(mapqs) / len(mapqs)) if mapqs else 0.0
+    low_mapq_frac = float(sum(1 for q in mapqs if q < 20) / len(mapqs)) if mapqs else 0.0
+    nm_mean = float(sum(nm_per_100bp) / len(nm_per_100bp)) if nm_per_100bp else 0.0
+    nm_p90 = float(pd.Series(nm_per_100bp).quantile(0.9)) if nm_per_100bp else 0.0
+    return {
+        "local_bam_mean_depth": _mean_depth_for_interval(bam, chrom=chrom, start_1based=start_1based, end_1based=end_1based),
+        "context_non_sv_reads": float(len(mapqs)),
+        "context_mapq_mean": mapq_mean,
+        "context_mapq_lt20_fraction": low_mapq_frac,
+        "context_nm_per_100bp_mean": nm_mean,
+        "context_nm_per_100bp_p90": nm_p90,
+    }
+
+
+def _load_bed_intervals(path: Path) -> dict[str, list[tuple[int, int]]]:
+    def _open_textmaybe_gz(p: Path):
+        if str(p).endswith(".gz"):
+            return gzip.open(p, "rt", encoding="utf-8")
+        return p.open("r", encoding="utf-8")
+
+    def _parse_interval_parts(parts: list[str]) -> tuple[str, int, int] | None:
+        if len(parts) >= 3 and parts[0].startswith("chr"):
+            chrom = parts[0]
+            start_idx = 1
+            end_idx = 2
+        elif len(parts) >= 4 and parts[1].startswith("chr"):
+            chrom = parts[1]
+            start_idx = 2
+            end_idx = 3
+        else:
+            return None
+        try:
+            start0 = int(parts[start_idx])
+            end0 = int(parts[end_idx])
+        except ValueError:
+            return None
+        if end0 <= start0:
+            return None
+        return (chrom, start0 + 1, end0)
+
+    intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    with _open_textmaybe_gz(path) as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            parsed = _parse_interval_parts(parts)
+            if parsed is None:
+                continue
+            chrom, start1, end1 = parsed
+            intervals[chrom].append((int(start1), int(end1)))
+    for chrom in list(intervals):
+        intervals[chrom] = sorted(intervals[chrom], key=lambda x: (x[0], x[1]))
+    return intervals
+
+
+def _load_low_mappability_intervals(path: Path, threshold: float) -> dict[str, list[tuple[int, int]]]:
+    intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    open_fn = gzip.open if str(path).endswith(".gz") else open
+    with open_fn(path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 4:
+                continue
+            if parts[0].startswith("chr"):
+                chrom = parts[0]
+                start_idx = 1
+                end_idx = 2
+                score_idx = 3
+            elif len(parts) >= 5 and parts[1].startswith("chr"):
+                chrom = parts[1]
+                start_idx = 2
+                end_idx = 3
+                score_idx = 4
+            else:
+                continue
+            try:
+                start0 = int(parts[start_idx])
+                end0 = int(parts[end_idx])
+                score = float(parts[score_idx])
+            except ValueError:
+                continue
+            if end0 <= start0 or score >= float(threshold):
+                continue
+            intervals[chrom].append((start0 + 1, end0))
+    for chrom in list(intervals):
+        intervals[chrom] = sorted(intervals[chrom], key=lambda x: (x[0], x[1]))
+    return intervals
+
+
+def _build_junk_interval_trees(
+    segdup_bed: Path | None,
+    low_mappability_bedgraph: Path | None,
+    low_mappability_threshold: float,
+    gap_bed: Path | None,
+    encode_blacklist_bed: Path | None,
+) -> dict[str, IntervalTree]:
+    trees: dict[str, IntervalTree] = {}
+
+    def _add_intervals(intervals: dict[str, list[tuple[int, int]]]) -> None:
+        for chrom, rows in intervals.items():
+            tree = trees.setdefault(str(chrom), IntervalTree())
+            for start1, end1 in rows:
+                tree.addi(int(start1), int(end1) + 1, 1)
+
+    if segdup_bed is not None and segdup_bed.exists():
+        _add_intervals(_load_bed_intervals(segdup_bed))
+    if low_mappability_bedgraph is not None and low_mappability_bedgraph.exists():
+        low_map_name = str(low_mappability_bedgraph).lower()
+        if low_map_name.endswith(".bed") or low_map_name.endswith(".bed.gz"):
+            _add_intervals(_load_bed_intervals(low_mappability_bedgraph))
+        else:
+            _add_intervals(_load_low_mappability_intervals(low_mappability_bedgraph, threshold=low_mappability_threshold))
+    if gap_bed is not None and gap_bed.exists():
+        _add_intervals(_load_bed_intervals(gap_bed))
+    if encode_blacklist_bed is not None and encode_blacklist_bed.exists():
+        _add_intervals(_load_bed_intervals(encode_blacklist_bed))
+    return trees
+
+
+def _write_interval_trees_to_bed(interval_trees: dict[str, IntervalTree], path: Path) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for chrom in sorted(interval_trees):
+            for iv in sorted(interval_trees[chrom], key=lambda x: (x.begin, x.end)):
+                start0 = max(0, int(iv.begin) - 1)
+                end0 = max(start0 + 1, int(iv.end) - 1)
+                handle.write(f"{chrom}\t{start0}\t{end0}\n")
+
+
+def _write_intervals_dict_to_bed(intervals: dict[str, list[tuple[int, int]]], path: Path) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for chrom in sorted(intervals):
+            for start1, end1 in intervals[chrom]:
+                start0 = max(0, int(start1) - 1)
+                end0 = max(start0 + 1, int(end1))
+                handle.write(f"{chrom}\t{start0}\t{end0}\n")
+
+
+def _sample_random_windows_with_bedtools(
+    target_chroms: list[str],
+    reference_lengths: dict[str, int],
+    sampled_span: int,
+    n_windows: int,
+    scope: str,
+    random_seed: int,
+    excluded_trees: dict[str, IntervalTree],
+    highconf_bed: Path | None,
+    junk_trees: dict[str, IntervalTree] | None = None,
+    junk_exclusion_bed: Path | None = None,
+) -> pd.DataFrame:
+    if not target_chroms or sampled_span <= 0 or n_windows <= 0:
+        return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
+
+    rng = random.Random(int(random_seed))
+    print(
+        f"[mei-annotate] empirical stage: bedtools shuffle start "
+        f"scope={scope} n={n_windows} chroms={len(target_chroms)} span={sampled_span}",
+        flush=True,
+    )
+    with tempfile.TemporaryDirectory(prefix="rtm_empirical_shuffle_") as tmpdir:
+        tmp = Path(tmpdir)
+        genome_path = tmp / "genome.txt"
+        seed_windows_path = tmp / "seed_windows.bed"
+        excl_path = tmp / "exclude.bed"
+        incl_path = tmp / "include.bed"
+        shuffled_path = tmp / "shuffled.bed"
+
+        with genome_path.open("w", encoding="utf-8") as gh:
+            for chrom in target_chroms:
+                gh.write(f"{chrom}\t{int(reference_lengths[chrom])}\n")
+
+        # Seed intervals define count and lengths; shuffle randomizes positions.
+        seeds: list[tuple[str, int, int]] = []
+        if scope == "chromosome":
+            for chrom in target_chroms:
+                for _ in range(int(n_windows)):
+                    seeds.append((chrom, 0, sampled_span))
+        else:
+            for _ in range(int(n_windows)):
+                chrom = rng.choice(target_chroms)
+                seeds.append((chrom, 0, sampled_span))
+        with seed_windows_path.open("w", encoding="utf-8") as sh:
+            for chrom, s0, e0 in seeds:
+                sh.write(f"{chrom}\t{s0}\t{e0}\n")
+
+        merged_excl: dict[str, IntervalTree] = {}
+        for chrom, tree in excluded_trees.items():
+            merged_excl.setdefault(chrom, IntervalTree()).update(tree)
+        if junk_exclusion_bed is None and junk_trees is not None:
+            for chrom, tree in junk_trees.items():
+                merged_excl.setdefault(chrom, IntervalTree()).update(tree)
+        for chrom in list(merged_excl):
+            merged_excl[chrom].merge_overlaps()
+        _write_interval_trees_to_bed(merged_excl, excl_path)
+        if junk_exclusion_bed is not None and Path(junk_exclusion_bed).exists():
+            with _open_textmaybe_gz(Path(junk_exclusion_bed)) as jh, excl_path.open("a", encoding="utf-8") as oh:
+                for line in jh:
+                    if not line.strip() or line.startswith("#"):
+                        continue
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 3:
+                        continue
+                    oh.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\n")
+
+        cmd = [
+            "bedtools",
+            "shuffle",
+            "-i",
+            str(seed_windows_path),
+            "-g",
+            str(genome_path),
+            "-seed",
+            str(int(random_seed)),
+            "-chrom",
+            "-excl",
+            str(excl_path),
+        ]
+        if highconf_bed is not None:
+            allowed = _load_bed_intervals(highconf_bed)
+            if not allowed:
+                return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
+            _write_intervals_dict_to_bed(allowed, incl_path)
+            cmd.extend(["-incl", str(incl_path)])
+
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        shuffled_path.write_text(proc.stdout, encoding="utf-8")
+        rows: list[dict[str, int | str]] = []
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            chrom = str(parts[0])
+            try:
+                start0 = int(parts[1])
+                end0 = int(parts[2])
+            except ValueError:
+                continue
+            if end0 <= start0:
+                continue
+            rows.append({"chrom": chrom, "window_start": start0 + 1, "window_end": end0})
+        print(
+            f"[mei-annotate] empirical stage: bedtools shuffle done windows={len(rows)}",
+            flush=True,
+        )
+        return pd.DataFrame(rows)
+
+
+def _sample_random_windows(
+    candidates: pd.DataFrame,
+    bam: pysam.AlignmentFile,
+    n_windows: int,
+    scope: str,
+    random_seed: int,
+    highconf_bed: Path | None,
+    junk_trees: dict[str, IntervalTree] | None = None,
+    junk_exclusion_bed: Path | None = None,
+) -> pd.DataFrame:
+    if n_windows <= 0 or candidates.empty:
+        return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
+
+    rng = random.Random(int(random_seed))
+    spans = (candidates["window_end"].astype(int) - candidates["window_start"].astype(int) + 1).clip(lower=50)
+    sampled_span = int(spans.median()) if len(spans) else 200
+
+    excluded_trees: dict[str, IntervalTree] = {}
+    for row in candidates.loc[:, ["chrom", "window_start", "window_end"]].itertuples(index=False):
+        chrom = str(row.chrom)
+        tree = excluded_trees.setdefault(chrom, IntervalTree())
+        tree.addi(int(row.window_start), int(row.window_end) + 1, 1)
+
+    reference_lengths = {str(chrom): int(length) for chrom, length in zip(bam.references, bam.lengths)}
+    target_chroms = [str(c) for c in candidates["chrom"].astype(str).unique().tolist() if str(c) in reference_lengths]
+    if not target_chroms:
+        target_chroms = [str(c) for c in bam.references if str(c) in reference_lengths]
+
+    # Prefer bedtools shuffle for interval randomization speed/reliability.
+    try:
+        print("[mei-annotate] empirical stage: trying bedtools-based random sampling", flush=True)
+        sampled = _sample_random_windows_with_bedtools(
+            target_chroms=target_chroms,
+            reference_lengths=reference_lengths,
+            sampled_span=sampled_span,
+            n_windows=n_windows,
+            scope=scope,
+            random_seed=random_seed,
+            excluded_trees=excluded_trees,
+            highconf_bed=highconf_bed,
+            junk_trees=junk_trees,
+            junk_exclusion_bed=junk_exclusion_bed,
+        )
+        if not sampled.empty:
+            return sampled
+    except Exception:
+        # Fall back to pure-Python sampling if bedtools shuffle is unavailable/fails.
+        print("[mei-annotate] empirical stage: bedtools sampling unavailable; using python fallback", flush=True)
+        pass
+
+    allowed_intervals = _load_bed_intervals(highconf_bed) if highconf_bed is not None else {}
+    if highconf_bed is not None:
+        target_chroms = [c for c in target_chroms if c in allowed_intervals]
+        if not target_chroms:
+            return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
+
+    targets: list[str] = []
+    if scope == "chromosome":
+        # Interpret n_windows as per-chromosome count when scope is chromosome.
+        for chrom in target_chroms:
+            for _ in range(int(n_windows)):
+                targets.append(chrom)
+        rng.shuffle(targets)
+    else:
+        for _ in range(int(n_windows)):
+            targets.append(rng.choice(target_chroms))
+
+    windows: list[dict[str, int | str]] = []
+    target_total = len(targets)
+    max_attempts = max(1000, target_total * 50)
+    attempts = 0
+    while len(windows) < target_total and attempts < max_attempts:
+        attempts += 1
+        chrom = targets[len(windows)] if len(windows) < len(targets) else rng.choice(target_chroms)
+        chrom_len = int(reference_lengths.get(chrom, 0))
+        if chrom_len < sampled_span:
+            continue
+
+        if highconf_bed is not None:
+            intervals = [iv for iv in allowed_intervals.get(chrom, []) if (iv[1] - iv[0] + 1) >= sampled_span]
+            if not intervals:
+                continue
+            iv_start, iv_end = rng.choice(intervals)
+            max_start = iv_end - sampled_span + 1
+            if max_start < iv_start:
+                continue
+            start = rng.randint(iv_start, max_start)
+        else:
+            start = rng.randint(1, chrom_len - sampled_span + 1)
+        end = start + sampled_span - 1
+
+        tree = excluded_trees.get(chrom)
+        if tree is not None and tree.overlaps(start, end + 1):
+            continue
+        if junk_trees is not None:
+            junk_tree = junk_trees.get(chrom)
+            if junk_tree is not None and junk_tree.overlaps(start, end + 1):
+                continue
+        windows.append({"chrom": chrom, "window_start": int(start), "window_end": int(end)})
+
+    print(
+        f"[mei-annotate] empirical stage: python fallback sampling done windows={len(windows)} "
+        f"attempts={attempts}",
+        flush=True,
+    )
+    return pd.DataFrame(windows)
+
+
+def _empirical_tail_prob(values: pd.Series, value: float, tail: str) -> float:
+    arr = values.dropna().astype(float)
+    n = int(len(arr))
+    if n <= 0:
+        return 1.0
+    if tail == "high":
+        k = int((arr >= float(value)).sum())
+    else:
+        k = int((arr <= float(value)).sum())
+    return float(k + 1) / float(n + 1)
+
+
+def _empirical_percentile(values: pd.Series, value: float) -> float:
+    arr = values.dropna().astype(float)
+    n = int(len(arr))
+    if n <= 0:
+        return 0.0
+    k = int((arr <= float(value)).sum())
+    return float(k) / float(n)
+
+
+def _apply_empirical_context_scores(
+    loci_metrics: pd.DataFrame,
+    random_metrics: pd.DataFrame,
+    sample_prefix: str,
+    scope: str,
+    progress_every: int = 0,
+) -> pd.DataFrame:
+    out = loci_metrics.copy()
+    metric_specs: list[tuple[str, str]] = [
+        ("local_bam_mean_depth", "high"),
+        ("context_mapq_mean", "low"),
+        ("context_mapq_lt20_fraction", "high"),
+        ("context_nm_per_100bp_mean", "high"),
+        ("context_nm_per_100bp_p90", "high"),
+    ]
+
+    out[f"{sample_prefix}_empirical_random_n"] = 0
+    for metric, tail in metric_specs:
+        out[f"{sample_prefix}_empirical_{metric}_percentile"] = 0.0
+        out[f"{sample_prefix}_empirical_{metric}_p_{tail}"] = 1.0
+
+    if random_metrics.empty:
+        return out
+
+    out[f"{sample_prefix}_empirical_random_n"] = int(len(random_metrics))
+    global_lookup = {metric: random_metrics[metric] for metric, _ in metric_specs}
+    by_chrom_lookup: dict[str, dict[str, pd.Series]] = {}
+    if scope == "chromosome":
+        for chrom, cdf in random_metrics.groupby("chrom", sort=False):
+            by_chrom_lookup[str(chrom)] = {metric: cdf[metric] for metric, _ in metric_specs}
+
+    total = int(len(out))
+    for i, (idx, row) in enumerate(out.iterrows(), start=1):
+        chrom = str(row.get("chrom", ""))
+        for metric, tail in metric_specs:
+            series = global_lookup[metric]
+            if scope == "chromosome":
+                chrom_series = by_chrom_lookup.get(chrom, {}).get(metric)
+                if chrom_series is not None and len(chrom_series) >= 50:
+                    series = chrom_series
+            value = float(row.get(metric, 0.0) or 0.0)
+            out.at[idx, f"{sample_prefix}_empirical_{metric}_percentile"] = _empirical_percentile(series, value)
+            out.at[idx, f"{sample_prefix}_empirical_{metric}_p_{tail}"] = _empirical_tail_prob(series, value, tail=tail)
+        if progress_every > 0 and (i % progress_every == 0 or i == total):
+            print(f"[mei-annotate] empirical scoring {sample_prefix}: {i}/{total} loci", flush=True)
+    return out
+
+
+def _file_stamp(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {"path": "", "exists": False}
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "exists": False}
+    st = p.stat()
+    return {"path": str(p), "exists": True, "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+
+
+def _empirical_cache_key(
+    loci: pd.DataFrame,
+    tumor_bam_path: Path,
+    normal_bam_path: Path,
+    empirical_random_windows: int,
+    empirical_random_scope: str,
+    empirical_random_seed: int,
+    empirical_highconf_bed: Path | None,
+    empirical_exclude_merged_bed: Path | None,
+    empirical_exclude_segdup_bed: Path | None,
+    empirical_exclude_mappability_bedgraph: Path | None,
+    empirical_exclude_mappability_threshold: float,
+    empirical_exclude_gap_bed: Path | None,
+    empirical_exclude_blacklist_bed: Path | None,
+) -> str:
+    loci_view = loci.loc[:, ["chrom", "window_start", "window_end"]].copy()
+    chrom_counts = (
+        loci_view.groupby("chrom", sort=True).size().to_dict() if not loci_view.empty else {}
+    )
+    spans = (
+        (loci_view["window_end"].astype(int) - loci_view["window_start"].astype(int) + 1).tolist()
+        if not loci_view.empty
+        else []
+    )
+    payload = {
+        "version": "empirical_cache_v1",
+        "loci_count": int(len(loci_view)),
+        "chrom_counts": {str(k): int(v) for k, v in chrom_counts.items()},
+        "span_median": float(pd.Series(spans).median()) if spans else 0.0,
+        "tumor_bam": _file_stamp(tumor_bam_path),
+        "normal_bam": _file_stamp(normal_bam_path),
+        "random_windows": int(empirical_random_windows),
+        "random_scope": str(empirical_random_scope),
+        "random_seed": int(empirical_random_seed),
+        "highconf": _file_stamp(empirical_highconf_bed),
+        "merged_exclusion": _file_stamp(empirical_exclude_merged_bed),
+        "segdup": _file_stamp(empirical_exclude_segdup_bed),
+        "mappability": _file_stamp(empirical_exclude_mappability_bedgraph),
+        "mappability_threshold": float(empirical_exclude_mappability_threshold),
+        "gap": _file_stamp(empirical_exclude_gap_bed),
+        "blacklist": _file_stamp(empirical_exclude_blacklist_bed),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
 def _annotate_bam_depth_for_consistent_loci(
     candidates: pd.DataFrame,
     tumor_bam_path: Path,
     normal_bam_path: Path,
+    empirical_random_windows: int = 1000,
+    empirical_random_scope: str = "chromosome",
+    empirical_random_seed: int = 13,
+    empirical_highconf_bed: Path | None = None,
+    empirical_exclude_merged_bed: Path | None = None,
+    empirical_exclude_segdup_bed: Path | None = None,
+    empirical_exclude_mappability_bedgraph: Path | None = None,
+    empirical_exclude_mappability_threshold: float = 0.5,
+    empirical_exclude_gap_bed: Path | None = None,
+    empirical_exclude_blacklist_bed: Path | None = None,
+    empirical_cache_dir: Path | None = None,
 ) -> pd.DataFrame:
+    stage_start = time.monotonic()
     out = candidates.copy()
     out["depth_filter_family_consistent"] = False
+    out["depth_filter_two_sided_consistent"] = False
     out["depth_filter_pass"] = False
     out["tumor_local_bam_mean_depth"] = 0.0
     out["normal_local_bam_mean_depth"] = 0.0
+    out["tumor_context_non_sv_reads"] = 0
+    out["normal_context_non_sv_reads"] = 0
+    out["tumor_context_mapq_mean"] = 0.0
+    out["normal_context_mapq_mean"] = 0.0
+    out["tumor_context_mapq_lt20_fraction"] = 0.0
+    out["normal_context_mapq_lt20_fraction"] = 0.0
+    out["tumor_context_nm_per_100bp_mean"] = 0.0
+    out["normal_context_nm_per_100bp_mean"] = 0.0
+    out["tumor_context_nm_per_100bp_p90"] = 0.0
+    out["normal_context_nm_per_100bp_p90"] = 0.0
     out["tumor_mei_support_per_100x_bam_depth"] = 0.0
     out["normal_mei_support_per_100x_bam_depth"] = 0.0
     out["mei_support_per_100x_bam_depth_delta"] = 0.0
@@ -2099,27 +2908,204 @@ def _annotate_bam_depth_for_consistent_loci(
 
     if out.empty:
         return out
+    t0 = time.monotonic()
 
     family_consistent = _consistent_family_mask(out)
     out["depth_filter_family_consistent"] = family_consistent
-    depth_mask = (out.get("junk_flag_count", 999).fillna(999).astype(int) == 0) & family_consistent
+    tumor_two_sided = out.get("tumor_two_sided_support", False).fillna(False).astype(bool)
+    normal_two_sided = out.get("normal_two_sided_support", False).fillna(False).astype(bool)
+    tumor_family_consistent = out.get("tumor_family_agreement", 0).fillna(0).astype(int) == 1
+    normal_family_consistent = out.get("normal_family_agreement", 0).fillna(0).astype(int) == 1
+    tumor_orientation_consistent = out.get("tumor_strand_agreement", 0).fillna(0).astype(int) == 1
+    normal_orientation_consistent = out.get("normal_strand_agreement", 0).fillna(0).astype(int) == 1
+    two_sided_consistent = (
+        (tumor_two_sided & tumor_family_consistent & tumor_orientation_consistent)
+        | (normal_two_sided & normal_family_consistent & normal_orientation_consistent)
+    )
+    out["depth_filter_two_sided_consistent"] = two_sided_consistent
+    silver_mask = out.get("silver_stage_pass", False).fillna(False).astype(bool)
+    if silver_mask.any():
+        depth_mask = silver_mask
+    else:
+        depth_mask = out.get("junk_flag_count", 999).fillna(999).astype(int) == 0
     out["depth_filter_pass"] = depth_mask
     idxs = out.index[depth_mask].tolist()
     if not idxs:
+        print("[mei-annotate] empirical stage skipped: no loci passed empirical prefilter", flush=True)
         return out
+
+    loci_for_empirical = out.loc[depth_mask, ["chrom", "window_start", "window_end"]].copy()
+    cache_key = _empirical_cache_key(
+        loci=loci_for_empirical,
+        tumor_bam_path=tumor_bam_path,
+        normal_bam_path=normal_bam_path,
+        empirical_random_windows=empirical_random_windows,
+        empirical_random_scope=empirical_random_scope,
+        empirical_random_seed=empirical_random_seed,
+        empirical_highconf_bed=empirical_highconf_bed,
+        empirical_exclude_merged_bed=empirical_exclude_merged_bed,
+        empirical_exclude_segdup_bed=empirical_exclude_segdup_bed,
+        empirical_exclude_mappability_bedgraph=empirical_exclude_mappability_bedgraph,
+        empirical_exclude_mappability_threshold=empirical_exclude_mappability_threshold,
+        empirical_exclude_gap_bed=empirical_exclude_gap_bed,
+        empirical_exclude_blacklist_bed=empirical_exclude_blacklist_bed,
+    )
+    random_tumor_df = pd.DataFrame()
+    random_normal_df = pd.DataFrame()
+    cache_hit = False
+    if empirical_cache_dir is not None:
+        empirical_cache_dir.mkdir(parents=True, exist_ok=True)
+        tumor_cache_path = empirical_cache_dir / f"{cache_key}.tumor.parquet"
+        normal_cache_path = empirical_cache_dir / f"{cache_key}.normal.parquet"
+        if tumor_cache_path.exists() and normal_cache_path.exists():
+            try:
+                random_tumor_df = pd.read_parquet(tumor_cache_path)
+                random_normal_df = pd.read_parquet(normal_cache_path)
+                cache_hit = True
+                print(
+                    f"[mei-annotate] empirical cache hit key={cache_key} "
+                    f"rows={len(random_tumor_df)}",
+                    flush=True,
+                )
+            except Exception:
+                cache_hit = False
+        else:
+            print(f"[mei-annotate] empirical cache miss key={cache_key}", flush=True)
+
+    prep_t0 = time.monotonic()
+    print("[mei-annotate] empirical stage: preparing junk exclusion masks", flush=True)
+    merged_exclusion_ready = (
+        empirical_exclude_merged_bed is not None and Path(empirical_exclude_merged_bed).exists()
+    )
+    junk_trees = {}
+    if not cache_hit and not merged_exclusion_ready:
+        junk_trees = _build_junk_interval_trees(
+            segdup_bed=empirical_exclude_segdup_bed,
+            low_mappability_bedgraph=empirical_exclude_mappability_bedgraph,
+            low_mappability_threshold=empirical_exclude_mappability_threshold,
+            gap_bed=empirical_exclude_gap_bed,
+            encode_blacklist_bed=empirical_exclude_blacklist_bed,
+        )
+        junk_interval_count = sum(len(tree) for tree in junk_trees.values())
+        print(
+            f"[mei-annotate] empirical stage: junk masks ready chroms={len(junk_trees)} intervals={junk_interval_count}",
+            flush=True,
+        )
+    elif not cache_hit and merged_exclusion_ready:
+        print(
+            f"[mei-annotate] empirical stage: using merged exclusion bed {empirical_exclude_merged_bed}",
+            flush=True,
+        )
+    print(
+        f"[mei-annotate] empirical stage: exclusion mask prep elapsed={time.monotonic() - prep_t0:.1f}s",
+        flush=True,
+    )
 
     with pysam.AlignmentFile(str(tumor_bam_path), "rb") as tumor_bam, pysam.AlignmentFile(
         str(normal_bam_path), "rb"
     ) as normal_bam:
-        for idx in idxs:
+        total_loci = int(len(idxs))
+        loci_progress_every = 100
+        print(f"[mei-annotate] empirical stage: computing context metrics for {total_loci} loci", flush=True)
+        for i, idx in enumerate(idxs, start=1):
             row = out.loc[idx]
             chrom = str(row["chrom"])
             start = int(row["window_start"])
             end = int(row["window_end"])
-            t_depth = _mean_depth_for_interval(tumor_bam, chrom=chrom, start_1based=start, end_1based=end)
-            n_depth = _mean_depth_for_interval(normal_bam, chrom=chrom, start_1based=start, end_1based=end)
-            out.at[idx, "tumor_local_bam_mean_depth"] = t_depth
-            out.at[idx, "normal_local_bam_mean_depth"] = n_depth
+            t_metrics = _context_quality_metrics_for_interval(tumor_bam, chrom=chrom, start_1based=start, end_1based=end)
+            n_metrics = _context_quality_metrics_for_interval(normal_bam, chrom=chrom, start_1based=start, end_1based=end)
+            out.at[idx, "tumor_local_bam_mean_depth"] = float(t_metrics["local_bam_mean_depth"])
+            out.at[idx, "normal_local_bam_mean_depth"] = float(n_metrics["local_bam_mean_depth"])
+            out.at[idx, "tumor_context_non_sv_reads"] = int(t_metrics["context_non_sv_reads"])
+            out.at[idx, "normal_context_non_sv_reads"] = int(n_metrics["context_non_sv_reads"])
+            out.at[idx, "tumor_context_mapq_mean"] = float(t_metrics["context_mapq_mean"])
+            out.at[idx, "normal_context_mapq_mean"] = float(n_metrics["context_mapq_mean"])
+            out.at[idx, "tumor_context_mapq_lt20_fraction"] = float(t_metrics["context_mapq_lt20_fraction"])
+            out.at[idx, "normal_context_mapq_lt20_fraction"] = float(n_metrics["context_mapq_lt20_fraction"])
+            out.at[idx, "tumor_context_nm_per_100bp_mean"] = float(t_metrics["context_nm_per_100bp_mean"])
+            out.at[idx, "normal_context_nm_per_100bp_mean"] = float(n_metrics["context_nm_per_100bp_mean"])
+            out.at[idx, "tumor_context_nm_per_100bp_p90"] = float(t_metrics["context_nm_per_100bp_p90"])
+            out.at[idx, "normal_context_nm_per_100bp_p90"] = float(n_metrics["context_nm_per_100bp_p90"])
+            if i % loci_progress_every == 0 or i == total_loci:
+                elapsed = time.monotonic() - t0
+                print(
+                    f"[mei-annotate] empirical stage: locus metrics {i}/{total_loci} "
+                    f"(elapsed={elapsed:.1f}s)",
+                    flush=True,
+                )
+
+        if not cache_hit:
+            print("[mei-annotate] empirical stage: building random-window background metrics", flush=True)
+            random_windows = _sample_random_windows(
+                candidates=out.loc[depth_mask].copy() if depth_mask.any() else out.copy(),
+                bam=tumor_bam,
+                n_windows=int(empirical_random_windows),
+                scope=str(empirical_random_scope),
+                random_seed=int(empirical_random_seed),
+                highconf_bed=empirical_highconf_bed,
+                junk_trees=junk_trees,
+                junk_exclusion_bed=empirical_exclude_merged_bed if merged_exclusion_ready else None,
+            )
+            print(
+                f"[mei-annotate] empirical stage: sampled {len(random_windows)} random windows "
+                f"(scope={empirical_random_scope}, n={empirical_random_windows})",
+                flush=True,
+            )
+            random_tumor_rows: list[dict[str, float | int | str]] = []
+            random_normal_rows: list[dict[str, float | int | str]] = []
+            random_progress_every = 200
+            total_random = int(len(random_windows))
+            for i, rw in enumerate(random_windows.itertuples(index=False), start=1):
+                chrom = str(rw.chrom)
+                start = int(rw.window_start)
+                end = int(rw.window_end)
+                t_metrics = _context_quality_metrics_for_interval(
+                    tumor_bam, chrom=chrom, start_1based=start, end_1based=end
+                )
+                n_metrics = _context_quality_metrics_for_interval(
+                    normal_bam, chrom=chrom, start_1based=start, end_1based=end
+                )
+                random_tumor_rows.append(
+                    {
+                        "chrom": chrom,
+                        "local_bam_mean_depth": float(t_metrics["local_bam_mean_depth"]),
+                        "context_mapq_mean": float(t_metrics["context_mapq_mean"]),
+                        "context_mapq_lt20_fraction": float(t_metrics["context_mapq_lt20_fraction"]),
+                        "context_nm_per_100bp_mean": float(t_metrics["context_nm_per_100bp_mean"]),
+                        "context_nm_per_100bp_p90": float(t_metrics["context_nm_per_100bp_p90"]),
+                    }
+                )
+                random_normal_rows.append(
+                    {
+                        "chrom": chrom,
+                        "local_bam_mean_depth": float(n_metrics["local_bam_mean_depth"]),
+                        "context_mapq_mean": float(n_metrics["context_mapq_mean"]),
+                        "context_mapq_lt20_fraction": float(n_metrics["context_mapq_lt20_fraction"]),
+                        "context_nm_per_100bp_mean": float(n_metrics["context_nm_per_100bp_mean"]),
+                        "context_nm_per_100bp_p90": float(n_metrics["context_nm_per_100bp_p90"]),
+                    }
+                )
+                if i % random_progress_every == 0 or i == total_random:
+                    elapsed = time.monotonic() - t0
+                    print(
+                        f"[mei-annotate] empirical stage: random-window metrics {i}/{total_random} "
+                        f"(elapsed={elapsed:.1f}s)",
+                        flush=True,
+                    )
+            random_tumor_df = pd.DataFrame(random_tumor_rows)
+            random_normal_df = pd.DataFrame(random_normal_rows)
+            if empirical_cache_dir is not None:
+                tumor_cache_path = empirical_cache_dir / f"{cache_key}.tumor.parquet"
+                normal_cache_path = empirical_cache_dir / f"{cache_key}.normal.parquet"
+                random_tumor_df.to_parquet(tumor_cache_path, index=False)
+                random_normal_df.to_parquet(normal_cache_path, index=False)
+                print(
+                    f"[mei-annotate] empirical cache write key={cache_key} "
+                    f"rows={len(random_tumor_df)}",
+                    flush=True,
+                )
+        else:
+            print("[mei-annotate] empirical stage: using cached random-window metrics", flush=True)
 
     t_mei = out.get("tumor_mei_supported_reads", 0).astype(float)
     n_mei = out.get("normal_mei_supported_reads", 0).astype(float)
@@ -2134,6 +3120,73 @@ def _annotate_bam_depth_for_consistent_loci(
         (out["tumor_mei_support_per_100x_bam_depth"] + 1e-3)
         / (out["normal_mei_support_per_100x_bam_depth"] + 1e-3)
     )
+
+    # Empirical scoring should be applied only to the evaluated subset (depth_mask),
+    # while leaving default neutral values for non-evaluated rows.
+    metric_specs: list[tuple[str, str]] = [
+        ("local_bam_mean_depth", "high"),
+        ("context_mapq_mean", "low"),
+        ("context_mapq_lt20_fraction", "high"),
+        ("context_nm_per_100bp_mean", "high"),
+        ("context_nm_per_100bp_p90", "high"),
+    ]
+    out["tumor_empirical_random_n"] = 0
+    out["normal_empirical_random_n"] = 0
+    for metric, tail in metric_specs:
+        out[f"tumor_empirical_{metric}_percentile"] = 0.0
+        out[f"tumor_empirical_{metric}_p_{tail}"] = 1.0
+        out[f"normal_empirical_{metric}_percentile"] = 0.0
+        out[f"normal_empirical_{metric}_p_{tail}"] = 1.0
+
+    score_idx = out.index[depth_mask]
+    if len(score_idx) > 0:
+        tumor_for_scoring = out.loc[score_idx, ["chrom"]].copy()
+        tumor_for_scoring["local_bam_mean_depth"] = out.loc[score_idx, "tumor_local_bam_mean_depth"].astype(float)
+        tumor_for_scoring["context_mapq_mean"] = out.loc[score_idx, "tumor_context_mapq_mean"].astype(float)
+        tumor_for_scoring["context_mapq_lt20_fraction"] = out.loc[score_idx, "tumor_context_mapq_lt20_fraction"].astype(
+            float
+        )
+        tumor_for_scoring["context_nm_per_100bp_mean"] = out.loc[score_idx, "tumor_context_nm_per_100bp_mean"].astype(
+            float
+        )
+        tumor_for_scoring["context_nm_per_100bp_p90"] = out.loc[score_idx, "tumor_context_nm_per_100bp_p90"].astype(float)
+        normal_for_scoring = out.loc[score_idx, ["chrom"]].copy()
+        normal_for_scoring["local_bam_mean_depth"] = out.loc[score_idx, "normal_local_bam_mean_depth"].astype(float)
+        normal_for_scoring["context_mapq_mean"] = out.loc[score_idx, "normal_context_mapq_mean"].astype(float)
+        normal_for_scoring["context_mapq_lt20_fraction"] = out.loc[score_idx, "normal_context_mapq_lt20_fraction"].astype(
+            float
+        )
+        normal_for_scoring["context_nm_per_100bp_mean"] = out.loc[score_idx, "normal_context_nm_per_100bp_mean"].astype(
+            float
+        )
+        normal_for_scoring["context_nm_per_100bp_p90"] = out.loc[score_idx, "normal_context_nm_per_100bp_p90"].astype(
+            float
+        )
+
+        tumor_scored = _apply_empirical_context_scores(
+            loci_metrics=tumor_for_scoring,
+            random_metrics=random_tumor_df,
+            sample_prefix="tumor",
+            scope=str(empirical_random_scope),
+            progress_every=200,
+        )
+        normal_scored = _apply_empirical_context_scores(
+            loci_metrics=normal_for_scoring,
+            random_metrics=random_normal_df,
+            sample_prefix="normal",
+            scope=str(empirical_random_scope),
+            progress_every=200,
+        )
+        for col in tumor_scored.columns:
+            if col.startswith("tumor_empirical_"):
+                out.loc[score_idx, col] = tumor_scored[col].values
+        for col in normal_scored.columns:
+            if col.startswith("normal_empirical_"):
+                out.loc[score_idx, col] = normal_scored[col].values
+    print("[mei-annotate] empirical stage: applying empirical p-value scoring complete", flush=True)
+    elapsed_total = time.monotonic() - t0
+    print(f"[mei-annotate] empirical stage complete (elapsed={elapsed_total:.1f}s)", flush=True)
+    print(f"[mei-annotate] empirical stage walltime={time.monotonic() - stage_start:.1f}s", flush=True)
     return out
 
 
@@ -2159,6 +3212,348 @@ def _add_local_depth_normalized_support(candidates: pd.DataFrame) -> pd.DataFram
         (out["tumor_mei_support_local_frac"] + 1e-4) / (out["normal_mei_support_local_frac"] + 1e-4)
     )
     return out
+
+
+def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
+    out = candidates.copy()
+    out["bronze_stage_pass"] = True
+
+    junk_clean = out.get("junk_flag_count", 999).fillna(999).astype(int) == 0
+    t_left_split = out.get("tumor_L_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    t_right_split = out.get("tumor_R_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    t_left_disc = out.get("tumor_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1
+    t_right_disc = out.get("tumor_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_left_split = out.get("normal_L_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_right_split = out.get("normal_R_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_left_disc = out.get("normal_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_right_disc = out.get("normal_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1
+
+    tumor_bilateral_any = (t_left_split | t_left_disc) & (t_right_split | t_right_disc)
+    normal_bilateral_any = (n_left_split | n_left_disc) & (n_right_split | n_right_disc)
+    out["silver_bilateral_support_any"] = tumor_bilateral_any | normal_bilateral_any
+    t_left_poly = out.get("tumor_L_poly_at_reads", 0).fillna(0).astype(float) >= 1
+    t_right_poly = out.get("tumor_R_poly_at_reads", 0).fillna(0).astype(float) >= 1
+    n_left_poly = out.get("normal_L_poly_at_reads", 0).fillna(0).astype(float) >= 1
+    n_right_poly = out.get("normal_R_poly_at_reads", 0).fillna(0).astype(float) >= 1
+
+    tumor_split_consistent = (
+        out.get("tumor_two_sided_support", False).fillna(False).astype(bool)
+        & (out.get("tumor_family_agreement", 0).fillna(0).astype(int) == 1)
+        & (out.get("tumor_strand_agreement", 0).fillna(0).astype(int) == 1)
+    )
+    normal_split_consistent = (
+        out.get("normal_two_sided_support", False).fillna(False).astype(bool)
+        & (out.get("normal_family_agreement", 0).fillna(0).astype(int) == 1)
+        & (out.get("normal_strand_agreement", 0).fillna(0).astype(int) == 1)
+    )
+
+    tumor_disc_consistent = (
+        out.get("tumor_discordant_mei_two_sided_support", False).fillna(False).astype(bool)
+        & (out.get("tumor_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & (out.get("tumor_discordant_mei_strand_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & out.get("tumor_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+        & out.get("tumor_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    )
+    normal_disc_consistent = (
+        (out.get("normal_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1)
+        & (out.get("normal_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1)
+        & (out.get("normal_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & (out.get("normal_discordant_mei_strand_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & out.get("normal_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+        & out.get("normal_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    )
+
+    event_family_consistent = out.get("event_family_consistent", False).fillna(False).astype(bool)
+    event_strand_consistent = out.get("event_strand_consistent", False).fillna(False).astype(bool)
+
+    # PolyA-rescue bilateral support:
+    # one side has MEI anchor support and the opposite side has polyA-clipped support.
+    # If orientation is known, enforce expected tail side:
+    # + insertion => right-side polyA; - insertion => left-side polyA.
+    tumor_ori = out.get("tumor_insertion_orientation", "").fillna("").astype(str)
+    normal_ori = out.get("normal_discordant_mei_strand", "").fillna("").astype(str)
+    t_poly_mei_any = (t_left_poly & (t_right_split | t_right_disc)) | (t_right_poly & (t_left_split | t_left_disc))
+    n_poly_mei_any = (n_left_poly & (n_right_split | n_right_disc)) | (n_right_poly & (n_left_split | n_left_disc))
+    t_poly_oriented = (
+        ((tumor_ori == "+") & t_right_poly & (t_left_split | t_left_disc))
+        | ((tumor_ori == "-") & t_left_poly & (t_right_split | t_right_disc))
+    )
+    n_poly_oriented = (
+        ((normal_ori == "+") & n_right_poly & (n_left_split | n_left_disc))
+        | ((normal_ori == "-") & n_left_poly & (n_right_split | n_right_disc))
+    )
+    poly_sidepair_support = (t_poly_mei_any & ((tumor_ori == "") | t_poly_oriented)) | (
+        n_poly_mei_any & ((normal_ori == "") | n_poly_oriented)
+    )
+    out["silver_polyA_sidepair_support"] = poly_sidepair_support
+
+    t_left_anchor_complex = out.get("tumor_discordant_anchor_left_complex_side", False).fillna(False).astype(bool)
+    t_right_anchor_complex = out.get("tumor_discordant_anchor_right_complex_side", False).fillna(False).astype(bool)
+    n_left_anchor_complex = out.get("normal_discordant_anchor_left_complex_side", False).fillna(False).astype(bool)
+    n_right_anchor_complex = out.get("normal_discordant_anchor_right_complex_side", False).fillna(False).astype(bool)
+    t_left_structural = t_left_split | t_left_disc | t_left_poly | t_left_anchor_complex
+    t_right_structural = t_right_split | t_right_disc | t_right_poly | t_right_anchor_complex
+    n_left_structural = n_left_split | n_left_disc | n_left_poly | n_left_anchor_complex
+    n_right_structural = n_right_split | n_right_disc | n_right_poly | n_right_anchor_complex
+    tumor_bilateral_structural = t_left_structural & t_right_structural
+    normal_bilateral_structural = n_left_structural & n_right_structural
+    out["silver_bilateral_structural_support"] = tumor_bilateral_structural | normal_bilateral_structural
+
+    tumor_complex_sidepair = (
+        (t_left_split | t_left_disc) & (t_right_anchor_complex | t_right_poly)
+    ) | ((t_right_split | t_right_disc) & (t_left_anchor_complex | t_left_poly))
+    normal_complex_sidepair = (
+        (n_left_split | n_left_disc) & (n_right_anchor_complex | n_right_poly)
+    ) | ((n_right_split | n_right_disc) & (n_left_anchor_complex | n_left_poly))
+    out["silver_complex_sidepair_support"] = tumor_complex_sidepair | normal_complex_sidepair
+    out["silver_complex_structural_consistent"] = (
+        out["silver_bilateral_structural_support"]
+        & out["silver_complex_sidepair_support"]
+        & (
+            out.get("tumor_mei_with_complex_sidepair", False).fillna(False).astype(bool)
+            | out.get("normal_mei_with_complex_sidepair", False).fillna(False).astype(bool)
+            | out.get("mei_with_complex_sv_signature", False).fillna(False).astype(bool)
+        )
+    )
+
+    silver_consistency = (
+        tumor_split_consistent | normal_split_consistent | tumor_disc_consistent | normal_disc_consistent
+    )
+    out["silver_consistency_pass"] = (
+        silver_consistency
+        | (event_family_consistent & event_strand_consistent)
+        | (poly_sidepair_support & event_family_consistent)
+        | out["silver_complex_structural_consistent"]
+    )
+    out["silver_discordant_two_sided_consistent"] = tumor_disc_consistent | normal_disc_consistent
+
+    tumor_l_bp = out.get("tumor_L_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    tumor_r_bp = out.get("tumor_R_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    normal_l_bp = out.get("normal_L_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    normal_r_bp = out.get("normal_R_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    out["silver_split_breakpoint_resolved"] = (
+        (t_left_split & (tumor_l_bp > 0))
+        | (t_right_split & (tumor_r_bp > 0))
+        | (n_left_split & (normal_l_bp > 0))
+        | (n_right_split & (normal_r_bp > 0))
+    )
+    out["silver_insertion_span_resolved"] = out.get("insertion_mei_span", 0).fillna(0).astype(int) > 0
+    out["silver_breakpoint_or_span_resolved"] = (
+        out["silver_split_breakpoint_resolved"] | out["silver_insertion_span_resolved"]
+    )
+
+    out["silver_stage_pass"] = junk_clean & (
+        (
+            out["silver_bilateral_support_any"]
+            | poly_sidepair_support
+            | out["silver_complex_structural_consistent"]
+            | out["silver_breakpoint_or_span_resolved"]
+        )
+        & (out["silver_consistency_pass"] | out["silver_breakpoint_or_span_resolved"])
+    )
+    out["analysis_stage_tier"] = "bronze"
+    out.loc[out["silver_stage_pass"], "analysis_stage_tier"] = "silver"
+    print(
+        "[mei-annotate] stage counts "
+        f"bronze={len(out)} silver={int(out['silver_stage_pass'].sum())}",
+        flush=True,
+    )
+    return out
+
+
+def _assign_gold_stage(candidates: pd.DataFrame, empirical_p_threshold: float = 0.001) -> pd.DataFrame:
+    out = candidates.copy()
+    out["gold_empirical_p_threshold"] = float(empirical_p_threshold)
+    out["gold_empirical_eval_available"] = False
+    out["gold_empirical_outlier"] = False
+    out["gold_stage_pass"] = False
+    out["gold_stage_fail_reason"] = ""
+
+    p_cols = [
+        "tumor_empirical_local_bam_mean_depth_p_high",
+        "tumor_empirical_context_mapq_mean_p_low",
+        "tumor_empirical_context_mapq_lt20_fraction_p_high",
+        "tumor_empirical_context_nm_per_100bp_mean_p_high",
+        "tumor_empirical_context_nm_per_100bp_p90_p_high",
+        "normal_empirical_local_bam_mean_depth_p_high",
+        "normal_empirical_context_mapq_mean_p_low",
+        "normal_empirical_context_mapq_lt20_fraction_p_high",
+        "normal_empirical_context_nm_per_100bp_mean_p_high",
+        "normal_empirical_context_nm_per_100bp_p90_p_high",
+    ]
+    available_cols = [c for c in p_cols if c in out.columns]
+    silver = out.get("silver_stage_pass", False).fillna(False).astype(bool)
+    if available_cols:
+        out["gold_empirical_eval_available"] = True
+        pvals = out.loc[:, available_cols].fillna(1.0).astype(float)
+        out["gold_empirical_outlier"] = (pvals < float(empirical_p_threshold)).any(axis=1)
+        out["gold_stage_pass"] = silver & (~out["gold_empirical_outlier"])
+        out.loc[silver & out["gold_empirical_outlier"], "gold_stage_fail_reason"] = "empirical_outlier"
+    else:
+        out["gold_stage_pass"] = silver
+        out.loc[silver, "gold_stage_fail_reason"] = "empirical_not_available"
+
+    out.loc[out["gold_stage_pass"], "analysis_stage_tier"] = "gold"
+    print(
+        "[mei-annotate] stage counts "
+        f"silver={int(silver.sum())} gold={int(out['gold_stage_pass'].sum())}",
+        flush=True,
+    )
+    return out
+
+
+def _two_sided_support_mask(df: pd.DataFrame) -> pd.Series:
+    tumor_left = df.get("tumor_left_supported_reads", 0).fillna(0).astype(int)
+    tumor_right = df.get("tumor_right_supported_reads", 0).fillna(0).astype(int)
+    normal_left = df.get("normal_left_supported_reads", 0).fillna(0).astype(int)
+    normal_right = df.get("normal_right_supported_reads", 0).fillna(0).astype(int)
+    bilateral = ((tumor_left >= 1) & (tumor_right >= 1)) | ((normal_left >= 1) & (normal_right >= 1))
+    if "silver_bilateral_support_any" in df.columns:
+        bilateral = bilateral | df["silver_bilateral_support_any"].fillna(False).astype(bool)
+    return bilateral
+
+
+def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = True) -> pd.DataFrame:
+    """Rank loci by evidence strength for manual review."""
+    out = candidates.copy()
+    out["two_sided_support"] = _two_sided_support_mask(out)
+
+    out["_prio_tsd"] = out.get("tsd_detected", False).fillna(False).astype(bool)
+    out["_prio_two_sided"] = out["two_sided_support"].astype(bool)
+    out["_prio_poly_at_max_run"] = out.get("poly_at_max_run", 0).fillna(0).astype(int)
+    out["_prio_breakpoint_resolved"] = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
+    out["_prio_g1k_region"] = out.get("g1k_melt_region_id", "").fillna("").astype(str).str.strip() != ""
+    out["_prio_insertion_mei_span"] = out.get("insertion_mei_span", 0).fillna(0).astype(int)
+    out["_prio_split_reads"] = (
+        out.get("tumor_split_mei_supported_reads", 0).fillna(0).astype(int)
+        + out.get("normal_split_mei_supported_reads", 0).fillna(0).astype(int)
+    )
+    out["_prio_discordant_reads"] = (
+        out.get("tumor_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+        + out.get("normal_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+    )
+
+    sort_cols: list[str] = []
+    ascending: list[bool] = []
+    if stage_first:
+        for col in ("gold_stage_pass", "silver_stage_pass"):
+            if col in out.columns:
+                sort_cols.append(col)
+                ascending.append(False)
+    sort_cols.extend(
+        [
+            "_prio_tsd",
+            "_prio_two_sided",
+            "_prio_poly_at_max_run",
+            "_prio_breakpoint_resolved",
+            "_prio_g1k_region",
+            "_prio_insertion_mei_span",
+            "_prio_split_reads",
+            "_prio_discordant_reads",
+        ]
+    )
+    ascending.extend([False] * 8)
+    sorted_out = out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
+    return sorted_out.drop(
+        columns=[c for c in sorted_out.columns if c.startswith("_prio_")],
+        errors="ignore",
+    ).reset_index(drop=True)
+
+
+def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
+    out = candidates.copy()
+    def _series_or_default(col: str, default: object) -> pd.Series:
+        if col in out.columns:
+            return out[col]
+        return pd.Series([default] * len(out), index=out.index)
+
+    out["breakpoint_resolved"] = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
+    out["tsd_or_polyA_supported"] = (
+        out.get("tsd_detected", False).fillna(False).astype(bool)
+        | (out.get("tumor_poly_at_reads", 0).fillna(0).astype(float) >= 1)
+        | (out.get("normal_poly_at_reads", 0).fillna(0).astype(float) >= 1)
+        | (out.get("poly_at_reads", 0).fillna(0).astype(float) >= 1)
+    )
+    out["consensus_sequence_label"] = _series_or_default("mei_subfamily", "").fillna("").astype(str)
+    out["g1k_overlap"] = _series_or_default("g1k_melt_id", "").fillna("").astype(str) != ""
+    out["g1k_mei_family"] = _series_or_default("g1k_melt_insertion_subfamily", "").fillna("").astype(str).apply(
+        lambda x: _infer_mei_family_from_fields(hit_id=x, family_hint=x, extra_hint="")
+    )
+    out["two_sided_support"] = _two_sided_support_mask(out)
+
+    selected_cols = [
+        "analysis_stage_tier",
+        "gold_stage_pass",
+        "silver_stage_pass",
+        "sample_status_label",
+        "insertion_call_tier",
+        "complex_mei_event",
+        "complex_sv_signature_label",
+        "mei_with_complex_sv_signature",
+        "chrom",
+        "window_start",
+        "window_end",
+        "tumor_split_mei_supported_reads",
+        "normal_split_mei_supported_reads",
+        "tumor_discordant_mei_supported_reads",
+        "normal_discordant_mei_supported_reads",
+        "tumor_left_supported_reads",
+        "tumor_right_supported_reads",
+        "normal_left_supported_reads",
+        "normal_right_supported_reads",
+        "tumor_family_agreement",
+        "tumor_strand_agreement",
+        "normal_family_agreement",
+        "normal_strand_agreement",
+        "tumor_insertion_breakpoint_pos",
+        "breakpoint_resolved",
+        "two_sided_support",
+        "insertion_orientation",
+        "insertion_mei_span",
+        "tsd_detected",
+        "tsd_len_estimate",
+        "tsd_seq",
+        "tumor_poly_at_reads",
+        "tumor_poly_at_max_run",
+        "tumor_poly_at_fraction_weighted",
+        "normal_poly_at_reads",
+        "normal_poly_at_max_run",
+        "normal_poly_at_fraction_weighted",
+        "poly_at_reads",
+        "poly_at_max_run",
+        "tsd_or_polyA_supported",
+        "mei_family",
+        "mei_subfamily",
+        "consensus_sequence_label",
+        "nested_same_class_orientation",
+        "g1k_overlap",
+        "g1k_melt_id",
+        "g1k_mei_family",
+        "g1k_melt_insertion_subfamily",
+        "g1k_melt_insertion_length",
+        "g1k_melt_tsd",
+        "g1k_melt_region_id",
+        "tumor_empirical_local_bam_mean_depth_p_high",
+        "tumor_empirical_context_mapq_mean_p_low",
+        "tumor_empirical_context_mapq_lt20_fraction_p_high",
+        "tumor_empirical_context_nm_per_100bp_mean_p_high",
+        "tumor_empirical_context_nm_per_100bp_p90_p_high",
+        "normal_empirical_local_bam_mean_depth_p_high",
+        "normal_empirical_context_mapq_mean_p_low",
+        "normal_empirical_context_mapq_lt20_fraction_p_high",
+        "normal_empirical_context_nm_per_100bp_mean_p_high",
+        "normal_empirical_context_nm_per_100bp_p90_p_high",
+        "gold_empirical_outlier",
+        "gold_stage_fail_reason",
+        "insertion_model_score",
+        "coherence_score",
+        "mei_score_enrichment_ratio",
+    ]
+    for col in selected_cols:
+        if col not in out.columns:
+            out[col] = ""
+    review = out.loc[:, selected_cols].copy()
+    return _prioritize_mei_candidates(review, stage_first=True)
 
 
 def _infer_mei_family_from_fields(hit_id: str, family_hint: str, extra_hint: str) -> str:
@@ -2385,6 +3780,7 @@ def _annotate_g1k_mei_overlap(
         return out
 
     out["row_id"] = out.index.astype(int)
+    row_by_id = {int(row.row_id): pd.Series(row._asdict()) for row in out.itertuples(index=False)}
     best_hits: dict[int, dict[str, object]] = {}
 
     with tempfile.TemporaryDirectory(prefix="rtm_g1k_mei_") as tmpdir:
@@ -2447,6 +3843,13 @@ def _annotate_g1k_mei_overlap(
                 overlap_bp = max(0, min(a_end0, b_end0) - max(a_start0, b_start0))
             except (ValueError, IndexError):
                 overlap_bp = 0
+            row = row_by_id.get(row_id)
+            if row is None:
+                continue
+            event_family = _choose_event_family(row)
+            g1k_family = _normalize_mei_family_token(f"{hit_id} {ins_type_s} {subfamily_s}")
+            if not event_family or g1k_family != event_family:
+                continue
             current = best_hits.get(row_id)
             if (current is None) or (int(current.get("overlap_bp", -1)) < overlap_bp):
                 best_hits[row_id] = {
@@ -2484,6 +3887,33 @@ def _normalize_mei_family_token(token: str) -> str:
     return ""
 
 
+def _choose_event_subfamily(row: pd.Series) -> str:
+    weighted: list[tuple[str, int]] = []
+    for subfamily_col, weight_col in [
+        ("tumor_discordant_mei_subfamily", "tumor_discordant_mei_supported_reads"),
+        ("tumor_discordant_mei_left_subfamily", "tumor_discordant_mei_left_supported_reads"),
+        ("tumor_discordant_mei_right_subfamily", "tumor_discordant_mei_right_supported_reads"),
+        ("tumor_L_mei_subfamily", "tumor_L_mei_supported_reads"),
+        ("tumor_R_mei_subfamily", "tumor_R_mei_supported_reads"),
+        ("normal_discordant_mei_subfamily", "normal_discordant_mei_supported_reads"),
+        ("normal_discordant_mei_left_subfamily", "normal_discordant_mei_left_supported_reads"),
+        ("normal_discordant_mei_right_subfamily", "normal_discordant_mei_right_supported_reads"),
+        ("normal_L_mei_subfamily", "normal_L_mei_supported_reads"),
+        ("normal_R_mei_subfamily", "normal_R_mei_supported_reads"),
+    ]:
+        label = str(row.get(subfamily_col, "") or "").strip()
+        weight = _row_int(row, weight_col)
+        if label and weight > 0:
+            weighted.append((label, weight))
+    g1k_subfamily = str(row.get("g1k_melt_insertion_subfamily", "") or "").strip()
+    if g1k_subfamily:
+        weighted.append((g1k_subfamily, 1))
+    if not weighted:
+        return ""
+    weighted.sort(key=lambda item: item[1], reverse=True)
+    return weighted[0][0]
+
+
 def _choose_event_family(row: pd.Series) -> str:
     candidates = [
         str(row.get("tumor_discordant_mei_family", "")),
@@ -2498,6 +3928,8 @@ def _choose_event_family(row: pd.Series) -> str:
         str(row.get("normal_discordant_mei_subfamily", "")),
         str(row.get("normal_L_mei_subfamily", "")),
         str(row.get("normal_R_mei_subfamily", "")),
+        str(row.get("g1k_melt_insertion_subfamily", "")),
+        str(row.get("g1k_melt_id", "")),
     ]
     for c in candidates:
         fam = _normalize_mei_family_token(c)
@@ -2508,7 +3940,9 @@ def _choose_event_family(row: pd.Series) -> str:
 
 def _choose_event_orientation(row: pd.Series) -> str:
     candidates = [
+        str(row.get("insertion_orientation", "")),
         str(row.get("tumor_insertion_orientation", "")),
+        str(row.get("normal_insertion_orientation", "")),
         str(row.get("tumor_discordant_mei_strand", "")),
         str(row.get("tumor_L_mei_strand", "")),
         str(row.get("tumor_R_mei_strand", "")),
@@ -2577,6 +4011,12 @@ def _load_rmsk_interval_trees(rmsk_table_path: Path) -> dict[str, IntervalTree]:
     return trees
 
 
+def _rmsk_interval_family_norm(data: dict[str, object]) -> str:
+    return _normalize_mei_family_token(
+        f"{data.get('rep_name', '')} {data.get('rep_class', '')} {data.get('rep_family', '')}"
+    )
+
+
 def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: Path) -> pd.DataFrame:
     out = candidates.copy()
     out["nested_repeat_overlap"] = False
@@ -2605,30 +4045,30 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
         event_orientation = _choose_event_orientation(as_row)
         tree = trees.get(chrom)
         overlaps = list(tree.at(pos0)) if tree is not None else []
-        if not overlaps:
+        if not overlaps or not event_family:
+            selected.append({})
+            continue
+
+        same_family_overlaps = [
+            iv for iv in overlaps if _rmsk_interval_family_norm(iv.data) == event_family
+        ]
+        if not same_family_overlaps:
             selected.append({})
             continue
 
         def score(iv) -> tuple[int, int]:
             d = iv.data
-            rep_family = _normalize_mei_family_token(
-                f"{d.get('rep_name','')} {d.get('rep_class','')} {d.get('rep_family','')}"
-            )
-            same_class = int(bool(event_family) and (rep_family == event_family))
+            rep_strand = str(d.get("strand", "")).strip()
             same_orient = int(
                 bool(event_orientation)
-                and str(d.get("strand", "")).strip() in {"+", "-"}
-                and (str(d.get("strand", "")).strip() == event_orientation)
+                and rep_strand in {"+", "-"}
+                and rep_strand == event_orientation
             )
-            return (same_class * 2 + same_orient, int(iv.end - iv.begin))
+            return (same_orient, int(iv.end - iv.begin))
 
-        best = max(overlaps, key=score)
+        best = max(same_family_overlaps, key=score)
         d = best.data
-        rep_family_norm = _normalize_mei_family_token(
-            f"{d.get('rep_name','')} {d.get('rep_class','')} {d.get('rep_family','')}"
-        )
         rep_strand = str(d.get("strand", "")).strip()
-        same_class = bool(event_family) and (rep_family_norm == event_family)
         same_orient = bool(event_orientation) and rep_strand in {"+", "-"} and (rep_strand == event_orientation)
         selected.append(
             {
@@ -2639,9 +4079,9 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
                 "nested_repeat_strand": rep_strand,
                 "nested_mei_family": event_family,
                 "nested_insertion_orientation": event_orientation,
-                "nested_same_class": same_class,
+                "nested_same_class": True,
                 "nested_same_orientation": same_orient,
-                "nested_same_class_orientation": "nested" if (same_class and same_orient) else "unnested",
+                "nested_same_class_orientation": "nested" if same_orient else "unnested",
             }
         )
 
@@ -2678,8 +4118,20 @@ def annotate_candidate_loci_with_mei(
     g1k_dpe_padding_min_bp: int = 200,
     g1k_dpe_padding_max_bp: int = 200,
     g1k_dpe_padding_tlen_factor: float = 0.0,
+    empirical_random_windows: int = 1000,
+    empirical_random_scope: str = "chromosome",
+    empirical_random_seed: int = 13,
+    empirical_highconf_bed: Path | None = None,
+    empirical_exclude_merged_bed: Path | None = None,
+    empirical_exclude_segdup_bed: Path | None = None,
+    empirical_exclude_mappability_bedgraph: Path | None = None,
+    empirical_exclude_mappability_threshold: float = 0.5,
+    empirical_exclude_gap_bed: Path | None = None,
+    empirical_exclude_blacklist_bed: Path | None = None,
+    empirical_cache_dir: Path | None = None,
     progress_every: int = 20000,
 ) -> Path:
+    total_t0 = time.monotonic()
     candidate = pd.read_csv(candidate_loci_path, sep="\t")
 
     split_tumor_raw = _load_table(evidence_dir, "split_evidence", "tumor")
@@ -2780,7 +4232,9 @@ def annotate_candidate_loci_with_mei(
     candidate = _add_local_depth_normalized_support(candidate)
     candidate = _infer_tumor_insertion_metrics(candidate, reference_fasta=reference_fasta)
     candidate = _compute_insertion_model_scores(candidate)
+    candidate = _assign_bronze_silver_stages(candidate)
     if g1k_mei_vcf is not None:
+        g1k_t0 = time.monotonic()
         candidate = _annotate_g1k_mei_overlap(
             candidate,
             g1k_mei_vcf=g1k_mei_vcf,
@@ -2789,32 +4243,51 @@ def annotate_candidate_loci_with_mei(
             dpe_padding_max_bp=g1k_dpe_padding_max_bp,
             dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
         )
-        print("[mei-annotate] added 1000G/MELT polymorphism overlap fields")
+        print(
+            f"[mei-annotate] added 1000G/MELT polymorphism overlap fields "
+            f"(elapsed={time.monotonic() - g1k_t0:.1f}s)"
+        )
+    candidate = _add_consolidated_event_fields(candidate)
+    candidate = _broaden_poly_at_fields(candidate)
     if rmsk_table_path is not None:
+        rmsk_t0 = time.monotonic()
         candidate = _annotate_nested_retrotransposon(candidate, rmsk_table_path=rmsk_table_path)
-        print("[mei-annotate] added nested-retrotransposon overlap annotation")
+        print(
+            f"[mei-annotate] added nested-retrotransposon overlap annotation "
+            f"(elapsed={time.monotonic() - rmsk_t0:.1f}s)"
+        )
     if tumor_bam_path is not None and normal_bam_path is not None:
+        emp_t0 = time.monotonic()
         candidate = _annotate_bam_depth_for_consistent_loci(
             candidate,
             tumor_bam_path=tumor_bam_path,
             normal_bam_path=normal_bam_path,
+            empirical_random_windows=empirical_random_windows,
+            empirical_random_scope=empirical_random_scope,
+            empirical_random_seed=empirical_random_seed,
+            empirical_highconf_bed=empirical_highconf_bed,
+            empirical_exclude_merged_bed=empirical_exclude_merged_bed,
+            empirical_exclude_segdup_bed=empirical_exclude_segdup_bed,
+            empirical_exclude_mappability_bedgraph=empirical_exclude_mappability_bedgraph,
+            empirical_exclude_mappability_threshold=empirical_exclude_mappability_threshold,
+            empirical_exclude_gap_bed=empirical_exclude_gap_bed,
+            empirical_exclude_blacklist_bed=empirical_exclude_blacklist_bed,
+            empirical_cache_dir=empirical_cache_dir if empirical_cache_dir is not None else out_path.parent / "empirical_cache",
         )
-        print("[mei-annotate] added BAM-depth normalization for family-consistent, junk-clean loci")
+        print(
+            f"[mei-annotate] added BAM-depth normalization for family-consistent, junk-clean loci "
+            f"(elapsed={time.monotonic() - emp_t0:.1f}s)"
+        )
+    candidate = _assign_gold_stage(candidate)
 
-    candidate = candidate.sort_values(
-        [
-            "passes_insertion_model",
-            "insertion_model_score",
-            "mei_score_enrichment_ratio",
-            "coherence_score",
-            "tumor_mei_supported_reads",
-            "enrichment_ratio",
-        ],
-        ascending=[False, False, False, False, False, False],
-        kind="mergesort",
-    )
+    candidate = _prioritize_mei_candidates(candidate, stage_first=True)
 
     candidate.to_csv(out_path, sep="\t", index=False)
     candidate.to_parquet(out_path.with_suffix(".parquet"), index=False)
+    gold_review = _build_gold_review_table(candidate)
+    gold_review_path = out_path.with_name(out_path.stem + ".gold_review.tsv")
+    gold_review.to_csv(gold_review_path, sep="\t", index=False)
+    print(f"[mei-annotate] wrote gold review table to {gold_review_path}")
     print(f"[mei-annotate] wrote {len(candidate)} rows to {out_path}")
+    print(f"[mei-annotate] total annotate walltime={time.monotonic() - total_t0:.1f}s")
     return out_path

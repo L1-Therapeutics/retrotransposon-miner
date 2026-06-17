@@ -17,6 +17,7 @@ class ExtractionSummary:
     split_evidence_rows: int
     discordant_evidence_rows: int = 0
     insert_size_threshold: int = 0
+    weak_only_discordant_filtered_rows: int = 0
 
 
 def _normalize_regions(regions: list[str] | str) -> list[str]:
@@ -260,6 +261,7 @@ def extract_discordant_evidence(
     poly_tail_rescue_min_run: int = 10,
     poly_tail_rescue_min_frac: float = 0.8,
     poly_tail_rescue_min_abs_tlen: int = 500,
+    require_strong_discordant_reason: bool = True,
 ) -> ExtractionSummary:
     outdir.mkdir(parents=True, exist_ok=True)
     insert_threshold = _estimate_insert_size_threshold(
@@ -271,6 +273,7 @@ def extract_discordant_evidence(
     )
 
     rows: list[dict[str, Any]] = []
+    weak_only_filtered_rows = 0
     total_reads_scanned = 0
     passing_reads = 0
     region_list = _normalize_regions(regions)
@@ -332,6 +335,11 @@ def extract_discordant_evidence(
                 reasons.append("poly_tail_anchor_rescue")
 
             if not reasons:
+                continue
+            strong_reasons = {"mate_unmapped", "interchrom", "large_insert", "poly_tail_anchor_rescue"}
+            has_strong_reason = any(r in strong_reasons for r in reasons)
+            if require_strong_discordant_reason and not has_strong_reason:
+                weak_only_filtered_rows += 1
                 continue
 
             chrom = bam.get_reference_name(read.reference_id)
@@ -402,4 +410,5 @@ def extract_discordant_evidence(
         split_evidence_rows=0,
         discordant_evidence_rows=len(df),
         insert_size_threshold=insert_threshold,
+        weak_only_discordant_filtered_rows=weak_only_filtered_rows,
     )

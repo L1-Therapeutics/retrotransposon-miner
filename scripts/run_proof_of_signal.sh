@@ -22,13 +22,23 @@ G1K_SPLIT_PADDING_BP="200"
 G1K_DPE_PADDING_MIN_BP="200"
 G1K_DPE_PADDING_MAX_BP="200"
 G1K_DPE_PADDING_TLEN_FACTOR="0"
+EMPIRICAL_RANDOM_WINDOWS="1000"
+EMPIRICAL_RANDOM_SCOPE="chromosome"
+EMPIRICAL_RANDOM_SEED="13"
+EMPIRICAL_HIGHCONF_BED=""
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
 SEG_DUP_BED="data/public/annotation/hg38/segdup/genomicSuperDups.bed"
 MAPPABILITY_BEDGRAPH="data/public/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+MAPPABILITY_LOW_BED="data/public/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
 GAP_BED="data/public/annotation/hg38/masks/gap.txt.gz"
 BLACKLIST_BED="data/public/annotation/hg38/blacklist/ENCFF356LFX.bed.gz"
+JUNK_MERGED_BED="data/public/annotation/hg38/junk/junk_exclusion_merged.bed"
+
+now_epoch() {
+  date +%s
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -84,6 +94,22 @@ while [[ $# -gt 0 ]]; do
       G1K_DPE_PADDING_TLEN_FACTOR="$2"
       shift 2
       ;;
+    --empirical-random-windows)
+      EMPIRICAL_RANDOM_WINDOWS="$2"
+      shift 2
+      ;;
+    --empirical-random-scope)
+      EMPIRICAL_RANDOM_SCOPE="$2"
+      shift 2
+      ;;
+    --empirical-random-seed)
+      EMPIRICAL_RANDOM_SEED="$2"
+      shift 2
+      ;;
+    --empirical-highconf-bed)
+      EMPIRICAL_HIGHCONF_BED="$2"
+      shift 2
+      ;;
     --python-bin)
       PYTHON_BIN="$2"
       shift 2
@@ -121,6 +147,16 @@ for f in "${TUMOR_BAM}" "${NORMAL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MAPPA
     exit 1
   fi
 done
+if [[ ! -f "${MAPPABILITY_LOW_BED}" ]]; then
+  echo "ERROR: required low-mappability BED not found: ${MAPPABILITY_LOW_BED}" >&2
+  echo "Re-run: python3 scripts/download_public_data.py --outdir data/public" >&2
+  exit 1
+fi
+if [[ ! -f "${JUNK_MERGED_BED}" ]]; then
+  echo "ERROR: required merged junk BED not found: ${JUNK_MERGED_BED}" >&2
+  echo "Re-run: python3 scripts/download_public_data.py --outdir data/public" >&2
+  exit 1
+fi
 if [[ -n "${REFERENCE_FASTA}" ]] && [[ ! -f "${REFERENCE_FASTA}" ]]; then
   echo "ERROR: reference FASTA not found: ${REFERENCE_FASTA}" >&2
   exit 1
@@ -131,6 +167,10 @@ if [[ -n "${RMSK_TABLE}" ]] && [[ ! -f "${RMSK_TABLE}" ]]; then
 fi
 if [[ -n "${G1K_MEI_VCF}" ]] && [[ ! -f "${G1K_MEI_VCF}" ]]; then
   echo "ERROR: 1000G/MELT MEI VCF not found: ${G1K_MEI_VCF}" >&2
+  exit 1
+fi
+if [[ -n "${EMPIRICAL_HIGHCONF_BED}" ]] && [[ ! -f "${EMPIRICAL_HIGHCONF_BED}" ]]; then
+  echo "ERROR: empirical high-confidence BED not found: ${EMPIRICAL_HIGHCONF_BED}" >&2
   exit 1
 fi
 
@@ -145,6 +185,7 @@ run_cli() {
   fi
 }
 
+stage_t0=$(now_epoch)
 echo "[proof-of-signal] stage=extract-split-evidence region=${REGION}"
 run_cli extract-split-evidence \
   --tumor-bam "${TUMOR_BAM}" \
@@ -154,7 +195,9 @@ run_cli extract-split-evidence \
   --min-mapq 20 \
   --min-mapq-discordant 20 \
   --min-clip-len 20
+echo "[proof-of-signal] stage=extract-split-evidence done elapsed=$(( $(now_epoch) - stage_t0 ))s"
 
+stage_t0=$(now_epoch)
 echo "[proof-of-signal] stage=build-candidate-loci window_size=${WINDOW_SIZE}"
 run_cli build-candidate-loci \
   --evidence-dir "${OUTDIR}" \
@@ -169,7 +212,9 @@ run_cli build-candidate-loci \
   --gap-min-fraction 0.1 \
   --encode-blacklist-bed "${BLACKLIST_BED}" \
   --encode-blacklist-min-fraction 0.1
+echo "[proof-of-signal] stage=build-candidate-loci done elapsed=$(( $(now_epoch) - stage_t0 ))s"
 
+stage_t0=$(now_epoch)
 echo "[proof-of-signal] stage=annotate-mei-support"
 annotate_cmd=(
   annotate-mei-support
@@ -178,7 +223,19 @@ annotate_cmd=(
   --mei-fasta "${MEI_FASTA}"
   --tumor-bam-depth "${TUMOR_BAM}"
   --normal-bam-depth "${NORMAL_BAM}"
+  --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
+  --empirical-exclude-segdup-bed "${SEG_DUP_BED}"
+  --empirical-exclude-mappability-bedgraph "${MAPPABILITY_LOW_BED}"
+  --empirical-exclude-mappability-threshold 0.5
+  --empirical-exclude-gap-bed "${GAP_BED}"
+  --empirical-exclude-blacklist-bed "${BLACKLIST_BED}"
+  --empirical-random-windows "${EMPIRICAL_RANDOM_WINDOWS}"
+  --empirical-random-scope "${EMPIRICAL_RANDOM_SCOPE}"
+  --empirical-random-seed "${EMPIRICAL_RANDOM_SEED}"
 )
+if [[ -n "${EMPIRICAL_HIGHCONF_BED}" ]]; then
+  annotate_cmd+=(--empirical-highconf-bed "${EMPIRICAL_HIGHCONF_BED}")
+fi
 if [[ -n "${REFERENCE_FASTA}" ]]; then
   annotate_cmd+=(--reference-fasta "${REFERENCE_FASTA}")
 fi
@@ -196,6 +253,7 @@ if [[ -n "${G1K_MEI_VCF}" ]]; then
 fi
 annotate_cmd+=(--out-tsv "${OUTDIR}/candidate_loci.mei.tsv")
 run_cli "${annotate_cmd[@]}"
+echo "[proof-of-signal] stage=annotate-mei-support done elapsed=$(( $(now_epoch) - stage_t0 ))s"
 
 echo "[proof-of-signal] done"
 echo "  ${OUTDIR}/split_evidence.summary.tsv"
