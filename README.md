@@ -111,15 +111,15 @@ echo 'eval "$($HOME/.local/bin/micromamba shell hook -s bash)"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-## Public tumor/normal BAM candidates for smoke tests
+## Public disease/control BAM candidates for smoke tests
 
-True matched tumor/normal WGS BAMs that are fully public in AWS S3 are uncommon
+True matched disease/control WGS BAMs that are fully public in AWS S3 are uncommon
 because many patient datasets are controlled-access. For immediate smoke testing,
 use SEQC2 public benchmark BAMs (widely used, open access) from NCBI FTP:
 
-- Tumor BAM:
+- disease BAM:
   `https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_T_1.bwa.dedup.bam`
-- Normal BAM:
+- control BAM:
   `https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_N_1.bwa.dedup.bam`
 
 These are large files; for quick iteration, subset one chromosome first.
@@ -130,16 +130,16 @@ Recommended: download BAM + BAI locally first, then subset `chr22`.
 
 ```bash
 bash scripts/smoke_test_chr.sh \
-  --tumor-bam "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_T_1.bwa.dedup.bam" \
-  --normal-bam "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_N_1.bwa.dedup.bam" \
+  --disease-bam "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_T_1.bwa.dedup.bam" \
+  --control-bam "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_N_1.bwa.dedup.bam" \
   --download-local \
   --chrom chr22 \
   --outdir smoke-test
 ```
 
 Outputs:
-- Downloaded inputs: `smoke-test/downloads/tumor.bam`, `smoke-test/downloads/normal.bam`
-- Subsets: `smoke-test/tumor.chr22.bam`, `smoke-test/normal.chr22.bam`
+- Downloaded inputs: `smoke-test/downloads/disease.bam`, `smoke-test/downloads/control.bam`
+- Subsets: `smoke-test/disease.chr22.bam`, `smoke-test/control.chr22.bam`
 
 ## Download public reference/annotation resources
 
@@ -162,10 +162,10 @@ This initial dataset pack includes:
 - Dfam-derived MEI FASTA library outputs:
   - `retrotransposon_db/dfam/dfam_human_curated.fasta`
   - `retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta`
-- Public SEQC2 tumor/normal test BAMs (downloaded as chr22 slices)
+- Public SEQC2 disease/control test BAMs (downloaded as chr22 slices)
 
 Post-download processing is automatic and includes:
-- remote slicing of SEQC2 tumor/normal BAMs to `chr22` (no full BAM local copy)
+- remote slicing of SEQC2 disease/control BAMs to `chr22` (no full BAM local copy)
 - converting selected hg38 resources to BED/BEDGRAPH
 - extracting MEI-focused BED rows from gnomAD SV track
 - lifting hg38 BED resources to hs1/T2T via `liftOver`
@@ -174,7 +174,7 @@ Post-download processing is automatic and includes:
   and generating a focused LINE1/Alu/SVA MEI FASTA subset
 
 Storage planning:
-- Full whole-genome tumor+normal BAM remapping workflows can require ~300GB free disk.
+- Full whole-genome disease+control BAM remapping workflows can require ~300GB free disk.
 - Default test-data download mode is chr22-sliced to keep storage much lower.
 
 Download only selected categories:
@@ -210,15 +210,15 @@ Notes on special cases:
 - `Repbase` requires a commercial license for proprietary use; keep it out of
   automated public-download workflows unless license terms are satisfied.
 
-## Reprocess tumor/normal BAMs into both hg38 and hs1/T2T
+## Reprocess disease/control BAMs into both hg38 and hs1/T2T
 
 To keep read alignments available on both assemblies, re-align the downloaded
 test pair to each reference:
 
 ```bash
 bash scripts/reprocess_pair_dual_reference.sh \
-  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
-  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
+  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
+  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
   --hg38-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --hs1-fasta data/public/reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa \
   --prefix seqc2_chr22 \
@@ -238,8 +238,8 @@ To regenerate the same chr22 test BAM set reproducibly from scratch:
 python3 scripts/download_public_data.py --outdir data/public --threads 4
 
 bash scripts/reprocess_pair_dual_reference.sh \
-  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
-  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
+  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
+  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
   --hg38-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --hs1-fasta data/public/reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa \
   --prefix seqc2_chr22 \
@@ -248,10 +248,10 @@ bash scripts/reprocess_pair_dual_reference.sh \
 ```
 
 Expected test outputs:
-- `results/reprocessed_bams/hg38/seqc2_chr22.tumor.hg38.bam`
-- `results/reprocessed_bams/hg38/seqc2_chr22.normal.hg38.bam`
-- `results/reprocessed_bams/hs1/seqc2_chr22.tumor.hs1.bam`
-- `results/reprocessed_bams/hs1/seqc2_chr22.normal.hs1.bam`
+- `results/reprocessed_bams/hg38/seqc2_chr22.disease.hg38.bam`
+- `results/reprocessed_bams/hg38/seqc2_chr22.control.hg38.bam`
+- `results/reprocessed_bams/hs1/seqc2_chr22.disease.hs1.bam`
+- `results/reprocessed_bams/hs1/seqc2_chr22.control.hs1.bam`
 
 ## Quick smoke test on a small chromosome
 

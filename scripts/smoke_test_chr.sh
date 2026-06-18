@@ -2,21 +2,21 @@
 set -euo pipefail
 
 # Smoke test:
-# - Accepts tumor/normal BAM paths or HTTP/FTP URLs
+# - Accepts disease/control BAM paths or HTTP/FTP URLs
 # - Optional local download mode for remote BAMs (recommended)
 # - Extracts one chromosome (default chr22) into small test BAMs
 # - Indexes outputs
 #
 # Usage:
 #   bash scripts/smoke_test_chr.sh \
-#     --tumor-bam <path-or-url> \
-#     --normal-bam <path-or-url> \
+#     --disease-bam <path-or-url> \
+#     --control-bam <path-or-url> \
 #     --download-local \
 #     --chrom chr22 \
 #     --outdir smoke-test
 
-TUMOR_BAM=""
-NORMAL_BAM=""
+DISEASE_BAM=""
+CONTROL_BAM=""
 CHROM="chr22"
 OUTDIR="smoke-test"
 THREADS="${THREADS:-4}"
@@ -24,12 +24,12 @@ DOWNLOAD_LOCAL="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tumor-bam)
-      TUMOR_BAM="$2"
+    --disease-bam)
+      DISEASE_BAM="$2"
       shift 2
       ;;
-    --normal-bam)
-      NORMAL_BAM="$2"
+    --control-bam)
+      CONTROL_BAM="$2"
       shift 2
       ;;
     --chrom)
@@ -51,8 +51,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${TUMOR_BAM}" || -z "${NORMAL_BAM}" ]]; then
-  echo "ERROR: --tumor-bam and --normal-bam are required." >&2
+if [[ -z "${DISEASE_BAM}" || -z "${CONTROL_BAM}" ]]; then
+  echo "ERROR: --disease-bam and --control-bam are required." >&2
   exit 1
 fi
 
@@ -133,19 +133,19 @@ slice_bam() {
 
 if [[ "${DOWNLOAD_LOCAL}" == "1" ]]; then
   echo "Local download mode enabled."
-  TUMOR_BAM="$(ensure_local_bam_and_index "${TUMOR_BAM}" "tumor")"
-  NORMAL_BAM="$(ensure_local_bam_and_index "${NORMAL_BAM}" "normal")"
+  DISEASE_BAM="$(ensure_local_bam_and_index "${DISEASE_BAM}" "disease")"
+  CONTROL_BAM="$(ensure_local_bam_and_index "${CONTROL_BAM}" "control")"
 fi
 
-echo "Extracting ${CHROM} from tumor BAM..."
-slice_bam "${TUMOR_BAM}" "${OUTDIR}/tumor.${CHROM}.bam"
+echo "Extracting ${CHROM} from disease BAM..."
+slice_bam "${DISEASE_BAM}" "${OUTDIR}/disease.${CHROM}.bam"
 
-echo "Extracting ${CHROM} from normal BAM..."
-slice_bam "${NORMAL_BAM}" "${OUTDIR}/normal.${CHROM}.bam"
+echo "Extracting ${CHROM} from control BAM..."
+slice_bam "${CONTROL_BAM}" "${OUTDIR}/control.${CHROM}.bam"
 
 echo "Done."
-echo "Tumor subset:  ${OUTDIR}/tumor.${CHROM}.bam"
-echo "Normal subset: ${OUTDIR}/normal.${CHROM}.bam"
+echo "disease subset:  ${OUTDIR}/disease.${CHROM}.bam"
+echo "control subset: ${OUTDIR}/control.${CHROM}.bam"
 echo "Suggested quick checks:"
-echo "  samtools idxstats ${OUTDIR}/tumor.${CHROM}.bam | head"
-echo "  samtools idxstats ${OUTDIR}/normal.${CHROM}.bam | head"
+echo "  samtools idxstats ${OUTDIR}/disease.${CHROM}.bam | head"
+echo "  samtools idxstats ${OUTDIR}/control.${CHROM}.bam | head"

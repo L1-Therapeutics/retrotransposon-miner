@@ -193,20 +193,20 @@ datasets:
     target_path: annotation/hg38/mane/MANE.GRCh38.v1.5.ensembl_genomic.gtf.gz
     required: true
 
-  - id: seqc2_tumor_bam
+  - id: seqc2_disease_bam
     category: test_bam
-    description: SEQC2 tumor WGS BAM sliced to chr22 during download
+    description: SEQC2 disease WGS BAM sliced to chr22 during download
     source: NCBI SEQC2
     url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_T_1.bwa.dedup.bam
-    target_path: test_data/seqc2/chr22/tumor.chr22.hg38.bam
+    target_path: test_data/seqc2/chr22/disease.chr22.hg38.bam
     region: chr22
     required: true
 
-  - id: seqc2_normal_bam
+  - id: seqc2_control_bam
     category: test_bam
-    description: SEQC2 normal WGS BAM sliced to chr22 during download
+    description: SEQC2 control WGS BAM sliced to chr22 during download
     source: NCBI SEQC2
     url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_N_1.bwa.dedup.bam
-    target_path: test_data/seqc2/chr22/normal.chr22.hg38.bam
+    target_path: test_data/seqc2/chr22/control.chr22.hg38.bam
     region: chr22
     required: true

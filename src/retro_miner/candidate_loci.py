@@ -99,10 +99,10 @@ def _distance_to_closed_interval(pos: int, start: int, end: int) -> int:
 
 
 def _build_loci_from_evidence(
-    split_tumor: pd.DataFrame,
-    split_normal: pd.DataFrame,
-    discordant_tumor: pd.DataFrame,
-    discordant_normal: pd.DataFrame,
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+    discordant_disease: pd.DataFrame,
+    discordant_control: pd.DataFrame,
     split_cluster_bp: int,
     discordant_cluster_bp: int,
     max_locus_span_bp: int,
@@ -112,8 +112,8 @@ def _build_loci_from_evidence(
         f"(split_cluster_bp={split_cluster_bp}, discordant_cluster_bp={discordant_cluster_bp}, "
         f"max_locus_span_bp={max_locus_span_bp})"
     )
-    split_all = pd.concat([split_tumor, split_normal], ignore_index=True)
-    discordant_all = pd.concat([discordant_tumor, discordant_normal], ignore_index=True)
+    split_all = pd.concat([split_disease, split_control], ignore_index=True)
+    discordant_all = pd.concat([discordant_disease, discordant_control], ignore_index=True)
     if split_all.empty and discordant_all.empty:
         _progress("no split/discordant evidence found; returning empty loci")
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
@@ -536,8 +536,8 @@ def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fractio
 
 def _annotate_junk_flags(
     loci: pd.DataFrame,
-    discordant_tumor: pd.DataFrame,
-    discordant_normal: pd.DataFrame,
+    discordant_disease: pd.DataFrame,
+    discordant_control: pd.DataFrame,
     segdup_bed: Path | None,
     segdup_min_fraction: float,
     low_mappability_bedgraph: Path | None,
@@ -572,7 +572,7 @@ def _annotate_junk_flags(
 
         key_cols = ["chrom", "window_start", "window_end"]
         candidate_key = out.loc[:, key_cols + ["row_id"]]
-        discordant_all = pd.concat([discordant_tumor, discordant_normal], ignore_index=True)
+        discordant_all = pd.concat([discordant_disease, discordant_control], ignore_index=True)
         if discordant_all.empty:
             mate_with_id = pd.DataFrame(columns=key_cols + ["row_id", "mate_chrom", "mate_pos"])
         else:
@@ -705,21 +705,21 @@ def build_candidate_loci(
         passing_counts = _read_passing_counts(evidence_dir / "split_evidence.summary.tsv")
 
         _progress("loading split/discordant evidence tables")
-        split_tumor_raw = _load_evidence_table(evidence_dir, "split_evidence", "tumor")
-        split_normal_raw = _load_evidence_table(evidence_dir, "split_evidence", "normal")
-        discordant_tumor_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "tumor")
-        discordant_normal_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "normal")
+        split_disease_raw = _load_evidence_table(evidence_dir, "split_evidence", "disease")
+        split_control_raw = _load_evidence_table(evidence_dir, "split_evidence", "control")
+        discordant_disease_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "disease")
+        discordant_control_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "control")
         _progress(
             "loaded evidence rows "
-            f"split_tumor={len(split_tumor_raw)}, split_normal={len(split_normal_raw)}, "
-            f"discordant_tumor={len(discordant_tumor_raw)}, discordant_normal={len(discordant_normal_raw)}"
+            f"split_disease={len(split_disease_raw)}, split_control={len(split_control_raw)}, "
+            f"discordant_disease={len(discordant_disease_raw)}, discordant_control={len(discordant_control_raw)}"
         )
 
         loci = _build_loci_from_evidence(
-        split_tumor=split_tumor_raw,
-        split_normal=split_normal_raw,
-        discordant_tumor=discordant_tumor_raw,
-        discordant_normal=discordant_normal_raw,
+        split_disease=split_disease_raw,
+        split_control=split_control_raw,
+        discordant_disease=discordant_disease_raw,
+        discordant_control=discordant_control_raw,
         split_cluster_bp=split_cluster_bp,
         discordant_cluster_bp=discordant_cluster_bp,
         max_locus_span_bp=max_locus_span_bp,
@@ -727,21 +727,21 @@ def build_candidate_loci(
         _progress(f"locus assignment target count={len(loci)}")
 
         _progress("assigning evidence rows to loci")
-        split_tumor = _assign_rows_to_loci(split_tumor_raw, loci)
-        split_normal = _assign_rows_to_loci(split_normal_raw, loci)
-        discordant_tumor = _assign_rows_to_loci(discordant_tumor_raw, loci)
-        discordant_normal = _assign_rows_to_loci(discordant_normal_raw, loci)
+        split_disease = _assign_rows_to_loci(split_disease_raw, loci)
+        split_control = _assign_rows_to_loci(split_control_raw, loci)
+        discordant_disease = _assign_rows_to_loci(discordant_disease_raw, loci)
+        discordant_control = _assign_rows_to_loci(discordant_control_raw, loci)
         _progress(
             "assigned rows "
-            f"split_tumor={len(split_tumor)}, split_normal={len(split_normal)}, "
-            f"discordant_tumor={len(discordant_tumor)}, discordant_normal={len(discordant_normal)}"
+            f"split_disease={len(split_disease)}, split_control={len(split_control)}, "
+            f"discordant_disease={len(discordant_disease)}, discordant_control={len(discordant_control)}"
         )
 
         _progress("aggregating split/discordant metrics per locus")
-        split_t = _aggregate_split_metrics(split_tumor, "split_tumor")
-        split_n = _aggregate_split_metrics(split_normal, "split_normal")
-        disc_t = _aggregate_discordant_metrics(discordant_tumor, "discordant_tumor")
-        disc_n = _aggregate_discordant_metrics(discordant_normal, "discordant_normal")
+        split_t = _aggregate_split_metrics(split_disease, "split_disease")
+        split_n = _aggregate_split_metrics(split_control, "split_control")
+        disc_t = _aggregate_discordant_metrics(discordant_disease, "discordant_disease")
+        disc_n = _aggregate_discordant_metrics(discordant_control, "discordant_control")
 
         _progress("merging per-sample locus metrics")
         merged = split_t.merge(split_n, on=["chrom", "window_start", "window_end"], how="outer")
@@ -762,24 +762,24 @@ def build_candidate_loci(
         for col in int_cols:
             merged[col] = merged[col].astype(int)
 
-        merged["tumor_total_rows"] = merged["split_tumor_rows"] + merged["discordant_tumor_rows"]
-        merged["normal_total_rows"] = merged["split_normal_rows"] + merged["discordant_normal_rows"]
+        merged["disease_total_rows"] = merged["split_disease_rows"] + merged["discordant_disease_rows"]
+        merged["control_total_rows"] = merged["split_control_rows"] + merged["discordant_control_rows"]
 
-        tumor_den = passing_counts.get("tumor", 0)
-        normal_den = passing_counts.get("normal", 0)
-        merged["tumor_total_cpm"] = _safe_cpm(merged["tumor_total_rows"], tumor_den)
-        merged["normal_total_cpm"] = _safe_cpm(merged["normal_total_rows"], normal_den)
+        disease_den = passing_counts.get("disease", 0)
+        control_den = passing_counts.get("control", 0)
+        merged["disease_total_cpm"] = _safe_cpm(merged["disease_total_rows"], disease_den)
+        merged["control_total_cpm"] = _safe_cpm(merged["control_total_rows"], control_den)
 
-        merged["enrichment_ratio"] = (merged["tumor_total_cpm"] + pseudocount) / (
-            merged["normal_total_cpm"] + pseudocount
+        merged["enrichment_ratio"] = (merged["disease_total_cpm"] + pseudocount) / (
+            merged["control_total_cpm"] + pseudocount
         )
-        merged["delta_cpm"] = merged["tumor_total_cpm"] - merged["normal_total_cpm"]
+        merged["delta_cpm"] = merged["disease_total_cpm"] - merged["control_total_cpm"]
 
         _progress("computing junk-region flags")
         merged = _annotate_junk_flags(
         loci=merged,
-        discordant_tumor=discordant_tumor,
-        discordant_normal=discordant_normal,
+        discordant_disease=discordant_disease,
+        discordant_control=discordant_control,
         segdup_bed=segdup_bed,
         segdup_min_fraction=segdup_min_fraction,
         low_mappability_bedgraph=low_mappability_bedgraph,
@@ -793,7 +793,7 @@ def build_candidate_loci(
     )
 
         _progress("sorting final candidate loci")
-        merged = merged.sort_values(["enrichment_ratio", "tumor_total_rows"], ascending=[False, False], kind="mergesort")
+        merged = merged.sort_values(["enrichment_ratio", "disease_total_rows"], ascending=[False, False], kind="mergesort")
 
         out_tsv = outdir / "candidate_loci.tsv"
         out_parquet = outdir / "candidate_loci.parquet"

@@ -27,8 +27,8 @@ def check_env() -> None:
 
 
 @cli.command("extract-split-evidence")
-@click.option("--tumor-bam", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--normal-bam", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--disease-bam", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--control-bam", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--outdir", type=click.Path(file_okay=False, path_type=Path), required=True)
 @click.option("--region", default="chr22", show_default=True, help="Region to scan, e.g. chr22 or chr1:1-1000000.")
 @click.option(
@@ -125,8 +125,8 @@ def check_env() -> None:
     ),
 )
 def extract_split_evidence_cmd(
-    tumor_bam: Path,
-    normal_bam: Path,
+    disease_bam: Path,
+    control_bam: Path,
     outdir: Path,
     region: str,
     regions: str | None,
@@ -155,7 +155,7 @@ def extract_split_evidence_cmd(
 
     split_summaries: list[ExtractionSummary] = []
     discordant_summaries: dict[str, ExtractionSummary] = {}
-    for sample, bam in (("tumor", tumor_bam), ("normal", normal_bam)):
+    for sample, bam in (("disease", disease_bam), ("control", control_bam)):
         sample_t0 = time.monotonic()
         click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
         split_summary = extract_split_evidence(
@@ -339,7 +339,7 @@ def build_candidate_loci_cmd(
     encode_blacklist_bed: Path | None,
     encode_blacklist_min_fraction: float,
 ) -> None:
-    """Aggregate split/discordant evidence into tumor-vs-normal candidate loci."""
+    """Aggregate split/discordant evidence into disease-vs-control candidate loci."""
     t0 = time.monotonic()
     target_outdir = outdir if outdir is not None else evidence_dir
     tsv_path = build_candidate_loci(
@@ -396,16 +396,16 @@ def build_candidate_loci_cmd(
     help="Optional reference FASTA for TSD sequence extraction and breakpoint-context annotation.",
 )
 @click.option(
-    "--tumor-bam-depth",
+    "--disease-bam-depth",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Optional tumor BAM path for local BAM-depth normalization on consistent/junk-clean loci.",
+    help="Optional disease BAM path for local BAM-depth controlization on consistent/junk-clean loci.",
 )
 @click.option(
-    "--normal-bam-depth",
+    "--control-bam-depth",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Optional normal BAM path for local BAM-depth normalization on consistent/junk-clean loci.",
+    help="Optional control BAM path for local BAM-depth controlization on consistent/junk-clean loci.",
 )
 @click.option(
     "--rmsk-table",
@@ -528,8 +528,8 @@ def annotate_mei_support_cmd(
     mei_fasta: Path,
     out_tsv: Path,
     reference_fasta: Path | None,
-    tumor_bam_depth: Path | None,
-    normal_bam_depth: Path | None,
+    disease_bam_depth: Path | None,
+    control_bam_depth: Path | None,
     rmsk_table: Path | None,
     g1k_mei_vcf: Path | None,
     g1k_split_padding_bp: int,
@@ -551,16 +551,16 @@ def annotate_mei_support_cmd(
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
     t0 = time.monotonic()
     click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
-    if (tumor_bam_depth is None) ^ (normal_bam_depth is None):
-        raise click.ClickException("Provide both --tumor-bam-depth and --normal-bam-depth, or neither.")
+    if (disease_bam_depth is None) ^ (control_bam_depth is None):
+        raise click.ClickException("Provide both --disease-bam-depth and --control-bam-depth, or neither.")
     out_path = annotate_candidate_loci_with_mei(
         evidence_dir=evidence_dir,
         candidate_loci_path=candidate_loci,
         mei_fasta=mei_fasta,
         out_path=out_tsv,
         reference_fasta=reference_fasta,
-        tumor_bam_path=tumor_bam_depth,
-        normal_bam_path=normal_bam_depth,
+        disease_bam_path=disease_bam_depth,
+        control_bam_path=control_bam_depth,
         rmsk_table_path=rmsk_table,
         g1k_mei_vcf=g1k_mei_vcf,
         g1k_split_padding_bp=g1k_split_padding_bp,

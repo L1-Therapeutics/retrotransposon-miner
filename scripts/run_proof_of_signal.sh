@@ -9,8 +9,8 @@ set -euo pipefail
 # This wrapper runs the same commands used in interactive development so the
 # workflow can be reproduced with one command.
 
-TUMOR_BAM=""
-NORMAL_BAM=""
+DISEASE_BAM=""
+CONTROL_BAM=""
 MEI_FASTA=""
 REFERENCE_FASTA=""
 RMSK_TABLE="data/public/annotation/hg38/repeats/rmsk.txt.gz"
@@ -42,12 +42,12 @@ now_epoch() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tumor-bam)
-      TUMOR_BAM="$2"
+    --disease-bam)
+      DISEASE_BAM="$2"
       shift 2
       ;;
-    --normal-bam)
-      NORMAL_BAM="$2"
+    --control-bam)
+      CONTROL_BAM="$2"
       shift 2
       ;;
     --mei-fasta)
@@ -134,14 +134,14 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   fi
 fi
 
-for required in "${TUMOR_BAM}" "${NORMAL_BAM}" "${MEI_FASTA}"; do
+for required in "${DISEASE_BAM}" "${CONTROL_BAM}" "${MEI_FASTA}"; do
   if [[ -z "${required}" ]]; then
-    echo "ERROR: missing required args: --tumor-bam, --normal-bam, --mei-fasta" >&2
+    echo "ERROR: missing required args: --disease-bam, --control-bam, --mei-fasta" >&2
     exit 1
   fi
 done
 
-for f in "${TUMOR_BAM}" "${NORMAL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MAPPABILITY_BEDGRAPH}" "${GAP_BED}" "${BLACKLIST_BED}"; do
+for f in "${DISEASE_BAM}" "${CONTROL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MAPPABILITY_BEDGRAPH}" "${GAP_BED}" "${BLACKLIST_BED}"; do
   if [[ ! -f "${f}" ]]; then
     echo "ERROR: required file not found: ${f}" >&2
     exit 1
@@ -188,8 +188,8 @@ run_cli() {
 stage_t0=$(now_epoch)
 echo "[proof-of-signal] stage=extract-split-evidence region=${REGION}"
 run_cli extract-split-evidence \
-  --tumor-bam "${TUMOR_BAM}" \
-  --normal-bam "${NORMAL_BAM}" \
+  --disease-bam "${DISEASE_BAM}" \
+  --control-bam "${CONTROL_BAM}" \
   --outdir "${OUTDIR}" \
   --region "${REGION}" \
   --min-mapq 20 \
@@ -221,8 +221,8 @@ annotate_cmd=(
   --evidence-dir "${OUTDIR}"
   --candidate-loci "${OUTDIR}/candidate_loci.tsv"
   --mei-fasta "${MEI_FASTA}"
-  --tumor-bam-depth "${TUMOR_BAM}"
-  --normal-bam-depth "${NORMAL_BAM}"
+  --disease-bam-depth "${DISEASE_BAM}"
+  --control-bam-depth "${CONTROL_BAM}"
   --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
   --empirical-exclude-segdup-bed "${SEG_DUP_BED}"
   --empirical-exclude-mappability-bedgraph "${MAPPABILITY_LOW_BED}"

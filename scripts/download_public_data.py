@@ -814,7 +814,7 @@ def main() -> int:
     }
 
     print(
-        "Storage note: full-BAM workflows (whole tumor+normal remap) may require ~300GB free disk. "
+        "Storage note: full-BAM workflows (whole disease+control remap) may require ~300GB free disk. "
         "This downloader uses chr22 remote slicing for test BAMs to reduce footprint.",
         file=sys.stderr,
     )

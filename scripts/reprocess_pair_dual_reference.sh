@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Re-map tumor/normal BAM pairs to both hg38 and hs1/T2T references.
+# Re-map disease/control BAM pairs to both hg38 and hs1/T2T references.
 # This is the assembly-harmonization path for having BAMs on both references.
 #
 # NOTE:
@@ -12,16 +12,16 @@ set -euo pipefail
 #
 # Example:
 #   bash scripts/reprocess_pair_dual_reference.sh \
-#     --tumor-bam data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam \
-#     --normal-bam data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam \
+#     --disease-bam data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam \
+#     --control-bam data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam \
 #     --hg38-fasta data/public/reference/hg38/hg38.fa \
 #     --hs1-fasta data/public/reference/hs1/GCA_009914755.4_T2T-CHM13v2.0_genomic.fna \
 #     --prefix seqc2_chr22 \
 #     --outdir results/reprocessed_bams \
 #     --threads 16
 
-TUMOR_BAM=""
-NORMAL_BAM=""
+DISEASE_BAM=""
+CONTROL_BAM=""
 HG38_FASTA=""
 HS1_FASTA=""
 OUTDIR="results/reprocessed_bams"
@@ -31,12 +31,12 @@ PREFIX=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tumor-bam)
-      TUMOR_BAM="$2"
+    --disease-bam)
+      DISEASE_BAM="$2"
       shift 2
       ;;
-    --normal-bam)
-      NORMAL_BAM="$2"
+    --control-bam)
+      CONTROL_BAM="$2"
       shift 2
       ;;
     --hg38-fasta)
@@ -80,7 +80,7 @@ make_output_stem() {
   fi
 }
 
-for required in "${TUMOR_BAM}" "${NORMAL_BAM}" "${HG38_FASTA}" "${HS1_FASTA}"; do
+for required in "${DISEASE_BAM}" "${CONTROL_BAM}" "${HG38_FASTA}" "${HS1_FASTA}"; do
   if [[ -z "${required}" ]]; then
     echo "ERROR: missing required arguments. See script header for usage." >&2
     exit 1
@@ -104,7 +104,7 @@ else
   exit 1
 fi
 
-for f in "${TUMOR_BAM}" "${NORMAL_BAM}" "${HG38_FASTA}" "${HS1_FASTA}"; do
+for f in "${DISEASE_BAM}" "${CONTROL_BAM}" "${HG38_FASTA}" "${HS1_FASTA}"; do
   if [[ ! -f "${f}" ]]; then
     echo "ERROR: file not found: ${f}" >&2
     exit 1
@@ -161,22 +161,22 @@ align_sample() {
   samtools index -@ "${THREADS}" "${out_bam}"
 }
 
-extract_fastq "${TUMOR_BAM}" "tumor"
-extract_fastq "${NORMAL_BAM}" "normal"
+extract_fastq "${DISEASE_BAM}" "disease"
+extract_fastq "${CONTROL_BAM}" "control"
 
-align_sample "tumor" "hg38" "${HG38_FASTA}"
-align_sample "normal" "hg38" "${HG38_FASTA}"
-align_sample "tumor" "hs1" "${HS1_FASTA}"
-align_sample "normal" "hs1" "${HS1_FASTA}"
+align_sample "disease" "hg38" "${HG38_FASTA}"
+align_sample "control" "hg38" "${HG38_FASTA}"
+align_sample "disease" "hs1" "${HS1_FASTA}"
+align_sample "control" "hs1" "${HS1_FASTA}"
 
 if [[ "${KEEP_FASTQ}" != "1" ]]; then
-  rm -f "${OUTDIR}/fastq/tumor.R1.fastq.gz" "${OUTDIR}/fastq/tumor.R2.fastq.gz"
-  rm -f "${OUTDIR}/fastq/normal.R1.fastq.gz" "${OUTDIR}/fastq/normal.R2.fastq.gz"
+  rm -f "${OUTDIR}/fastq/disease.R1.fastq.gz" "${OUTDIR}/fastq/disease.R2.fastq.gz"
+  rm -f "${OUTDIR}/fastq/control.R1.fastq.gz" "${OUTDIR}/fastq/control.R2.fastq.gz"
 fi
 
 echo "Done."
 echo "Outputs:"
-echo "  ${OUTDIR}/hg38/$(make_output_stem tumor hg38).bam"
-echo "  ${OUTDIR}/hg38/$(make_output_stem normal hg38).bam"
-echo "  ${OUTDIR}/hs1/$(make_output_stem tumor hs1).bam"
-echo "  ${OUTDIR}/hs1/$(make_output_stem normal hs1).bam"
+echo "  ${OUTDIR}/hg38/$(make_output_stem disease hg38).bam"
+echo "  ${OUTDIR}/hg38/$(make_output_stem control hg38).bam"
+echo "  ${OUTDIR}/hs1/$(make_output_stem disease hs1).bam"
+echo "  ${OUTDIR}/hs1/$(make_output_stem control hs1).bam"

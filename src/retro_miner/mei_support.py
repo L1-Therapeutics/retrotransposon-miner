@@ -1183,60 +1183,60 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
     return pivot
 
 
-def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Path | None = None) -> pd.DataFrame:
+def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Path | None = None) -> pd.DataFrame:
     out = candidates.copy()
     for col in [
-        "tumor_L_mei_start",
-        "tumor_R_mei_start",
-        "tumor_L_mei_end",
-        "tumor_R_mei_end",
-        "tumor_L_mei_breakpoint_mode",
-        "tumor_R_mei_breakpoint_mode",
-        "normal_L_mei_breakpoint_mode",
-        "normal_R_mei_breakpoint_mode",
-        "tumor_L_mei_supported_reads",
-        "tumor_R_mei_supported_reads",
-        "normal_L_mei_supported_reads",
-        "normal_R_mei_supported_reads",
+        "disease_L_mei_start",
+        "disease_R_mei_start",
+        "disease_L_mei_end",
+        "disease_R_mei_end",
+        "disease_L_mei_breakpoint_mode",
+        "disease_R_mei_breakpoint_mode",
+        "control_L_mei_breakpoint_mode",
+        "control_R_mei_breakpoint_mode",
+        "disease_L_mei_supported_reads",
+        "disease_R_mei_supported_reads",
+        "control_L_mei_supported_reads",
+        "control_R_mei_supported_reads",
     ]:
         if col not in out.columns:
             out[col] = 0
         out[col] = out[col].fillna(0).astype(int)
 
-    out["tumor_insertion_mei_start"] = out.apply(
-        lambda r: min([x for x in [r["tumor_L_mei_start"], r["tumor_R_mei_start"]] if x > 0], default=0),
+    out["disease_insertion_mei_start"] = out.apply(
+        lambda r: min([x for x in [r["disease_L_mei_start"], r["disease_R_mei_start"]] if x > 0], default=0),
         axis=1,
     )
-    out["tumor_insertion_mei_end"] = out.apply(
-        lambda r: max([x for x in [r["tumor_L_mei_end"], r["tumor_R_mei_end"]] if x > 0], default=0),
+    out["disease_insertion_mei_end"] = out.apply(
+        lambda r: max([x for x in [r["disease_L_mei_end"], r["disease_R_mei_end"]] if x > 0], default=0),
         axis=1,
     )
-    out["tumor_insertion_mei_span"] = (
-        out["tumor_insertion_mei_end"] - out["tumor_insertion_mei_start"] + 1
-    ).where((out["tumor_insertion_mei_start"] > 0) & (out["tumor_insertion_mei_end"] >= out["tumor_insertion_mei_start"]), 0)
+    out["disease_insertion_mei_span"] = (
+        out["disease_insertion_mei_end"] - out["disease_insertion_mei_start"] + 1
+    ).where((out["disease_insertion_mei_start"] > 0) & (out["disease_insertion_mei_end"] >= out["disease_insertion_mei_start"]), 0)
 
     def orient(row: pd.Series) -> str:
-        strands = [s for s in [row.get("tumor_L_mei_strand", ""), row.get("tumor_R_mei_strand", "")] if s in {"+", "-"}]
+        strands = [s for s in [row.get("disease_L_mei_strand", ""), row.get("disease_R_mei_strand", "")] if s in {"+", "-"}]
         if not strands:
             return ""
         if len(set(strands)) == 1:
             return strands[0]
         return "mixed"
 
-    out["tumor_insertion_orientation"] = out.apply(orient, axis=1)
+    out["disease_insertion_orientation"] = out.apply(orient, axis=1)
 
     def _pick_tsd_pair(row: pd.Series) -> tuple[int, int, int]:
-        # Prefer strict bilateral pairs from either tumor or normal.
+        # Prefer strict bilateral pairs from either disease or control.
         # If strict length is invalid, allow a small ±2 bp breakpoint rescue.
         candidates: list[tuple[int, int, int, int]] = []
-        t_l = int(row.get("tumor_L_mei_breakpoint_mode", 0))
-        t_r = int(row.get("tumor_R_mei_breakpoint_mode", 0))
-        t_support = int(row.get("tumor_L_mei_supported_reads", 0)) + int(row.get("tumor_R_mei_supported_reads", 0))
+        t_l = int(row.get("disease_L_mei_breakpoint_mode", 0))
+        t_r = int(row.get("disease_R_mei_breakpoint_mode", 0))
+        t_support = int(row.get("disease_L_mei_supported_reads", 0)) + int(row.get("disease_R_mei_supported_reads", 0))
         if t_l > 0 and t_r > 0:
             candidates.append((t_l, t_r, t_support, 0))
-        n_l = int(row.get("normal_L_mei_breakpoint_mode", 0))
-        n_r = int(row.get("normal_R_mei_breakpoint_mode", 0))
-        n_support = int(row.get("normal_L_mei_supported_reads", 0)) + int(row.get("normal_R_mei_supported_reads", 0))
+        n_l = int(row.get("control_L_mei_breakpoint_mode", 0))
+        n_r = int(row.get("control_R_mei_breakpoint_mode", 0))
+        n_support = int(row.get("control_L_mei_supported_reads", 0)) + int(row.get("control_R_mei_supported_reads", 0))
         if n_l > 0 and n_r > 0:
             candidates.append((n_l, n_r, n_support, 1))
         if not candidates:
@@ -1285,12 +1285,12 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
         r = int(row.get("tsd_right_breakpoint", 0))
         if l > 0 and r > 0:
             return int((l + r) // 2)
-        l = int(row.get("tumor_L_mei_breakpoint_mode", 0))
-        r = int(row.get("tumor_R_mei_breakpoint_mode", 0))
+        l = int(row.get("disease_L_mei_breakpoint_mode", 0))
+        r = int(row.get("disease_R_mei_breakpoint_mode", 0))
         if l > 0 and r > 0:
             return int((l + r) // 2)
-        l = int(row.get("normal_L_mei_breakpoint_mode", 0))
-        r = int(row.get("normal_R_mei_breakpoint_mode", 0))
+        l = int(row.get("control_L_mei_breakpoint_mode", 0))
+        r = int(row.get("control_R_mei_breakpoint_mode", 0))
         if l > 0 and r > 0:
             return int((l + r) // 2)
         if l > 0:
@@ -1299,29 +1299,29 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
             return r
         return 0
 
-    out["tumor_insertion_breakpoint_pos"] = out.apply(_breakpoint_pos, axis=1).astype(int)
+    out["disease_insertion_breakpoint_pos"] = out.apply(_breakpoint_pos, axis=1).astype(int)
     out["tsd_seq"] = ""
-    out["tumor_breakpoint_context_11bp"] = ""
-    out["tumor_breakpoint_l1_en_hexamer"] = ""
-    out["tumor_breakpoint_l1_en_pattern"] = ""
-    out["tumor_breakpoint_context_11bp_oriented"] = ""
-    out["tumor_breakpoint_l1_en_hexamer_oriented"] = ""
-    out["tumor_breakpoint_l1_en_pattern_yy_rrrr"] = ""
-    out["tumor_breakpoint_l1_en_orientation_source"] = "unknown"
-    out["tumor_breakpoint_l1_en_motif_like"] = False
-    out["tumor_breakpoint_l1_en_best_motif"] = ""
-    out["tumor_breakpoint_l1_en_motif_type"] = ""
-    out["tumor_breakpoint_l1_en_mismatches"] = 99
-    out["tumor_breakpoint_l1_en_mismatch_tolerance"] = 0
-    out["tumor_breakpoint_l1_en_best_match_seq"] = ""
-    out["tumor_breakpoint_l1_en_best_match_offset"] = 0
-    out["tumor_breakpoint_l1_en_best_match_strand"] = "unknown"
-    out["tumor_breakpoint_l1_en_best_match_anchor_6mer"] = ""
-    out["tumor_breakpoint_l1_en_best_match_pattern_yy_rrrr"] = ""
-    out["tumor_breakpoint_yyrrrr_logodds"] = float("nan")
-    out["tumor_breakpoint_yyrrrr_logodds_shift1_max"] = float("nan")
-    out["tumor_breakpoint_yyrrrr_best_offset"] = -1
-    out["tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = float("nan")
+    out["disease_breakpoint_context_11bp"] = ""
+    out["disease_breakpoint_l1_en_hexamer"] = ""
+    out["disease_breakpoint_l1_en_pattern"] = ""
+    out["disease_breakpoint_context_11bp_oriented"] = ""
+    out["disease_breakpoint_l1_en_hexamer_oriented"] = ""
+    out["disease_breakpoint_l1_en_pattern_yy_rrrr"] = ""
+    out["disease_breakpoint_l1_en_orientation_source"] = "unknown"
+    out["disease_breakpoint_l1_en_motif_like"] = False
+    out["disease_breakpoint_l1_en_best_motif"] = ""
+    out["disease_breakpoint_l1_en_motif_type"] = ""
+    out["disease_breakpoint_l1_en_mismatches"] = 99
+    out["disease_breakpoint_l1_en_mismatch_tolerance"] = 0
+    out["disease_breakpoint_l1_en_best_match_seq"] = ""
+    out["disease_breakpoint_l1_en_best_match_offset"] = 0
+    out["disease_breakpoint_l1_en_best_match_strand"] = "unknown"
+    out["disease_breakpoint_l1_en_best_match_anchor_6mer"] = ""
+    out["disease_breakpoint_l1_en_best_match_pattern_yy_rrrr"] = ""
+    out["disease_breakpoint_yyrrrr_logodds"] = float("nan")
+    out["disease_breakpoint_yyrrrr_logodds_shift1_max"] = float("nan")
+    out["disease_breakpoint_yyrrrr_best_offset"] = -1
+    out["disease_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = float("nan")
     if reference_fasta is not None:
         with pysam.FastaFile(str(reference_fasta)) as ref:
             seqs = []
@@ -1358,7 +1358,7 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
                     except Exception:
                         seqs.append("")
 
-                bp = int(getattr(row, "tumor_insertion_breakpoint_pos", 0))
+                bp = int(getattr(row, "disease_insertion_breakpoint_pos", 0))
                 if bp <= 0:
                     contexts_11bp.append("")
                     l1_hexamers.append("")
@@ -1401,7 +1401,7 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
                 oriented_hex6, oriented_ctx11, orientation_source = _orient_to_insertion_strand(
                     hexamer=hex6,
                     context11bp=ctx11,
-                    orientation=str(getattr(row, "tumor_insertion_orientation", "")),
+                    orientation=str(getattr(row, "disease_insertion_orientation", "")),
                 )
                 patt_yy_rrrr = f"{oriented_hex6[:2]}/{oriented_hex6[2:6]}" if len(oriented_hex6) == 6 else ""
                 allow_reverse_scan = orientation_source == "unknown"
@@ -1446,96 +1446,96 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
                 yyrrrr_best_offsets.append(int(yyrrrr_best_off))
                 yyrrrr_shift1_mt_adj_scores.append(float(yyrrrr_shift1_mt_adj))
             out["tsd_seq"] = seqs
-            out["tumor_breakpoint_context_11bp"] = contexts_11bp
-            out["tumor_breakpoint_l1_en_hexamer"] = l1_hexamers
-            out["tumor_breakpoint_l1_en_pattern"] = l1_patterns
-            out["tumor_breakpoint_context_11bp_oriented"] = contexts_11bp_oriented
-            out["tumor_breakpoint_l1_en_hexamer_oriented"] = l1_hexamers_oriented
-            out["tumor_breakpoint_l1_en_pattern_yy_rrrr"] = l1_patterns_yy_rrrr
-            out["tumor_breakpoint_l1_en_orientation_source"] = l1_orientation_source
-            out["tumor_breakpoint_l1_en_motif_like"] = l1_like
-            out["tumor_breakpoint_l1_en_best_motif"] = l1_best_motif
-            out["tumor_breakpoint_l1_en_motif_type"] = l1_motif_type
-            out["tumor_breakpoint_l1_en_mismatches"] = l1_mismatches
-            out["tumor_breakpoint_l1_en_mismatch_tolerance"] = l1_tolerance
-            out["tumor_breakpoint_l1_en_best_match_seq"] = l1_best_match_seq
-            out["tumor_breakpoint_l1_en_best_match_offset"] = l1_best_match_offset
-            out["tumor_breakpoint_l1_en_best_match_strand"] = l1_best_match_strand
-            out["tumor_breakpoint_l1_en_best_match_anchor_6mer"] = l1_best_match_anchor_6mer
-            out["tumor_breakpoint_l1_en_best_match_pattern_yy_rrrr"] = l1_best_match_pattern
-            out["tumor_breakpoint_yyrrrr_logodds"] = yyrrrr_scores
-            out["tumor_breakpoint_yyrrrr_logodds_shift1_max"] = yyrrrr_shift1_scores
-            out["tumor_breakpoint_yyrrrr_best_offset"] = yyrrrr_best_offsets
-            out["tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = yyrrrr_shift1_mt_adj_scores
+            out["disease_breakpoint_context_11bp"] = contexts_11bp
+            out["disease_breakpoint_l1_en_hexamer"] = l1_hexamers
+            out["disease_breakpoint_l1_en_pattern"] = l1_patterns
+            out["disease_breakpoint_context_11bp_oriented"] = contexts_11bp_oriented
+            out["disease_breakpoint_l1_en_hexamer_oriented"] = l1_hexamers_oriented
+            out["disease_breakpoint_l1_en_pattern_yy_rrrr"] = l1_patterns_yy_rrrr
+            out["disease_breakpoint_l1_en_orientation_source"] = l1_orientation_source
+            out["disease_breakpoint_l1_en_motif_like"] = l1_like
+            out["disease_breakpoint_l1_en_best_motif"] = l1_best_motif
+            out["disease_breakpoint_l1_en_motif_type"] = l1_motif_type
+            out["disease_breakpoint_l1_en_mismatches"] = l1_mismatches
+            out["disease_breakpoint_l1_en_mismatch_tolerance"] = l1_tolerance
+            out["disease_breakpoint_l1_en_best_match_seq"] = l1_best_match_seq
+            out["disease_breakpoint_l1_en_best_match_offset"] = l1_best_match_offset
+            out["disease_breakpoint_l1_en_best_match_strand"] = l1_best_match_strand
+            out["disease_breakpoint_l1_en_best_match_anchor_6mer"] = l1_best_match_anchor_6mer
+            out["disease_breakpoint_l1_en_best_match_pattern_yy_rrrr"] = l1_best_match_pattern
+            out["disease_breakpoint_yyrrrr_logodds"] = yyrrrr_scores
+            out["disease_breakpoint_yyrrrr_logodds_shift1_max"] = yyrrrr_shift1_scores
+            out["disease_breakpoint_yyrrrr_best_offset"] = yyrrrr_best_offsets
+            out["disease_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = yyrrrr_shift1_mt_adj_scores
 
     # Weighted coherence metrics for ranking (annotation-only, no hard filtering).
-    out["tumor_breakpoint_mode_fraction_weighted"] = (
-        out.get("tumor_L_mei_breakpoint_mode_fraction", 0.0) * out.get("tumor_L_mei_supported_reads", 0)
-        + out.get("tumor_R_mei_breakpoint_mode_fraction", 0.0) * out.get("tumor_R_mei_supported_reads", 0)
-    ) / out.get("tumor_mei_supported_reads", 0).replace(0, 1)
-    out["normal_breakpoint_mode_fraction_weighted"] = (
-        out.get("normal_L_mei_breakpoint_mode_fraction", 0.0) * out.get("normal_L_mei_supported_reads", 0)
-        + out.get("normal_R_mei_breakpoint_mode_fraction", 0.0) * out.get("normal_R_mei_supported_reads", 0)
-    ) / out.get("normal_mei_supported_reads", 0).replace(0, 1)
-    out["tumor_subfamily_purity_weighted"] = (
-        out.get("tumor_L_mei_subfamily_purity", 0.0) * out.get("tumor_L_mei_supported_reads", 0)
-        + out.get("tumor_R_mei_subfamily_purity", 0.0) * out.get("tumor_R_mei_supported_reads", 0)
-    ) / out.get("tumor_mei_supported_reads", 0).replace(0, 1)
-    out["normal_subfamily_purity_weighted"] = (
-        out.get("normal_L_mei_subfamily_purity", 0.0) * out.get("normal_L_mei_supported_reads", 0)
-        + out.get("normal_R_mei_subfamily_purity", 0.0) * out.get("normal_R_mei_supported_reads", 0)
-    ) / out.get("normal_mei_supported_reads", 0).replace(0, 1)
-    mapq_scaled = (out.get("split_tumor_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0)
+    out["disease_breakpoint_mode_fraction_weighted"] = (
+        out.get("disease_L_mei_breakpoint_mode_fraction", 0.0) * out.get("disease_L_mei_supported_reads", 0)
+        + out.get("disease_R_mei_breakpoint_mode_fraction", 0.0) * out.get("disease_R_mei_supported_reads", 0)
+    ) / out.get("disease_mei_supported_reads", 0).replace(0, 1)
+    out["control_breakpoint_mode_fraction_weighted"] = (
+        out.get("control_L_mei_breakpoint_mode_fraction", 0.0) * out.get("control_L_mei_supported_reads", 0)
+        + out.get("control_R_mei_breakpoint_mode_fraction", 0.0) * out.get("control_R_mei_supported_reads", 0)
+    ) / out.get("control_mei_supported_reads", 0).replace(0, 1)
+    out["disease_subfamily_purity_weighted"] = (
+        out.get("disease_L_mei_subfamily_purity", 0.0) * out.get("disease_L_mei_supported_reads", 0)
+        + out.get("disease_R_mei_subfamily_purity", 0.0) * out.get("disease_R_mei_supported_reads", 0)
+    ) / out.get("disease_mei_supported_reads", 0).replace(0, 1)
+    out["control_subfamily_purity_weighted"] = (
+        out.get("control_L_mei_subfamily_purity", 0.0) * out.get("control_L_mei_supported_reads", 0)
+        + out.get("control_R_mei_subfamily_purity", 0.0) * out.get("control_R_mei_supported_reads", 0)
+    ) / out.get("control_mei_supported_reads", 0).replace(0, 1)
+    mapq_scaled = (out.get("split_disease_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0)
     out["coherence_score"] = (
-        0.4 * out["tumor_breakpoint_mode_fraction_weighted"].fillna(0.0)
-        + 0.4 * out["tumor_subfamily_purity_weighted"].fillna(0.0)
+        0.4 * out["disease_breakpoint_mode_fraction_weighted"].fillna(0.0)
+        + 0.4 * out["disease_subfamily_purity_weighted"].fillna(0.0)
         + 0.2 * mapq_scaled.fillna(0.0)
     )
-    out["normal_background_score"] = (
-        out.get("normal_mei_supported_reads", 0).astype(float)
-        + out.get("normal_total_rows", 0).astype(float)
+    out["control_background_score"] = (
+        out.get("control_mei_supported_reads", 0).astype(float)
+        + out.get("control_total_rows", 0).astype(float)
     )
 
-    out["tumor_poly_at_reads"] = out.get("tumor_L_poly_at_reads", 0).fillna(0).astype(int) + out.get(
-        "tumor_R_poly_at_reads", 0
+    out["disease_poly_at_reads"] = out.get("disease_L_poly_at_reads", 0).fillna(0).astype(int) + out.get(
+        "disease_R_poly_at_reads", 0
     ).fillna(0).astype(int)
-    out["normal_poly_at_reads"] = out.get("normal_L_poly_at_reads", 0).fillna(0).astype(int) + out.get(
-        "normal_R_poly_at_reads", 0
+    out["control_poly_at_reads"] = out.get("control_L_poly_at_reads", 0).fillna(0).astype(int) + out.get(
+        "control_R_poly_at_reads", 0
     ).fillna(0).astype(int)
-    out["tumor_poly_at_max_run"] = (
-        out.get("tumor_L_poly_at_max_run", 0).fillna(0).astype(int).combine(
-            out.get("tumor_R_poly_at_max_run", 0).fillna(0).astype(int), max
+    out["disease_poly_at_max_run"] = (
+        out.get("disease_L_poly_at_max_run", 0).fillna(0).astype(int).combine(
+            out.get("disease_R_poly_at_max_run", 0).fillna(0).astype(int), max
         )
     )
-    out["normal_poly_at_max_run"] = (
-        out.get("normal_L_poly_at_max_run", 0).fillna(0).astype(int).combine(
-            out.get("normal_R_poly_at_max_run", 0).fillna(0).astype(int), max
+    out["control_poly_at_max_run"] = (
+        out.get("control_L_poly_at_max_run", 0).fillna(0).astype(int).combine(
+            out.get("control_R_poly_at_max_run", 0).fillna(0).astype(int), max
         )
     )
-    out["tumor_poly_at_fraction_weighted"] = (
-        out.get("tumor_L_poly_at_fraction", 0.0).fillna(0.0).astype(float) * out.get("tumor_L_mei_supported_reads", 0)
-        + out.get("tumor_R_poly_at_fraction", 0.0).fillna(0.0).astype(float) * out.get("tumor_R_mei_supported_reads", 0)
-    ) / out.get("tumor_mei_supported_reads", 0).replace(0, 1)
-    out["normal_poly_at_fraction_weighted"] = (
-        out.get("normal_L_poly_at_fraction", 0.0).fillna(0.0).astype(float)
-        * out.get("normal_L_mei_supported_reads", 0)
-        + out.get("normal_R_poly_at_fraction", 0.0).fillna(0.0).astype(float)
-        * out.get("normal_R_mei_supported_reads", 0)
-    ) / out.get("normal_mei_supported_reads", 0).replace(0, 1)
+    out["disease_poly_at_fraction_weighted"] = (
+        out.get("disease_L_poly_at_fraction", 0.0).fillna(0.0).astype(float) * out.get("disease_L_mei_supported_reads", 0)
+        + out.get("disease_R_poly_at_fraction", 0.0).fillna(0.0).astype(float) * out.get("disease_R_mei_supported_reads", 0)
+    ) / out.get("disease_mei_supported_reads", 0).replace(0, 1)
+    out["control_poly_at_fraction_weighted"] = (
+        out.get("control_L_poly_at_fraction", 0.0).fillna(0.0).astype(float)
+        * out.get("control_L_mei_supported_reads", 0)
+        + out.get("control_R_poly_at_fraction", 0.0).fillna(0.0).astype(float)
+        * out.get("control_R_mei_supported_reads", 0)
+    ) / out.get("control_mei_supported_reads", 0).replace(0, 1)
 
-    normal_metrics = out.apply(
-        lambda r: _sample_insertion_span_and_orientation(r, "normal"),
+    control_metrics = out.apply(
+        lambda r: _sample_insertion_span_and_orientation(r, "control"),
         axis=1,
         result_type="expand",
     )
-    normal_metrics.columns = [
-        "normal_insertion_mei_start",
-        "normal_insertion_mei_end",
-        "normal_insertion_mei_span",
-        "normal_insertion_orientation",
+    control_metrics.columns = [
+        "control_insertion_mei_start",
+        "control_insertion_mei_end",
+        "control_insertion_mei_span",
+        "control_insertion_orientation",
     ]
-    for col in normal_metrics.columns:
-        out[col] = normal_metrics[col]
+    for col in control_metrics.columns:
+        out[col] = control_metrics[col]
     out["insertion_orientation"] = out.apply(_choose_consolidated_insertion_orientation, axis=1)
     out["insertion_mei_span"] = out.apply(_choose_consolidated_insertion_mei_span, axis=1).astype(int)
     return out
@@ -1601,43 +1601,43 @@ def _sample_has_bilateral_discordant_support(row: pd.Series, prefix: str) -> boo
 
 
 def _choose_consolidated_insertion_orientation(row: pd.Series) -> str:
-    tumor_orient = str(row.get("tumor_insertion_orientation", "") or "").strip()
-    normal_orient = str(row.get("normal_insertion_orientation", "") or "").strip()
-    tumor_bilateral = _sample_has_bilateral_split_support(row, "tumor") or _sample_has_bilateral_discordant_support(
-        row, "tumor"
+    disease_orient = str(row.get("disease_insertion_orientation", "") or "").strip()
+    control_orient = str(row.get("control_insertion_orientation", "") or "").strip()
+    disease_bilateral = _sample_has_bilateral_split_support(row, "disease") or _sample_has_bilateral_discordant_support(
+        row, "disease"
     )
-    normal_bilateral = _sample_has_bilateral_split_support(row, "normal") or _sample_has_bilateral_discordant_support(
-        row, "normal"
+    control_bilateral = _sample_has_bilateral_split_support(row, "control") or _sample_has_bilateral_discordant_support(
+        row, "control"
     )
-    if tumor_bilateral and tumor_orient in {"+", "-"}:
-        return tumor_orient
-    if normal_bilateral and normal_orient in {"+", "-"}:
-        return normal_orient
-    if tumor_orient in {"+", "-"}:
-        return tumor_orient
-    if normal_orient in {"+", "-"}:
-        return normal_orient
+    if disease_bilateral and disease_orient in {"+", "-"}:
+        return disease_orient
+    if control_bilateral and control_orient in {"+", "-"}:
+        return control_orient
+    if disease_orient in {"+", "-"}:
+        return disease_orient
+    if control_orient in {"+", "-"}:
+        return control_orient
     return _choose_event_orientation(row)
 
 
 def _choose_consolidated_insertion_mei_span(row: pd.Series) -> int:
-    tumor_span = _row_int(row, "tumor_insertion_mei_span")
-    normal_span = _row_int(row, "normal_insertion_mei_span")
-    tumor_bilateral = _sample_has_bilateral_split_support(row, "tumor") or _sample_has_bilateral_discordant_support(
-        row, "tumor"
+    disease_span = _row_int(row, "disease_insertion_mei_span")
+    control_span = _row_int(row, "control_insertion_mei_span")
+    disease_bilateral = _sample_has_bilateral_split_support(row, "disease") or _sample_has_bilateral_discordant_support(
+        row, "disease"
     )
-    normal_bilateral = _sample_has_bilateral_split_support(row, "normal") or _sample_has_bilateral_discordant_support(
-        row, "normal"
+    control_bilateral = _sample_has_bilateral_split_support(row, "control") or _sample_has_bilateral_discordant_support(
+        row, "control"
     )
-    if tumor_bilateral and tumor_span > 0:
-        return tumor_span
-    if normal_bilateral and normal_span > 0:
-        return normal_span
-    if tumor_span > 0 and normal_span > 0:
-        tumor_reads = _row_int(row, "tumor_mei_supported_reads")
-        normal_reads = _row_int(row, "normal_mei_supported_reads")
-        return tumor_span if tumor_reads >= normal_reads else normal_span
-    return max(tumor_span, normal_span)
+    if disease_bilateral and disease_span > 0:
+        return disease_span
+    if control_bilateral and control_span > 0:
+        return control_span
+    if disease_span > 0 and control_span > 0:
+        disease_reads = _row_int(row, "disease_mei_supported_reads")
+        control_reads = _row_int(row, "control_mei_supported_reads")
+        return disease_span if disease_reads >= control_reads else control_span
+    return max(disease_span, control_span)
 
 
 def _broaden_poly_at_fields(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -1654,7 +1654,7 @@ def _broaden_poly_at_fields(candidates: pd.DataFrame) -> pd.DataFrame:
             return pd.Series(0, index=out.index, dtype=int)
         return pd.concat(parts, axis=1).max(axis=1).astype(int)
 
-    for prefix in ("tumor", "normal"):
+    for prefix in ("disease", "control"):
         out[f"{prefix}_poly_at_max_run"] = _max_int_series(
             f"{prefix}_poly_at_max_run",
             f"split_{prefix}_poly_tail_at_run_max",
@@ -1668,14 +1668,14 @@ def _broaden_poly_at_fields(candidates: pd.DataFrame) -> pd.DataFrame:
             + discordant_poly_reads
         )
 
-    out["poly_at_max_run"] = _max_int_series("tumor_poly_at_max_run", "normal_poly_at_max_run")
-    out["poly_at_reads"] = _col_int("tumor_poly_at_reads") + _col_int("normal_poly_at_reads")
+    out["poly_at_max_run"] = _max_int_series("disease_poly_at_max_run", "control_poly_at_max_run")
+    out["poly_at_reads"] = _col_int("disease_poly_at_reads") + _col_int("control_poly_at_reads")
     return out
 
 
 def _add_consolidated_event_fields(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
-    for prefix in ("tumor", "normal"):
+    for prefix in ("disease", "control"):
         out[f"{prefix}_left_supported_reads"] = (
             out.get(f"{prefix}_L_mei_supported_reads", 0).fillna(0).astype(int)
             + out.get(f"{prefix}_discordant_mei_left_supported_reads", 0).fillna(0).astype(int)
@@ -1747,16 +1747,16 @@ def _df_col_series(df: pd.DataFrame, col: str, default: object) -> pd.Series:
 
 def _complex_locus_companion_fraction(df: pd.DataFrame) -> pd.Series:
     fraction_cols = [
-        "discordant_tumor_large_insert_fraction",
-        "discordant_tumor_interchrom_fraction",
-        "discordant_tumor_mate_unmapped_fraction",
-        "discordant_tumor_same_strand_fraction",
-        "discordant_tumor_improper_pair_fraction",
-        "discordant_normal_large_insert_fraction",
-        "discordant_normal_interchrom_fraction",
-        "discordant_normal_mate_unmapped_fraction",
-        "discordant_normal_same_strand_fraction",
-        "discordant_normal_improper_pair_fraction",
+        "discordant_disease_large_insert_fraction",
+        "discordant_disease_interchrom_fraction",
+        "discordant_disease_mate_unmapped_fraction",
+        "discordant_disease_same_strand_fraction",
+        "discordant_disease_improper_pair_fraction",
+        "discordant_control_large_insert_fraction",
+        "discordant_control_interchrom_fraction",
+        "discordant_control_mate_unmapped_fraction",
+        "discordant_control_same_strand_fraction",
+        "discordant_control_improper_pair_fraction",
     ]
     parts = [_df_col_float(df, col) for col in fraction_cols if col in df.columns]
     if not parts:
@@ -1766,12 +1766,12 @@ def _complex_locus_companion_fraction(df: pd.DataFrame) -> pd.Series:
 
 def _complex_locus_strong_companion_fraction(df: pd.DataFrame) -> pd.Series:
     fraction_cols = [
-        "discordant_tumor_large_insert_fraction",
-        "discordant_tumor_interchrom_fraction",
-        "discordant_tumor_mate_unmapped_fraction",
-        "discordant_normal_large_insert_fraction",
-        "discordant_normal_interchrom_fraction",
-        "discordant_normal_mate_unmapped_fraction",
+        "discordant_disease_large_insert_fraction",
+        "discordant_disease_interchrom_fraction",
+        "discordant_disease_mate_unmapped_fraction",
+        "discordant_control_large_insert_fraction",
+        "discordant_control_interchrom_fraction",
+        "discordant_control_mate_unmapped_fraction",
     ]
     parts = [_df_col_float(df, col) for col in fraction_cols if col in df.columns]
     if not parts:
@@ -1932,90 +1932,90 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
 
     for col in [
-        "tumor_L_mei_family",
-        "tumor_R_mei_family",
-        "tumor_L_mei_subfamily",
-        "tumor_R_mei_subfamily",
-        "tumor_L_mei_strand",
-        "tumor_R_mei_strand",
+        "disease_L_mei_family",
+        "disease_R_mei_family",
+        "disease_L_mei_subfamily",
+        "disease_R_mei_subfamily",
+        "disease_L_mei_strand",
+        "disease_R_mei_strand",
     ]:
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].fillna("").astype(str)
 
-    out["tumor_family_agreement"] = [
-        _agreement_flag(a, b) for a, b in zip(out["tumor_L_mei_family"], out["tumor_R_mei_family"])
+    out["disease_family_agreement"] = [
+        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_family"], out["disease_R_mei_family"])
     ]
-    out["tumor_subfamily_agreement"] = [
-        _agreement_flag(a, b) for a, b in zip(out["tumor_L_mei_subfamily"], out["tumor_R_mei_subfamily"])
+    out["disease_subfamily_agreement"] = [
+        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_subfamily"], out["disease_R_mei_subfamily"])
     ]
-    out["tumor_strand_agreement"] = [
-        _agreement_flag(a, b) for a, b in zip(out["tumor_L_mei_strand"], out["tumor_R_mei_strand"])
+    out["disease_strand_agreement"] = [
+        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_strand"], out["disease_R_mei_strand"])
     ]
-    out["normal_family_agreement"] = [
+    out["control_family_agreement"] = [
         _agreement_flag(a, b)
         for a, b in zip(
-            out.get("normal_L_mei_family", "").fillna("").astype(str),
-            out.get("normal_R_mei_family", "").fillna("").astype(str),
+            out.get("control_L_mei_family", "").fillna("").astype(str),
+            out.get("control_R_mei_family", "").fillna("").astype(str),
         )
     ]
-    out["normal_subfamily_agreement"] = [
+    out["control_subfamily_agreement"] = [
         _agreement_flag(a, b)
         for a, b in zip(
-            out.get("normal_L_mei_subfamily", "").fillna("").astype(str),
-            out.get("normal_R_mei_subfamily", "").fillna("").astype(str),
+            out.get("control_L_mei_subfamily", "").fillna("").astype(str),
+            out.get("control_R_mei_subfamily", "").fillna("").astype(str),
         )
     ]
-    out["normal_strand_agreement"] = [
+    out["control_strand_agreement"] = [
         _agreement_flag(a, b)
         for a, b in zip(
-            out.get("normal_L_mei_strand", "").fillna("").astype(str),
-            out.get("normal_R_mei_strand", "").fillna("").astype(str),
+            out.get("control_L_mei_strand", "").fillna("").astype(str),
+            out.get("control_R_mei_strand", "").fillna("").astype(str),
         )
     ]
 
-    tumor_mei_reads = out.get("tumor_mei_supported_reads", 0).astype(float)
-    normal_mei_reads = out.get("normal_mei_supported_reads", 0).astype(float)
-    total_rows = out.get("tumor_total_rows", 0).astype(float).replace(0, 1.0)
+    disease_mei_reads = out.get("disease_mei_supported_reads", 0).astype(float)
+    control_mei_reads = out.get("control_mei_supported_reads", 0).astype(float)
+    total_rows = out.get("disease_total_rows", 0).astype(float).replace(0, 1.0)
     mei_enrichment = out.get("mei_score_enrichment_ratio", 0.0).astype(float)
     mei_enrichment_scaled = (mei_enrichment / (mei_enrichment + 1.0)).clip(lower=0.0, upper=1.0)
-    mei_read_fraction = (tumor_mei_reads / total_rows).clip(lower=0.0, upper=1.0)
+    mei_read_fraction = (disease_mei_reads / total_rows).clip(lower=0.0, upper=1.0)
 
-    # Event-centric confidence score: do not bias to tumor-only support.
+    # Event-centric confidence score: do not bias to disease-only support.
     event_subfamily_purity = pd.concat(
         [
-            out.get("tumor_subfamily_purity_weighted", 0.0).astype(float).fillna(0.0),
-            out.get("normal_subfamily_purity_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("disease_subfamily_purity_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("control_subfamily_purity_weighted", 0.0).astype(float).fillna(0.0),
         ],
         axis=1,
     ).max(axis=1)
     event_breakpoint_consistency = pd.concat(
         [
-            out.get("tumor_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
-            out.get("normal_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("disease_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("control_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
         ],
         axis=1,
     ).max(axis=1)
     event_family_agreement = pd.concat(
-        [out["tumor_family_agreement"].astype(float), out["normal_family_agreement"].astype(float)],
+        [out["disease_family_agreement"].astype(float), out["control_family_agreement"].astype(float)],
         axis=1,
     ).max(axis=1)
     event_subfamily_agreement = pd.concat(
-        [out["tumor_subfamily_agreement"].astype(float), out["normal_subfamily_agreement"].astype(float)],
+        [out["disease_subfamily_agreement"].astype(float), out["control_subfamily_agreement"].astype(float)],
         axis=1,
     ).max(axis=1)
     event_strand_agreement = pd.concat(
-        [out["tumor_strand_agreement"].astype(float), out["normal_strand_agreement"].astype(float)],
+        [out["disease_strand_agreement"].astype(float), out["control_strand_agreement"].astype(float)],
         axis=1,
     ).max(axis=1)
-    normal_mei_fraction = (
-        normal_mei_reads / out.get("normal_total_rows", 0).astype(float).replace(0, 1.0)
+    control_mei_fraction = (
+        control_mei_reads / out.get("control_total_rows", 0).astype(float).replace(0, 1.0)
     ).clip(lower=0.0, upper=1.0)
-    event_mei_fraction = pd.concat([mei_read_fraction.fillna(0.0), normal_mei_fraction.fillna(0.0)], axis=1).max(axis=1)
+    event_mei_fraction = pd.concat([mei_read_fraction.fillna(0.0), control_mei_fraction.fillna(0.0)], axis=1).max(axis=1)
     mapq_event = pd.concat(
         [
-            (out.get("split_tumor_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0),
-            (out.get("split_normal_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0),
+            (out.get("split_disease_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0),
+            (out.get("split_control_mapq_mean", 0.0).astype(float) / 60.0).clip(lower=0.0, upper=1.0),
         ],
         axis=1,
     ).max(axis=1)
@@ -2023,13 +2023,13 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     tsd_boost = out.get("tsd_detected", False).fillna(False).astype(bool).astype(float)
     polyA_event = pd.concat(
         [
-            out.get("tumor_poly_at_fraction_weighted", 0.0).astype(float).fillna(0.0),
-            out.get("normal_poly_at_fraction_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("disease_poly_at_fraction_weighted", 0.0).astype(float).fillna(0.0),
+            out.get("control_poly_at_fraction_weighted", 0.0).astype(float).fillna(0.0),
         ],
         axis=1,
     ).max(axis=1).clip(lower=0.0, upper=1.0)
-    motif_boost = out.get("tumor_breakpoint_l1_en_motif_like", False).fillna(False).astype(bool).astype(float)
-    motif_logodds = out.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0).astype(float).fillna(0.0)
+    motif_boost = out.get("disease_breakpoint_l1_en_motif_like", False).fillna(False).astype(bool).astype(float)
+    motif_logodds = out.get("disease_breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0).astype(float).fillna(0.0)
     motif_logodds_scaled = (motif_logodds / 6.0).clip(lower=0.0, upper=1.0)
 
     base_score = (
@@ -2050,16 +2050,16 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     # Track complex SV-like companion signatures without suppressing MEI detection.
     complex_companion_fraction = _complex_locus_companion_fraction(out)
     complex_strong_companion_fraction = _complex_locus_strong_companion_fraction(out)
-    large_insert_fraction = _df_col_float(out, "discordant_tumor_large_insert_fraction")
-    interchrom_fraction = _df_col_float(out, "discordant_tumor_interchrom_fraction")
-    mate_unmapped_fraction = _df_col_float(out, "discordant_tumor_mate_unmapped_fraction")
+    large_insert_fraction = _df_col_float(out, "discordant_disease_large_insert_fraction")
+    interchrom_fraction = _df_col_float(out, "discordant_disease_interchrom_fraction")
+    mate_unmapped_fraction = _df_col_float(out, "discordant_disease_mate_unmapped_fraction")
 
     out["complex_sv_large_insert_flag"] = large_insert_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
     out["complex_sv_interchrom_flag"] = interchrom_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
     out["complex_sv_mate_unmapped_flag"] = mate_unmapped_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
     out["complex_sv_companion_signal"] = complex_strong_companion_fraction >= _COMPLEX_LOCUS_STRONG_MIN_FRACTION
     out["complex_sv_signal_score"] = complex_companion_fraction
-    out["mei_with_complex_sv_signature"] = out["complex_sv_companion_signal"] & (tumor_mei_reads >= 2)
+    out["mei_with_complex_sv_signature"] = out["complex_sv_companion_signal"] & (disease_mei_reads >= 2)
     out["complex_sv_signature_label"] = "none"
     out.loc[out["complex_sv_large_insert_flag"], "complex_sv_signature_label"] = "large_insert"
     out.loc[out["complex_sv_interchrom_flag"], "complex_sv_signature_label"] = "interchrom"
@@ -2075,8 +2075,8 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         out["complex_sv_mate_unmapped_flag"] & (out["complex_sv_signature_label"] != "none"),
         "complex_sv_signature_label",
     ] = out["complex_sv_signature_label"] + "+mate_unmapped"
-    same_strand_fraction = _df_col_float(out, "discordant_tumor_same_strand_fraction")
-    improper_pair_fraction = _df_col_float(out, "discordant_tumor_improper_pair_fraction")
+    same_strand_fraction = _df_col_float(out, "discordant_disease_same_strand_fraction")
+    improper_pair_fraction = _df_col_float(out, "discordant_disease_improper_pair_fraction")
     out.loc[
         (same_strand_fraction >= _COMPLEX_LOCUS_WEAK_MIN_FRACTION) & (out["complex_sv_signature_label"] == "none"),
         "complex_sv_signature_label",
@@ -2088,131 +2088,131 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
 
     score = base_score.clip(lower=0.0, upper=1.0)
     out["insertion_model_score"] = score
-    left_reads = out.get("tumor_L_mei_supported_reads", 0).astype(float)
-    right_reads = out.get("tumor_R_mei_supported_reads", 0).astype(float)
-    discordant_mei_reads = out.get("tumor_discordant_mei_supported_reads", 0).astype(float)
-    left_mode_frac = out.get("tumor_L_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0)
-    right_mode_frac = out.get("tumor_R_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0)
-    left_purity = out.get("tumor_L_mei_subfamily_purity", 0.0).astype(float).fillna(0.0)
-    right_purity = out.get("tumor_R_mei_subfamily_purity", 0.0).astype(float).fillna(0.0)
-    out["tumor_two_sided_support"] = (left_reads >= 1) & (right_reads >= 1)
-    out["tumor_two_sided_strong_support"] = (left_reads >= 2) & (right_reads >= 2)
-    out["tumor_one_sided_split_support"] = ((left_reads >= 2) & (right_reads < 2)) | (
+    left_reads = out.get("disease_L_mei_supported_reads", 0).astype(float)
+    right_reads = out.get("disease_R_mei_supported_reads", 0).astype(float)
+    discordant_mei_reads = out.get("disease_discordant_mei_supported_reads", 0).astype(float)
+    left_mode_frac = out.get("disease_L_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0)
+    right_mode_frac = out.get("disease_R_mei_breakpoint_mode_fraction", 0.0).astype(float).fillna(0.0)
+    left_purity = out.get("disease_L_mei_subfamily_purity", 0.0).astype(float).fillna(0.0)
+    right_purity = out.get("disease_R_mei_subfamily_purity", 0.0).astype(float).fillna(0.0)
+    out["disease_two_sided_support"] = (left_reads >= 1) & (right_reads >= 1)
+    out["disease_two_sided_strong_support"] = (left_reads >= 2) & (right_reads >= 2)
+    out["disease_one_sided_split_support"] = ((left_reads >= 2) & (right_reads < 2)) | (
         (right_reads >= 2) & (left_reads < 2)
     )
-    out["tumor_discordant_mei_strong_support"] = discordant_mei_reads >= 3
-    dpe_left = out.get("tumor_discordant_mei_left_supported_reads", 0).astype(float)
-    dpe_right = out.get("tumor_discordant_mei_right_supported_reads", 0).astype(float)
-    dpe_family_purity = out.get("tumor_discordant_mei_family_purity", 0.0).astype(float).fillna(0.0)
-    dpe_strand_purity = out.get("tumor_discordant_mei_strand_purity", 0.0).astype(float).fillna(0.0)
+    out["disease_discordant_mei_strong_support"] = discordant_mei_reads >= 3
+    dpe_left = out.get("disease_discordant_mei_left_supported_reads", 0).astype(float)
+    dpe_right = out.get("disease_discordant_mei_right_supported_reads", 0).astype(float)
+    dpe_family_purity = out.get("disease_discordant_mei_family_purity", 0.0).astype(float).fillna(0.0)
+    dpe_strand_purity = out.get("disease_discordant_mei_strand_purity", 0.0).astype(float).fillna(0.0)
     dpe_geometry_consistent = (
-        out.get("tumor_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+        out.get("disease_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
     )
     dpe_self_consistent = (
-        out.get("tumor_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+        out.get("disease_discordant_mei_self_consistent", True).fillna(True).astype(bool)
     )
-    out["tumor_discordant_mei_two_sided_support"] = (dpe_left >= 1) & (dpe_right >= 1)
-    out["tumor_discordant_mei_consistent_support"] = (
-        out["tumor_discordant_mei_two_sided_support"]
+    out["disease_discordant_mei_two_sided_support"] = (dpe_left >= 1) & (dpe_right >= 1)
+    out["disease_discordant_mei_consistent_support"] = (
+        out["disease_discordant_mei_two_sided_support"]
         & (dpe_family_purity >= 0.60)
         & (dpe_strand_purity >= 0.60)
         & dpe_geometry_consistent
         & dpe_self_consistent
     )
-    normal_left_reads = out.get("normal_L_mei_supported_reads", 0).astype(float)
-    normal_right_reads = out.get("normal_R_mei_supported_reads", 0).astype(float)
-    out["normal_two_sided_support"] = (normal_left_reads >= 1) & (normal_right_reads >= 1)
-    normal_dpe_left = out.get("normal_discordant_mei_left_supported_reads", 0).astype(float)
-    normal_dpe_right = out.get("normal_discordant_mei_right_supported_reads", 0).astype(float)
-    normal_dpe_family_purity = out.get("normal_discordant_mei_family_purity", 0.0).astype(float).fillna(0.0)
-    normal_dpe_strand_purity = out.get("normal_discordant_mei_strand_purity", 0.0).astype(float).fillna(0.0)
-    normal_dpe_geometry_consistent = (
-        out.get("normal_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+    control_left_reads = out.get("control_L_mei_supported_reads", 0).astype(float)
+    control_right_reads = out.get("control_R_mei_supported_reads", 0).astype(float)
+    out["control_two_sided_support"] = (control_left_reads >= 1) & (control_right_reads >= 1)
+    control_dpe_left = out.get("control_discordant_mei_left_supported_reads", 0).astype(float)
+    control_dpe_right = out.get("control_discordant_mei_right_supported_reads", 0).astype(float)
+    control_dpe_family_purity = out.get("control_discordant_mei_family_purity", 0.0).astype(float).fillna(0.0)
+    control_dpe_strand_purity = out.get("control_discordant_mei_strand_purity", 0.0).astype(float).fillna(0.0)
+    control_dpe_geometry_consistent = (
+        out.get("control_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
     )
-    normal_dpe_self_consistent = (
-        out.get("normal_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    control_dpe_self_consistent = (
+        out.get("control_discordant_mei_self_consistent", True).fillna(True).astype(bool)
     )
-    out["normal_discordant_mei_consistent_support"] = (
-        (normal_dpe_left >= 1)
-        & (normal_dpe_right >= 1)
-        & (normal_dpe_family_purity >= 0.60)
-        & (normal_dpe_strand_purity >= 0.60)
-        & normal_dpe_geometry_consistent
-        & normal_dpe_self_consistent
+    out["control_discordant_mei_consistent_support"] = (
+        (control_dpe_left >= 1)
+        & (control_dpe_right >= 1)
+        & (control_dpe_family_purity >= 0.60)
+        & (control_dpe_strand_purity >= 0.60)
+        & control_dpe_geometry_consistent
+        & control_dpe_self_consistent
     )
-    tumor_left_mei_consistent = _split_side_mei_for_complex(
+    disease_left_mei_consistent = _split_side_mei_for_complex(
         left_reads,
-        out.get("tumor_L_mei_subfamily_purity", 0.0).astype(float),
-        out.get("tumor_L_mei_breakpoint_mode_fraction", 0.0).astype(float),
+        out.get("disease_L_mei_subfamily_purity", 0.0).astype(float),
+        out.get("disease_L_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    tumor_right_mei_consistent = _split_side_mei_for_complex(
+    disease_right_mei_consistent = _split_side_mei_for_complex(
         right_reads,
-        out.get("tumor_R_mei_subfamily_purity", 0.0).astype(float),
-        out.get("tumor_R_mei_breakpoint_mode_fraction", 0.0).astype(float),
+        out.get("disease_R_mei_subfamily_purity", 0.0).astype(float),
+        out.get("disease_R_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    tumor_left_anchor_complex = _discordant_anchor_side_is_complex(
-        out.get("tumor_discordant_anchor_left_unique_reads", 0).astype(float),
-        out.get("tumor_discordant_anchor_left_complex_reason_max_fraction", 0.0).astype(float),
-        out.get("tumor_discordant_mei_left_supported_reads", 0).astype(float),
+    disease_left_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("disease_discordant_anchor_left_unique_reads", 0).astype(float),
+        out.get("disease_discordant_anchor_left_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("disease_discordant_mei_left_supported_reads", 0).astype(float),
     )
-    tumor_right_anchor_complex = _discordant_anchor_side_is_complex(
-        out.get("tumor_discordant_anchor_right_unique_reads", 0).astype(float),
-        out.get("tumor_discordant_anchor_right_complex_reason_max_fraction", 0.0).astype(float),
-        out.get("tumor_discordant_mei_right_supported_reads", 0).astype(float),
+    disease_right_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("disease_discordant_anchor_right_unique_reads", 0).astype(float),
+        out.get("disease_discordant_anchor_right_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("disease_discordant_mei_right_supported_reads", 0).astype(float),
     )
-    out["tumor_discordant_anchor_left_complex_side"] = tumor_left_anchor_complex
-    out["tumor_discordant_anchor_right_complex_side"] = tumor_right_anchor_complex
-    out["tumor_mei_with_complex_sidepair"] = (
-        (tumor_left_mei_consistent & tumor_right_anchor_complex)
-        | (tumor_right_mei_consistent & tumor_left_anchor_complex)
+    out["disease_discordant_anchor_left_complex_side"] = disease_left_anchor_complex
+    out["disease_discordant_anchor_right_complex_side"] = disease_right_anchor_complex
+    out["disease_mei_with_complex_sidepair"] = (
+        (disease_left_mei_consistent & disease_right_anchor_complex)
+        | (disease_right_mei_consistent & disease_left_anchor_complex)
     )
 
-    normal_left_mei_consistent = _split_side_mei_for_complex(
-        normal_left_reads,
-        out.get("normal_L_mei_subfamily_purity", 0.0).astype(float),
-        out.get("normal_L_mei_breakpoint_mode_fraction", 0.0).astype(float),
+    control_left_mei_consistent = _split_side_mei_for_complex(
+        control_left_reads,
+        out.get("control_L_mei_subfamily_purity", 0.0).astype(float),
+        out.get("control_L_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    normal_right_mei_consistent = _split_side_mei_for_complex(
-        normal_right_reads,
-        out.get("normal_R_mei_subfamily_purity", 0.0).astype(float),
-        out.get("normal_R_mei_breakpoint_mode_fraction", 0.0).astype(float),
+    control_right_mei_consistent = _split_side_mei_for_complex(
+        control_right_reads,
+        out.get("control_R_mei_subfamily_purity", 0.0).astype(float),
+        out.get("control_R_mei_breakpoint_mode_fraction", 0.0).astype(float),
     )
-    normal_left_anchor_complex = _discordant_anchor_side_is_complex(
-        out.get("normal_discordant_anchor_left_unique_reads", 0).astype(float),
-        out.get("normal_discordant_anchor_left_complex_reason_max_fraction", 0.0).astype(float),
-        out.get("normal_discordant_mei_left_supported_reads", 0).astype(float),
+    control_left_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("control_discordant_anchor_left_unique_reads", 0).astype(float),
+        out.get("control_discordant_anchor_left_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("control_discordant_mei_left_supported_reads", 0).astype(float),
     )
-    normal_right_anchor_complex = _discordant_anchor_side_is_complex(
-        out.get("normal_discordant_anchor_right_unique_reads", 0).astype(float),
-        out.get("normal_discordant_anchor_right_complex_reason_max_fraction", 0.0).astype(float),
-        out.get("normal_discordant_mei_right_supported_reads", 0).astype(float),
+    control_right_anchor_complex = _discordant_anchor_side_is_complex(
+        out.get("control_discordant_anchor_right_unique_reads", 0).astype(float),
+        out.get("control_discordant_anchor_right_complex_reason_max_fraction", 0.0).astype(float),
+        out.get("control_discordant_mei_right_supported_reads", 0).astype(float),
     )
-    out["normal_discordant_anchor_left_complex_side"] = normal_left_anchor_complex
-    out["normal_discordant_anchor_right_complex_side"] = normal_right_anchor_complex
-    out["normal_mei_with_complex_sidepair"] = (
-        (normal_left_mei_consistent & normal_right_anchor_complex)
-        | (normal_right_mei_consistent & normal_left_anchor_complex)
+    out["control_discordant_anchor_left_complex_side"] = control_left_anchor_complex
+    out["control_discordant_anchor_right_complex_side"] = control_right_anchor_complex
+    out["control_mei_with_complex_sidepair"] = (
+        (control_left_mei_consistent & control_right_anchor_complex)
+        | (control_right_mei_consistent & control_left_anchor_complex)
     )
-    out["tumor_two_sided_like_support"] = out["tumor_two_sided_strong_support"] | (
-        out["tumor_one_sided_split_support"] & out["tumor_discordant_mei_strong_support"]
-    ) | out["tumor_discordant_mei_consistent_support"]
-    out["tumor_side_breakpoint_consistency"] = left_mode_frac.combine(right_mode_frac, min)
-    out["tumor_side_subfamily_purity"] = left_purity.combine(right_purity, min)
-    out["tumor_two_sided_family_consistent"] = out["tumor_two_sided_support"] & (out["tumor_family_agreement"] == 1)
-    out["tumor_two_sided_subfamily_consistent"] = out["tumor_two_sided_support"] & (
-        out["tumor_subfamily_agreement"] == 1
+    out["disease_two_sided_like_support"] = out["disease_two_sided_strong_support"] | (
+        out["disease_one_sided_split_support"] & out["disease_discordant_mei_strong_support"]
+    ) | out["disease_discordant_mei_consistent_support"]
+    out["disease_side_breakpoint_consistency"] = left_mode_frac.combine(right_mode_frac, min)
+    out["disease_side_subfamily_purity"] = left_purity.combine(right_purity, min)
+    out["disease_two_sided_family_consistent"] = out["disease_two_sided_support"] & (out["disease_family_agreement"] == 1)
+    out["disease_two_sided_subfamily_consistent"] = out["disease_two_sided_support"] & (
+        out["disease_subfamily_agreement"] == 1
     )
     out["event_two_sided_like_support"] = (
-        out["tumor_two_sided_like_support"]
-        | out["normal_two_sided_support"]
-        | out["normal_discordant_mei_consistent_support"]
+        out["disease_two_sided_like_support"]
+        | out["control_two_sided_support"]
+        | out["control_discordant_mei_consistent_support"]
     )
-    out["event_family_consistent"] = (out["tumor_family_agreement"] == 1) | (out["normal_family_agreement"] == 1)
-    out["event_strand_consistent"] = (out["tumor_strand_agreement"] == 1) | (out["normal_strand_agreement"] == 1)
+    out["event_family_consistent"] = (out["disease_family_agreement"] == 1) | (out["control_family_agreement"] == 1)
+    out["event_strand_consistent"] = (out["disease_strand_agreement"] == 1) | (out["control_strand_agreement"] == 1)
     out["event_side_breakpoint_consistency"] = pd.concat(
         [
-            out["tumor_side_breakpoint_consistency"].astype(float).fillna(0.0),
-            out.get("normal_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
+            out["disease_side_breakpoint_consistency"].astype(float).fillna(0.0),
+            out.get("control_breakpoint_mode_fraction_weighted", 0.0).astype(float).fillna(0.0),
         ],
         axis=1,
     ).max(axis=1)
@@ -2240,14 +2240,14 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         & (out["insertion_model_score"] >= 0.55)
         & (
             out["event_two_sided_like_support"]
-            | ((tumor_mei_reads + normal_mei_reads) >= 1)
-            | ((discordant_mei_reads + out.get("normal_discordant_mei_supported_reads", 0).astype(float)) >= 1)
+            | ((disease_mei_reads + control_mei_reads) >= 1)
+            | ((discordant_mei_reads + out.get("control_discordant_mei_supported_reads", 0).astype(float)) >= 1)
         )
         & out["event_family_consistent"]
         & (out.get("coherence_score", 0.0).astype(float) >= 0.50)
     )
     complex_sidepair_event = (
-        out["tumor_mei_with_complex_sidepair"] | out["normal_mei_with_complex_sidepair"]
+        out["disease_mei_with_complex_sidepair"] | out["control_mei_with_complex_sidepair"]
     )
     complex_sidepair_pass = (
         (~high_conf_pass)
@@ -2268,23 +2268,23 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out.loc[complex_sidepair_event, "insertion_call_tier"] = "mei_with_complex"
     out.loc[high_conf_pass, "insertion_call_tier"] = "high_conf_two_sided"
 
-    # Sample presence: shared when both tumor and normal have MEI support (>=1 read each).
+    # Sample presence: shared when both disease and control have MEI support (>=1 read each).
     out["sample_status_label"] = "low_support"
-    out.loc[(tumor_mei_reads >= 1) & (normal_mei_reads >= 1), "sample_status_label"] = "shared"
-    out.loc[(tumor_mei_reads >= 1) & (normal_mei_reads == 0), "sample_status_label"] = "somatic_only"
-    out.loc[(tumor_mei_reads == 0) & (normal_mei_reads >= 1), "sample_status_label"] = "germline_only"
+    out.loc[(disease_mei_reads >= 1) & (control_mei_reads >= 1), "sample_status_label"] = "shared"
+    out.loc[(disease_mei_reads >= 1) & (control_mei_reads == 0), "sample_status_label"] = "disease_only"
+    out.loc[(disease_mei_reads == 0) & (control_mei_reads >= 1), "sample_status_label"] = "control_only"
 
     # Explicit convenience flag for downstream filtering.
-    out["likely_false_positive_germline_only"] = out["sample_status_label"] == "germline_only"
+    out["likely_false_positive_control_only"] = out["sample_status_label"] == "control_only"
     return out
 
 
 def _consistent_family_mask(df: pd.DataFrame) -> pd.Series:
     family_cols = [
-        "tumor_L_mei_family",
-        "tumor_R_mei_family",
-        "normal_L_mei_family",
-        "normal_R_mei_family",
+        "disease_L_mei_family",
+        "disease_R_mei_family",
+        "control_L_mei_family",
+        "control_R_mei_family",
     ]
     missing = [c for c in family_cols if c not in df.columns]
     if missing:
@@ -2830,8 +2830,8 @@ def _file_stamp(path: Path | None) -> dict[str, object]:
 
 def _empirical_cache_key(
     loci: pd.DataFrame,
-    tumor_bam_path: Path,
-    normal_bam_path: Path,
+    disease_bam_path: Path,
+    control_bam_path: Path,
     empirical_random_windows: int,
     empirical_random_scope: str,
     empirical_random_seed: int,
@@ -2857,8 +2857,8 @@ def _empirical_cache_key(
         "loci_count": int(len(loci_view)),
         "chrom_counts": {str(k): int(v) for k, v in chrom_counts.items()},
         "span_median": float(pd.Series(spans).median()) if spans else 0.0,
-        "tumor_bam": _file_stamp(tumor_bam_path),
-        "normal_bam": _file_stamp(normal_bam_path),
+        "disease_bam": _file_stamp(disease_bam_path),
+        "control_bam": _file_stamp(control_bam_path),
         "random_windows": int(empirical_random_windows),
         "random_scope": str(empirical_random_scope),
         "random_seed": int(empirical_random_seed),
@@ -2876,8 +2876,8 @@ def _empirical_cache_key(
 
 def _annotate_bam_depth_for_consistent_loci(
     candidates: pd.DataFrame,
-    tumor_bam_path: Path,
-    normal_bam_path: Path,
+    disease_bam_path: Path,
+    control_bam_path: Path,
     empirical_random_windows: int = 1000,
     empirical_random_scope: str = "chromosome",
     empirical_random_seed: int = 13,
@@ -2895,20 +2895,20 @@ def _annotate_bam_depth_for_consistent_loci(
     out["depth_filter_family_consistent"] = False
     out["depth_filter_two_sided_consistent"] = False
     out["depth_filter_pass"] = False
-    out["tumor_local_bam_mean_depth"] = 0.0
-    out["normal_local_bam_mean_depth"] = 0.0
-    out["tumor_context_non_sv_reads"] = 0
-    out["normal_context_non_sv_reads"] = 0
-    out["tumor_context_mapq_mean"] = 0.0
-    out["normal_context_mapq_mean"] = 0.0
-    out["tumor_context_mapq_lt20_fraction"] = 0.0
-    out["normal_context_mapq_lt20_fraction"] = 0.0
-    out["tumor_context_nm_per_100bp_mean"] = 0.0
-    out["normal_context_nm_per_100bp_mean"] = 0.0
-    out["tumor_context_nm_per_100bp_p90"] = 0.0
-    out["normal_context_nm_per_100bp_p90"] = 0.0
-    out["tumor_mei_support_per_100x_bam_depth"] = 0.0
-    out["normal_mei_support_per_100x_bam_depth"] = 0.0
+    out["disease_local_bam_mean_depth"] = 0.0
+    out["control_local_bam_mean_depth"] = 0.0
+    out["disease_context_non_sv_reads"] = 0
+    out["control_context_non_sv_reads"] = 0
+    out["disease_context_mapq_mean"] = 0.0
+    out["control_context_mapq_mean"] = 0.0
+    out["disease_context_mapq_lt20_fraction"] = 0.0
+    out["control_context_mapq_lt20_fraction"] = 0.0
+    out["disease_context_nm_per_100bp_mean"] = 0.0
+    out["control_context_nm_per_100bp_mean"] = 0.0
+    out["disease_context_nm_per_100bp_p90"] = 0.0
+    out["control_context_nm_per_100bp_p90"] = 0.0
+    out["disease_mei_support_per_100x_bam_depth"] = 0.0
+    out["control_mei_support_per_100x_bam_depth"] = 0.0
     out["mei_support_per_100x_bam_depth_delta"] = 0.0
     out["mei_support_per_100x_bam_depth_ratio"] = 1.0
 
@@ -2918,15 +2918,15 @@ def _annotate_bam_depth_for_consistent_loci(
 
     family_consistent = _consistent_family_mask(out)
     out["depth_filter_family_consistent"] = family_consistent
-    tumor_two_sided = out.get("tumor_two_sided_support", False).fillna(False).astype(bool)
-    normal_two_sided = out.get("normal_two_sided_support", False).fillna(False).astype(bool)
-    tumor_family_consistent = out.get("tumor_family_agreement", 0).fillna(0).astype(int) == 1
-    normal_family_consistent = out.get("normal_family_agreement", 0).fillna(0).astype(int) == 1
-    tumor_orientation_consistent = out.get("tumor_strand_agreement", 0).fillna(0).astype(int) == 1
-    normal_orientation_consistent = out.get("normal_strand_agreement", 0).fillna(0).astype(int) == 1
+    disease_two_sided = out.get("disease_two_sided_support", False).fillna(False).astype(bool)
+    control_two_sided = out.get("control_two_sided_support", False).fillna(False).astype(bool)
+    disease_family_consistent = out.get("disease_family_agreement", 0).fillna(0).astype(int) == 1
+    control_family_consistent = out.get("control_family_agreement", 0).fillna(0).astype(int) == 1
+    disease_orientation_consistent = out.get("disease_strand_agreement", 0).fillna(0).astype(int) == 1
+    control_orientation_consistent = out.get("control_strand_agreement", 0).fillna(0).astype(int) == 1
     two_sided_consistent = (
-        (tumor_two_sided & tumor_family_consistent & tumor_orientation_consistent)
-        | (normal_two_sided & normal_family_consistent & normal_orientation_consistent)
+        (disease_two_sided & disease_family_consistent & disease_orientation_consistent)
+        | (control_two_sided & control_family_consistent & control_orientation_consistent)
     )
     out["depth_filter_two_sided_consistent"] = two_sided_consistent
     silver_mask = out.get("silver_stage_pass", False).fillna(False).astype(bool)
@@ -2943,8 +2943,8 @@ def _annotate_bam_depth_for_consistent_loci(
     loci_for_empirical = out.loc[depth_mask, ["chrom", "window_start", "window_end"]].copy()
     cache_key = _empirical_cache_key(
         loci=loci_for_empirical,
-        tumor_bam_path=tumor_bam_path,
-        normal_bam_path=normal_bam_path,
+        disease_bam_path=disease_bam_path,
+        control_bam_path=control_bam_path,
         empirical_random_windows=empirical_random_windows,
         empirical_random_scope=empirical_random_scope,
         empirical_random_seed=empirical_random_seed,
@@ -2956,21 +2956,21 @@ def _annotate_bam_depth_for_consistent_loci(
         empirical_exclude_gap_bed=empirical_exclude_gap_bed,
         empirical_exclude_blacklist_bed=empirical_exclude_blacklist_bed,
     )
-    random_tumor_df = pd.DataFrame()
-    random_normal_df = pd.DataFrame()
+    random_disease_df = pd.DataFrame()
+    random_control_df = pd.DataFrame()
     cache_hit = False
     if empirical_cache_dir is not None:
         empirical_cache_dir.mkdir(parents=True, exist_ok=True)
-        tumor_cache_path = empirical_cache_dir / f"{cache_key}.tumor.parquet"
-        normal_cache_path = empirical_cache_dir / f"{cache_key}.normal.parquet"
-        if tumor_cache_path.exists() and normal_cache_path.exists():
+        disease_cache_path = empirical_cache_dir / f"{cache_key}.disease.parquet"
+        control_cache_path = empirical_cache_dir / f"{cache_key}.control.parquet"
+        if disease_cache_path.exists() and control_cache_path.exists():
             try:
-                random_tumor_df = pd.read_parquet(tumor_cache_path)
-                random_normal_df = pd.read_parquet(normal_cache_path)
+                random_disease_df = pd.read_parquet(disease_cache_path)
+                random_control_df = pd.read_parquet(control_cache_path)
                 cache_hit = True
                 print(
                     f"[mei-annotate] empirical cache hit key={cache_key} "
-                    f"rows={len(random_tumor_df)}",
+                    f"rows={len(random_disease_df)}",
                     flush=True,
                 )
             except Exception:
@@ -3007,9 +3007,9 @@ def _annotate_bam_depth_for_consistent_loci(
         flush=True,
     )
 
-    with pysam.AlignmentFile(str(tumor_bam_path), "rb") as tumor_bam, pysam.AlignmentFile(
-        str(normal_bam_path), "rb"
-    ) as normal_bam:
+    with pysam.AlignmentFile(str(disease_bam_path), "rb") as disease_bam, pysam.AlignmentFile(
+        str(control_bam_path), "rb"
+    ) as control_bam:
         total_loci = int(len(idxs))
         loci_progress_every = 100
         print(f"[mei-annotate] empirical stage: computing context metrics for {total_loci} loci", flush=True)
@@ -3018,20 +3018,20 @@ def _annotate_bam_depth_for_consistent_loci(
             chrom = str(row["chrom"])
             start = int(row["window_start"])
             end = int(row["window_end"])
-            t_metrics = _context_quality_metrics_for_interval(tumor_bam, chrom=chrom, start_1based=start, end_1based=end)
-            n_metrics = _context_quality_metrics_for_interval(normal_bam, chrom=chrom, start_1based=start, end_1based=end)
-            out.at[idx, "tumor_local_bam_mean_depth"] = float(t_metrics["local_bam_mean_depth"])
-            out.at[idx, "normal_local_bam_mean_depth"] = float(n_metrics["local_bam_mean_depth"])
-            out.at[idx, "tumor_context_non_sv_reads"] = int(t_metrics["context_non_sv_reads"])
-            out.at[idx, "normal_context_non_sv_reads"] = int(n_metrics["context_non_sv_reads"])
-            out.at[idx, "tumor_context_mapq_mean"] = float(t_metrics["context_mapq_mean"])
-            out.at[idx, "normal_context_mapq_mean"] = float(n_metrics["context_mapq_mean"])
-            out.at[idx, "tumor_context_mapq_lt20_fraction"] = float(t_metrics["context_mapq_lt20_fraction"])
-            out.at[idx, "normal_context_mapq_lt20_fraction"] = float(n_metrics["context_mapq_lt20_fraction"])
-            out.at[idx, "tumor_context_nm_per_100bp_mean"] = float(t_metrics["context_nm_per_100bp_mean"])
-            out.at[idx, "normal_context_nm_per_100bp_mean"] = float(n_metrics["context_nm_per_100bp_mean"])
-            out.at[idx, "tumor_context_nm_per_100bp_p90"] = float(t_metrics["context_nm_per_100bp_p90"])
-            out.at[idx, "normal_context_nm_per_100bp_p90"] = float(n_metrics["context_nm_per_100bp_p90"])
+            t_metrics = _context_quality_metrics_for_interval(disease_bam, chrom=chrom, start_1based=start, end_1based=end)
+            n_metrics = _context_quality_metrics_for_interval(control_bam, chrom=chrom, start_1based=start, end_1based=end)
+            out.at[idx, "disease_local_bam_mean_depth"] = float(t_metrics["local_bam_mean_depth"])
+            out.at[idx, "control_local_bam_mean_depth"] = float(n_metrics["local_bam_mean_depth"])
+            out.at[idx, "disease_context_non_sv_reads"] = int(t_metrics["context_non_sv_reads"])
+            out.at[idx, "control_context_non_sv_reads"] = int(n_metrics["context_non_sv_reads"])
+            out.at[idx, "disease_context_mapq_mean"] = float(t_metrics["context_mapq_mean"])
+            out.at[idx, "control_context_mapq_mean"] = float(n_metrics["context_mapq_mean"])
+            out.at[idx, "disease_context_mapq_lt20_fraction"] = float(t_metrics["context_mapq_lt20_fraction"])
+            out.at[idx, "control_context_mapq_lt20_fraction"] = float(n_metrics["context_mapq_lt20_fraction"])
+            out.at[idx, "disease_context_nm_per_100bp_mean"] = float(t_metrics["context_nm_per_100bp_mean"])
+            out.at[idx, "control_context_nm_per_100bp_mean"] = float(n_metrics["context_nm_per_100bp_mean"])
+            out.at[idx, "disease_context_nm_per_100bp_p90"] = float(t_metrics["context_nm_per_100bp_p90"])
+            out.at[idx, "control_context_nm_per_100bp_p90"] = float(n_metrics["context_nm_per_100bp_p90"])
             if i % loci_progress_every == 0 or i == total_loci:
                 elapsed = time.monotonic() - t0
                 print(
@@ -3044,7 +3044,7 @@ def _annotate_bam_depth_for_consistent_loci(
             print("[mei-annotate] empirical stage: building random-window background metrics", flush=True)
             random_windows = _sample_random_windows(
                 candidates=out.loc[depth_mask].copy() if depth_mask.any() else out.copy(),
-                bam=tumor_bam,
+                bam=disease_bam,
                 n_windows=int(empirical_random_windows),
                 scope=str(empirical_random_scope),
                 random_seed=int(empirical_random_seed),
@@ -3057,8 +3057,8 @@ def _annotate_bam_depth_for_consistent_loci(
                 f"(scope={empirical_random_scope}, n={empirical_random_windows})",
                 flush=True,
             )
-            random_tumor_rows: list[dict[str, float | int | str]] = []
-            random_normal_rows: list[dict[str, float | int | str]] = []
+            random_disease_rows: list[dict[str, float | int | str]] = []
+            random_control_rows: list[dict[str, float | int | str]] = []
             random_progress_every = 200
             total_random = int(len(random_windows))
             for i, rw in enumerate(random_windows.itertuples(index=False), start=1):
@@ -3066,12 +3066,12 @@ def _annotate_bam_depth_for_consistent_loci(
                 start = int(rw.window_start)
                 end = int(rw.window_end)
                 t_metrics = _context_quality_metrics_for_interval(
-                    tumor_bam, chrom=chrom, start_1based=start, end_1based=end
+                    disease_bam, chrom=chrom, start_1based=start, end_1based=end
                 )
                 n_metrics = _context_quality_metrics_for_interval(
-                    normal_bam, chrom=chrom, start_1based=start, end_1based=end
+                    control_bam, chrom=chrom, start_1based=start, end_1based=end
                 )
-                random_tumor_rows.append(
+                random_disease_rows.append(
                     {
                         "chrom": chrom,
                         "local_bam_mean_depth": float(t_metrics["local_bam_mean_depth"]),
@@ -3081,7 +3081,7 @@ def _annotate_bam_depth_for_consistent_loci(
                         "context_nm_per_100bp_p90": float(t_metrics["context_nm_per_100bp_p90"]),
                     }
                 )
-                random_normal_rows.append(
+                random_control_rows.append(
                     {
                         "chrom": chrom,
                         "local_bam_mean_depth": float(n_metrics["local_bam_mean_depth"]),
@@ -3098,33 +3098,33 @@ def _annotate_bam_depth_for_consistent_loci(
                         f"(elapsed={elapsed:.1f}s)",
                         flush=True,
                     )
-            random_tumor_df = pd.DataFrame(random_tumor_rows)
-            random_normal_df = pd.DataFrame(random_normal_rows)
+            random_disease_df = pd.DataFrame(random_disease_rows)
+            random_control_df = pd.DataFrame(random_control_rows)
             if empirical_cache_dir is not None:
-                tumor_cache_path = empirical_cache_dir / f"{cache_key}.tumor.parquet"
-                normal_cache_path = empirical_cache_dir / f"{cache_key}.normal.parquet"
-                random_tumor_df.to_parquet(tumor_cache_path, index=False)
-                random_normal_df.to_parquet(normal_cache_path, index=False)
+                disease_cache_path = empirical_cache_dir / f"{cache_key}.disease.parquet"
+                control_cache_path = empirical_cache_dir / f"{cache_key}.control.parquet"
+                random_disease_df.to_parquet(disease_cache_path, index=False)
+                random_control_df.to_parquet(control_cache_path, index=False)
                 print(
                     f"[mei-annotate] empirical cache write key={cache_key} "
-                    f"rows={len(random_tumor_df)}",
+                    f"rows={len(random_disease_df)}",
                     flush=True,
                 )
         else:
             print("[mei-annotate] empirical stage: using cached random-window metrics", flush=True)
 
-    t_mei = out.get("tumor_mei_supported_reads", 0).astype(float)
-    n_mei = out.get("normal_mei_supported_reads", 0).astype(float)
-    t_depth = out["tumor_local_bam_mean_depth"].astype(float)
-    n_depth = out["normal_local_bam_mean_depth"].astype(float)
-    out["tumor_mei_support_per_100x_bam_depth"] = (t_mei * 100.0) / t_depth.replace(0, 1.0)
-    out["normal_mei_support_per_100x_bam_depth"] = (n_mei * 100.0) / n_depth.replace(0, 1.0)
+    t_mei = out.get("disease_mei_supported_reads", 0).astype(float)
+    n_mei = out.get("control_mei_supported_reads", 0).astype(float)
+    t_depth = out["disease_local_bam_mean_depth"].astype(float)
+    n_depth = out["control_local_bam_mean_depth"].astype(float)
+    out["disease_mei_support_per_100x_bam_depth"] = (t_mei * 100.0) / t_depth.replace(0, 1.0)
+    out["control_mei_support_per_100x_bam_depth"] = (n_mei * 100.0) / n_depth.replace(0, 1.0)
     out["mei_support_per_100x_bam_depth_delta"] = (
-        out["tumor_mei_support_per_100x_bam_depth"] - out["normal_mei_support_per_100x_bam_depth"]
+        out["disease_mei_support_per_100x_bam_depth"] - out["control_mei_support_per_100x_bam_depth"]
     )
     out["mei_support_per_100x_bam_depth_ratio"] = (
-        (out["tumor_mei_support_per_100x_bam_depth"] + 1e-3)
-        / (out["normal_mei_support_per_100x_bam_depth"] + 1e-3)
+        (out["disease_mei_support_per_100x_bam_depth"] + 1e-3)
+        / (out["control_mei_support_per_100x_bam_depth"] + 1e-3)
     )
 
     # Empirical scoring should be applied only to the evaluated subset (depth_mask),
@@ -3136,59 +3136,59 @@ def _annotate_bam_depth_for_consistent_loci(
         ("context_nm_per_100bp_mean", "high"),
         ("context_nm_per_100bp_p90", "high"),
     ]
-    out["tumor_empirical_random_n"] = 0
-    out["normal_empirical_random_n"] = 0
+    out["disease_empirical_random_n"] = 0
+    out["control_empirical_random_n"] = 0
     for metric, tail in metric_specs:
-        out[f"tumor_empirical_{metric}_percentile"] = 0.0
-        out[f"tumor_empirical_{metric}_p_{tail}"] = 1.0
-        out[f"normal_empirical_{metric}_percentile"] = 0.0
-        out[f"normal_empirical_{metric}_p_{tail}"] = 1.0
+        out[f"disease_empirical_{metric}_percentile"] = 0.0
+        out[f"disease_empirical_{metric}_p_{tail}"] = 1.0
+        out[f"control_empirical_{metric}_percentile"] = 0.0
+        out[f"control_empirical_{metric}_p_{tail}"] = 1.0
 
     score_idx = out.index[depth_mask]
     if len(score_idx) > 0:
-        tumor_for_scoring = out.loc[score_idx, ["chrom"]].copy()
-        tumor_for_scoring["local_bam_mean_depth"] = out.loc[score_idx, "tumor_local_bam_mean_depth"].astype(float)
-        tumor_for_scoring["context_mapq_mean"] = out.loc[score_idx, "tumor_context_mapq_mean"].astype(float)
-        tumor_for_scoring["context_mapq_lt20_fraction"] = out.loc[score_idx, "tumor_context_mapq_lt20_fraction"].astype(
+        disease_for_scoring = out.loc[score_idx, ["chrom"]].copy()
+        disease_for_scoring["local_bam_mean_depth"] = out.loc[score_idx, "disease_local_bam_mean_depth"].astype(float)
+        disease_for_scoring["context_mapq_mean"] = out.loc[score_idx, "disease_context_mapq_mean"].astype(float)
+        disease_for_scoring["context_mapq_lt20_fraction"] = out.loc[score_idx, "disease_context_mapq_lt20_fraction"].astype(
             float
         )
-        tumor_for_scoring["context_nm_per_100bp_mean"] = out.loc[score_idx, "tumor_context_nm_per_100bp_mean"].astype(
+        disease_for_scoring["context_nm_per_100bp_mean"] = out.loc[score_idx, "disease_context_nm_per_100bp_mean"].astype(
             float
         )
-        tumor_for_scoring["context_nm_per_100bp_p90"] = out.loc[score_idx, "tumor_context_nm_per_100bp_p90"].astype(float)
-        normal_for_scoring = out.loc[score_idx, ["chrom"]].copy()
-        normal_for_scoring["local_bam_mean_depth"] = out.loc[score_idx, "normal_local_bam_mean_depth"].astype(float)
-        normal_for_scoring["context_mapq_mean"] = out.loc[score_idx, "normal_context_mapq_mean"].astype(float)
-        normal_for_scoring["context_mapq_lt20_fraction"] = out.loc[score_idx, "normal_context_mapq_lt20_fraction"].astype(
+        disease_for_scoring["context_nm_per_100bp_p90"] = out.loc[score_idx, "disease_context_nm_per_100bp_p90"].astype(float)
+        control_for_scoring = out.loc[score_idx, ["chrom"]].copy()
+        control_for_scoring["local_bam_mean_depth"] = out.loc[score_idx, "control_local_bam_mean_depth"].astype(float)
+        control_for_scoring["context_mapq_mean"] = out.loc[score_idx, "control_context_mapq_mean"].astype(float)
+        control_for_scoring["context_mapq_lt20_fraction"] = out.loc[score_idx, "control_context_mapq_lt20_fraction"].astype(
             float
         )
-        normal_for_scoring["context_nm_per_100bp_mean"] = out.loc[score_idx, "normal_context_nm_per_100bp_mean"].astype(
+        control_for_scoring["context_nm_per_100bp_mean"] = out.loc[score_idx, "control_context_nm_per_100bp_mean"].astype(
             float
         )
-        normal_for_scoring["context_nm_per_100bp_p90"] = out.loc[score_idx, "normal_context_nm_per_100bp_p90"].astype(
+        control_for_scoring["context_nm_per_100bp_p90"] = out.loc[score_idx, "control_context_nm_per_100bp_p90"].astype(
             float
         )
 
-        tumor_scored = _apply_empirical_context_scores(
-            loci_metrics=tumor_for_scoring,
-            random_metrics=random_tumor_df,
-            sample_prefix="tumor",
+        disease_scored = _apply_empirical_context_scores(
+            loci_metrics=disease_for_scoring,
+            random_metrics=random_disease_df,
+            sample_prefix="disease",
             scope=str(empirical_random_scope),
             progress_every=200,
         )
-        normal_scored = _apply_empirical_context_scores(
-            loci_metrics=normal_for_scoring,
-            random_metrics=random_normal_df,
-            sample_prefix="normal",
+        control_scored = _apply_empirical_context_scores(
+            loci_metrics=control_for_scoring,
+            random_metrics=random_control_df,
+            sample_prefix="control",
             scope=str(empirical_random_scope),
             progress_every=200,
         )
-        for col in tumor_scored.columns:
-            if col.startswith("tumor_empirical_"):
-                out.loc[score_idx, col] = tumor_scored[col].values
-        for col in normal_scored.columns:
-            if col.startswith("normal_empirical_"):
-                out.loc[score_idx, col] = normal_scored[col].values
+        for col in disease_scored.columns:
+            if col.startswith("disease_empirical_"):
+                out.loc[score_idx, col] = disease_scored[col].values
+        for col in control_scored.columns:
+            if col.startswith("control_empirical_"):
+                out.loc[score_idx, col] = control_scored[col].values
     print("[mei-annotate] empirical stage: applying empirical p-value scoring complete", flush=True)
     elapsed_total = time.monotonic() - t0
     print(f"[mei-annotate] empirical stage complete (elapsed={elapsed_total:.1f}s)", flush=True)
@@ -3198,24 +3198,24 @@ def _annotate_bam_depth_for_consistent_loci(
 
 def _add_local_depth_normalized_support(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
-    tumor_total = out.get("tumor_total_rows", 0).astype(float)
-    normal_total = out.get("normal_total_rows", 0).astype(float)
-    tumor_mei = out.get("tumor_mei_supported_reads", 0).astype(float)
-    normal_mei = out.get("normal_mei_supported_reads", 0).astype(float)
+    disease_total = out.get("disease_total_rows", 0).astype(float)
+    control_total = out.get("control_total_rows", 0).astype(float)
+    disease_mei = out.get("disease_mei_supported_reads", 0).astype(float)
+    control_mei = out.get("control_mei_supported_reads", 0).astype(float)
 
     # Local informative depth proxy from candidate-building stage.
-    out["tumor_local_informative_rows"] = tumor_total.fillna(0.0).astype(int)
-    out["normal_local_informative_rows"] = normal_total.fillna(0.0).astype(int)
+    out["disease_local_informative_rows"] = disease_total.fillna(0.0).astype(int)
+    out["control_local_informative_rows"] = control_total.fillna(0.0).astype(int)
 
-    out["tumor_mei_support_local_frac"] = (tumor_mei / tumor_total.replace(0, 1)).fillna(0.0)
-    out["normal_mei_support_local_frac"] = (normal_mei / normal_total.replace(0, 1)).fillna(0.0)
-    out["tumor_mei_support_per_100_local_rows"] = out["tumor_mei_support_local_frac"] * 100.0
-    out["normal_mei_support_per_100_local_rows"] = out["normal_mei_support_local_frac"] * 100.0
+    out["disease_mei_support_local_frac"] = (disease_mei / disease_total.replace(0, 1)).fillna(0.0)
+    out["control_mei_support_local_frac"] = (control_mei / control_total.replace(0, 1)).fillna(0.0)
+    out["disease_mei_support_per_100_local_rows"] = out["disease_mei_support_local_frac"] * 100.0
+    out["control_mei_support_per_100_local_rows"] = out["control_mei_support_local_frac"] * 100.0
     out["mei_local_support_frac_delta"] = (
-        out["tumor_mei_support_local_frac"] - out["normal_mei_support_local_frac"]
+        out["disease_mei_support_local_frac"] - out["control_mei_support_local_frac"]
     )
     out["mei_local_support_frac_ratio"] = (
-        (out["tumor_mei_support_local_frac"] + 1e-4) / (out["normal_mei_support_local_frac"] + 1e-4)
+        (out["disease_mei_support_local_frac"] + 1e-4) / (out["control_mei_support_local_frac"] + 1e-4)
     )
     return out
 
@@ -3225,48 +3225,48 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
     out["bronze_stage_pass"] = True
 
     junk_clean = out.get("junk_flag_count", 999).fillna(999).astype(int) == 0
-    t_left_split = out.get("tumor_L_mei_supported_reads", 0).fillna(0).astype(float) >= 1
-    t_right_split = out.get("tumor_R_mei_supported_reads", 0).fillna(0).astype(float) >= 1
-    t_left_disc = out.get("tumor_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1
-    t_right_disc = out.get("tumor_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1
-    n_left_split = out.get("normal_L_mei_supported_reads", 0).fillna(0).astype(float) >= 1
-    n_right_split = out.get("normal_R_mei_supported_reads", 0).fillna(0).astype(float) >= 1
-    n_left_disc = out.get("normal_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1
-    n_right_disc = out.get("normal_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1
+    t_left_split = out.get("disease_L_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    t_right_split = out.get("disease_R_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    t_left_disc = out.get("disease_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1
+    t_right_disc = out.get("disease_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_left_split = out.get("control_L_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_right_split = out.get("control_R_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_left_disc = out.get("control_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1
+    n_right_disc = out.get("control_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1
 
-    tumor_bilateral_any = (t_left_split | t_left_disc) & (t_right_split | t_right_disc)
-    normal_bilateral_any = (n_left_split | n_left_disc) & (n_right_split | n_right_disc)
-    out["silver_bilateral_support_any"] = tumor_bilateral_any | normal_bilateral_any
-    t_left_poly = out.get("tumor_L_poly_at_reads", 0).fillna(0).astype(float) >= 1
-    t_right_poly = out.get("tumor_R_poly_at_reads", 0).fillna(0).astype(float) >= 1
-    n_left_poly = out.get("normal_L_poly_at_reads", 0).fillna(0).astype(float) >= 1
-    n_right_poly = out.get("normal_R_poly_at_reads", 0).fillna(0).astype(float) >= 1
+    disease_bilateral_any = (t_left_split | t_left_disc) & (t_right_split | t_right_disc)
+    control_bilateral_any = (n_left_split | n_left_disc) & (n_right_split | n_right_disc)
+    out["silver_bilateral_support_any"] = disease_bilateral_any | control_bilateral_any
+    t_left_poly = out.get("disease_L_poly_at_reads", 0).fillna(0).astype(float) >= 1
+    t_right_poly = out.get("disease_R_poly_at_reads", 0).fillna(0).astype(float) >= 1
+    n_left_poly = out.get("control_L_poly_at_reads", 0).fillna(0).astype(float) >= 1
+    n_right_poly = out.get("control_R_poly_at_reads", 0).fillna(0).astype(float) >= 1
 
-    tumor_split_consistent = (
-        out.get("tumor_two_sided_support", False).fillna(False).astype(bool)
-        & (out.get("tumor_family_agreement", 0).fillna(0).astype(int) == 1)
-        & (out.get("tumor_strand_agreement", 0).fillna(0).astype(int) == 1)
+    disease_split_consistent = (
+        out.get("disease_two_sided_support", False).fillna(False).astype(bool)
+        & (out.get("disease_family_agreement", 0).fillna(0).astype(int) == 1)
+        & (out.get("disease_strand_agreement", 0).fillna(0).astype(int) == 1)
     )
-    normal_split_consistent = (
-        out.get("normal_two_sided_support", False).fillna(False).astype(bool)
-        & (out.get("normal_family_agreement", 0).fillna(0).astype(int) == 1)
-        & (out.get("normal_strand_agreement", 0).fillna(0).astype(int) == 1)
+    control_split_consistent = (
+        out.get("control_two_sided_support", False).fillna(False).astype(bool)
+        & (out.get("control_family_agreement", 0).fillna(0).astype(int) == 1)
+        & (out.get("control_strand_agreement", 0).fillna(0).astype(int) == 1)
     )
 
-    tumor_disc_consistent = (
-        out.get("tumor_discordant_mei_two_sided_support", False).fillna(False).astype(bool)
-        & (out.get("tumor_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
-        & (out.get("tumor_discordant_mei_strand_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
-        & out.get("tumor_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
-        & out.get("tumor_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    disease_disc_consistent = (
+        out.get("disease_discordant_mei_two_sided_support", False).fillna(False).astype(bool)
+        & (out.get("disease_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & (out.get("disease_discordant_mei_strand_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & out.get("disease_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+        & out.get("disease_discordant_mei_self_consistent", True).fillna(True).astype(bool)
     )
-    normal_disc_consistent = (
-        (out.get("normal_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1)
-        & (out.get("normal_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1)
-        & (out.get("normal_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
-        & (out.get("normal_discordant_mei_strand_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
-        & out.get("normal_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
-        & out.get("normal_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    control_disc_consistent = (
+        (out.get("control_discordant_mei_left_supported_reads", 0).fillna(0).astype(float) >= 1)
+        & (out.get("control_discordant_mei_right_supported_reads", 0).fillna(0).astype(float) >= 1)
+        & (out.get("control_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & (out.get("control_discordant_mei_strand_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+        & out.get("control_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+        & out.get("control_discordant_mei_self_consistent", True).fillna(True).astype(bool)
     )
 
     event_family_consistent = out.get("event_family_consistent", False).fillna(False).astype(bool)
@@ -3276,54 +3276,54 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
     # one side has MEI anchor support and the opposite side has polyA-clipped support.
     # If orientation is known, enforce expected tail side:
     # + insertion => right-side polyA; - insertion => left-side polyA.
-    tumor_ori = out.get("tumor_insertion_orientation", "").fillna("").astype(str)
-    normal_ori = out.get("normal_discordant_mei_strand", "").fillna("").astype(str)
+    disease_ori = out.get("disease_insertion_orientation", "").fillna("").astype(str)
+    control_ori = out.get("control_discordant_mei_strand", "").fillna("").astype(str)
     t_poly_mei_any = (t_left_poly & (t_right_split | t_right_disc)) | (t_right_poly & (t_left_split | t_left_disc))
     n_poly_mei_any = (n_left_poly & (n_right_split | n_right_disc)) | (n_right_poly & (n_left_split | n_left_disc))
     t_poly_oriented = (
-        ((tumor_ori == "+") & t_right_poly & (t_left_split | t_left_disc))
-        | ((tumor_ori == "-") & t_left_poly & (t_right_split | t_right_disc))
+        ((disease_ori == "+") & t_right_poly & (t_left_split | t_left_disc))
+        | ((disease_ori == "-") & t_left_poly & (t_right_split | t_right_disc))
     )
     n_poly_oriented = (
-        ((normal_ori == "+") & n_right_poly & (n_left_split | n_left_disc))
-        | ((normal_ori == "-") & n_left_poly & (n_right_split | n_right_disc))
+        ((control_ori == "+") & n_right_poly & (n_left_split | n_left_disc))
+        | ((control_ori == "-") & n_left_poly & (n_right_split | n_right_disc))
     )
-    poly_sidepair_support = (t_poly_mei_any & ((tumor_ori == "") | t_poly_oriented)) | (
-        n_poly_mei_any & ((normal_ori == "") | n_poly_oriented)
+    poly_sidepair_support = (t_poly_mei_any & ((disease_ori == "") | t_poly_oriented)) | (
+        n_poly_mei_any & ((control_ori == "") | n_poly_oriented)
     )
     out["silver_polyA_sidepair_support"] = poly_sidepair_support
 
-    t_left_anchor_complex = out.get("tumor_discordant_anchor_left_complex_side", False).fillna(False).astype(bool)
-    t_right_anchor_complex = out.get("tumor_discordant_anchor_right_complex_side", False).fillna(False).astype(bool)
-    n_left_anchor_complex = out.get("normal_discordant_anchor_left_complex_side", False).fillna(False).astype(bool)
-    n_right_anchor_complex = out.get("normal_discordant_anchor_right_complex_side", False).fillna(False).astype(bool)
+    t_left_anchor_complex = out.get("disease_discordant_anchor_left_complex_side", False).fillna(False).astype(bool)
+    t_right_anchor_complex = out.get("disease_discordant_anchor_right_complex_side", False).fillna(False).astype(bool)
+    n_left_anchor_complex = out.get("control_discordant_anchor_left_complex_side", False).fillna(False).astype(bool)
+    n_right_anchor_complex = out.get("control_discordant_anchor_right_complex_side", False).fillna(False).astype(bool)
     t_left_structural = t_left_split | t_left_disc | t_left_poly | t_left_anchor_complex
     t_right_structural = t_right_split | t_right_disc | t_right_poly | t_right_anchor_complex
     n_left_structural = n_left_split | n_left_disc | n_left_poly | n_left_anchor_complex
     n_right_structural = n_right_split | n_right_disc | n_right_poly | n_right_anchor_complex
-    tumor_bilateral_structural = t_left_structural & t_right_structural
-    normal_bilateral_structural = n_left_structural & n_right_structural
-    out["silver_bilateral_structural_support"] = tumor_bilateral_structural | normal_bilateral_structural
+    disease_bilateral_structural = t_left_structural & t_right_structural
+    control_bilateral_structural = n_left_structural & n_right_structural
+    out["silver_bilateral_structural_support"] = disease_bilateral_structural | control_bilateral_structural
 
-    tumor_complex_sidepair = (
+    disease_complex_sidepair = (
         (t_left_split | t_left_disc) & (t_right_anchor_complex | t_right_poly)
     ) | ((t_right_split | t_right_disc) & (t_left_anchor_complex | t_left_poly))
-    normal_complex_sidepair = (
+    control_complex_sidepair = (
         (n_left_split | n_left_disc) & (n_right_anchor_complex | n_right_poly)
     ) | ((n_right_split | n_right_disc) & (n_left_anchor_complex | n_left_poly))
-    out["silver_complex_sidepair_support"] = tumor_complex_sidepair | normal_complex_sidepair
+    out["silver_complex_sidepair_support"] = disease_complex_sidepair | control_complex_sidepair
     out["silver_complex_structural_consistent"] = (
         out["silver_bilateral_structural_support"]
         & out["silver_complex_sidepair_support"]
         & (
-            out.get("tumor_mei_with_complex_sidepair", False).fillna(False).astype(bool)
-            | out.get("normal_mei_with_complex_sidepair", False).fillna(False).astype(bool)
+            out.get("disease_mei_with_complex_sidepair", False).fillna(False).astype(bool)
+            | out.get("control_mei_with_complex_sidepair", False).fillna(False).astype(bool)
             | out.get("mei_with_complex_sv_signature", False).fillna(False).astype(bool)
         )
     )
 
     silver_consistency = (
-        tumor_split_consistent | normal_split_consistent | tumor_disc_consistent | normal_disc_consistent
+        disease_split_consistent | control_split_consistent | disease_disc_consistent | control_disc_consistent
     )
     out["silver_consistency_pass"] = (
         silver_consistency
@@ -3331,17 +3331,17 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
         | (poly_sidepair_support & event_family_consistent)
         | out["silver_complex_structural_consistent"]
     )
-    out["silver_discordant_two_sided_consistent"] = tumor_disc_consistent | normal_disc_consistent
+    out["silver_discordant_two_sided_consistent"] = disease_disc_consistent | control_disc_consistent
 
-    tumor_l_bp = out.get("tumor_L_mei_breakpoint_mode", 0).fillna(0).astype(int)
-    tumor_r_bp = out.get("tumor_R_mei_breakpoint_mode", 0).fillna(0).astype(int)
-    normal_l_bp = out.get("normal_L_mei_breakpoint_mode", 0).fillna(0).astype(int)
-    normal_r_bp = out.get("normal_R_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    disease_l_bp = out.get("disease_L_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    disease_r_bp = out.get("disease_R_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    control_l_bp = out.get("control_L_mei_breakpoint_mode", 0).fillna(0).astype(int)
+    control_r_bp = out.get("control_R_mei_breakpoint_mode", 0).fillna(0).astype(int)
     out["silver_split_breakpoint_resolved"] = (
-        (t_left_split & (tumor_l_bp > 0))
-        | (t_right_split & (tumor_r_bp > 0))
-        | (n_left_split & (normal_l_bp > 0))
-        | (n_right_split & (normal_r_bp > 0))
+        (t_left_split & (disease_l_bp > 0))
+        | (t_right_split & (disease_r_bp > 0))
+        | (n_left_split & (control_l_bp > 0))
+        | (n_right_split & (control_r_bp > 0))
     )
     out["silver_insertion_span_resolved"] = out.get("insertion_mei_span", 0).fillna(0).astype(int) > 0
     out["silver_breakpoint_or_span_resolved"] = (
@@ -3376,16 +3376,16 @@ def _assign_gold_stage(candidates: pd.DataFrame, empirical_p_threshold: float = 
     out["gold_stage_fail_reason"] = ""
 
     p_cols = [
-        "tumor_empirical_local_bam_mean_depth_p_high",
-        "tumor_empirical_context_mapq_mean_p_low",
-        "tumor_empirical_context_mapq_lt20_fraction_p_high",
-        "tumor_empirical_context_nm_per_100bp_mean_p_high",
-        "tumor_empirical_context_nm_per_100bp_p90_p_high",
-        "normal_empirical_local_bam_mean_depth_p_high",
-        "normal_empirical_context_mapq_mean_p_low",
-        "normal_empirical_context_mapq_lt20_fraction_p_high",
-        "normal_empirical_context_nm_per_100bp_mean_p_high",
-        "normal_empirical_context_nm_per_100bp_p90_p_high",
+        "disease_empirical_local_bam_mean_depth_p_high",
+        "disease_empirical_context_mapq_mean_p_low",
+        "disease_empirical_context_mapq_lt20_fraction_p_high",
+        "disease_empirical_context_nm_per_100bp_mean_p_high",
+        "disease_empirical_context_nm_per_100bp_p90_p_high",
+        "control_empirical_local_bam_mean_depth_p_high",
+        "control_empirical_context_mapq_mean_p_low",
+        "control_empirical_context_mapq_lt20_fraction_p_high",
+        "control_empirical_context_nm_per_100bp_mean_p_high",
+        "control_empirical_context_nm_per_100bp_p90_p_high",
     ]
     available_cols = [c for c in p_cols if c in out.columns]
     silver = out.get("silver_stage_pass", False).fillna(False).astype(bool)
@@ -3409,11 +3409,11 @@ def _assign_gold_stage(candidates: pd.DataFrame, empirical_p_threshold: float = 
 
 
 def _two_sided_support_mask(df: pd.DataFrame) -> pd.Series:
-    tumor_left = df.get("tumor_left_supported_reads", 0).fillna(0).astype(int)
-    tumor_right = df.get("tumor_right_supported_reads", 0).fillna(0).astype(int)
-    normal_left = df.get("normal_left_supported_reads", 0).fillna(0).astype(int)
-    normal_right = df.get("normal_right_supported_reads", 0).fillna(0).astype(int)
-    bilateral = ((tumor_left >= 1) & (tumor_right >= 1)) | ((normal_left >= 1) & (normal_right >= 1))
+    disease_left = df.get("disease_left_supported_reads", 0).fillna(0).astype(int)
+    disease_right = df.get("disease_right_supported_reads", 0).fillna(0).astype(int)
+    control_left = df.get("control_left_supported_reads", 0).fillna(0).astype(int)
+    control_right = df.get("control_right_supported_reads", 0).fillna(0).astype(int)
+    bilateral = ((disease_left >= 1) & (disease_right >= 1)) | ((control_left >= 1) & (control_right >= 1))
     if "silver_bilateral_support_any" in df.columns:
         bilateral = bilateral | df["silver_bilateral_support_any"].fillna(False).astype(bool)
     return bilateral
@@ -3439,17 +3439,17 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     out["_prio_high_conf_two_sided"] = (
         _df_col_series(out, "insertion_call_tier", "").fillna("").astype(str) == "high_conf_two_sided"
     )
-    out["_prio_breakpoint_resolved"] = _df_col_series(out, "tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
+    out["_prio_breakpoint_resolved"] = _df_col_series(out, "disease_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
     out["_prio_g1k_region"] = _df_col_series(out, "g1k_melt_region_id", "").fillna("").astype(str).str.strip() != ""
     out["_prio_insertion_mei_span"] = _df_col_series(out, "insertion_mei_span", 0).fillna(0).astype(int)
     out["_prio_poly_at"] = out["poly_at_supported"].astype(bool)
     out["_prio_split_reads"] = (
-        _df_col_series(out, "tumor_split_mei_supported_reads", 0).fillna(0).astype(int)
-        + _df_col_series(out, "normal_split_mei_supported_reads", 0).fillna(0).astype(int)
+        _df_col_series(out, "disease_split_mei_supported_reads", 0).fillna(0).astype(int)
+        + _df_col_series(out, "control_split_mei_supported_reads", 0).fillna(0).astype(int)
     )
     out["_prio_discordant_reads"] = (
-        _df_col_series(out, "tumor_discordant_mei_supported_reads", 0).fillna(0).astype(int)
-        + _df_col_series(out, "normal_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+        _df_col_series(out, "disease_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+        + _df_col_series(out, "control_discordant_mei_supported_reads", 0).fillna(0).astype(int)
     )
 
     sort_cols: list[str] = []
@@ -3494,7 +3494,7 @@ _YYRRRR_MT_ADJ_REPORT_MIN = 0.0  # report motif fields only when MT-adjusted log
 
 
 def _yyrrrr_mt_adj_value(row: pd.Series) -> float:
-    val = row.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan"))
+    val = row.get("disease_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan"))
     if pd.isna(val):
         return float("nan")
     try:
@@ -3511,17 +3511,17 @@ def _yyrrrr_mt_adj_reportable(row: pd.Series) -> bool:
 def _apply_breakpoint_motif_report_gating(df: pd.DataFrame) -> pd.DataFrame:
     """Mask motif report fields unless breakpoint log-odds pass the report threshold."""
     out = df.copy()
-    observed_hex = out.get("tumor_breakpoint_l1_en_hexamer_oriented", "").fillna("").astype(str)
-    observed_pattern = out.get("tumor_breakpoint_l1_en_pattern_yy_rrrr", "").fillna("").astype(str)
-    out["tumor_breakpoint_l1_en_observed_motif"] = observed_hex
-    out["tumor_breakpoint_l1_en_observed_motif_pattern"] = observed_pattern
-    mt_adj = out.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan")).astype(float)
+    observed_hex = out.get("disease_breakpoint_l1_en_hexamer_oriented", "").fillna("").astype(str)
+    observed_pattern = out.get("disease_breakpoint_l1_en_pattern_yy_rrrr", "").fillna("").astype(str)
+    out["disease_breakpoint_l1_en_observed_motif"] = observed_hex
+    out["disease_breakpoint_l1_en_observed_motif_pattern"] = observed_pattern
+    mt_adj = out.get("disease_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan")).astype(float)
     reportable = mt_adj.notna() & (mt_adj > _YYRRRR_MT_ADJ_REPORT_MIN)
     for col in (
-        "tumor_breakpoint_l1_en_observed_motif",
-        "tumor_breakpoint_l1_en_observed_motif_pattern",
-        "tumor_breakpoint_l1_en_best_motif",
-        "tumor_breakpoint_l1_en_motif_type",
+        "disease_breakpoint_l1_en_observed_motif",
+        "disease_breakpoint_l1_en_observed_motif_pattern",
+        "disease_breakpoint_l1_en_best_motif",
+        "disease_breakpoint_l1_en_motif_type",
     ):
         if col not in out.columns:
             continue
@@ -3532,8 +3532,8 @@ def _apply_breakpoint_motif_report_gating(df: pd.DataFrame) -> pd.DataFrame:
 def _consensus_retrotransposition_class(row: pd.Series) -> str:
     if not _yyrrrr_mt_adj_reportable(row):
         return ""
-    if bool(row.get("tumor_breakpoint_l1_en_motif_like", False)):
-        motif_type = str(row.get("tumor_breakpoint_l1_en_motif_type", "") or "").strip()
+    if bool(row.get("disease_breakpoint_l1_en_motif_like", False)):
+        motif_type = str(row.get("disease_breakpoint_l1_en_motif_type", "") or "").strip()
         if motif_type == "l1_en_canonical":
             return "classical"
         if motif_type in {"l1_en_alternative", "nested_novel_like"}:
@@ -3545,11 +3545,11 @@ def _consensus_sequence_signature(row: pd.Series, *, retro_class: str = "") -> s
     if not retro_class:
         return ""
     for col in (
-        "tumor_breakpoint_l1_en_observed_motif_pattern",
-        "tumor_breakpoint_l1_en_observed_motif",
-        "tumor_breakpoint_l1_en_pattern_yy_rrrr",
-        "tumor_breakpoint_l1_en_best_match_pattern_yy_rrrr",
-        "tumor_breakpoint_l1_en_best_motif",
+        "disease_breakpoint_l1_en_observed_motif_pattern",
+        "disease_breakpoint_l1_en_observed_motif",
+        "disease_breakpoint_l1_en_pattern_yy_rrrr",
+        "disease_breakpoint_l1_en_best_match_pattern_yy_rrrr",
+        "disease_breakpoint_l1_en_best_motif",
     ):
         pattern = str(row.get(col, "") or "").strip()
         if pattern:
@@ -3577,8 +3577,8 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
 
     out["tsd_or_polyA_supported"] = (
         out.get("tsd_detected", False).fillna(False).astype(bool)
-        | (out.get("tumor_poly_at_reads", 0).fillna(0).astype(float) >= 1)
-        | (out.get("normal_poly_at_reads", 0).fillna(0).astype(float) >= 1)
+        | (out.get("disease_poly_at_reads", 0).fillna(0).astype(float) >= 1)
+        | (out.get("control_poly_at_reads", 0).fillna(0).astype(float) >= 1)
         | (out.get("poly_at_reads", 0).fillna(0).astype(float) >= 1)
     )
     out = _annotate_consensus_retrotransposition_fields(out)
@@ -3587,8 +3587,8 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
     )
     out["two_sided_support"] = _two_sided_support_mask(out)
     out["poly_at_supported"] = _poly_at_supported_mask(out)
-    bp_pos = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int)
-    out["tumor_insertion_breakpoint_pos"] = bp_pos.where(bp_pos > 0, -1)
+    bp_pos = out.get("disease_insertion_breakpoint_pos", 0).fillna(0).astype(int)
+    out["disease_insertion_breakpoint_pos"] = bp_pos.where(bp_pos > 0, -1)
 
     selected_cols = [
         "analysis_stage_tier",
@@ -3599,7 +3599,7 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "chrom",
         "window_start",
         "window_end",
-        "tumor_insertion_breakpoint_pos",
+        "disease_insertion_breakpoint_pos",
         "insertion_orientation",
         "insertion_mei_span",
         "nested_same_class_orientation",
@@ -3612,45 +3612,45 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "g1k_melt_insertion_length",
         "g1k_melt_tsd",
         "g1k_melt_region_id",
-        "tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj",
-        "tumor_breakpoint_l1_en_best_motif",
-        "tumor_breakpoint_l1_en_motif_type",
+        "disease_breakpoint_yyrrrr_logodds_shift1_mt_adj",
+        "disease_breakpoint_l1_en_best_motif",
+        "disease_breakpoint_l1_en_motif_type",
         "consensus_retrotransposition_class",
-        "tumor_breakpoint_l1_en_observed_motif",
-        "tumor_breakpoint_l1_en_observed_motif_pattern",
+        "disease_breakpoint_l1_en_observed_motif",
+        "disease_breakpoint_l1_en_observed_motif_pattern",
         "consensus_sequence_signature",
-        "tumor_split_mei_supported_reads",
-        "normal_split_mei_supported_reads",
-        "tumor_discordant_mei_supported_reads",
-        "normal_discordant_mei_supported_reads",
-        "tumor_left_supported_reads",
-        "tumor_right_supported_reads",
-        "normal_left_supported_reads",
-        "normal_right_supported_reads",
-        "tumor_family_agreement",
-        "tumor_strand_agreement",
-        "normal_family_agreement",
-        "normal_strand_agreement",
+        "disease_split_mei_supported_reads",
+        "control_split_mei_supported_reads",
+        "disease_discordant_mei_supported_reads",
+        "control_discordant_mei_supported_reads",
+        "disease_left_supported_reads",
+        "disease_right_supported_reads",
+        "control_left_supported_reads",
+        "control_right_supported_reads",
+        "disease_family_agreement",
+        "disease_strand_agreement",
+        "control_family_agreement",
+        "control_strand_agreement",
         "two_sided_support",
-        "tumor_poly_at_reads",
-        "tumor_poly_at_max_run",
-        "tumor_poly_at_fraction_weighted",
-        "normal_poly_at_reads",
-        "normal_poly_at_max_run",
-        "normal_poly_at_fraction_weighted",
+        "disease_poly_at_reads",
+        "disease_poly_at_max_run",
+        "disease_poly_at_fraction_weighted",
+        "control_poly_at_reads",
+        "control_poly_at_max_run",
+        "control_poly_at_fraction_weighted",
         "poly_at_reads",
         "poly_at_supported",
         "tsd_or_polyA_supported",
-        "tumor_empirical_local_bam_mean_depth_p_high",
-        "tumor_empirical_context_mapq_mean_p_low",
-        "tumor_empirical_context_mapq_lt20_fraction_p_high",
-        "tumor_empirical_context_nm_per_100bp_mean_p_high",
-        "tumor_empirical_context_nm_per_100bp_p90_p_high",
-        "normal_empirical_local_bam_mean_depth_p_high",
-        "normal_empirical_context_mapq_mean_p_low",
-        "normal_empirical_context_mapq_lt20_fraction_p_high",
-        "normal_empirical_context_nm_per_100bp_mean_p_high",
-        "normal_empirical_context_nm_per_100bp_p90_p_high",
+        "disease_empirical_local_bam_mean_depth_p_high",
+        "disease_empirical_context_mapq_mean_p_low",
+        "disease_empirical_context_mapq_lt20_fraction_p_high",
+        "disease_empirical_context_nm_per_100bp_mean_p_high",
+        "disease_empirical_context_nm_per_100bp_p90_p_high",
+        "control_empirical_local_bam_mean_depth_p_high",
+        "control_empirical_context_mapq_mean_p_low",
+        "control_empirical_context_mapq_lt20_fraction_p_high",
+        "control_empirical_context_nm_per_100bp_mean_p_high",
+        "control_empirical_context_nm_per_100bp_p90_p_high",
         "gold_empirical_outlier",
         "gold_stage_fail_reason",
         "insertion_model_score",
@@ -3835,21 +3835,21 @@ def _g1k_query_interval_for_row(
     window_start = int(row.get("window_start", 1))
     window_end = int(row.get("window_end", window_start))
     midpoint = (window_start + window_end) // 2
-    breakpoint_pos = int(row.get("tumor_insertion_breakpoint_pos", 0))
+    breakpoint_pos = int(row.get("disease_insertion_breakpoint_pos", 0))
     if breakpoint_pos <= 0:
         breakpoint_pos = midpoint
 
-    left_split = int(row.get("tumor_L_mei_supported_reads", 0))
-    right_split = int(row.get("tumor_R_mei_supported_reads", 0))
-    split_total = int(row.get("tumor_split_mei_supported_reads", 0))
+    left_split = int(row.get("disease_L_mei_supported_reads", 0))
+    right_split = int(row.get("disease_R_mei_supported_reads", 0))
+    split_total = int(row.get("disease_split_mei_supported_reads", 0))
     split_resolved = (split_total >= 2) or ((left_split >= 1) and (right_split >= 1))
 
-    tumor_dpe = int(row.get("tumor_discordant_mei_supported_reads", 0))
-    normal_dpe = int(row.get("normal_discordant_mei_supported_reads", 0))
-    dpe_present = (tumor_dpe + normal_dpe) > 0
+    disease_dpe = int(row.get("disease_discordant_mei_supported_reads", 0))
+    control_dpe = int(row.get("control_discordant_mei_supported_reads", 0))
+    dpe_present = (disease_dpe + control_dpe) > 0
     dpe_tlen_mean = max(
-        float(row.get("discordant_tumor_abs_tlen_mean", 0.0) or 0.0),
-        float(row.get("discordant_normal_abs_tlen_mean", 0.0) or 0.0),
+        float(row.get("discordant_disease_abs_tlen_mean", 0.0) or 0.0),
+        float(row.get("discordant_control_abs_tlen_mean", 0.0) or 0.0),
     )
 
     if split_resolved:
@@ -4000,16 +4000,16 @@ def _normalize_mei_family_token(token: str) -> str:
 def _choose_event_subfamily(row: pd.Series) -> str:
     weighted: list[tuple[str, int]] = []
     for subfamily_col, weight_col in [
-        ("tumor_discordant_mei_subfamily", "tumor_discordant_mei_supported_reads"),
-        ("tumor_discordant_mei_left_subfamily", "tumor_discordant_mei_left_supported_reads"),
-        ("tumor_discordant_mei_right_subfamily", "tumor_discordant_mei_right_supported_reads"),
-        ("tumor_L_mei_subfamily", "tumor_L_mei_supported_reads"),
-        ("tumor_R_mei_subfamily", "tumor_R_mei_supported_reads"),
-        ("normal_discordant_mei_subfamily", "normal_discordant_mei_supported_reads"),
-        ("normal_discordant_mei_left_subfamily", "normal_discordant_mei_left_supported_reads"),
-        ("normal_discordant_mei_right_subfamily", "normal_discordant_mei_right_supported_reads"),
-        ("normal_L_mei_subfamily", "normal_L_mei_supported_reads"),
-        ("normal_R_mei_subfamily", "normal_R_mei_supported_reads"),
+        ("disease_discordant_mei_subfamily", "disease_discordant_mei_supported_reads"),
+        ("disease_discordant_mei_left_subfamily", "disease_discordant_mei_left_supported_reads"),
+        ("disease_discordant_mei_right_subfamily", "disease_discordant_mei_right_supported_reads"),
+        ("disease_L_mei_subfamily", "disease_L_mei_supported_reads"),
+        ("disease_R_mei_subfamily", "disease_R_mei_supported_reads"),
+        ("control_discordant_mei_subfamily", "control_discordant_mei_supported_reads"),
+        ("control_discordant_mei_left_subfamily", "control_discordant_mei_left_supported_reads"),
+        ("control_discordant_mei_right_subfamily", "control_discordant_mei_right_supported_reads"),
+        ("control_L_mei_subfamily", "control_L_mei_supported_reads"),
+        ("control_R_mei_subfamily", "control_R_mei_supported_reads"),
     ]:
         label = str(row.get(subfamily_col, "") or "").strip()
         weight = _row_int(row, weight_col)
@@ -4026,18 +4026,18 @@ def _choose_event_subfamily(row: pd.Series) -> str:
 
 def _choose_event_family(row: pd.Series) -> str:
     candidates = [
-        str(row.get("tumor_discordant_mei_family", "")),
-        str(row.get("tumor_L_mei_family", "")),
-        str(row.get("tumor_R_mei_family", "")),
-        str(row.get("normal_discordant_mei_family", "")),
-        str(row.get("normal_L_mei_family", "")),
-        str(row.get("normal_R_mei_family", "")),
-        str(row.get("tumor_discordant_mei_subfamily", "")),
-        str(row.get("tumor_L_mei_subfamily", "")),
-        str(row.get("tumor_R_mei_subfamily", "")),
-        str(row.get("normal_discordant_mei_subfamily", "")),
-        str(row.get("normal_L_mei_subfamily", "")),
-        str(row.get("normal_R_mei_subfamily", "")),
+        str(row.get("disease_discordant_mei_family", "")),
+        str(row.get("disease_L_mei_family", "")),
+        str(row.get("disease_R_mei_family", "")),
+        str(row.get("control_discordant_mei_family", "")),
+        str(row.get("control_L_mei_family", "")),
+        str(row.get("control_R_mei_family", "")),
+        str(row.get("disease_discordant_mei_subfamily", "")),
+        str(row.get("disease_L_mei_subfamily", "")),
+        str(row.get("disease_R_mei_subfamily", "")),
+        str(row.get("control_discordant_mei_subfamily", "")),
+        str(row.get("control_L_mei_subfamily", "")),
+        str(row.get("control_R_mei_subfamily", "")),
         str(row.get("g1k_melt_insertion_subfamily", "")),
         str(row.get("g1k_melt_id", "")),
     ]
@@ -4051,14 +4051,14 @@ def _choose_event_family(row: pd.Series) -> str:
 def _choose_event_orientation(row: pd.Series) -> str:
     candidates = [
         str(row.get("insertion_orientation", "")),
-        str(row.get("tumor_insertion_orientation", "")),
-        str(row.get("normal_insertion_orientation", "")),
-        str(row.get("tumor_discordant_mei_strand", "")),
-        str(row.get("tumor_L_mei_strand", "")),
-        str(row.get("tumor_R_mei_strand", "")),
-        str(row.get("normal_discordant_mei_strand", "")),
-        str(row.get("normal_L_mei_strand", "")),
-        str(row.get("normal_R_mei_strand", "")),
+        str(row.get("disease_insertion_orientation", "")),
+        str(row.get("control_insertion_orientation", "")),
+        str(row.get("disease_discordant_mei_strand", "")),
+        str(row.get("disease_L_mei_strand", "")),
+        str(row.get("disease_R_mei_strand", "")),
+        str(row.get("control_discordant_mei_strand", "")),
+        str(row.get("control_L_mei_strand", "")),
+        str(row.get("control_R_mei_strand", "")),
     ]
     for c in candidates:
         cc = (c or "").strip()
@@ -4147,7 +4147,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
     for row in out.itertuples(index=False):
         as_row = pd.Series(row._asdict())
         chrom = str(getattr(row, "chrom"))
-        pos_1based = int(getattr(row, "tumor_insertion_breakpoint_pos", 0))
+        pos_1based = int(getattr(row, "disease_insertion_breakpoint_pos", 0))
         if pos_1based <= 0:
             pos_1based = int((int(getattr(row, "window_start", 1)) + int(getattr(row, "window_end", 1))) // 2)
         pos0 = max(0, pos_1based - 1)
@@ -4220,8 +4220,8 @@ def annotate_candidate_loci_with_mei(
     mei_fasta: Path,
     out_path: Path,
     reference_fasta: Path | None = None,
-    tumor_bam_path: Path | None = None,
-    normal_bam_path: Path | None = None,
+    disease_bam_path: Path | None = None,
+    control_bam_path: Path | None = None,
     rmsk_table_path: Path | None = None,
     g1k_mei_vcf: Path | None = None,
     g1k_split_padding_bp: int = 200,
@@ -4244,33 +4244,33 @@ def annotate_candidate_loci_with_mei(
     total_t0 = time.monotonic()
     candidate = pd.read_csv(candidate_loci_path, sep="\t")
 
-    split_tumor_raw = _load_table(evidence_dir, "split_evidence", "tumor")
-    split_normal_raw = _load_table(evidence_dir, "split_evidence", "normal")
-    discordant_tumor_raw = _load_table(evidence_dir, "discordant_evidence", "tumor")
-    discordant_normal_raw = _load_table(evidence_dir, "discordant_evidence", "normal")
-    split_tumor = _assign_rows_to_candidate_loci(split_tumor_raw, candidate)
-    split_normal = _assign_rows_to_candidate_loci(split_normal_raw, candidate)
-    discordant_tumor = _assign_rows_to_candidate_loci(discordant_tumor_raw, candidate)
-    discordant_normal = _assign_rows_to_candidate_loci(discordant_normal_raw, candidate)
+    split_disease_raw = _load_table(evidence_dir, "split_evidence", "disease")
+    split_control_raw = _load_table(evidence_dir, "split_evidence", "control")
+    discordant_disease_raw = _load_table(evidence_dir, "discordant_evidence", "disease")
+    discordant_control_raw = _load_table(evidence_dir, "discordant_evidence", "control")
+    split_disease = _assign_rows_to_candidate_loci(split_disease_raw, candidate)
+    split_control = _assign_rows_to_candidate_loci(split_control_raw, candidate)
+    discordant_disease = _assign_rows_to_candidate_loci(discordant_disease_raw, candidate)
+    discordant_control = _assign_rows_to_candidate_loci(discordant_control_raw, candidate)
 
-    tumor_hits, tumor_summary = _align_clips_with_minimap2(split_tumor, mei_fasta, sample="tumor")
-    normal_hits, normal_summary = _align_clips_with_minimap2(split_normal, mei_fasta, sample="normal")
-    tumor_disc_hits, tumor_disc_summary = _align_discordant_reads_with_minimap2(
-        discordant_tumor, mei_fasta, sample="tumor"
+    disease_hits, disease_summary = _align_clips_with_minimap2(split_disease, mei_fasta, sample="disease")
+    control_hits, control_summary = _align_clips_with_minimap2(split_control, mei_fasta, sample="control")
+    disease_disc_hits, disease_disc_summary = _align_discordant_reads_with_minimap2(
+        discordant_disease, mei_fasta, sample="disease"
     )
-    normal_disc_hits, normal_disc_summary = _align_discordant_reads_with_minimap2(
-        discordant_normal, mei_fasta, sample="normal"
+    control_disc_hits, control_disc_summary = _align_discordant_reads_with_minimap2(
+        discordant_control, mei_fasta, sample="control"
     )
 
     print(
-        f"[mei-annotate] tumor clips={tumor_summary.clip_count} hits={tumor_summary.paf_hits}; "
-        f"normal clips={normal_summary.clip_count} hits={normal_summary.paf_hits}; "
-        f"tumor discordant reads={tumor_disc_summary.clip_count} hits={tumor_disc_summary.paf_hits}; "
-        f"normal discordant reads={normal_disc_summary.clip_count} hits={normal_disc_summary.paf_hits}"
+        f"[mei-annotate] disease clips={disease_summary.clip_count} hits={disease_summary.paf_hits}; "
+        f"control clips={control_summary.clip_count} hits={control_summary.paf_hits}; "
+        f"disease discordant reads={disease_disc_summary.clip_count} hits={disease_disc_summary.paf_hits}; "
+        f"control discordant reads={control_disc_summary.clip_count} hits={control_disc_summary.paf_hits}"
     )
 
     anno_parts = []
-    for sample_prefix, df in (("tumor", tumor_hits), ("normal", normal_hits)):
+    for sample_prefix, df in (("disease", disease_hits), ("control", control_hits)):
         for side in ("L", "R"):
             anno_parts.append(_aggregate_side_metrics(df, sample_prefix=sample_prefix, side=side))
 
@@ -4281,10 +4281,10 @@ def annotate_candidate_loci_with_mei(
         if (idx + 1) % 2 == 0:
             print(f"[mei-annotate] merged side metrics {idx + 1}/{len(anno_parts)}")
 
-    disc_t = _aggregate_discordant_mei_metrics(tumor_disc_hits, sample_prefix="tumor")
-    disc_n = _aggregate_discordant_mei_metrics(normal_disc_hits, sample_prefix="normal")
-    disc_anchor_t = _aggregate_discordant_anchor_side_metrics(discordant_tumor, sample_prefix="tumor")
-    disc_anchor_n = _aggregate_discordant_anchor_side_metrics(discordant_normal, sample_prefix="normal")
+    disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits, sample_prefix="disease")
+    disc_n = _aggregate_discordant_mei_metrics(control_disc_hits, sample_prefix="control")
+    disc_anchor_t = _aggregate_discordant_anchor_side_metrics(discordant_disease, sample_prefix="disease")
+    disc_anchor_n = _aggregate_discordant_anchor_side_metrics(discordant_control, sample_prefix="control")
     if not disc_t.empty:
         candidate = candidate.merge(disc_t, on=["chrom", "window_start", "window_end"], how="left")
     if not disc_n.empty:
@@ -4310,37 +4310,37 @@ def annotate_candidate_loci_with_mei(
     # De-fragment frame before adding many derived columns to avoid pandas PerformanceWarning.
     candidate = candidate.copy()
 
-    candidate["tumor_split_mei_score_sum"] = candidate.get("tumor_L_mei_score_sum", 0.0) + candidate.get(
-        "tumor_R_mei_score_sum", 0.0
+    candidate["disease_split_mei_score_sum"] = candidate.get("disease_L_mei_score_sum", 0.0) + candidate.get(
+        "disease_R_mei_score_sum", 0.0
     )
-    candidate["normal_split_mei_score_sum"] = candidate.get("normal_L_mei_score_sum", 0.0) + candidate.get(
-        "normal_R_mei_score_sum", 0.0
+    candidate["control_split_mei_score_sum"] = candidate.get("control_L_mei_score_sum", 0.0) + candidate.get(
+        "control_R_mei_score_sum", 0.0
     )
-    candidate["tumor_split_mei_supported_reads"] = candidate.get("tumor_L_mei_supported_reads", 0) + candidate.get(
-        "tumor_R_mei_supported_reads", 0
+    candidate["disease_split_mei_supported_reads"] = candidate.get("disease_L_mei_supported_reads", 0) + candidate.get(
+        "disease_R_mei_supported_reads", 0
     )
-    candidate["normal_split_mei_supported_reads"] = candidate.get("normal_L_mei_supported_reads", 0) + candidate.get(
-        "normal_R_mei_supported_reads", 0
+    candidate["control_split_mei_supported_reads"] = candidate.get("control_L_mei_supported_reads", 0) + candidate.get(
+        "control_R_mei_supported_reads", 0
     )
-    candidate["tumor_discordant_mei_supported_reads"] = candidate.get("tumor_discordant_mei_supported_reads", 0).fillna(0).astype(int)
-    candidate["normal_discordant_mei_supported_reads"] = candidate.get("normal_discordant_mei_supported_reads", 0).fillna(0).astype(int)
-    candidate["tumor_discordant_mei_score_sum"] = candidate.get("tumor_discordant_mei_score_sum", 0.0).fillna(0.0).astype(float)
-    candidate["normal_discordant_mei_score_sum"] = candidate.get("normal_discordant_mei_score_sum", 0.0).fillna(0.0).astype(float)
+    candidate["disease_discordant_mei_supported_reads"] = candidate.get("disease_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+    candidate["control_discordant_mei_supported_reads"] = candidate.get("control_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+    candidate["disease_discordant_mei_score_sum"] = candidate.get("disease_discordant_mei_score_sum", 0.0).fillna(0.0).astype(float)
+    candidate["control_discordant_mei_score_sum"] = candidate.get("control_discordant_mei_score_sum", 0.0).fillna(0.0).astype(float)
 
-    candidate["tumor_mei_score_sum"] = candidate["tumor_split_mei_score_sum"] + candidate["tumor_discordant_mei_score_sum"]
-    candidate["normal_mei_score_sum"] = candidate["normal_split_mei_score_sum"] + candidate["normal_discordant_mei_score_sum"]
-    candidate["tumor_mei_supported_reads"] = (
-        candidate["tumor_split_mei_supported_reads"] + candidate["tumor_discordant_mei_supported_reads"]
+    candidate["disease_mei_score_sum"] = candidate["disease_split_mei_score_sum"] + candidate["disease_discordant_mei_score_sum"]
+    candidate["control_mei_score_sum"] = candidate["control_split_mei_score_sum"] + candidate["control_discordant_mei_score_sum"]
+    candidate["disease_mei_supported_reads"] = (
+        candidate["disease_split_mei_supported_reads"] + candidate["disease_discordant_mei_supported_reads"]
     )
-    candidate["normal_mei_supported_reads"] = (
-        candidate["normal_split_mei_supported_reads"] + candidate["normal_discordant_mei_supported_reads"]
+    candidate["control_mei_supported_reads"] = (
+        candidate["control_split_mei_supported_reads"] + candidate["control_discordant_mei_supported_reads"]
     )
-    candidate["mei_score_enrichment_ratio"] = (candidate["tumor_mei_score_sum"] + 0.1) / (
-        candidate["normal_mei_score_sum"] + 0.1
+    candidate["mei_score_enrichment_ratio"] = (candidate["disease_mei_score_sum"] + 0.1) / (
+        candidate["control_mei_score_sum"] + 0.1
     )
 
     candidate = _add_local_depth_normalized_support(candidate)
-    candidate = _infer_tumor_insertion_metrics(candidate, reference_fasta=reference_fasta)
+    candidate = _infer_disease_insertion_metrics(candidate, reference_fasta=reference_fasta)
     candidate = _compute_insertion_model_scores(candidate)
     candidate = _assign_bronze_silver_stages(candidate)
     if g1k_mei_vcf is not None:
@@ -4366,12 +4366,12 @@ def annotate_candidate_loci_with_mei(
             f"[mei-annotate] added nested-retrotransposon overlap annotation "
             f"(elapsed={time.monotonic() - rmsk_t0:.1f}s)"
         )
-    if tumor_bam_path is not None and normal_bam_path is not None:
+    if disease_bam_path is not None and control_bam_path is not None:
         emp_t0 = time.monotonic()
         candidate = _annotate_bam_depth_for_consistent_loci(
             candidate,
-            tumor_bam_path=tumor_bam_path,
-            normal_bam_path=normal_bam_path,
+            disease_bam_path=disease_bam_path,
+            control_bam_path=control_bam_path,
             empirical_random_windows=empirical_random_windows,
             empirical_random_scope=empirical_random_scope,
             empirical_random_seed=empirical_random_seed,
@@ -4385,7 +4385,7 @@ def annotate_candidate_loci_with_mei(
             empirical_cache_dir=empirical_cache_dir if empirical_cache_dir is not None else out_path.parent / "empirical_cache",
         )
         print(
-            f"[mei-annotate] added BAM-depth normalization for family-consistent, junk-clean loci "
+            f"[mei-annotate] added BAM-depth controlization for family-consistent, junk-clean loci "
             f"(elapsed={time.monotonic() - emp_t0:.1f}s)"
         )
     candidate = _assign_gold_stage(candidate)

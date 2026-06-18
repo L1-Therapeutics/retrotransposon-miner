@@ -1,12 +1,12 @@
 # Proof-of-Signal Runbook
 
-This runbook reproduces the current end-to-end prototype for tumor-vs-normal
+This runbook reproduces the current end-to-end prototype for disease-vs-control
 MEI signal discovery on chr22-style test data.
 
 ## Inputs
 
-- Tumor BAM on hg38 (chr22-sliced in current test flow)
-- Normal BAM on hg38 (chr22-sliced)
+- disease BAM on hg38 (chr22-sliced in current test flow)
+- control BAM on hg38 (chr22-sliced)
 - MEI reference FASTA (LINE1/Alu/SVA subset), e.g.:
   - `data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta`
 - Reference genome FASTA (optional but recommended for TSD sequence and breakpoint
@@ -34,8 +34,8 @@ Run from repo root:
 
 ```bash
 bash scripts/run_proof_of_signal.sh \
-  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
-  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
+  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
+  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
   --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
   --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --outdir results/mei_step1_hg38_chr22 \
@@ -50,8 +50,8 @@ repo-relative paths:
 
 ```bash
 RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
-  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
-  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
+  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
+  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
   --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
   --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --g1k-mei-vcf data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz \
@@ -67,8 +67,8 @@ scoring during `annotate-mei-support`:
 
 ```bash
 RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
-  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
-  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
+  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
+  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
   --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
   --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --g1k-mei-vcf data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz \
@@ -98,8 +98,8 @@ ls -lh data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz
 
 ```bash
 bash scripts/run_proof_of_signal.sh \
-  --tumor-bam data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam \
-  --normal-bam data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam \
+  --disease-bam data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam \
+  --control-bam data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam \
   --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
   --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --outdir results/mei_step1_hg38_chr15 \
@@ -111,8 +111,8 @@ If running via micromamba command-level execution:
 
 ```bash
 RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
-  --tumor-bam data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam \
-  --normal-bam data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam \
+  --disease-bam data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam \
+  --control-bam data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam \
   --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
   --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --outdir results/mei_step1_hg38_chr15 \
@@ -125,8 +125,8 @@ execution, add:
 
 ```bash
 RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
-  --tumor-bam data/public/test_data/seqc2/chr22/tumor.chr22.hg38.bam \
-  --normal-bam data/public/test_data/seqc2/chr22/normal.chr22.hg38.bam \
+  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
+  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
   --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
   --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta
 ```
@@ -154,7 +154,7 @@ Nested insertion columns in `candidate_loci.mei.tsv`:
 ## Rough high-confidence count
 
 ```bash
-awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) c[$i]=i; next} ($c["junk_flag_count"]+0)==0 && ($c["mate_junk_flag_count"]+0)==0 && ($c["tumor_mei_supported_reads"]+0)>=2 && ($c["mei_score_enrichment_ratio"]+0)>=2 && ($c["enrichment_ratio"]+0)>1 && ($c["tumor_insertion_mei_span"]+0)>=30 {n++} END{print n+0}' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv
+awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) c[$i]=i; next} ($c["junk_flag_count"]+0)==0 && ($c["mate_junk_flag_count"]+0)==0 && ($c["disease_mei_supported_reads"]+0)>=2 && ($c["mei_score_enrichment_ratio"]+0)>=2 && ($c["enrichment_ratio"]+0)>1 && ($c["disease_insertion_mei_span"]+0)>=30 {n++} END{print n+0}' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv
 ```
 
 ## Condensed review table (key fields)
@@ -167,28 +167,28 @@ awk -F'\t' '
 NR==1{
   for(i=1;i<=NF;i++) c[$i]=i
   print "chrom","window_start","window_end","tier","score","coherence", \
-        "tumor_mei_supported_reads","normal_mei_supported_reads","mei_ratio", \
-        "tumor_insertion_breakpoint_pos","tumor_insertion_mei_span","tumor_poly_at_max_run","tumor_poly_at_reads", \
-        "tumor_poly_at_fraction_weighted","tsd_detected","tsd_len_estimate","tsd_seq", \
-        "tumor_breakpoint_context_11bp_oriented","tumor_breakpoint_l1_en_pattern_yy_rrrr","tumor_breakpoint_l1_en_orientation_source", \
-        "tumor_breakpoint_l1_en_best_motif", \
-        "tumor_breakpoint_l1_en_motif_type","tumor_breakpoint_l1_en_best_match_seq","tumor_breakpoint_l1_en_best_match_offset","tumor_breakpoint_yyrrrr_logodds","tumor_breakpoint_yyrrrr_logodds_shift1_max","tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj","tumor_breakpoint_yyrrrr_best_offset","tumor_breakpoint_l1_en_motif_like", \
-        "tumor_subfamily","normal_subfamily"
+        "disease_mei_supported_reads","control_mei_supported_reads","mei_ratio", \
+        "disease_insertion_breakpoint_pos","disease_insertion_mei_span","disease_poly_at_max_run","disease_poly_at_reads", \
+        "disease_poly_at_fraction_weighted","tsd_detected","tsd_len_estimate","tsd_seq", \
+        "disease_breakpoint_context_11bp_oriented","disease_breakpoint_l1_en_pattern_yy_rrrr","disease_breakpoint_l1_en_orientation_source", \
+        "disease_breakpoint_l1_en_best_motif", \
+        "disease_breakpoint_l1_en_motif_type","disease_breakpoint_l1_en_best_match_seq","disease_breakpoint_l1_en_best_match_offset","disease_breakpoint_yyrrrr_logodds","disease_breakpoint_yyrrrr_logodds_shift1_max","disease_breakpoint_yyrrrr_logodds_shift1_mt_adj","disease_breakpoint_yyrrrr_best_offset","disease_breakpoint_l1_en_motif_like", \
+        "disease_subfamily","control_subfamily"
   next
 }
 {
-  t = $c["tumor_mei_supported_reads"]+0
-  n = $c["normal_mei_supported_reads"]+0
+  t = $c["disease_mei_supported_reads"]+0
+  n = $c["control_mei_supported_reads"]+0
   s = $c["insertion_model_score"]+0
   coh = $c["coherence_score"]+0
   if (t>=2 && n>=2 && s>=0.50 && coh>=0.45) {
     print $c["chrom"],$c["window_start"],$c["window_end"],$c["insertion_call_tier"],s,coh, \
           t,n,$c["mei_score_enrichment_ratio"], \
-          $c["tumor_insertion_breakpoint_pos"],$c["tumor_insertion_mei_span"],$c["tumor_poly_at_max_run"],$c["tumor_poly_at_reads"], \
-          $c["tumor_poly_at_fraction_weighted"],$c["tsd_detected"],$c["tsd_len_estimate"],$c["tsd_seq"], \
-          $c["tumor_breakpoint_context_11bp_oriented"],$c["tumor_breakpoint_l1_en_pattern_yy_rrrr"],$c["tumor_breakpoint_l1_en_orientation_source"],$c["tumor_breakpoint_l1_en_best_motif"], \
-          $c["tumor_breakpoint_l1_en_motif_type"],$c["tumor_breakpoint_l1_en_best_match_seq"],$c["tumor_breakpoint_l1_en_best_match_offset"],$c["tumor_breakpoint_yyrrrr_logodds"],$c["tumor_breakpoint_yyrrrr_logodds_shift1_max"],$c["tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj"],$c["tumor_breakpoint_yyrrrr_best_offset"],$c["tumor_breakpoint_l1_en_motif_like"], \
-          $c["tumor_R_mei_subfamily"],$c["normal_R_mei_subfamily"]
+          $c["disease_insertion_breakpoint_pos"],$c["disease_insertion_mei_span"],$c["disease_poly_at_max_run"],$c["disease_poly_at_reads"], \
+          $c["disease_poly_at_fraction_weighted"],$c["tsd_detected"],$c["tsd_len_estimate"],$c["tsd_seq"], \
+          $c["disease_breakpoint_context_11bp_oriented"],$c["disease_breakpoint_l1_en_pattern_yy_rrrr"],$c["disease_breakpoint_l1_en_orientation_source"],$c["disease_breakpoint_l1_en_best_motif"], \
+          $c["disease_breakpoint_l1_en_motif_type"],$c["disease_breakpoint_l1_en_best_match_seq"],$c["disease_breakpoint_l1_en_best_match_offset"],$c["disease_breakpoint_yyrrrr_logodds"],$c["disease_breakpoint_yyrrrr_logodds_shift1_max"],$c["disease_breakpoint_yyrrrr_logodds_shift1_mt_adj"],$c["disease_breakpoint_yyrrrr_best_offset"],$c["disease_breakpoint_l1_en_motif_like"], \
+          $c["disease_R_mei_subfamily"],$c["control_R_mei_subfamily"]
   }
 }
 ' OFS='\t' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv | sort -t$'\t' -k5,5gr
@@ -198,10 +198,10 @@ For chr15, replace the input path with:
 
 `results/mei_step1_hg38_chr15/candidate_loci.mei.tsv`
 
-## Strict somatic-only DPE shortlist
+## Strict disease-only DPE shortlist
 
-Use this to keep only loci with bilateral tumor DPE support (1+ each side),
-perfect tumor DPE family/strand consistency, no junk flag, and **zero** normal
+Use this to keep only loci with bilateral disease DPE support (1+ each side),
+perfect disease DPE family/strand consistency, no junk flag, and **zero** control
 MEI support (split or DPE):
 
 ```bash
@@ -209,34 +209,34 @@ awk -F'\t' '
 NR==1{
   for(i=1;i<=NF;i++) c[$i]=i
   print "chrom","window_start","window_end","sample_status","tier", \
-        "tumor_split_total","normal_split_total","tumor_dpe_total","normal_dpe_total", \
-        "tumor_dpe_left","tumor_dpe_right","normal_dpe_left","normal_dpe_right", \
-        "tumor_dpe_family","tumor_dpe_subfamily","tumor_dpe_strand", \
-        "tumor_dpe_family_purity","tumor_dpe_strand_purity", \
-        "tumor_anchor_mapq_mean","tumor_anchor_mapq_min","normal_anchor_mapq_mean","normal_anchor_mapq_min"
+        "disease_split_total","control_split_total","disease_dpe_total","control_dpe_total", \
+        "disease_dpe_left","disease_dpe_right","control_dpe_left","control_dpe_right", \
+        "disease_dpe_family","disease_dpe_subfamily","disease_dpe_strand", \
+        "disease_dpe_family_purity","disease_dpe_strand_purity", \
+        "disease_anchor_mapq_mean","disease_anchor_mapq_min","control_anchor_mapq_mean","control_anchor_mapq_min"
   next
 }
 {
-  tSplit = ($c["tumor_L_mei_supported_reads"]+0) + ($c["tumor_R_mei_supported_reads"]+0)
-  nSplit = ($c["normal_L_mei_supported_reads"]+0) + ($c["normal_R_mei_supported_reads"]+0)
-  tDpe = $c["tumor_discordant_mei_supported_reads"]+0
-  nDpe = $c["normal_discordant_mei_supported_reads"]+0
+  tSplit = ($c["disease_L_mei_supported_reads"]+0) + ($c["disease_R_mei_supported_reads"]+0)
+  nSplit = ($c["control_L_mei_supported_reads"]+0) + ($c["control_R_mei_supported_reads"]+0)
+  tDpe = $c["disease_discordant_mei_supported_reads"]+0
+  nDpe = $c["control_discordant_mei_supported_reads"]+0
   if (
     ($c["junk_flag_count"]+0)==0 &&
-    ($c["tumor_discordant_mei_left_supported_reads"]+0)>=1 &&
-    ($c["tumor_discordant_mei_right_supported_reads"]+0)>=1 &&
-    ($c["tumor_discordant_mei_family_purity"]+0)==1.0 &&
-    ($c["tumor_discordant_mei_strand_purity"]+0)==1.0 &&
+    ($c["disease_discordant_mei_left_supported_reads"]+0)>=1 &&
+    ($c["disease_discordant_mei_right_supported_reads"]+0)>=1 &&
+    ($c["disease_discordant_mei_family_purity"]+0)==1.0 &&
+    ($c["disease_discordant_mei_strand_purity"]+0)==1.0 &&
     nSplit==0 &&
     nDpe==0
   ) {
     print $c["chrom"],$c["window_start"],$c["window_end"],$c["sample_status_label"],$c["insertion_call_tier"], \
           tSplit,nSplit,tDpe,nDpe, \
-          $c["tumor_discordant_mei_left_supported_reads"],$c["tumor_discordant_mei_right_supported_reads"], \
-          $c["normal_discordant_mei_left_supported_reads"],$c["normal_discordant_mei_right_supported_reads"], \
-          $c["tumor_discordant_mei_family"],$c["tumor_discordant_mei_subfamily"],$c["tumor_discordant_mei_strand"], \
-          $c["tumor_discordant_mei_family_purity"],$c["tumor_discordant_mei_strand_purity"], \
-          $c["discordant_tumor_mapq_mean"],$c["discordant_tumor_mapq_min"],$c["discordant_normal_mapq_mean"],$c["discordant_normal_mapq_min"]
+          $c["disease_discordant_mei_left_supported_reads"],$c["disease_discordant_mei_right_supported_reads"], \
+          $c["control_discordant_mei_left_supported_reads"],$c["control_discordant_mei_right_supported_reads"], \
+          $c["disease_discordant_mei_family"],$c["disease_discordant_mei_subfamily"],$c["disease_discordant_mei_strand"], \
+          $c["disease_discordant_mei_family_purity"],$c["disease_discordant_mei_strand_purity"], \
+          $c["discordant_disease_mapq_mean"],$c["discordant_disease_mapq_min"],$c["discordant_control_mapq_mean"],$c["discordant_control_mapq_min"]
   }
 }
 ' OFS='\t' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv | sort -t$'\t' -k1,1 -k2,2n
@@ -246,12 +246,12 @@ NR==1{
 
 Use this to keep high-consistency bilateral DPE loci in clean regions while
 removing contradictory single-sample labels:
-- drop `somatic_only`/`tumor_only` if any normal support exists
-- drop `germline_only` if any tumor support exists
+- drop `disease_only` if any control support exists
+- drop `control_only` if any disease support exists
 - keep `shared`
 
 ```bash
-awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) c[$i]=i; print "chrom","window_start","window_end","sample_status","tier","tumor_dpe_total","tumor_dpe_left","tumor_dpe_right","normal_dpe_total","normal_dpe_left","normal_dpe_right","tumor_dpe_family","normal_dpe_family","tumor_dpe_subfamily","normal_dpe_subfamily","tumor_dpe_strand","normal_dpe_strand","tumor_dpe_family_purity","normal_dpe_family_purity","tumor_dpe_strand_purity","normal_dpe_strand_purity"; next} {tSplit=($c["tumor_L_mei_supported_reads"]+0)+($c["tumor_R_mei_supported_reads"]+0); nSplit=($c["normal_L_mei_supported_reads"]+0)+($c["normal_R_mei_supported_reads"]+0); tDpe=$c["tumor_discordant_mei_supported_reads"]+0; nDpe=$c["normal_discordant_mei_supported_reads"]+0; tAny=(tSplit+tDpe); nAny=(nSplit+nDpe); status=$c["sample_status_label"]; bilateral=((($c["tumor_discordant_mei_left_supported_reads"]+0)>=1 && ($c["tumor_discordant_mei_right_supported_reads"]+0)>=1 && ($c["tumor_discordant_mei_family_purity"]+0)==1.0 && ($c["tumor_discordant_mei_strand_purity"]+0)==1.0) || (($c["normal_discordant_mei_left_supported_reads"]+0)>=1 && ($c["normal_discordant_mei_right_supported_reads"]+0)>=1 && ($c["normal_discordant_mei_family_purity"]+0)==1.0 && ($c["normal_discordant_mei_strand_purity"]+0)==1.0)); drop_false_somatic=((status=="somatic_only" || status=="tumor_only") && nAny>=1); drop_false_germline=((status=="germline_only") && tAny>=1); if((($c["junk_flag_count"]+0)==0) && bilateral && !drop_false_somatic && !drop_false_germline){print $c["chrom"],$c["window_start"],$c["window_end"],status,$c["insertion_call_tier"],tDpe,$c["tumor_discordant_mei_left_supported_reads"],$c["tumor_discordant_mei_right_supported_reads"],nDpe,$c["normal_discordant_mei_left_supported_reads"],$c["normal_discordant_mei_right_supported_reads"],$c["tumor_discordant_mei_family"],$c["normal_discordant_mei_family"],$c["tumor_discordant_mei_subfamily"],$c["normal_discordant_mei_subfamily"],$c["tumor_discordant_mei_strand"],$c["normal_discordant_mei_strand"],$c["tumor_discordant_mei_family_purity"],$c["normal_discordant_mei_family_purity"],$c["tumor_discordant_mei_strand_purity"],$c["normal_discordant_mei_strand_purity"]}}' OFS='\t' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv | sort -t$'\t' -k4,4 -k1,1 -k2,2n
+awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) c[$i]=i; print "chrom","window_start","window_end","sample_status","tier","disease_dpe_total","disease_dpe_left","disease_dpe_right","control_dpe_total","control_dpe_left","control_dpe_right","disease_dpe_family","control_dpe_family","disease_dpe_subfamily","control_dpe_subfamily","disease_dpe_strand","control_dpe_strand","disease_dpe_family_purity","control_dpe_family_purity","disease_dpe_strand_purity","control_dpe_strand_purity"; next} {tSplit=($c["disease_L_mei_supported_reads"]+0)+($c["disease_R_mei_supported_reads"]+0); nSplit=($c["control_L_mei_supported_reads"]+0)+($c["control_R_mei_supported_reads"]+0); tDpe=$c["disease_discordant_mei_supported_reads"]+0; nDpe=$c["control_discordant_mei_supported_reads"]+0; tAny=(tSplit+tDpe); nAny=(nSplit+nDpe); status=$c["sample_status_label"]; bilateral=((($c["disease_discordant_mei_left_supported_reads"]+0)>=1 && ($c["disease_discordant_mei_right_supported_reads"]+0)>=1 && ($c["disease_discordant_mei_family_purity"]+0)==1.0 && ($c["disease_discordant_mei_strand_purity"]+0)==1.0) || (($c["control_discordant_mei_left_supported_reads"]+0)>=1 && ($c["control_discordant_mei_right_supported_reads"]+0)>=1 && ($c["control_discordant_mei_family_purity"]+0)==1.0 && ($c["control_discordant_mei_strand_purity"]+0)==1.0)); drop_false_disease=((status=="disease_only") && nAny>=1); drop_false_control=((status=="control_only") && tAny>=1); if((($c["junk_flag_count"]+0)==0) && bilateral && !drop_false_disease && !drop_false_control){print $c["chrom"],$c["window_start"],$c["window_end"],status,$c["insertion_call_tier"],tDpe,$c["disease_discordant_mei_left_supported_reads"],$c["disease_discordant_mei_right_supported_reads"],nDpe,$c["control_discordant_mei_left_supported_reads"],$c["control_discordant_mei_right_supported_reads"],$c["disease_discordant_mei_family"],$c["control_discordant_mei_family"],$c["disease_discordant_mei_subfamily"],$c["control_discordant_mei_subfamily"],$c["disease_discordant_mei_strand"],$c["control_discordant_mei_strand"],$c["disease_discordant_mei_family_purity"],$c["control_discordant_mei_family_purity"],$c["disease_discordant_mei_strand_purity"],$c["control_discordant_mei_strand_purity"]}}' OFS='\t' results/mei_step1_hg38_chr22/candidate_loci.mei.tsv | sort -t$'\t' -k4,4 -k1,1 -k2,2n
 ```
 
 ## Notes
