@@ -1318,10 +1318,10 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
     out["tumor_breakpoint_l1_en_best_match_strand"] = "unknown"
     out["tumor_breakpoint_l1_en_best_match_anchor_6mer"] = ""
     out["tumor_breakpoint_l1_en_best_match_pattern_yy_rrrr"] = ""
-    out["tumor_breakpoint_yyrrrr_logodds"] = 0.0
-    out["tumor_breakpoint_yyrrrr_logodds_shift1_max"] = 0.0
-    out["tumor_breakpoint_yyrrrr_best_offset"] = 0
-    out["tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = 0.0
+    out["tumor_breakpoint_yyrrrr_logodds"] = float("nan")
+    out["tumor_breakpoint_yyrrrr_logodds_shift1_max"] = float("nan")
+    out["tumor_breakpoint_yyrrrr_best_offset"] = -1
+    out["tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = float("nan")
     if reference_fasta is not None:
         with pysam.FastaFile(str(reference_fasta)) as ref:
             seqs = []
@@ -1377,10 +1377,10 @@ def _infer_tumor_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Pa
                     l1_best_match_strand.append("unknown")
                     l1_best_match_anchor_6mer.append("")
                     l1_best_match_pattern.append("")
-                    yyrrrr_scores.append(0.0)
-                    yyrrrr_shift1_scores.append(0.0)
-                    yyrrrr_best_offsets.append(0)
-                    yyrrrr_shift1_mt_adj_scores.append(0.0)
+                    yyrrrr_scores.append(float("nan"))
+                    yyrrrr_shift1_scores.append(float("nan"))
+                    yyrrrr_best_offsets.append(-1)
+                    yyrrrr_shift1_mt_adj_scores.append(float("nan"))
                     continue
                 chrom = str(row.chrom)
                 # 11 bp centered on breakpoint base (5 upstream + anchor + 5 downstream).
@@ -3469,12 +3469,47 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     ).reset_index(drop=True)
 
 
-_YYRRRR_MT_ADJ_SIGNIFICANCE_MIN = 1.5  # matches motif_logodds_scaled >= 0.25 in insertion model scoring.
+_YYRRRR_MT_ADJ_REPORT_MIN = 0.0  # report motif fields only when MT-adjusted log-odds are positive.
+
+
+def _yyrrrr_mt_adj_value(row: pd.Series) -> float:
+    val = row.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan"))
+    if pd.isna(val):
+        return float("nan")
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _yyrrrr_mt_adj_reportable(row: pd.Series) -> bool:
+    val = _yyrrrr_mt_adj_value(row)
+    return not pd.isna(val) and val > _YYRRRR_MT_ADJ_REPORT_MIN
+
+
+def _apply_breakpoint_motif_report_gating(df: pd.DataFrame) -> pd.DataFrame:
+    """Mask motif report fields unless breakpoint log-odds pass the report threshold."""
+    out = df.copy()
+    observed_hex = out.get("tumor_breakpoint_l1_en_hexamer_oriented", "").fillna("").astype(str)
+    observed_pattern = out.get("tumor_breakpoint_l1_en_pattern_yy_rrrr", "").fillna("").astype(str)
+    out["tumor_breakpoint_l1_en_observed_motif"] = observed_hex
+    out["tumor_breakpoint_l1_en_observed_motif_pattern"] = observed_pattern
+    mt_adj = out.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan")).astype(float)
+    reportable = mt_adj.notna() & (mt_adj > _YYRRRR_MT_ADJ_REPORT_MIN)
+    for col in (
+        "tumor_breakpoint_l1_en_observed_motif",
+        "tumor_breakpoint_l1_en_observed_motif_pattern",
+        "tumor_breakpoint_l1_en_best_motif",
+        "tumor_breakpoint_l1_en_motif_type",
+    ):
+        if col not in out.columns:
+            continue
+        out.loc[~reportable, col] = ""
+    return out
 
 
 def _consensus_retrotransposition_class(row: pd.Series) -> str:
-    mt_adj = float(row.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0) or 0.0)
-    if mt_adj < _YYRRRR_MT_ADJ_SIGNIFICANCE_MIN:
+    if not _yyrrrr_mt_adj_reportable(row):
         return ""
     if bool(row.get("tumor_breakpoint_l1_en_motif_like", False)):
         motif_type = str(row.get("tumor_breakpoint_l1_en_motif_type", "") or "").strip()
@@ -3485,20 +3520,30 @@ def _consensus_retrotransposition_class(row: pd.Series) -> str:
     return "classical"
 
 
-def _consensus_sequence_signature(row: pd.Series) -> str:
-    if not _consensus_retrotransposition_class(row):
+def _consensus_sequence_signature(row: pd.Series, *, retro_class: str = "") -> str:
+    if not retro_class:
         return ""
-    pattern = str(row.get("tumor_breakpoint_l1_en_pattern_yy_rrrr", "") or "").strip()
-    if pattern:
-        return pattern
-    return str(row.get("tumor_breakpoint_l1_en_best_motif", "") or "").strip()
+    for col in (
+        "tumor_breakpoint_l1_en_observed_motif_pattern",
+        "tumor_breakpoint_l1_en_observed_motif",
+        "tumor_breakpoint_l1_en_pattern_yy_rrrr",
+        "tumor_breakpoint_l1_en_best_match_pattern_yy_rrrr",
+        "tumor_breakpoint_l1_en_best_motif",
+    ):
+        pattern = str(row.get(col, "") or "").strip()
+        if pattern:
+            return pattern
+    return ""
 
 
 def _annotate_consensus_retrotransposition_fields(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     classes = out.apply(_consensus_retrotransposition_class, axis=1)
     out["consensus_retrotransposition_class"] = classes
-    out["consensus_sequence_signature"] = out.apply(_consensus_sequence_signature, axis=1)
+    out["consensus_sequence_signature"] = [
+        _consensus_sequence_signature(row, retro_class=retro_class)
+        for (_, row), retro_class in zip(out.iterrows(), classes)
+    ]
     out["consensus_sequence_label"] = out["consensus_sequence_signature"]
     return out
 
@@ -3573,6 +3618,8 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "consensus_sequence_signature",
         "consensus_sequence_label",
         "tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj",
+        "tumor_breakpoint_l1_en_observed_motif",
+        "tumor_breakpoint_l1_en_observed_motif_pattern",
         "tumor_breakpoint_l1_en_best_motif",
         "tumor_breakpoint_l1_en_motif_type",
         "nested_same_class_orientation",
@@ -4330,6 +4377,7 @@ def annotate_candidate_loci_with_mei(
         )
     candidate = _assign_gold_stage(candidate)
 
+    candidate = _apply_breakpoint_motif_report_gating(candidate)
     candidate = _prioritize_mei_candidates(candidate, stage_first=True)
 
     candidate.to_csv(out_path, sep="\t", index=False)
