@@ -3419,11 +3419,13 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     out["two_sided_support"] = _two_sided_support_mask(out)
 
     out["_prio_tsd"] = out.get("tsd_detected", False).fillna(False).astype(bool)
-    out["_prio_two_sided"] = out["two_sided_support"].astype(bool)
-    out["_prio_poly_at_max_run"] = out.get("poly_at_max_run", 0).fillna(0).astype(int)
+    out["_prio_high_conf_two_sided"] = (
+        out.get("insertion_call_tier", "").fillna("").astype(str) == "high_conf_two_sided"
+    )
     out["_prio_breakpoint_resolved"] = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
     out["_prio_g1k_region"] = out.get("g1k_melt_region_id", "").fillna("").astype(str).str.strip() != ""
     out["_prio_insertion_mei_span"] = out.get("insertion_mei_span", 0).fillna(0).astype(int)
+    out["_prio_poly_at_max_run"] = out.get("poly_at_max_run", 0).fillna(0).astype(int)
     out["_prio_split_reads"] = (
         out.get("tumor_split_mei_supported_reads", 0).fillna(0).astype(int)
         + out.get("normal_split_mei_supported_reads", 0).fillna(0).astype(int)
@@ -3443,11 +3445,11 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     sort_cols.extend(
         [
             "_prio_tsd",
-            "_prio_two_sided",
-            "_prio_poly_at_max_run",
+            "_prio_high_conf_two_sided",
             "_prio_breakpoint_resolved",
             "_prio_g1k_region",
             "_prio_insertion_mei_span",
+            "_prio_poly_at_max_run",
             "_prio_split_reads",
             "_prio_discordant_reads",
         ]
