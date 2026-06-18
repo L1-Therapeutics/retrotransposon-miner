@@ -3665,7 +3665,9 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
 
 
 def _infer_mei_family_from_fields(hit_id: str, family_hint: str, extra_hint: str) -> str:
-    txt = " ".join([hit_id or "", family_hint or "", extra_hint or ""]).upper()
+    txt = " ".join([hit_id or "", family_hint or "", extra_hint or ""]).strip().upper()
+    if not txt:
+        return ""
     if "ALU" in txt:
         return "ALU"
     if "SVA" in txt:
@@ -3674,7 +3676,7 @@ def _infer_mei_family_from_fields(hit_id: str, family_hint: str, extra_hint: str
         return "LINE1"
     if "HERV" in txt or "ERV" in txt:
         return "ERV"
-    return "OTHER"
+    return ""
 
 
 def _extract_float_from_info(value: object, default: float = -1.0) -> float:
