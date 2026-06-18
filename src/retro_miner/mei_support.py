@@ -1739,6 +1739,12 @@ def _df_col_float(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series
     return pd.Series(default, index=df.index, dtype=float)
 
 
+def _df_col_series(df: pd.DataFrame, col: str, default: object) -> pd.Series:
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
+
+
 def _complex_locus_companion_fraction(df: pd.DataFrame) -> pd.Series:
     fraction_cols = [
         "discordant_tumor_large_insert_fraction",
@@ -3425,30 +3431,45 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     out["two_sided_support"] = _two_sided_support_mask(out)
     out["poly_at_supported"] = _poly_at_supported_mask(out)
 
-    out["_prio_tsd"] = out.get("tsd_detected", False).fillna(False).astype(bool)
+    if "tsd_detected" in out.columns:
+        tsd_signal = _df_col_series(out, "tsd_detected", False).fillna(False).astype(bool)
+    else:
+        tsd_signal = _df_col_series(out, "tsd_or_polyA_supported", False).fillna(False).astype(bool)
+    out["_prio_tsd"] = tsd_signal
     out["_prio_high_conf_two_sided"] = (
-        out.get("insertion_call_tier", "").fillna("").astype(str) == "high_conf_two_sided"
+        _df_col_series(out, "insertion_call_tier", "").fillna("").astype(str) == "high_conf_two_sided"
     )
-    out["_prio_breakpoint_resolved"] = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
-    out["_prio_g1k_region"] = out.get("g1k_melt_region_id", "").fillna("").astype(str).str.strip() != ""
-    out["_prio_insertion_mei_span"] = out.get("insertion_mei_span", 0).fillna(0).astype(int)
+    out["_prio_breakpoint_resolved"] = _df_col_series(out, "tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
+    out["_prio_g1k_region"] = _df_col_series(out, "g1k_melt_region_id", "").fillna("").astype(str).str.strip() != ""
+    out["_prio_insertion_mei_span"] = _df_col_series(out, "insertion_mei_span", 0).fillna(0).astype(int)
     out["_prio_poly_at"] = out["poly_at_supported"].astype(bool)
     out["_prio_split_reads"] = (
-        out.get("tumor_split_mei_supported_reads", 0).fillna(0).astype(int)
-        + out.get("normal_split_mei_supported_reads", 0).fillna(0).astype(int)
+        _df_col_series(out, "tumor_split_mei_supported_reads", 0).fillna(0).astype(int)
+        + _df_col_series(out, "normal_split_mei_supported_reads", 0).fillna(0).astype(int)
     )
     out["_prio_discordant_reads"] = (
-        out.get("tumor_discordant_mei_supported_reads", 0).fillna(0).astype(int)
-        + out.get("normal_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+        _df_col_series(out, "tumor_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+        + _df_col_series(out, "normal_discordant_mei_supported_reads", 0).fillna(0).astype(int)
     )
 
     sort_cols: list[str] = []
     ascending: list[bool] = []
     if stage_first:
-        for col in ("gold_stage_pass", "silver_stage_pass"):
-            if col in out.columns:
+        if "gold_stage_pass" in out.columns and "silver_stage_pass" in out.columns:
+            for col in ("gold_stage_pass", "silver_stage_pass"):
                 sort_cols.append(col)
                 ascending.append(False)
+        elif "analysis_stage_tier" in out.columns:
+            out["_prio_stage"] = (
+                out["analysis_stage_tier"]
+                .fillna("")
+                .astype(str)
+                .map({"gold": 0, "silver": 1, "bronze": 2})
+                .fillna(3)
+                .astype(int)
+            )
+            sort_cols.append("_prio_stage")
+            ascending.append(True)
     sort_cols.extend(
         [
             "_prio_tsd",
@@ -3544,7 +3565,6 @@ def _annotate_consensus_retrotransposition_fields(df: pd.DataFrame) -> pd.DataFr
         _consensus_sequence_signature(row, retro_class=retro_class)
         for (_, row), retro_class in zip(out.iterrows(), classes)
     ]
-    out["consensus_sequence_label"] = out["consensus_sequence_signature"]
     return out
 
 
@@ -3555,7 +3575,6 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
             return out[col]
         return pd.Series([default] * len(out), index=out.index)
 
-    out["breakpoint_resolved"] = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
     out["tsd_or_polyA_supported"] = (
         out.get("tsd_detected", False).fillna(False).astype(bool)
         | (out.get("tumor_poly_at_reads", 0).fillna(0).astype(float) >= 1)
@@ -3563,25 +3582,43 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         | (out.get("poly_at_reads", 0).fillna(0).astype(float) >= 1)
     )
     out = _annotate_consensus_retrotransposition_fields(out)
-    out["g1k_overlap"] = _series_or_default("g1k_melt_id", "").fillna("").astype(str) != ""
     out["g1k_mei_family"] = _series_or_default("g1k_melt_insertion_subfamily", "").fillna("").astype(str).apply(
         lambda x: _infer_mei_family_from_fields(hit_id=x, family_hint=x, extra_hint="")
     )
     out["two_sided_support"] = _two_sided_support_mask(out)
     out["poly_at_supported"] = _poly_at_supported_mask(out)
+    bp_pos = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int)
+    out["tumor_insertion_breakpoint_pos"] = bp_pos.where(bp_pos > 0, -1)
 
     selected_cols = [
         "analysis_stage_tier",
-        "gold_stage_pass",
-        "silver_stage_pass",
         "sample_status_label",
         "insertion_call_tier",
         "complex_mei_event",
         "complex_sv_signature_label",
-        "mei_with_complex_sv_signature",
         "chrom",
         "window_start",
         "window_end",
+        "tumor_insertion_breakpoint_pos",
+        "insertion_orientation",
+        "insertion_mei_span",
+        "nested_same_class_orientation",
+        "poly_at_max_run",
+        "mei_family",
+        "mei_subfamily",
+        "g1k_melt_id",
+        "g1k_mei_family",
+        "g1k_melt_insertion_subfamily",
+        "g1k_melt_insertion_length",
+        "g1k_melt_tsd",
+        "g1k_melt_region_id",
+        "tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj",
+        "tumor_breakpoint_l1_en_best_motif",
+        "tumor_breakpoint_l1_en_motif_type",
+        "consensus_retrotransposition_class",
+        "tumor_breakpoint_l1_en_observed_motif",
+        "tumor_breakpoint_l1_en_observed_motif_pattern",
+        "consensus_sequence_signature",
         "tumor_split_mei_supported_reads",
         "normal_split_mei_supported_reads",
         "tumor_discordant_mei_supported_reads",
@@ -3594,14 +3631,7 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "tumor_strand_agreement",
         "normal_family_agreement",
         "normal_strand_agreement",
-        "tumor_insertion_breakpoint_pos",
-        "breakpoint_resolved",
         "two_sided_support",
-        "insertion_orientation",
-        "insertion_mei_span",
-        "tsd_detected",
-        "tsd_len_estimate",
-        "tsd_seq",
         "tumor_poly_at_reads",
         "tumor_poly_at_max_run",
         "tumor_poly_at_fraction_weighted",
@@ -3609,27 +3639,8 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "normal_poly_at_max_run",
         "normal_poly_at_fraction_weighted",
         "poly_at_reads",
-        "poly_at_max_run",
         "poly_at_supported",
         "tsd_or_polyA_supported",
-        "mei_family",
-        "mei_subfamily",
-        "consensus_retrotransposition_class",
-        "consensus_sequence_signature",
-        "consensus_sequence_label",
-        "tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj",
-        "tumor_breakpoint_l1_en_observed_motif",
-        "tumor_breakpoint_l1_en_observed_motif_pattern",
-        "tumor_breakpoint_l1_en_best_motif",
-        "tumor_breakpoint_l1_en_motif_type",
-        "nested_same_class_orientation",
-        "g1k_overlap",
-        "g1k_melt_id",
-        "g1k_mei_family",
-        "g1k_melt_insertion_subfamily",
-        "g1k_melt_insertion_length",
-        "g1k_melt_tsd",
-        "g1k_melt_region_id",
         "tumor_empirical_local_bam_mean_depth_p_high",
         "tumor_empirical_context_mapq_mean_p_low",
         "tumor_empirical_context_mapq_lt20_fraction_p_high",
