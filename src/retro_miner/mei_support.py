@@ -3413,10 +3413,17 @@ def _two_sided_support_mask(df: pd.DataFrame) -> pd.Series:
     return bilateral
 
 
+def _poly_at_supported_mask(df: pd.DataFrame) -> pd.Series:
+    return (df.get("poly_at_reads", 0).fillna(0).astype(int) > 0) | (
+        df.get("poly_at_max_run", 0).fillna(0).astype(int) > 0
+    )
+
+
 def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = True) -> pd.DataFrame:
     """Rank loci by evidence strength for manual review."""
     out = candidates.copy()
     out["two_sided_support"] = _two_sided_support_mask(out)
+    out["poly_at_supported"] = _poly_at_supported_mask(out)
 
     out["_prio_tsd"] = out.get("tsd_detected", False).fillna(False).astype(bool)
     out["_prio_high_conf_two_sided"] = (
@@ -3425,7 +3432,7 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     out["_prio_breakpoint_resolved"] = out.get("tumor_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
     out["_prio_g1k_region"] = out.get("g1k_melt_region_id", "").fillna("").astype(str).str.strip() != ""
     out["_prio_insertion_mei_span"] = out.get("insertion_mei_span", 0).fillna(0).astype(int)
-    out["_prio_poly_at_max_run"] = out.get("poly_at_max_run", 0).fillna(0).astype(int)
+    out["_prio_poly_at"] = out["poly_at_supported"].astype(bool)
     out["_prio_split_reads"] = (
         out.get("tumor_split_mei_supported_reads", 0).fillna(0).astype(int)
         + out.get("normal_split_mei_supported_reads", 0).fillna(0).astype(int)
@@ -3449,7 +3456,7 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
             "_prio_breakpoint_resolved",
             "_prio_g1k_region",
             "_prio_insertion_mei_span",
-            "_prio_poly_at_max_run",
+            "_prio_poly_at",
             "_prio_split_reads",
             "_prio_discordant_reads",
         ]
@@ -3460,6 +3467,40 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
         columns=[c for c in sorted_out.columns if c.startswith("_prio_")],
         errors="ignore",
     ).reset_index(drop=True)
+
+
+_YYRRRR_MT_ADJ_SIGNIFICANCE_MIN = 1.5  # matches motif_logodds_scaled >= 0.25 in insertion model scoring.
+
+
+def _consensus_retrotransposition_class(row: pd.Series) -> str:
+    mt_adj = float(row.get("tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0) or 0.0)
+    if mt_adj < _YYRRRR_MT_ADJ_SIGNIFICANCE_MIN:
+        return ""
+    if bool(row.get("tumor_breakpoint_l1_en_motif_like", False)):
+        motif_type = str(row.get("tumor_breakpoint_l1_en_motif_type", "") or "").strip()
+        if motif_type == "l1_en_canonical":
+            return "classical"
+        if motif_type in {"l1_en_alternative", "nested_novel_like"}:
+            return "non_classical"
+    return "classical"
+
+
+def _consensus_sequence_signature(row: pd.Series) -> str:
+    if not _consensus_retrotransposition_class(row):
+        return ""
+    pattern = str(row.get("tumor_breakpoint_l1_en_pattern_yy_rrrr", "") or "").strip()
+    if pattern:
+        return pattern
+    return str(row.get("tumor_breakpoint_l1_en_best_motif", "") or "").strip()
+
+
+def _annotate_consensus_retrotransposition_fields(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    classes = out.apply(_consensus_retrotransposition_class, axis=1)
+    out["consensus_retrotransposition_class"] = classes
+    out["consensus_sequence_signature"] = out.apply(_consensus_sequence_signature, axis=1)
+    out["consensus_sequence_label"] = out["consensus_sequence_signature"]
+    return out
 
 
 def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -3476,12 +3517,13 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         | (out.get("normal_poly_at_reads", 0).fillna(0).astype(float) >= 1)
         | (out.get("poly_at_reads", 0).fillna(0).astype(float) >= 1)
     )
-    out["consensus_sequence_label"] = _series_or_default("mei_subfamily", "").fillna("").astype(str)
+    out = _annotate_consensus_retrotransposition_fields(out)
     out["g1k_overlap"] = _series_or_default("g1k_melt_id", "").fillna("").astype(str) != ""
     out["g1k_mei_family"] = _series_or_default("g1k_melt_insertion_subfamily", "").fillna("").astype(str).apply(
         lambda x: _infer_mei_family_from_fields(hit_id=x, family_hint=x, extra_hint="")
     )
     out["two_sided_support"] = _two_sided_support_mask(out)
+    out["poly_at_supported"] = _poly_at_supported_mask(out)
 
     selected_cols = [
         "analysis_stage_tier",
@@ -3523,10 +3565,16 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "normal_poly_at_fraction_weighted",
         "poly_at_reads",
         "poly_at_max_run",
+        "poly_at_supported",
         "tsd_or_polyA_supported",
         "mei_family",
         "mei_subfamily",
+        "consensus_retrotransposition_class",
+        "consensus_sequence_signature",
         "consensus_sequence_label",
+        "tumor_breakpoint_yyrrrr_logodds_shift1_mt_adj",
+        "tumor_breakpoint_l1_en_best_motif",
+        "tumor_breakpoint_l1_en_motif_type",
         "nested_same_class_orientation",
         "g1k_overlap",
         "g1k_melt_id",
