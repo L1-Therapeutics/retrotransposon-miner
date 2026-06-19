@@ -4,11 +4,15 @@ set -euo pipefail
 echo "Validating retrotransposon-miner environment..."
 
 required_bins=(
+  git
   samtools
   bedtools
   minimap2
   bwa-mem2
   bcftools
+  liftOver
+  bigBedToBed
+  bigWigToBedGraph
 )
 
 for bin in "${required_bins[@]}"; do
@@ -19,9 +23,11 @@ for bin in "${required_bins[@]}"; do
 done
 
 optional_bins=(
-  liftOver
-  bigBedToBed
-  bigWigToBedGraph
+  igv
+  spades.py
+  java
+  Xvfb
+  xvfb-run
 )
 
 for bin in "${optional_bins[@]}"; do
@@ -29,6 +35,13 @@ for bin in "${optional_bins[@]}"; do
     echo "WARN: optional binary not found: ${bin}" >&2
   fi
 done
+
+if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]]; then
+  if ! command -v xvfb-run >/dev/null 2>&1 && ! command -v Xvfb >/dev/null 2>&1; then
+    echo "WARN: headless Linux without Xvfb; IGV snapshots will fail." >&2
+    echo "      Run: bash scripts/install_headless_igv_deps.sh" >&2
+  fi
+fi
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then

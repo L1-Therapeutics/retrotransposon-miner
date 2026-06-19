@@ -65,12 +65,19 @@ else
   create_or_update_with_micromamba "${MM_CMD}"
 fi
 
+if [[ "$(uname -s)" == "Linux" ]]; then
+  echo
+  echo "Checking headless IGV dependencies (system Xvfb)..."
+  bash "${ROOT_DIR}/scripts/install_headless_igv_deps.sh" || \
+    echo "WARN: could not install headless IGV deps; run: bash scripts/install_headless_igv_deps.sh" >&2
+fi
+
 echo
 echo "Environment ready."
 echo "Activate it with one of:"
-echo "  conda activate ${ENV_NAME}"
-echo "  mamba activate ${ENV_NAME}"
 echo "  micromamba activate ${ENV_NAME}"
+echo "  mamba activate ${ENV_NAME}"
+echo "  conda activate ${ENV_NAME}"
 echo
 echo "Then run:"
 echo "  bash scripts/validate_environment.sh"

@@ -522,6 +522,124 @@ def build_candidate_loci_cmd(
     default=None,
     help="Optional cache directory for empirical random-window metrics (defaults to out-tsv directory/empirical_cache).",
 )
+@click.option(
+    "--igv-plots/--no-igv-plots",
+    default=True,
+    show_default=True,
+    help="Generate IGV snapshot PNGs for top gold-review variants (requires reference + disease/control BAMs).",
+)
+@click.option(
+    "--igv-top-n",
+    type=int,
+    default=100,
+    show_default=True,
+    help="Maximum number of prioritized gold-review variants to snapshot with IGV.",
+)
+@click.option(
+    "--igv-snapshot-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory for IGV snapshots (default: <out-tsv-stem>.gold_review.igv).",
+)
+@click.option(
+    "--igv-launcher",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to igv.sh (default: search PATH and CONDA_PREFIX/bin).",
+)
+@click.option(
+    "--igv-gold-only/--igv-all-tiers",
+    default=True,
+    show_default=True,
+    help="Restrict IGV snapshots to gold-tier variants only.",
+)
+@click.option(
+    "--igv-panel-height-min",
+    type=int,
+    default=250,
+    show_default=True,
+    help="Minimum IGV maxPanelHeight per snapshot (pixels).",
+)
+@click.option(
+    "--igv-panel-height-max",
+    type=int,
+    default=8000,
+    show_default=True,
+    help="Maximum IGV maxPanelHeight per snapshot (pixels).",
+)
+@click.option(
+    "--igv-timeout-sec",
+    type=int,
+    default=None,
+    help="Optional timeout for the IGV batch run.",
+)
+@click.option(
+    "--local-assembly/--no-local-assembly",
+    default=False,
+    show_default=True,
+    help="Run per-silver-locus local assembly (SPAdes) for disease/control read stacks.",
+)
+@click.option(
+    "--assembly-cache-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Optional cache directory for local assembly artifacts (default: output dir/assembly_cache).",
+)
+@click.option(
+    "--assembly-interval-pad-bp",
+    type=int,
+    default=250,
+    show_default=True,
+    help="Local-assembly interval half-padding around breakpoint/window center.",
+)
+@click.option(
+    "--assembly-retry-pad-bp",
+    type=int,
+    default=600,
+    show_default=True,
+    help="Retry interval padding if initial local assembly fails.",
+)
+@click.option(
+    "--assembly-max-reads-per-sample",
+    type=int,
+    default=600,
+    show_default=True,
+    help="Cap extracted reads per sample per locus for local assembly.",
+)
+@click.option(
+    "--assembly-spades-threads",
+    type=int,
+    default=1,
+    show_default=True,
+    help="SPAdes threads per locus assembly.",
+)
+@click.option(
+    "--assembly-spades-memory-gb",
+    type=int,
+    default=8,
+    show_default=True,
+    help="SPAdes memory limit (GB) per locus assembly.",
+)
+@click.option(
+    "--assembly-minimap2-threads",
+    type=int,
+    default=1,
+    show_default=True,
+    help="minimap2 threads for per-locus contig alignments.",
+)
+@click.option(
+    "--assembly-locus-workers",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Number of loci to process in parallel during local assembly (0 = auto-size from CPU/RAM).",
+)
+@click.option(
+    "--assembly-reuse-cache-only/--no-assembly-reuse-cache-only",
+    default=False,
+    show_default=True,
+    help="Only reuse existing assembled cache entries; do not run SPAdes on cache miss.",
+)
 def annotate_mei_support_cmd(
     evidence_dir: Path,
     candidate_loci: Path,
@@ -547,6 +665,24 @@ def annotate_mei_support_cmd(
     empirical_exclude_gap_bed: Path | None,
     empirical_exclude_blacklist_bed: Path | None,
     empirical_cache_dir: Path | None,
+    igv_plots: bool,
+    igv_top_n: int,
+    igv_snapshot_dir: Path | None,
+    igv_launcher: Path | None,
+    igv_gold_only: bool,
+    igv_panel_height_min: int,
+    igv_panel_height_max: int,
+    igv_timeout_sec: int | None,
+    local_assembly: bool,
+    assembly_cache_dir: Path | None,
+    assembly_interval_pad_bp: int,
+    assembly_retry_pad_bp: int,
+    assembly_max_reads_per_sample: int,
+    assembly_spades_threads: int,
+    assembly_spades_memory_gb: int,
+    assembly_minimap2_threads: int,
+    assembly_locus_workers: int,
+    assembly_reuse_cache_only: bool,
 ) -> None:
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
     t0 = time.monotonic()
@@ -578,6 +714,24 @@ def annotate_mei_support_cmd(
         empirical_exclude_gap_bed=empirical_exclude_gap_bed,
         empirical_exclude_blacklist_bed=empirical_exclude_blacklist_bed,
         empirical_cache_dir=empirical_cache_dir,
+        igv_plots=igv_plots,
+        igv_top_n=igv_top_n,
+        igv_snapshot_dir=igv_snapshot_dir,
+        igv_launcher=igv_launcher,
+        igv_gold_only=igv_gold_only,
+        igv_panel_height_min=igv_panel_height_min,
+        igv_panel_height_max=igv_panel_height_max,
+        igv_timeout_sec=igv_timeout_sec,
+        local_assembly=local_assembly,
+        assembly_cache_dir=assembly_cache_dir,
+        assembly_interval_pad_bp=assembly_interval_pad_bp,
+        assembly_retry_pad_bp=assembly_retry_pad_bp,
+        assembly_max_reads_per_sample=assembly_max_reads_per_sample,
+        assembly_spades_threads=assembly_spades_threads,
+        assembly_spades_memory_gb=assembly_spades_memory_gb,
+        assembly_minimap2_threads=assembly_minimap2_threads,
+        assembly_locus_workers=assembly_locus_workers,
+        assembly_reuse_cache_only=assembly_reuse_cache_only,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 

@@ -168,11 +168,11 @@ NR==1{
   for(i=1;i<=NF;i++) c[$i]=i
   print "chrom","window_start","window_end","tier","score","coherence", \
         "disease_mei_supported_reads","control_mei_supported_reads","mei_ratio", \
-        "disease_insertion_breakpoint_pos","disease_insertion_mei_span","disease_poly_at_max_run","disease_poly_at_reads", \
+        "insertion_breakpoint_pos","disease_insertion_mei_span","disease_poly_at_max_run","disease_poly_at_reads", \
         "disease_poly_at_fraction_weighted","tsd_detected","tsd_len_estimate","tsd_seq", \
-        "disease_breakpoint_context_11bp_oriented","disease_breakpoint_l1_en_pattern_yy_rrrr","disease_breakpoint_l1_en_orientation_source", \
-        "disease_breakpoint_l1_en_best_motif", \
-        "disease_breakpoint_l1_en_motif_type","disease_breakpoint_l1_en_best_match_seq","disease_breakpoint_l1_en_best_match_offset","disease_breakpoint_yyrrrr_logodds","disease_breakpoint_yyrrrr_logodds_shift1_max","disease_breakpoint_yyrrrr_logodds_shift1_mt_adj","disease_breakpoint_yyrrrr_best_offset","disease_breakpoint_l1_en_motif_like", \
+        "breakpoint_context_11bp_oriented","breakpoint_l1_en_pattern_yy_rrrr","breakpoint_l1_en_orientation_source", \
+        "breakpoint_l1_en_best_motif", \
+        "breakpoint_l1_en_motif_type","breakpoint_l1_en_best_match_seq","breakpoint_l1_en_best_match_offset","breakpoint_yyrrrr_logodds","breakpoint_yyrrrr_logodds_shift1_max","breakpoint_yyrrrr_logodds_shift1_mt_adj","breakpoint_yyrrrr_best_offset","breakpoint_l1_en_motif_like", \
         "disease_subfamily","control_subfamily"
   next
 }
@@ -184,10 +184,10 @@ NR==1{
   if (t>=2 && n>=2 && s>=0.50 && coh>=0.45) {
     print $c["chrom"],$c["window_start"],$c["window_end"],$c["insertion_call_tier"],s,coh, \
           t,n,$c["mei_score_enrichment_ratio"], \
-          $c["disease_insertion_breakpoint_pos"],$c["disease_insertion_mei_span"],$c["disease_poly_at_max_run"],$c["disease_poly_at_reads"], \
+          $c["insertion_breakpoint_pos"],$c["disease_insertion_mei_span"],$c["disease_poly_at_max_run"],$c["disease_poly_at_reads"], \
           $c["disease_poly_at_fraction_weighted"],$c["tsd_detected"],$c["tsd_len_estimate"],$c["tsd_seq"], \
-          $c["disease_breakpoint_context_11bp_oriented"],$c["disease_breakpoint_l1_en_pattern_yy_rrrr"],$c["disease_breakpoint_l1_en_orientation_source"],$c["disease_breakpoint_l1_en_best_motif"], \
-          $c["disease_breakpoint_l1_en_motif_type"],$c["disease_breakpoint_l1_en_best_match_seq"],$c["disease_breakpoint_l1_en_best_match_offset"],$c["disease_breakpoint_yyrrrr_logodds"],$c["disease_breakpoint_yyrrrr_logodds_shift1_max"],$c["disease_breakpoint_yyrrrr_logodds_shift1_mt_adj"],$c["disease_breakpoint_yyrrrr_best_offset"],$c["disease_breakpoint_l1_en_motif_like"], \
+          $c["breakpoint_context_11bp_oriented"],$c["breakpoint_l1_en_pattern_yy_rrrr"],$c["breakpoint_l1_en_orientation_source"],$c["breakpoint_l1_en_best_motif"], \
+          $c["breakpoint_l1_en_motif_type"],$c["breakpoint_l1_en_best_match_seq"],$c["breakpoint_l1_en_best_match_offset"],$c["breakpoint_yyrrrr_logodds"],$c["breakpoint_yyrrrr_logodds_shift1_max"],$c["breakpoint_yyrrrr_logodds_shift1_mt_adj"],$c["breakpoint_yyrrrr_best_offset"],$c["breakpoint_l1_en_motif_like"], \
           $c["disease_R_mei_subfamily"],$c["control_R_mei_subfamily"]
   }
 }

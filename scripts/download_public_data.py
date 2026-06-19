@@ -90,12 +90,27 @@ def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> d
     )
 
     started = time.time()
-    with urllib.request.urlopen(request, timeout=timeout_sec) as resp, out_path.open("wb") as out_handle:
-        while True:
-            chunk = resp.read(1024 * 1024)
-            if not chunk:
-                break
-            out_handle.write(chunk)
+    tmp_path = out_path.with_name(f"{out_path.name}.part")
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as resp, tmp_path.open("wb") as out_handle:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_handle.write(chunk)
+        tmp_path.replace(out_path)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     elapsed = time.time() - started
     size = out_path.stat().st_size
     return {
@@ -128,6 +143,19 @@ def _run_cmd(cmd: list[str], required: bool = True) -> tuple[bool, str]:
     except subprocess.CalledProcessError as err:
         msg = f"command failed: {' '.join(cmd)}\n{err.stderr}"
         return (False, msg) if not required else (_raise_runtime(msg))
+
+
+def _ensure_postprocess_binaries() -> None:
+    required_bins = ("bigWigToBedGraph", "bigBedToBed", "liftOver")
+    missing = [name for name in required_bins if shutil.which(name) is None]
+    if not missing:
+        return
+    raise RuntimeError(
+        "Missing required postprocess executables: "
+        f"{', '.join(missing)}. "
+        "Install environment dependencies (including UCSC tools) and re-run, e.g. "
+        "'bash scripts/bootstrap_env.sh' followed by 'bash scripts/validate_environment.sh'."
+    )
 
 
 def _raise_runtime(msg: str) -> tuple[bool, str]:
@@ -303,14 +331,34 @@ def _convert_ucsc_txt_to_bed(src_gz: Path, dst_bed: Path, force: bool) -> dict[s
         for row in reader:
             if not row:
                 continue
-            # UCSC database dumps include `bin` in column 1.
-            # standard chrom/start/end are columns 2/3/4 (0-based indices 1/2/3).
-            if len(row) < 4:
+            # UCSC table dumps vary by schema:
+            # - plain BED-like rows: chrom/start/end at columns 0/1/2
+            # - many db-table dumps: `bin` + score fields before chrom/start/end
+            # Locate the first `chr*` token and read the next two numeric columns.
+            chrom = ""
+            start = ""
+            end = ""
+            extra = "."
+            for i, token in enumerate(row):
+                if not token.startswith("chr"):
+                    continue
+                if i + 2 >= len(row):
+                    continue
+                try:
+                    start_i = int(row[i + 1])
+                    end_i = int(row[i + 2])
+                except ValueError:
+                    continue
+                if end_i <= start_i:
+                    continue
+                chrom = token
+                start = str(start_i)
+                end = str(end_i)
+                if i + 3 < len(row):
+                    extra = row[i + 3] if row[i + 3] else "."
+                break
+            if not chrom:
                 continue
-            chrom = row[1]
-            start = row[2]
-            end = row[3]
-            extra = row[4] if len(row) > 4 else "."
             out_handle.write(f"{chrom}\t{start}\t{end}\t{extra}\n")
             lines += 1
 
@@ -328,7 +376,32 @@ def _filter_mei_bed(src_bed: Path, dst_bed: Path, force: bool) -> dict[str, Any]
         for line in in_handle:
             low = line.lower()
             if any(p in low for p in patterns):
-                out_handle.write(line)
+                parts = line.rstrip("\n").split("\t")
+                chrom = ""
+                start_i = -1
+                end_i = -1
+                extra = "."
+                for i, token in enumerate(parts):
+                    if not token.startswith("chr"):
+                        continue
+                    if i + 2 >= len(parts):
+                        continue
+                    try:
+                        s = int(parts[i + 1])
+                        e = int(parts[i + 2])
+                    except ValueError:
+                        continue
+                    if e <= s:
+                        continue
+                    chrom = token
+                    start_i = s
+                    end_i = e
+                    if i + 3 < len(parts) and parts[i + 3]:
+                        extra = parts[i + 3]
+                    break
+                if not chrom:
+                    continue
+                out_handle.write(f"{chrom}\t{start_i}\t{end_i}\t{extra}\n")
                 kept += 1
     return {"status": "filtered", "path": str(dst_bed), "rows": kept}
 
@@ -859,8 +932,30 @@ def main() -> int:
             print(f"[error] {ds.dataset_id}: {err}", file=sys.stderr)
 
         manifest["results"].append(result)
+        print(
+            f"[download:{result.get('status', 'unknown')}] {ds.dataset_id} -> {target}",
+            file=sys.stderr,
+        )
 
     if not args.skip_postprocess:
+        try:
+            _ensure_postprocess_binaries()
+        except Exception as err:  # noqa: BLE001
+            manifest["postprocess"].append({"step": "postprocess_dependency_check", "status": "failed", "error": str(err)})
+            manifest["summary"] = {
+                "downloaded": sum(1 for r in manifest["results"] if r["status"] == "downloaded"),
+                "skipped_exists": sum(1 for r in manifest["results"] if r["status"] == "skipped_exists"),
+                "failed_required": sum(1 for r in manifest["results"] if r["status"] == "failed" and r["required"]),
+                "failed_optional": sum(1 for r in manifest["results"] if r["status"] == "failed" and not r["required"]),
+                "postprocess_failed": 1,
+            }
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            with manifest_path.open("w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2)
+                handle.write("\n")
+            print(f"Wrote manifest: {manifest_path}")
+            print(json.dumps(manifest["summary"], indent=2))
+            return 1
         try:
             manifest["postprocess"] = _postprocess(
                 outdir,

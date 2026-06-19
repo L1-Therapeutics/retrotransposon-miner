@@ -17,6 +17,9 @@ import pandas as pd
 import pysam
 from intervaltree import IntervalTree
 
+from retro_miner.igv_plots import generate_gold_review_igv_plots
+from retro_miner.local_assembly import annotate_silver_with_local_assembly
+
 
 @dataclass
 class ClipAlignmentSummary:
@@ -1225,37 +1228,52 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
 
     out["disease_insertion_orientation"] = out.apply(orient, axis=1)
 
-    def _pick_tsd_pair(row: pd.Series) -> tuple[int, int, int]:
+    control_metrics = out.apply(
+        lambda r: _sample_insertion_span_and_orientation(r, "control"),
+        axis=1,
+        result_type="expand",
+    )
+    control_metrics.columns = [
+        "control_insertion_mei_start",
+        "control_insertion_mei_end",
+        "control_insertion_mei_span",
+        "control_insertion_orientation",
+    ]
+    for col in control_metrics.columns:
+        out[col] = control_metrics[col]
+
+    def _pick_tsd_pair(row: pd.Series) -> tuple[int, int, int, str]:
         # Prefer strict bilateral pairs from either disease or control.
         # If strict length is invalid, allow a small ±2 bp breakpoint rescue.
-        candidates: list[tuple[int, int, int, int]] = []
+        candidates: list[tuple[int, int, int, str]] = []
         t_l = int(row.get("disease_L_mei_breakpoint_mode", 0))
         t_r = int(row.get("disease_R_mei_breakpoint_mode", 0))
         t_support = int(row.get("disease_L_mei_supported_reads", 0)) + int(row.get("disease_R_mei_supported_reads", 0))
         if t_l > 0 and t_r > 0:
-            candidates.append((t_l, t_r, t_support, 0))
+            candidates.append((t_l, t_r, t_support, "tsd_disease"))
         n_l = int(row.get("control_L_mei_breakpoint_mode", 0))
         n_r = int(row.get("control_R_mei_breakpoint_mode", 0))
         n_support = int(row.get("control_L_mei_supported_reads", 0)) + int(row.get("control_R_mei_supported_reads", 0))
         if n_l > 0 and n_r > 0:
-            candidates.append((n_l, n_r, n_support, 1))
+            candidates.append((n_l, n_r, n_support, "tsd_control"))
         if not candidates:
-            return (0, 0, 0)
+            return (0, 0, 0, "")
 
         # Try strict first (no coordinate adjustment).
-        strict_ok: list[tuple[int, int, int]] = []
-        for l, r, support, _sample_priority in candidates:
+        strict_ok: list[tuple[int, int, int, str]] = []
+        for l, r, support, source in candidates:
             tsd_len = int(r - l + 1)
             if 2 <= tsd_len <= 30:
-                strict_ok.append((support, l, r))
+                strict_ok.append((support, l, r, source))
         if strict_ok:
             strict_ok.sort(key=lambda x: (x[0], x[2] - x[1]), reverse=True)
-            _support, best_l, best_r = strict_ok[0]
-            return (best_l, best_r, int(best_r - best_l + 1))
+            _support, best_l, best_r, source = strict_ok[0]
+            return (best_l, best_r, int(best_r - best_l + 1), source)
 
         # Rescue with ±2 bp shift when strict pairing misses by a few bases.
-        rescue: list[tuple[int, int, int, int, int]] = []
-        for l, r, support, sample_priority in candidates:
+        rescue: list[tuple[int, int, int, str, int, int]] = []
+        for l, r, support, source in candidates:
+            sample_priority = 0 if source == "tsd_disease" else 1
             for dl in (-2, -1, 0, 1, 2):
                 for dr in (-2, -1, 0, 1, 2):
                     ll = int(l + dl)
@@ -1265,63 +1283,68 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
                     tsd_len = int(rr - ll + 1)
                     if 2 <= tsd_len <= 30:
                         shift_penalty = abs(dl) + abs(dr)
-                        rescue.append((shift_penalty, -support, sample_priority, ll, rr))
+                        rescue.append((shift_penalty, -support, sample_priority, source, ll, rr))
         if not rescue:
-            return (0, 0, 0)
+            return (0, 0, 0, "")
         rescue.sort()
-        _shift_penalty, _neg_support, _sample_priority, best_l, best_r = rescue[0]
-        return (best_l, best_r, int(best_r - best_l + 1))
+        _shift_penalty, _neg_support, _sample_priority, source, best_l, best_r = rescue[0]
+        return (best_l, best_r, int(best_r - best_l + 1), source)
 
     tsd_pairs = out.apply(_pick_tsd_pair, axis=1, result_type="expand")
-    tsd_pairs.columns = ["tsd_left_breakpoint", "tsd_right_breakpoint", "tsd_len_estimate"]
+    tsd_pairs.columns = ["tsd_left_breakpoint", "tsd_right_breakpoint", "tsd_len_estimate", "tsd_evidence_source"]
     out["tsd_left_breakpoint"] = tsd_pairs["tsd_left_breakpoint"].astype(int)
     out["tsd_right_breakpoint"] = tsd_pairs["tsd_right_breakpoint"].astype(int)
     out["tsd_len_estimate"] = tsd_pairs["tsd_len_estimate"].astype(int)
+    out["tsd_evidence_source"] = tsd_pairs["tsd_evidence_source"].fillna("").astype(str)
     # Strict TSD evidence threshold: 4 bp or longer.
     out["tsd_detected"] = out["tsd_len_estimate"] >= 4
 
-    def _breakpoint_pos(row: pd.Series) -> int:
+    def _breakpoint_pos_and_source(row: pd.Series) -> tuple[int, str]:
         l = int(row.get("tsd_left_breakpoint", 0))
         r = int(row.get("tsd_right_breakpoint", 0))
         if l > 0 and r > 0:
-            return int((l + r) // 2)
+            source = str(row.get("tsd_evidence_source", "") or "").strip() or "tsd_unknown"
+            return int((l + r) // 2), source
         l = int(row.get("disease_L_mei_breakpoint_mode", 0))
         r = int(row.get("disease_R_mei_breakpoint_mode", 0))
         if l > 0 and r > 0:
-            return int((l + r) // 2)
+            return int((l + r) // 2), "disease_split"
         l = int(row.get("control_L_mei_breakpoint_mode", 0))
         r = int(row.get("control_R_mei_breakpoint_mode", 0))
         if l > 0 and r > 0:
-            return int((l + r) // 2)
+            return int((l + r) // 2), "control_split"
         if l > 0:
-            return l
+            return l, "control_single"
         if r > 0:
-            return r
-        return 0
+            return r, "control_single"
+        return 0, ""
 
-    out["disease_insertion_breakpoint_pos"] = out.apply(_breakpoint_pos, axis=1).astype(int)
+    bp_fields = out.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
+    bp_fields.columns = ["insertion_breakpoint_pos", "breakpoint_evidence_source"]
+    out["insertion_breakpoint_pos"] = bp_fields["insertion_breakpoint_pos"].astype(int)
+    out["breakpoint_evidence_source"] = bp_fields["breakpoint_evidence_source"].fillna("").astype(str)
     out["tsd_seq"] = ""
-    out["disease_breakpoint_context_11bp"] = ""
-    out["disease_breakpoint_l1_en_hexamer"] = ""
-    out["disease_breakpoint_l1_en_pattern"] = ""
-    out["disease_breakpoint_context_11bp_oriented"] = ""
-    out["disease_breakpoint_l1_en_hexamer_oriented"] = ""
-    out["disease_breakpoint_l1_en_pattern_yy_rrrr"] = ""
-    out["disease_breakpoint_l1_en_orientation_source"] = "unknown"
-    out["disease_breakpoint_l1_en_motif_like"] = False
-    out["disease_breakpoint_l1_en_best_motif"] = ""
-    out["disease_breakpoint_l1_en_motif_type"] = ""
-    out["disease_breakpoint_l1_en_mismatches"] = 99
-    out["disease_breakpoint_l1_en_mismatch_tolerance"] = 0
-    out["disease_breakpoint_l1_en_best_match_seq"] = ""
-    out["disease_breakpoint_l1_en_best_match_offset"] = 0
-    out["disease_breakpoint_l1_en_best_match_strand"] = "unknown"
-    out["disease_breakpoint_l1_en_best_match_anchor_6mer"] = ""
-    out["disease_breakpoint_l1_en_best_match_pattern_yy_rrrr"] = ""
-    out["disease_breakpoint_yyrrrr_logodds"] = float("nan")
-    out["disease_breakpoint_yyrrrr_logodds_shift1_max"] = float("nan")
-    out["disease_breakpoint_yyrrrr_best_offset"] = -1
-    out["disease_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = float("nan")
+    out["breakpoint_context_11bp"] = ""
+    out["breakpoint_l1_en_hexamer"] = ""
+    out["breakpoint_l1_en_pattern"] = ""
+    out["breakpoint_context_11bp_oriented"] = ""
+    out["breakpoint_l1_en_hexamer_oriented"] = ""
+    out["breakpoint_l1_en_pattern_yy_rrrr"] = ""
+    out["breakpoint_l1_en_orientation_source"] = "unknown"
+    out["breakpoint_l1_en_motif_like"] = False
+    out["breakpoint_l1_en_best_motif"] = ""
+    out["breakpoint_l1_en_motif_type"] = ""
+    out["breakpoint_l1_en_mismatches"] = 99
+    out["breakpoint_l1_en_mismatch_tolerance"] = 0
+    out["breakpoint_l1_en_best_match_seq"] = ""
+    out["breakpoint_l1_en_best_match_offset"] = 0
+    out["breakpoint_l1_en_best_match_strand"] = "unknown"
+    out["breakpoint_l1_en_best_match_anchor_6mer"] = ""
+    out["breakpoint_l1_en_best_match_pattern_yy_rrrr"] = ""
+    out["breakpoint_yyrrrr_logodds"] = float("nan")
+    out["breakpoint_yyrrrr_logodds_shift1_max"] = float("nan")
+    out["breakpoint_yyrrrr_best_offset"] = -1
+    out["breakpoint_yyrrrr_logodds_shift1_mt_adj"] = float("nan")
     if reference_fasta is not None:
         with pysam.FastaFile(str(reference_fasta)) as ref:
             seqs = []
@@ -1358,7 +1381,7 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
                     except Exception:
                         seqs.append("")
 
-                bp = int(getattr(row, "disease_insertion_breakpoint_pos", 0))
+                bp = int(getattr(row, "insertion_breakpoint_pos", 0))
                 if bp <= 0:
                     contexts_11bp.append("")
                     l1_hexamers.append("")
@@ -1401,7 +1424,9 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
                 oriented_hex6, oriented_ctx11, orientation_source = _orient_to_insertion_strand(
                     hexamer=hex6,
                     context11bp=ctx11,
-                    orientation=str(getattr(row, "disease_insertion_orientation", "")),
+                    orientation=str(
+                        _choose_consolidated_insertion_orientation(pd.Series(row._asdict()))
+                    ),
                 )
                 patt_yy_rrrr = f"{oriented_hex6[:2]}/{oriented_hex6[2:6]}" if len(oriented_hex6) == 6 else ""
                 allow_reverse_scan = orientation_source == "unknown"
@@ -1446,27 +1471,27 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
                 yyrrrr_best_offsets.append(int(yyrrrr_best_off))
                 yyrrrr_shift1_mt_adj_scores.append(float(yyrrrr_shift1_mt_adj))
             out["tsd_seq"] = seqs
-            out["disease_breakpoint_context_11bp"] = contexts_11bp
-            out["disease_breakpoint_l1_en_hexamer"] = l1_hexamers
-            out["disease_breakpoint_l1_en_pattern"] = l1_patterns
-            out["disease_breakpoint_context_11bp_oriented"] = contexts_11bp_oriented
-            out["disease_breakpoint_l1_en_hexamer_oriented"] = l1_hexamers_oriented
-            out["disease_breakpoint_l1_en_pattern_yy_rrrr"] = l1_patterns_yy_rrrr
-            out["disease_breakpoint_l1_en_orientation_source"] = l1_orientation_source
-            out["disease_breakpoint_l1_en_motif_like"] = l1_like
-            out["disease_breakpoint_l1_en_best_motif"] = l1_best_motif
-            out["disease_breakpoint_l1_en_motif_type"] = l1_motif_type
-            out["disease_breakpoint_l1_en_mismatches"] = l1_mismatches
-            out["disease_breakpoint_l1_en_mismatch_tolerance"] = l1_tolerance
-            out["disease_breakpoint_l1_en_best_match_seq"] = l1_best_match_seq
-            out["disease_breakpoint_l1_en_best_match_offset"] = l1_best_match_offset
-            out["disease_breakpoint_l1_en_best_match_strand"] = l1_best_match_strand
-            out["disease_breakpoint_l1_en_best_match_anchor_6mer"] = l1_best_match_anchor_6mer
-            out["disease_breakpoint_l1_en_best_match_pattern_yy_rrrr"] = l1_best_match_pattern
-            out["disease_breakpoint_yyrrrr_logodds"] = yyrrrr_scores
-            out["disease_breakpoint_yyrrrr_logodds_shift1_max"] = yyrrrr_shift1_scores
-            out["disease_breakpoint_yyrrrr_best_offset"] = yyrrrr_best_offsets
-            out["disease_breakpoint_yyrrrr_logodds_shift1_mt_adj"] = yyrrrr_shift1_mt_adj_scores
+            out["breakpoint_context_11bp"] = contexts_11bp
+            out["breakpoint_l1_en_hexamer"] = l1_hexamers
+            out["breakpoint_l1_en_pattern"] = l1_patterns
+            out["breakpoint_context_11bp_oriented"] = contexts_11bp_oriented
+            out["breakpoint_l1_en_hexamer_oriented"] = l1_hexamers_oriented
+            out["breakpoint_l1_en_pattern_yy_rrrr"] = l1_patterns_yy_rrrr
+            out["breakpoint_l1_en_orientation_source"] = l1_orientation_source
+            out["breakpoint_l1_en_motif_like"] = l1_like
+            out["breakpoint_l1_en_best_motif"] = l1_best_motif
+            out["breakpoint_l1_en_motif_type"] = l1_motif_type
+            out["breakpoint_l1_en_mismatches"] = l1_mismatches
+            out["breakpoint_l1_en_mismatch_tolerance"] = l1_tolerance
+            out["breakpoint_l1_en_best_match_seq"] = l1_best_match_seq
+            out["breakpoint_l1_en_best_match_offset"] = l1_best_match_offset
+            out["breakpoint_l1_en_best_match_strand"] = l1_best_match_strand
+            out["breakpoint_l1_en_best_match_anchor_6mer"] = l1_best_match_anchor_6mer
+            out["breakpoint_l1_en_best_match_pattern_yy_rrrr"] = l1_best_match_pattern
+            out["breakpoint_yyrrrr_logodds"] = yyrrrr_scores
+            out["breakpoint_yyrrrr_logodds_shift1_max"] = yyrrrr_shift1_scores
+            out["breakpoint_yyrrrr_best_offset"] = yyrrrr_best_offsets
+            out["breakpoint_yyrrrr_logodds_shift1_mt_adj"] = yyrrrr_shift1_mt_adj_scores
 
     # Weighted coherence metrics for ranking (annotation-only, no hard filtering).
     out["disease_breakpoint_mode_fraction_weighted"] = (
@@ -1523,21 +1548,179 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
         * out.get("control_R_mei_supported_reads", 0)
     ) / out.get("control_mei_supported_reads", 0).replace(0, 1)
 
-    control_metrics = out.apply(
-        lambda r: _sample_insertion_span_and_orientation(r, "control"),
-        axis=1,
-        result_type="expand",
-    )
-    control_metrics.columns = [
-        "control_insertion_mei_start",
-        "control_insertion_mei_end",
-        "control_insertion_mei_span",
-        "control_insertion_orientation",
-    ]
-    for col in control_metrics.columns:
-        out[col] = control_metrics[col]
     out["insertion_orientation"] = out.apply(_choose_consolidated_insertion_orientation, axis=1)
     out["insertion_mei_span"] = out.apply(_choose_consolidated_insertion_mei_span, axis=1).astype(int)
+    return out
+
+
+def _apply_assembly_refinement_overrides(candidates: pd.DataFrame) -> pd.DataFrame:
+    out = candidates.copy()
+    asm_source = out.get("asm_breakpoint_source", "").fillna("").astype(str)
+    asm_has_mei = asm_source.isin(["disease", "control"])
+
+    asm_bp = pd.to_numeric(out.get("asm_consensus_breakpoint_pos", float("nan")), errors="coerce")
+    out["insertion_breakpoint_pos"] = asm_bp.where(asm_has_mei & asm_bp.notna(), out.get("insertion_breakpoint_pos", 0)).fillna(0).astype(int)
+    out.loc[asm_has_mei, "breakpoint_evidence_source"] = asm_source.loc[asm_has_mei]
+
+    asm_tsd_seq = out.get("asm_tsd_seq", "").fillna("").astype(str)
+    out["tsd_seq"] = asm_tsd_seq.where(asm_has_mei & (asm_tsd_seq.str.len() > 0), out.get("tsd_seq", "").fillna("").astype(str))
+    asm_tsd_len = pd.to_numeric(out.get("asm_tsd_len", float("nan")), errors="coerce")
+    out["tsd_len_estimate"] = asm_tsd_len.where(asm_has_mei & asm_tsd_len.notna(), out.get("tsd_len_estimate", 0)).fillna(0).astype(int)
+    out["tsd_detected"] = out["tsd_len_estimate"].astype(float) >= 4.0
+
+    asm_poly = pd.to_numeric(out.get("asm_polyA_max_run", float("nan")), errors="coerce")
+    out["poly_at_max_run"] = asm_poly.where(asm_has_mei & asm_poly.notna(), out.get("poly_at_max_run", 0)).fillna(0).astype(int)
+
+    asm_orient = out.get("asm_insertion_orientation", "").fillna("").astype(str)
+    out["insertion_orientation"] = asm_orient.where(asm_has_mei & asm_orient.isin(["+", "-"]), out.get("insertion_orientation", "").fillna("").astype(str))
+
+    asm_span = pd.to_numeric(out.get("asm_insertion_length", float("nan")), errors="coerce")
+    out["insertion_mei_span"] = asm_span.where(asm_has_mei & asm_span.notna(), out.get("insertion_mei_span", 0)).fillna(0).astype(int)
+
+    asm_start = pd.to_numeric(out.get("asm_insertion_mei_start", float("nan")), errors="coerce")
+    asm_end = pd.to_numeric(out.get("asm_insertion_mei_end", float("nan")), errors="coerce")
+    out["disease_insertion_mei_start"] = asm_start.where(
+        asm_has_mei & (asm_source == "disease") & asm_start.gt(0),
+        out.get("disease_insertion_mei_start", 0),
+    ).fillna(0).astype(int)
+    out["disease_insertion_mei_end"] = asm_end.where(
+        asm_has_mei & (asm_source == "disease") & asm_end.gt(0),
+        out.get("disease_insertion_mei_end", 0),
+    ).fillna(0).astype(int)
+    out["control_insertion_mei_start"] = asm_start.where(
+        asm_has_mei & (asm_source == "control") & asm_start.gt(0),
+        out.get("control_insertion_mei_start", 0),
+    ).fillna(0).astype(int)
+    out["control_insertion_mei_end"] = asm_end.where(
+        asm_has_mei & (asm_source == "control") & asm_end.gt(0),
+        out.get("control_insertion_mei_end", 0),
+    ).fillna(0).astype(int)
+
+    return out
+
+
+def _recompute_breakpoint_sequence_metrics(candidates: pd.DataFrame, reference_fasta: Path | None) -> pd.DataFrame:
+    out = candidates.copy()
+    if reference_fasta is None:
+        return out
+    with pysam.FastaFile(str(reference_fasta)) as ref:
+        contexts_11bp: list[str] = []
+        l1_hexamers: list[str] = []
+        l1_patterns: list[str] = []
+        contexts_11bp_oriented: list[str] = []
+        l1_hexamers_oriented: list[str] = []
+        l1_patterns_yy_rrrr: list[str] = []
+        l1_orientation_source: list[str] = []
+        l1_like: list[bool] = []
+        l1_best_motif: list[str] = []
+        l1_motif_type: list[str] = []
+        l1_mismatches: list[int] = []
+        l1_tolerance: list[int] = []
+        l1_best_match_seq: list[str] = []
+        l1_best_match_offset: list[int] = []
+        l1_best_match_strand: list[str] = []
+        l1_best_match_anchor_6mer: list[str] = []
+        l1_best_match_pattern: list[str] = []
+        yyrrrr_scores: list[float] = []
+        yyrrrr_shift1_scores: list[float] = []
+        yyrrrr_best_offsets: list[int] = []
+        yyrrrr_shift1_mt_adj_scores: list[float] = []
+        for row in out.itertuples(index=False):
+            bp = int(getattr(row, "insertion_breakpoint_pos", 0) or 0)
+            if bp <= 0:
+                contexts_11bp.append("")
+                l1_hexamers.append("")
+                l1_patterns.append("")
+                contexts_11bp_oriented.append("")
+                l1_hexamers_oriented.append("")
+                l1_patterns_yy_rrrr.append("")
+                l1_orientation_source.append("unknown")
+                l1_like.append(False)
+                l1_best_motif.append("")
+                l1_motif_type.append("")
+                l1_mismatches.append(99)
+                l1_tolerance.append(0)
+                l1_best_match_seq.append("")
+                l1_best_match_offset.append(0)
+                l1_best_match_strand.append("unknown")
+                l1_best_match_anchor_6mer.append("")
+                l1_best_match_pattern.append("")
+                yyrrrr_scores.append(float("nan"))
+                yyrrrr_shift1_scores.append(float("nan"))
+                yyrrrr_best_offsets.append(-1)
+                yyrrrr_shift1_mt_adj_scores.append(float("nan"))
+                continue
+            chrom = str(getattr(row, "chrom", ""))
+            start0_11 = max(0, bp - 6)
+            end0_11 = max(start0_11 + 1, bp + 5)
+            start0_6 = max(0, bp - 5)
+            end0_6 = max(start0_6 + 1, bp + 1)
+            try:
+                ctx11 = ref.fetch(chrom, start0_11, end0_11).upper()
+            except Exception:
+                ctx11 = ""
+            try:
+                hex6 = ref.fetch(chrom, start0_6, end0_6).upper()
+            except Exception:
+                hex6 = ""
+            patt = f"{hex6[:4]}/{hex6[4:6]}" if len(hex6) == 6 else ""
+            oriented_hex6, oriented_ctx11, orientation_source = _orient_to_insertion_strand(
+                hexamer=hex6,
+                context11bp=ctx11,
+                orientation=str(getattr(row, "insertion_orientation", "")),
+            )
+            patt_yy_rrrr = f"{oriented_hex6[:2]}/{oriented_hex6[2:6]}" if len(oriented_hex6) == 6 else ""
+            allow_reverse_scan = orientation_source == "unknown"
+            motif_like, motif, motif_type, motif_mm, motif_tol, best_seq, best_off, best_strand, best_anchor6, best_pattern = (
+                _match_l1_endonuclease_motif(
+                    context11bp_oriented=oriented_ctx11,
+                    allow_reverse_scan=allow_reverse_scan,
+                )
+            )
+            yyrrrr_score, yyrrrr_shift1_score, yyrrrr_best_off = _yyrrrr_logodds_with_shift_tolerance(oriented_ctx11=oriented_ctx11)
+            yyrrrr_shift1_mt_adj = _yyrrrr_shift1_logodds_mt_adjusted(yyrrrr_shift1_score)
+            contexts_11bp.append(ctx11)
+            l1_hexamers.append(hex6)
+            l1_patterns.append(patt)
+            contexts_11bp_oriented.append(oriented_ctx11)
+            l1_hexamers_oriented.append(oriented_hex6)
+            l1_patterns_yy_rrrr.append(patt_yy_rrrr)
+            l1_orientation_source.append(orientation_source)
+            l1_like.append(bool(motif_like))
+            l1_best_motif.append(motif)
+            l1_motif_type.append(motif_type)
+            l1_mismatches.append(int(motif_mm))
+            l1_tolerance.append(int(motif_tol))
+            l1_best_match_seq.append(best_seq)
+            l1_best_match_offset.append(int(best_off))
+            l1_best_match_strand.append(best_strand)
+            l1_best_match_anchor_6mer.append(best_anchor6)
+            l1_best_match_pattern.append(best_pattern)
+            yyrrrr_scores.append(float(yyrrrr_score))
+            yyrrrr_shift1_scores.append(float(yyrrrr_shift1_score))
+            yyrrrr_best_offsets.append(int(yyrrrr_best_off))
+            yyrrrr_shift1_mt_adj_scores.append(float(yyrrrr_shift1_mt_adj))
+    out["breakpoint_context_11bp"] = contexts_11bp
+    out["breakpoint_l1_en_hexamer"] = l1_hexamers
+    out["breakpoint_l1_en_pattern"] = l1_patterns
+    out["breakpoint_context_11bp_oriented"] = contexts_11bp_oriented
+    out["breakpoint_l1_en_hexamer_oriented"] = l1_hexamers_oriented
+    out["breakpoint_l1_en_pattern_yy_rrrr"] = l1_patterns_yy_rrrr
+    out["breakpoint_l1_en_orientation_source"] = l1_orientation_source
+    out["breakpoint_l1_en_motif_like"] = l1_like
+    out["breakpoint_l1_en_best_motif"] = l1_best_motif
+    out["breakpoint_l1_en_motif_type"] = l1_motif_type
+    out["breakpoint_l1_en_mismatches"] = l1_mismatches
+    out["breakpoint_l1_en_mismatch_tolerance"] = l1_tolerance
+    out["breakpoint_l1_en_best_match_seq"] = l1_best_match_seq
+    out["breakpoint_l1_en_best_match_offset"] = l1_best_match_offset
+    out["breakpoint_l1_en_best_match_strand"] = l1_best_match_strand
+    out["breakpoint_l1_en_best_match_anchor_6mer"] = l1_best_match_anchor_6mer
+    out["breakpoint_l1_en_best_match_pattern_yy_rrrr"] = l1_best_match_pattern
+    out["breakpoint_yyrrrr_logodds"] = yyrrrr_scores
+    out["breakpoint_yyrrrr_logodds_shift1_max"] = yyrrrr_shift1_scores
+    out["breakpoint_yyrrrr_best_offset"] = yyrrrr_best_offsets
+    out["breakpoint_yyrrrr_logodds_shift1_mt_adj"] = yyrrrr_shift1_mt_adj_scores
     return out
 
 
@@ -1876,41 +2059,33 @@ def _match_l1_endonuclease_motif(
     if len(q11) < 8:
         return (False, "", "", 99, 0, "", 0, "unknown", "", "")
 
+    # Use the observed breakpoint-anchor 6-mer (offset 0) as the source of truth
+    # for "best motif", so it always reflects what is closest to observed sequence.
+    anchor6 = q11[1:7]
+    if len(anchor6) != 6:
+        return (False, "", "", 99, 0, "", 0, "unknown", "", "")
+
     best_motif = ""
     best_type = ""
     best_mm = 99
     best_seq = ""
-    best_offset = 0
+    best_offset = 0  # fixed to anchor-at-breakpoint window
     best_strand = "forward"
-    best_anchor6 = ""
-    best_pattern = ""
-    strand_queries = [("forward", q11)]
-    if allow_reverse_scan:
-        strand_queries.append(("reverse", _revcomp(q11)))
+    best_anchor6 = anchor6
+    best_pattern = f"{anchor6[:2]}/{anchor6[2:6]}"
 
-    for strand_label, q in strand_queries:
-        # Candidate 6bp windows anchored around breakpoint with offsets -1/0/+1.
-        for offset, start in [(-1, 0), (0, 1), (1, 2)]:
-            end = start + 6
-            if end > len(q):
+    for motif, mtype in _L1_EN_PAPER_MOTIFS.items():
+        mlen = len(motif)
+        windows = [anchor6] if mlen == 6 else [anchor6[:5], anchor6[1:6]]
+        for win in windows:
+            if len(win) != mlen:
                 continue
-            seq6 = q[start:end]
-            for motif, mtype in _L1_EN_PAPER_MOTIFS.items():
-                mlen = len(motif)
-                windows = [seq6] if mlen == 6 else [seq6[:5], seq6[1:6]]
-                for win in windows:
-                    if len(win) != mlen:
-                        continue
-                    mm = _hamming(win, motif)
-                    if mm < best_mm:
-                        best_mm = mm
-                        best_motif = motif
-                        best_type = mtype
-                        best_seq = win
-                        best_offset = int(offset)
-                        best_strand = strand_label
-                        best_anchor6 = seq6
-                        best_pattern = f"{seq6[:2]}/{seq6[2:6]}" if len(seq6) == 6 else ""
+            mm = _hamming(win, motif)
+            if mm < best_mm:
+                best_mm = mm
+                best_motif = motif
+                best_type = mtype
+                best_seq = win
 
     allowed_mm = _L1_EN_MOTIF_ALLOWED_MISMATCHES.get(best_motif, 0)
     motif_like = bool(best_motif) and best_mm <= allowed_mm
@@ -2028,8 +2203,8 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         ],
         axis=1,
     ).max(axis=1).clip(lower=0.0, upper=1.0)
-    motif_boost = out.get("disease_breakpoint_l1_en_motif_like", False).fillna(False).astype(bool).astype(float)
-    motif_logodds = out.get("disease_breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0).astype(float).fillna(0.0)
+    motif_boost = out.get("breakpoint_l1_en_motif_like", False).fillna(False).astype(bool).astype(float)
+    motif_logodds = out.get("breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0).astype(float).fillna(0.0)
     motif_logodds_scaled = (motif_logodds / 6.0).clip(lower=0.0, upper=1.0)
 
     base_score = (
@@ -3220,6 +3395,89 @@ def _add_local_depth_normalized_support(candidates: pd.DataFrame) -> pd.DataFram
     return out
 
 
+def _normal_ci_bounds_from_soft_counts(
+    p: pd.Series,
+    n_eff: pd.Series,
+    z: float = 1.96,
+) -> tuple[pd.Series, pd.Series]:
+    # Heuristic uncertainty bounds for weighted-support VAF.
+    n_pos = n_eff.astype(float).where(n_eff.astype(float) > 0.0)
+    se = ((p * (1.0 - p)) / n_pos).pow(0.5)
+    low = (p - (z * se)).clip(lower=0.0, upper=1.0)
+    high = (p + (z * se)).clip(lower=0.0, upper=1.0)
+    return low.where(n_pos.notna()), high.where(n_pos.notna())
+
+
+def _add_heuristic_assembly_like_vaf_fields(candidates: pd.DataFrame) -> pd.DataFrame:
+    out = candidates.copy()
+
+    sr_t = out.get("disease_split_mei_supported_reads", 0).fillna(0).astype(float)
+    sr_n = out.get("control_split_mei_supported_reads", 0).fillna(0).astype(float)
+    dpe_t = out.get("disease_discordant_mei_supported_reads", 0).fillna(0).astype(float)
+    dpe_n = out.get("control_discordant_mei_supported_reads", 0).fillna(0).astype(float)
+
+    # TODO(v2): replace this heuristic weighted model with RF-based TE genotyping/AF
+    # inference (xTea-style feature model using SR/DRP/reference-support evidence).
+    out["asm_disease_sr_alt_reads"] = sr_t
+    out["asm_control_sr_alt_reads"] = sr_n
+    out["asm_disease_dpe_alt_reads"] = dpe_t
+    out["asm_control_dpe_alt_reads"] = dpe_n
+    out["asm_disease_alt_soft_reads"] = sr_t + (0.5 * dpe_t)
+    out["asm_control_alt_soft_reads"] = sr_n + (0.5 * dpe_n)
+    out["asm_vaf_method"] = "heuristic_sr_plus_half_dpe_over_alt_plus_ref"
+
+    if "disease_context_non_sv_reads" in out.columns and "control_context_non_sv_reads" in out.columns:
+        out["asm_disease_ref_support_reads"] = out["disease_context_non_sv_reads"].fillna(0).astype(float)
+        out["asm_control_ref_support_reads"] = out["control_context_non_sv_reads"].fillna(0).astype(float)
+        out["asm_reference_support_source"] = "context_non_sv_reads"
+    else:
+        out["asm_disease_ref_support_reads"] = float("nan")
+        out["asm_control_ref_support_reads"] = float("nan")
+        out["asm_reference_support_source"] = "unavailable"
+
+    disease_total = out["asm_disease_alt_soft_reads"] + out["asm_disease_ref_support_reads"]
+    control_total = out["asm_control_alt_soft_reads"] + out["asm_control_ref_support_reads"]
+    out["asm_disease_callable_reads"] = disease_total
+    out["asm_control_callable_reads"] = control_total
+    out["asm_disease_vaf"] = out["asm_disease_alt_soft_reads"] / disease_total.where(disease_total > 0.0)
+    out["asm_control_vaf"] = out["asm_control_alt_soft_reads"] / control_total.where(control_total > 0.0)
+    out["asm_vaf_delta"] = out["asm_disease_vaf"] - out["asm_control_vaf"]
+
+    d_low, d_high = _normal_ci_bounds_from_soft_counts(
+        out["asm_disease_vaf"].fillna(0.0),
+        out["asm_disease_callable_reads"].fillna(0.0),
+    )
+    n_low, n_high = _normal_ci_bounds_from_soft_counts(
+        out["asm_control_vaf"].fillna(0.0),
+        out["asm_control_callable_reads"].fillna(0.0),
+    )
+    out["asm_disease_vaf_ci_low"] = d_low
+    out["asm_disease_vaf_ci_high"] = d_high
+    out["asm_control_vaf_ci_low"] = n_low
+    out["asm_control_vaf_ci_high"] = n_high
+
+    disease_width = (out["asm_disease_vaf_ci_high"] - out["asm_disease_vaf_ci_low"]).astype(float)
+    control_width = (out["asm_control_vaf_ci_high"] - out["asm_control_vaf_ci_low"]).astype(float)
+    out["assembly_confidence_score"] = (
+        1.0 - ((disease_width.fillna(1.0) + control_width.fillna(1.0)) / 2.0)
+    ).clip(lower=0.0, upper=1.0)
+
+    silver_mask = out.get("silver_stage_pass", False).fillna(False).astype(bool)
+    existing_status = out.get("asm_status", pd.Series([""] * len(out), index=out.index)).fillna("").astype(str)
+    out["asm_status"] = existing_status
+    out.loc[silver_mask & (out["asm_status"] == ""), "asm_status"] = "heuristic_estimated"
+    no_ref = out["asm_reference_support_source"] == "unavailable"
+    no_evidence = silver_mask & (
+        (out["asm_disease_callable_reads"].fillna(0.0) <= 0.0)
+        & (out["asm_control_callable_reads"].fillna(0.0) <= 0.0)
+    )
+    out.loc[silver_mask & no_ref & (out["asm_status"] == "heuristic_estimated"), "asm_status"] = (
+        "heuristic_no_reference_support"
+    )
+    out.loc[no_evidence & (out["asm_status"].str.startswith("heuristic")), "asm_status"] = "heuristic_no_callable_reads"
+    return out
+
+
 def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
     out["bronze_stage_pass"] = True
@@ -3439,10 +3697,16 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     out["_prio_high_conf_two_sided"] = (
         _df_col_series(out, "insertion_call_tier", "").fillna("").astype(str) == "high_conf_two_sided"
     )
-    out["_prio_breakpoint_resolved"] = _df_col_series(out, "disease_insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
+    out["_prio_breakpoint_resolved"] = _df_col_series(out, "insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
     out["_prio_g1k_region"] = _df_col_series(out, "g1k_melt_region_id", "").fillna("").astype(str).str.strip() != ""
     out["_prio_insertion_mei_span"] = _df_col_series(out, "insertion_mei_span", 0).fillna(0).astype(int)
     out["_prio_poly_at"] = out["poly_at_supported"].astype(bool)
+    asm_source = _df_col_series(out, "asm_breakpoint_source", "").fillna("").astype(str)
+    out["_prio_assembly_mei_informative"] = asm_source.isin(["disease", "control"])
+    out["_prio_assembly_contig_present"] = _df_col_series(out, "asm_consensus_primary_contig_id", "").fillna("").astype(str).str.len() > 0
+    out["_prio_assembly_complex_class_rank"] = _df_col_series(out, "asm_complex_class", "").fillna("").astype(str).map(
+        {"simple_mei": 1, "mei_plus_sv": 2, "multi_junction": 3}
+    ).fillna(0).astype(int)
     out["_prio_split_reads"] = (
         _df_col_series(out, "disease_split_mei_supported_reads", 0).fillna(0).astype(int)
         + _df_col_series(out, "control_split_mei_supported_reads", 0).fillna(0).astype(int)
@@ -3477,12 +3741,15 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
             "_prio_breakpoint_resolved",
             "_prio_g1k_region",
             "_prio_insertion_mei_span",
+            "_prio_assembly_mei_informative",
+            "_prio_assembly_contig_present",
+            "_prio_assembly_complex_class_rank",
             "_prio_poly_at",
             "_prio_split_reads",
             "_prio_discordant_reads",
         ]
     )
-    ascending.extend([False] * 8)
+    ascending.extend([False] * 11)
     sorted_out = out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
     return sorted_out.drop(
         columns=[c for c in sorted_out.columns if c.startswith("_prio_")],
@@ -3494,7 +3761,7 @@ _YYRRRR_MT_ADJ_REPORT_MIN = 0.0  # report motif fields only when MT-adjusted log
 
 
 def _yyrrrr_mt_adj_value(row: pd.Series) -> float:
-    val = row.get("disease_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan"))
+    val = row.get("breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan"))
     if pd.isna(val):
         return float("nan")
     try:
@@ -3511,17 +3778,17 @@ def _yyrrrr_mt_adj_reportable(row: pd.Series) -> bool:
 def _apply_breakpoint_motif_report_gating(df: pd.DataFrame) -> pd.DataFrame:
     """Mask motif report fields unless breakpoint log-odds pass the report threshold."""
     out = df.copy()
-    observed_hex = out.get("disease_breakpoint_l1_en_hexamer_oriented", "").fillna("").astype(str)
-    observed_pattern = out.get("disease_breakpoint_l1_en_pattern_yy_rrrr", "").fillna("").astype(str)
-    out["disease_breakpoint_l1_en_observed_motif"] = observed_hex
-    out["disease_breakpoint_l1_en_observed_motif_pattern"] = observed_pattern
-    mt_adj = out.get("disease_breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan")).astype(float)
+    observed_hex = out.get("breakpoint_l1_en_hexamer_oriented", "").fillna("").astype(str)
+    observed_pattern = out.get("breakpoint_l1_en_pattern_yy_rrrr", "").fillna("").astype(str)
+    out["breakpoint_l1_en_observed_motif"] = observed_hex
+    out["breakpoint_l1_en_observed_motif_pattern"] = observed_pattern
+    mt_adj = out.get("breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan")).astype(float)
     reportable = mt_adj.notna() & (mt_adj > _YYRRRR_MT_ADJ_REPORT_MIN)
     for col in (
-        "disease_breakpoint_l1_en_observed_motif",
-        "disease_breakpoint_l1_en_observed_motif_pattern",
-        "disease_breakpoint_l1_en_best_motif",
-        "disease_breakpoint_l1_en_motif_type",
+        "breakpoint_l1_en_observed_motif",
+        "breakpoint_l1_en_observed_motif_pattern",
+        "breakpoint_l1_en_best_motif",
+        "breakpoint_l1_en_motif_type",
     ):
         if col not in out.columns:
             continue
@@ -3532,8 +3799,8 @@ def _apply_breakpoint_motif_report_gating(df: pd.DataFrame) -> pd.DataFrame:
 def _consensus_retrotransposition_class(row: pd.Series) -> str:
     if not _yyrrrr_mt_adj_reportable(row):
         return ""
-    if bool(row.get("disease_breakpoint_l1_en_motif_like", False)):
-        motif_type = str(row.get("disease_breakpoint_l1_en_motif_type", "") or "").strip()
+    if bool(row.get("breakpoint_l1_en_motif_like", False)):
+        motif_type = str(row.get("breakpoint_l1_en_motif_type", "") or "").strip()
         if motif_type == "l1_en_canonical":
             return "classical"
         if motif_type in {"l1_en_alternative", "nested_novel_like"}:
@@ -3545,11 +3812,11 @@ def _consensus_sequence_signature(row: pd.Series, *, retro_class: str = "") -> s
     if not retro_class:
         return ""
     for col in (
-        "disease_breakpoint_l1_en_observed_motif_pattern",
-        "disease_breakpoint_l1_en_observed_motif",
-        "disease_breakpoint_l1_en_pattern_yy_rrrr",
-        "disease_breakpoint_l1_en_best_match_pattern_yy_rrrr",
-        "disease_breakpoint_l1_en_best_motif",
+        "breakpoint_l1_en_observed_motif_pattern",
+        "breakpoint_l1_en_observed_motif",
+        "breakpoint_l1_en_pattern_yy_rrrr",
+        "breakpoint_l1_en_best_match_pattern_yy_rrrr",
+        "breakpoint_l1_en_best_motif",
     ):
         pattern = str(row.get(col, "") or "").strip()
         if pattern:
@@ -3566,6 +3833,32 @@ def _annotate_consensus_retrotransposition_fields(df: pd.DataFrame) -> pd.DataFr
         for (_, row), retro_class in zip(out.iterrows(), classes)
     ]
     return out
+
+
+def _stable_tsv_export_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a TSV-export copy with stable column dtypes for pandas re-import."""
+    out = df.copy()
+    for col in out.columns:
+        series = out[col]
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            out[col] = series.where(series.notna(), "").astype(str)
+        elif pd.api.types.is_bool_dtype(series):
+            out[col] = series.astype(int)
+    return out
+
+
+def _round_sig_value(value: float, sig: int) -> float:
+    if pd.isna(value):
+        return value
+    if value == 0:
+        return 0.0
+    return round(float(value), int(sig - math.floor(math.log10(abs(float(value)))) - 1))
+
+
+def _round_sig_series(series: pd.Series, sig: int) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    rounded = numeric.apply(lambda v: _round_sig_value(v, sig))
+    return rounded.where(numeric.notna(), series)
 
 
 def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -3587,8 +3880,84 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
     )
     out["two_sided_support"] = _two_sided_support_mask(out)
     out["poly_at_supported"] = _poly_at_supported_mask(out)
-    bp_pos = out.get("disease_insertion_breakpoint_pos", 0).fillna(0).astype(int)
-    out["disease_insertion_breakpoint_pos"] = bp_pos.where(bp_pos > 0, -1)
+    out["disease_vaf"] = _series_or_default("asm_disease_vaf", float("nan")).astype(float)
+    out["control_vaf"] = _series_or_default("asm_control_vaf", float("nan")).astype(float)
+    out["vaf_delta"] = _series_or_default("asm_vaf_delta", float("nan")).astype(float)
+    out["assembly_status"] = _series_or_default("asm_status", "not_run").fillna("not_run").astype(str)
+    out["assembly_confidence_score"] = _series_or_default("assembly_confidence_score", 0.0).fillna(0.0).astype(float)
+    asm_source = _series_or_default("asm_breakpoint_source", "").fillna("").astype(str)
+    asm_has_mei = asm_source.isin(["disease", "control"])
+    bp_pos = out.get("insertion_breakpoint_pos", 0).fillna(0).astype(int)
+    out["insertion_breakpoint_pos"] = bp_pos.where(bp_pos > 0, -1)
+
+    # Assembly-preferred consensus fields (non-destructive): use assembly-derived
+    # values when present, else fall back to current evidence-derived fields.
+    asm_bp = pd.to_numeric(_series_or_default("asm_consensus_breakpoint_pos", float("nan")), errors="coerce")
+    out["consensus_insertion_breakpoint_pos"] = asm_bp.where(asm_has_mei & asm_bp.notna(), out["insertion_breakpoint_pos"]).astype(int)
+    out["consensus_breakpoint_source"] = asm_source.copy()
+    out.loc[out["consensus_breakpoint_source"] == "", "consensus_breakpoint_source"] = _series_or_default(
+        "breakpoint_evidence_source", ""
+    ).fillna("").astype(str)
+
+    asm_tsd_seq = _series_or_default("asm_tsd_seq", "").fillna("").astype(str)
+    out["consensus_tsd_seq"] = asm_tsd_seq.where(
+        asm_has_mei & (asm_tsd_seq.str.len() > 0),
+        _series_or_default("tsd_seq", "").fillna("").astype(str),
+    )
+    asm_tsd_len = pd.to_numeric(_series_or_default("asm_tsd_len", float("nan")), errors="coerce")
+    base_tsd_len = pd.to_numeric(_series_or_default("tsd_len_estimate", float("nan")), errors="coerce")
+    out["consensus_tsd_len_estimate"] = asm_tsd_len.where(asm_has_mei & asm_tsd_len.notna(), base_tsd_len)
+    out["consensus_tsd_detected"] = out["consensus_tsd_len_estimate"].fillna(0).astype(float) >= 4.0
+
+    asm_poly = pd.to_numeric(_series_or_default("asm_polyA_max_run", float("nan")), errors="coerce")
+    out["consensus_poly_at_max_run"] = asm_poly.where(
+        asm_has_mei & asm_poly.notna(),
+        pd.to_numeric(out.get("poly_at_max_run", 0), errors="coerce"),
+    )
+    out["consensus_poly_at_supported"] = out["consensus_poly_at_max_run"].fillna(0).astype(float) >= 8.0
+
+    asm_span = pd.to_numeric(_series_or_default("asm_insertion_length", float("nan")), errors="coerce")
+    base_span = pd.to_numeric(_series_or_default("insertion_mei_span", float("nan")), errors="coerce")
+    out["consensus_insertion_mei_span"] = asm_span.where(asm_has_mei & asm_span.notna(), base_span)
+    asm_mei_start = pd.to_numeric(_series_or_default("asm_insertion_mei_start", float("nan")), errors="coerce")
+    asm_mei_end = pd.to_numeric(_series_or_default("asm_insertion_mei_end", float("nan")), errors="coerce")
+    disease_start = pd.to_numeric(_series_or_default("disease_insertion_mei_start", float("nan")), errors="coerce")
+    control_start = pd.to_numeric(_series_or_default("control_insertion_mei_start", float("nan")), errors="coerce")
+    disease_end = pd.to_numeric(_series_or_default("disease_insertion_mei_end", float("nan")), errors="coerce")
+    control_end = pd.to_numeric(_series_or_default("control_insertion_mei_end", float("nan")), errors="coerce")
+    base_start = disease_start.where(disease_start > 0, control_start)
+    base_end = disease_end.where(disease_end > 0, control_end)
+    out["consensus_insertion_mei_start"] = asm_mei_start.where(
+        asm_has_mei & asm_mei_start.gt(0),
+        base_start,
+    )
+    out["consensus_insertion_mei_end"] = asm_mei_end.where(
+        asm_has_mei & asm_mei_end.gt(0),
+        base_end,
+    )
+
+    asm_orient = _series_or_default("asm_insertion_orientation", "").fillna("").astype(str)
+    out["consensus_insertion_orientation"] = asm_orient.where(
+        asm_orient.isin(["+", "-"]),
+        _series_or_default("insertion_orientation", "").fillna("").astype(str),
+    )
+    asm_subfamily = _series_or_default("asm_mei_subfamily", "").fillna("").astype(str)
+    out["consensus_mei_subfamily"] = asm_subfamily.where(
+        asm_subfamily.str.len() > 0,
+        _series_or_default("mei_subfamily", "").fillna("").astype(str),
+    )
+    asm_family = _series_or_default("asm_mei_family", "").fillna("").astype(str)
+    out["consensus_mei_family"] = asm_family.where(
+        asm_family.str.len() > 0,
+        _series_or_default("mei_family", "").fillna("").astype(str),
+    )
+    out["assembly_best_contig_id"] = _series_or_default("asm_consensus_primary_contig_id", "").fillna("").astype(str)
+    out.loc[out["assembly_best_contig_id"] == "", "assembly_best_contig_id"] = _series_or_default(
+        "asm_disease_primary_contig_id", ""
+    ).fillna("").astype(str)
+    out.loc[out["assembly_best_contig_id"] == "", "assembly_best_contig_id"] = _series_or_default(
+        "asm_control_primary_contig_id", ""
+    ).fillna("").astype(str)
 
     selected_cols = [
         "analysis_stage_tier",
@@ -3599,25 +3968,43 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "chrom",
         "window_start",
         "window_end",
-        "disease_insertion_breakpoint_pos",
+        "insertion_breakpoint_pos",
+        "breakpoint_evidence_source",
+        "consensus_insertion_breakpoint_pos",
+        "consensus_breakpoint_source",
         "insertion_orientation",
         "insertion_mei_span",
+        "consensus_insertion_orientation",
+        "consensus_insertion_mei_span",
+        "consensus_insertion_mei_start",
+        "consensus_insertion_mei_end",
         "nested_same_class_orientation",
         "poly_at_max_run",
+        "consensus_poly_at_max_run",
         "mei_family",
         "mei_subfamily",
+        "consensus_mei_family",
+        "consensus_mei_subfamily",
+        "consensus_tsd_seq",
+        "consensus_tsd_len_estimate",
+        "consensus_tsd_detected",
+        "consensus_poly_at_supported",
         "g1k_melt_id",
         "g1k_mei_family",
         "g1k_melt_insertion_subfamily",
         "g1k_melt_insertion_length",
         "g1k_melt_tsd",
         "g1k_melt_region_id",
-        "disease_breakpoint_yyrrrr_logodds_shift1_mt_adj",
-        "disease_breakpoint_l1_en_best_motif",
-        "disease_breakpoint_l1_en_motif_type",
+        "breakpoint_yyrrrr_logodds_shift1_mt_adj",
+        "breakpoint_l1_en_observed_motif",
+        "breakpoint_l1_en_best_motif",
+        "breakpoint_l1_en_observed_motif_pattern",
+        "breakpoint_l1_en_motif_type",
+        "breakpoint_l1_en_mismatches",
+        "breakpoint_l1_en_mismatch_tolerance",
+        "breakpoint_l1_en_best_match_seq",
+        "breakpoint_l1_en_best_match_pattern_yy_rrrr",
         "consensus_retrotransposition_class",
-        "disease_breakpoint_l1_en_observed_motif",
-        "disease_breakpoint_l1_en_observed_motif_pattern",
         "consensus_sequence_signature",
         "disease_split_mei_supported_reads",
         "control_split_mei_supported_reads",
@@ -3632,6 +4019,21 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         "control_family_agreement",
         "control_strand_agreement",
         "two_sided_support",
+        "disease_vaf",
+        "control_vaf",
+        "vaf_delta",
+        "assembly_status",
+        "assembly_confidence_score",
+        "assembly_best_contig_id",
+        "asm_insertion_mei_start",
+        "asm_insertion_mei_end",
+        "asm_complex_class",
+        "asm_non_mei_partner_chrom",
+        "asm_non_mei_partner_pos",
+        "asm_non_mei_partner_type",
+        "asm_breakpoint_side_status",
+        "asm_complexity_source",
+        "asm_top_contigs",
         "disease_poly_at_reads",
         "disease_poly_at_max_run",
         "disease_poly_at_fraction_weighted",
@@ -3661,6 +4063,38 @@ def _build_gold_review_table(candidates: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = ""
     review = out.loc[:, selected_cols].copy()
+
+    sig4_cols = [
+        "disease_vaf",
+        "control_vaf",
+        "vaf_delta",
+        "disease_empirical_local_bam_mean_depth_p_high",
+        "disease_empirical_context_mapq_mean_p_low",
+        "disease_empirical_context_mapq_lt20_fraction_p_high",
+        "disease_empirical_context_nm_per_100bp_mean_p_high",
+        "disease_empirical_context_nm_per_100bp_p90_p_high",
+        "control_empirical_local_bam_mean_depth_p_high",
+        "control_empirical_context_mapq_mean_p_low",
+        "control_empirical_context_mapq_lt20_fraction_p_high",
+        "control_empirical_context_nm_per_100bp_mean_p_high",
+        "control_empirical_context_nm_per_100bp_p90_p_high",
+    ]
+    sig3_cols = [
+        "assembly_confidence_score",
+        "disease_poly_at_fraction_weighted",
+        "control_poly_at_fraction_weighted",
+        "breakpoint_yyrrrr_logodds_shift1_mt_adj",
+        "insertion_model_score",
+        "coherence_score",
+        "mei_score_enrichment_ratio",
+    ]
+    for col in sig4_cols:
+        if col in review.columns:
+            review[col] = _round_sig_series(review[col], sig=4)
+    for col in sig3_cols:
+        if col in review.columns:
+            review[col] = _round_sig_series(review[col], sig=3)
+
     return _prioritize_mei_candidates(review, stage_first=True)
 
 
@@ -3835,7 +4269,7 @@ def _g1k_query_interval_for_row(
     window_start = int(row.get("window_start", 1))
     window_end = int(row.get("window_end", window_start))
     midpoint = (window_start + window_end) // 2
-    breakpoint_pos = int(row.get("disease_insertion_breakpoint_pos", 0))
+    breakpoint_pos = int(row.get("insertion_breakpoint_pos", 0))
     if breakpoint_pos <= 0:
         breakpoint_pos = midpoint
 
@@ -4147,7 +4581,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
     for row in out.itertuples(index=False):
         as_row = pd.Series(row._asdict())
         chrom = str(getattr(row, "chrom"))
-        pos_1based = int(getattr(row, "disease_insertion_breakpoint_pos", 0))
+        pos_1based = int(getattr(row, "insertion_breakpoint_pos", 0))
         if pos_1based <= 0:
             pos_1based = int((int(getattr(row, "window_start", 1)) + int(getattr(row, "window_end", 1))) // 2)
         pos0 = max(0, pos_1based - 1)
@@ -4240,6 +4674,24 @@ def annotate_candidate_loci_with_mei(
     empirical_exclude_blacklist_bed: Path | None = None,
     empirical_cache_dir: Path | None = None,
     progress_every: int = 20000,
+    igv_plots: bool = True,
+    igv_top_n: int = 100,
+    igv_snapshot_dir: Path | None = None,
+    igv_launcher: Path | None = None,
+    igv_gold_only: bool = True,
+    igv_panel_height_min: int = 250,
+    igv_panel_height_max: int = 8000,
+    igv_timeout_sec: int | None = None,
+    local_assembly: bool = False,
+    assembly_cache_dir: Path | None = None,
+    assembly_interval_pad_bp: int = 250,
+    assembly_retry_pad_bp: int = 600,
+    assembly_max_reads_per_sample: int = 600,
+    assembly_spades_threads: int = 1,
+    assembly_spades_memory_gb: int = 8,
+    assembly_minimap2_threads: int = 1,
+    assembly_locus_workers: int = 0,
+    assembly_reuse_cache_only: bool = False,
 ) -> Path:
     total_t0 = time.monotonic()
     candidate = pd.read_csv(candidate_loci_path, sep="\t")
@@ -4343,6 +4795,33 @@ def annotate_candidate_loci_with_mei(
     candidate = _infer_disease_insertion_metrics(candidate, reference_fasta=reference_fasta)
     candidate = _compute_insertion_model_scores(candidate)
     candidate = _assign_bronze_silver_stages(candidate)
+    if local_assembly and disease_bam_path is not None and control_bam_path is not None:
+        asm_t0 = time.monotonic()
+        asm_dir = assembly_cache_dir if assembly_cache_dir is not None else out_path.parent / "assembly_cache"
+        asm_df = annotate_silver_with_local_assembly(
+            candidate,
+            disease_bam_path=disease_bam_path,
+            control_bam_path=control_bam_path,
+            assembly_cache_dir=asm_dir,
+            mei_fasta=mei_fasta,
+            reference_fasta=reference_fasta,
+            interval_pad_bp=assembly_interval_pad_bp,
+            retry_pad_bp=assembly_retry_pad_bp,
+            max_reads_per_sample=assembly_max_reads_per_sample,
+            spades_threads=assembly_spades_threads,
+            spades_memory_gb=assembly_spades_memory_gb,
+            minimap2_threads=assembly_minimap2_threads,
+            locus_workers=assembly_locus_workers,
+            reuse_cache_only=assembly_reuse_cache_only,
+        )
+        if not asm_df.empty:
+            candidate = candidate.merge(asm_df, on=["chrom", "window_start", "window_end"], how="left")
+            candidate = _apply_assembly_refinement_overrides(candidate)
+            candidate = _recompute_breakpoint_sequence_metrics(candidate, reference_fasta=reference_fasta)
+        print(
+            f"[mei-annotate] local assembly complete loci={len(asm_df)} "
+            f"cache={asm_dir} elapsed={time.monotonic() - asm_t0:.1f}s"
+        )
     if g1k_mei_vcf is not None:
         g1k_t0 = time.monotonic()
         candidate = _annotate_g1k_mei_overlap(
@@ -4388,17 +4867,56 @@ def annotate_candidate_loci_with_mei(
             f"[mei-annotate] added BAM-depth controlization for family-consistent, junk-clean loci "
             f"(elapsed={time.monotonic() - emp_t0:.1f}s)"
         )
+    candidate = _add_heuristic_assembly_like_vaf_fields(candidate)
     candidate = _assign_gold_stage(candidate)
 
     candidate = _apply_breakpoint_motif_report_gating(candidate)
     candidate = _prioritize_mei_candidates(candidate, stage_first=True)
 
-    candidate.to_csv(out_path, sep="\t", index=False)
+    candidate_tsv = _stable_tsv_export_frame(candidate)
+    candidate_tsv.to_csv(out_path, sep="\t", index=False)
     candidate.to_parquet(out_path.with_suffix(".parquet"), index=False)
     gold_review = _build_gold_review_table(candidate)
     gold_review_path = out_path.with_name(out_path.stem + ".gold_review.tsv")
-    gold_review.to_csv(gold_review_path, sep="\t", index=False)
+    gold_review_tsv = _stable_tsv_export_frame(gold_review)
+    gold_review_tsv.to_csv(gold_review_path, sep="\t", index=False)
     print(f"[mei-annotate] wrote gold review table to {gold_review_path}")
+    if (
+        igv_plots
+        and disease_bam_path is not None
+        and control_bam_path is not None
+        and reference_fasta is not None
+    ):
+        igv_dir = igv_snapshot_dir if igv_snapshot_dir is not None else out_path.with_name(out_path.stem + ".gold_review.igv")
+        try:
+            generate_gold_review_igv_plots(
+                gold_review,
+                reference_fasta=reference_fasta,
+                disease_bam=disease_bam_path,
+                control_bam=control_bam_path,
+                snapshot_dir=igv_dir,
+                top_n=igv_top_n,
+                gold_only=igv_gold_only,
+                launcher=igv_launcher,
+                panel_height_min=igv_panel_height_min,
+                panel_height_max=igv_panel_height_max,
+                timeout_sec=igv_timeout_sec,
+                assembly_cache_dir=asm_dir if local_assembly else None,
+            )
+        except FileNotFoundError as exc:
+            print(f"[mei-annotate] IGV snapshot generation skipped: {exc}", flush=True)
+        except (subprocess.CalledProcessError, RuntimeError) as exc:
+            print(
+                f"[mei-annotate] IGV snapshot generation failed: {exc}; "
+                f"batch script remains at {igv_dir / 'igv_batch.txt'}",
+                flush=True,
+            )
+    elif igv_plots and (disease_bam_path is None or control_bam_path is None or reference_fasta is None):
+        print(
+            "[mei-annotate] IGV snapshot generation skipped: require --reference-fasta, "
+            "--disease-bam-depth, and --control-bam-depth",
+            flush=True,
+        )
     print(f"[mei-annotate] wrote {len(candidate)} rows to {out_path}")
     print(f"[mei-annotate] total annotate walltime={time.monotonic() - total_t0:.1f}s")
     return out_path
