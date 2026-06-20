@@ -157,6 +157,7 @@ This initial dataset pack includes:
 - RepeatMasker + segmental duplication tables (hg38)
 - UCSC 100bp mappability (`k100.Umap.MultiTrackMappability.bw`)
 - gnomAD SV polymorphism track (includes MEI classes)
+- 1000G ONT Vienna long-read SVAN cohort callset (v1.1, sequence-resolved MEI annotations)
 - hg38<->hs1 liftOver chains
 - Dfam FamDB archive (required; extract human families with `famdb.py`)
 - Dfam-derived MEI FASTA library outputs:

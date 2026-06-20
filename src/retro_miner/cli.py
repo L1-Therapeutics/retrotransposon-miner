@@ -420,6 +420,12 @@ def build_candidate_loci_cmd(
     help="Optional 1000G/MELT MEI VCF(.gz) for overlap annotation.",
 )
 @click.option(
+    "--lr-mei-vcf",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional 1000G ONT Vienna long-read SVAN MEI VCF(.gz) for overlap annotation.",
+)
+@click.option(
     "--g1k-split-padding-bp",
     type=int,
     default=200,
@@ -446,6 +452,12 @@ def build_candidate_loci_cmd(
     default=0.0,
     show_default=True,
     help="Scale factor applied to discordant TLEN mean when deriving discordant-dominant query padding.",
+)
+@click.option(
+    "--empirical-stage/--no-empirical-stage",
+    default=False,
+    show_default=True,
+    help="Enable empirical BAM/context outlier scoring stage.",
 )
 @click.option(
     "--empirical-random-windows",
@@ -526,14 +538,14 @@ def build_candidate_loci_cmd(
     "--igv-plots/--no-igv-plots",
     default=True,
     show_default=True,
-    help="Generate IGV snapshot PNGs for top gold-review variants (requires reference + disease/control BAMs).",
+    help="Generate IGV snapshot PNGs for gold-review variants (requires reference + disease/control BAMs).",
 )
 @click.option(
     "--igv-top-n",
     type=int,
-    default=100,
+    default=0,
     show_default=True,
-    help="Maximum number of prioritized gold-review variants to snapshot with IGV.",
+    help="Maximum number of prioritized gold-review variants to snapshot with IGV (<=0 means all).",
 )
 @click.option(
     "--igv-snapshot-dir",
@@ -650,10 +662,12 @@ def annotate_mei_support_cmd(
     control_bam_depth: Path | None,
     rmsk_table: Path | None,
     g1k_mei_vcf: Path | None,
+    lr_mei_vcf: Path | None,
     g1k_split_padding_bp: int,
     g1k_dpe_padding_min_bp: int,
     g1k_dpe_padding_max_bp: int,
     g1k_dpe_padding_tlen_factor: float,
+    empirical_stage: bool,
     empirical_random_windows: int,
     empirical_random_scope: str,
     empirical_random_seed: int,
@@ -699,10 +713,12 @@ def annotate_mei_support_cmd(
         control_bam_path=control_bam_depth,
         rmsk_table_path=rmsk_table,
         g1k_mei_vcf=g1k_mei_vcf,
+        lr_mei_vcf=lr_mei_vcf,
         g1k_split_padding_bp=g1k_split_padding_bp,
         g1k_dpe_padding_min_bp=g1k_dpe_padding_min_bp,
         g1k_dpe_padding_max_bp=g1k_dpe_padding_max_bp,
         g1k_dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
+        empirical_stage=empirical_stage,
         empirical_random_windows=empirical_random_windows,
         empirical_random_scope=empirical_random_scope.lower(),
         empirical_random_seed=empirical_random_seed,

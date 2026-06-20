@@ -15,6 +15,7 @@ MEI_FASTA=""
 REFERENCE_FASTA=""
 RMSK_TABLE="data/public/annotation/hg38/repeats/rmsk.txt.gz"
 G1K_MEI_VCF=""
+LR_MEI_VCF=""
 OUTDIR="results/mei_step1_hg38_chr22"
 REGION="chr22"
 WINDOW_SIZE="200"
@@ -26,6 +27,7 @@ EMPIRICAL_RANDOM_WINDOWS="1000"
 EMPIRICAL_RANDOM_SCOPE="chromosome"
 EMPIRICAL_RANDOM_SEED="13"
 EMPIRICAL_HIGHCONF_BED=""
+LOCAL_ASSEMBLY="1"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
@@ -70,6 +72,10 @@ while [[ $# -gt 0 ]]; do
       G1K_MEI_VCF="$2"
       shift 2
       ;;
+    --lr-mei-vcf)
+      LR_MEI_VCF="$2"
+      shift 2
+      ;;
     --region)
       REGION="$2"
       shift 2
@@ -109,6 +115,14 @@ while [[ $# -gt 0 ]]; do
     --empirical-highconf-bed)
       EMPIRICAL_HIGHCONF_BED="$2"
       shift 2
+      ;;
+    --local-assembly)
+      LOCAL_ASSEMBLY="1"
+      shift 1
+      ;;
+    --no-local-assembly)
+      LOCAL_ASSEMBLY="0"
+      shift 1
       ;;
     --python-bin)
       PYTHON_BIN="$2"
@@ -167,6 +181,10 @@ if [[ -n "${RMSK_TABLE}" ]] && [[ ! -f "${RMSK_TABLE}" ]]; then
 fi
 if [[ -n "${G1K_MEI_VCF}" ]] && [[ ! -f "${G1K_MEI_VCF}" ]]; then
   echo "ERROR: 1000G/MELT MEI VCF not found: ${G1K_MEI_VCF}" >&2
+  exit 1
+fi
+if [[ -n "${LR_MEI_VCF}" ]] && [[ ! -f "${LR_MEI_VCF}" ]]; then
+  echo "ERROR: long-read SVAN MEI VCF not found: ${LR_MEI_VCF}" >&2
   exit 1
 fi
 if [[ -n "${EMPIRICAL_HIGHCONF_BED}" ]] && [[ ! -f "${EMPIRICAL_HIGHCONF_BED}" ]]; then
@@ -250,6 +268,12 @@ if [[ -n "${G1K_MEI_VCF}" ]]; then
     --g1k-dpe-padding-max-bp "${G1K_DPE_PADDING_MAX_BP}"
     --g1k-dpe-padding-tlen-factor "${G1K_DPE_PADDING_TLEN_FACTOR}"
   )
+fi
+if [[ -n "${LR_MEI_VCF}" ]]; then
+  annotate_cmd+=(--lr-mei-vcf "${LR_MEI_VCF}")
+fi
+if [[ "${LOCAL_ASSEMBLY}" == "1" ]]; then
+  annotate_cmd+=(--local-assembly)
 fi
 annotate_cmd+=(--out-tsv "${OUTDIR}/candidate_loci.mei.tsv")
 run_cli "${annotate_cmd[@]}"

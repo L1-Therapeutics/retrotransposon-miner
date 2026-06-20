@@ -313,7 +313,10 @@ def _select_variants_for_plots(
     subset = gold_review
     if gold_only and "analysis_stage_tier" in subset.columns:
         subset = subset.loc[subset["analysis_stage_tier"].fillna("").astype(str).str.lower() == "gold"]
-    return subset.head(max(0, int(top_n))).copy()
+    limit = int(top_n)
+    if limit > 0:
+        return subset.head(limit).copy()
+    return subset.copy()
 
 
 def _write_contig_annotation_bed(variants: pd.DataFrame, snapshot_dir: Path) -> Path | None:
@@ -454,7 +457,7 @@ def generate_gold_review_igv_plots(
     disease_bam: Path,
     control_bam: Path,
     snapshot_dir: Path,
-    top_n: int = 100,
+    top_n: int = 0,
     gold_only: bool = True,
     launcher: Path | None = None,
     panel_height_min: int = 250,
@@ -524,7 +527,7 @@ def generate_gold_review_igv_plots(
     t0 = time.monotonic()
     print(
         f"[igv-plots] generating {len(index_rows)} snapshots in {snapshot_dir} "
-        f"(top_n={top_n}, gold_only={gold_only})",
+        f"(top_n={'all' if top_n <= 0 else top_n}, gold_only={gold_only})",
         flush=True,
     )
     run_igv_batch(batch_script_path, launcher=launcher, timeout_sec=timeout_sec)

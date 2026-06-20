@@ -145,6 +145,22 @@ datasets:
     target_path: polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz.tbi
     required: true
 
+  - id: lr_1kg_ont_vienna_svan_mei_vcf
+    category: mei_polymorphism
+    description: 1000G ONT Vienna long-read SVAN annotation callset (v1.1)
+    source: 1000 Genomes ONT Vienna
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/release/v1.1/svan-annotation/final-vcf.unphased.SVAN_1.3.vcf.gz
+    target_path: polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz
+    required: true
+
+  - id: lr_1kg_ont_vienna_svan_mei_vcf_tbi
+    category: mei_polymorphism
+    description: 1000G ONT Vienna long-read SVAN annotation callset index (v1.1)
+    source: 1000 Genomes ONT Vienna
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/release/v1.1/svan-annotation/final-vcf.unphased.SVAN_1.3.vcf.gz.tbi
+    target_path: polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz.tbi
+    required: true
+
   - id: giab_stratifications_v35_readme
     category: benchmark
     description: GIAB stratifications v3.5 documentation and release index

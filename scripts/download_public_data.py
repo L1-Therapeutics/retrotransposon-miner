@@ -634,7 +634,8 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
         return {"status": "failed", "error": tool_status, "db_dir": str(db_dir)}
 
     curated_fasta = dfam_dir / "dfam_human_curated.fasta"
-    if force or not curated_fasta.exists():
+    curated_missing_or_empty = (not curated_fasta.exists()) or (curated_fasta.stat().st_size <= 0)
+    if force or curated_missing_or_empty:
         cmd = [
             sys.executable,
             famdb_py,
@@ -653,15 +654,26 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
             if proc.returncode != 0:
                 raise RuntimeError(f"famdb export failed: {' '.join(cmd)}\n{proc.stderr}")
             out_handle.write(proc.stdout)
+    curated_bytes = curated_fasta.stat().st_size if curated_fasta.exists() else 0
+    if curated_bytes <= 0:
+        raise RuntimeError(
+            f"dfam curated FASTA is empty after export: {curated_fasta}. "
+            "Re-run with --force and verify FamDB export output."
+        )
 
     mei_subset_fasta = dfam_dir / "dfam_human_mei_l1_alu_sva.fasta"
     subset_stats = _export_human_mei_subset(curated_fasta, mei_subset_fasta)
+    if int(subset_stats.get("bytes", 0)) <= 0 or int(subset_stats.get("mei_families", 0)) <= 0:
+        raise RuntimeError(
+            "dfam MEI subset FASTA is empty after export "
+            f"(path={mei_subset_fasta}, families={subset_stats.get('mei_families', 0)})."
+        )
     return {
         "status": "prepared",
         "famdb_tool": tool_status,
         "db_dir": str(db_dir),
         "curated_fasta": str(curated_fasta),
-        "curated_fasta_bytes": curated_fasta.stat().st_size if curated_fasta.exists() else 0,
+        "curated_fasta_bytes": curated_bytes,
         **subset_stats,
     }
 

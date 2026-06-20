@@ -14,6 +14,8 @@ MEI signal discovery on chr22-style test data.
   - `data/public/reference/hg38/Homo_sapiens_assembly38.fasta`
 - 1000G/MELT polymorphism VCF (optional; overlap + population frequency), e.g.:
   - `data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz`
+- 1000G ONT Vienna long-read SVAN polymorphism VCF (optional), e.g.:
+  - `data/public/polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz`
 - RepeatMasker table (optional; nested insertion annotation), e.g.:
   - `data/public/annotation/hg38/repeats/rmsk.txt.gz`
 
@@ -40,7 +42,8 @@ bash scripts/run_proof_of_signal.sh \
   --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
   --outdir results/mei_step1_hg38_chr22 \
   --region chr22 \
-  --window-size 200
+  --window-size 200 \
+  --local-assembly
 ```
 
 ### Add 1000G/MELT overlap annotation
@@ -57,7 +60,24 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --g1k-mei-vcf data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz \
   --outdir results/mei_step1_hg38_chr22_g1k \
   --region chr22 \
-  --window-size 200
+  --window-size 200 \
+  --local-assembly
+```
+
+### Add both MELT + long-read cohort overlap annotation
+
+```bash
+RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
+  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
+  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
+  --mei-fasta data/public/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta \
+  --reference-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
+  --g1k-mei-vcf data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz \
+  --lr-mei-vcf data/public/polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz \
+  --outdir results/mei_step1_hg38_chr22_g1k_lr \
+  --region chr22 \
+  --window-size 200 \
+  --local-assembly
 ```
 
 ### EC2 command with empirical context scoring (N=1000)
@@ -74,13 +94,15 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --g1k-mei-vcf data/public/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz \
   --outdir results/mei_step1_hg38_chr22_empirical \
   --region chr22 \
-  --window-size 200
+  --window-size 200 \
+  --local-assembly
 ```
 
 Defaults in the wrapper are:
 - `empirical_random_windows=1000`
 - `empirical_random_seed=13`
 - `empirical_random_scope=chromosome`
+- `local_assembly=on` (disable with `--no-local-assembly`)
 - with `scope=chromosome`, this means `1000` random windows per chromosome in
   the run (for `scope=genome`, it is `1000` total)
 

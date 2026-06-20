@@ -57,6 +57,7 @@ mods = [
     "pysam",
     "pandas",
     "pyarrow",
+    "h5py",
     "click",
     "Bio",
 ]

@@ -17,6 +17,11 @@ import pysam
 
 _MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
 _MINIMAP2_INDEX_LOCK = threading.Lock()
+_MEI_FASTA_LENGTH_CACHE: dict[str, dict[str, int]] = {}
+_MEI_FASTA_LENGTH_CACHE_LOCK = threading.Lock()
+_MIN_SIDE_ANCHOR_ALN_LEN = 30
+_MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
+_ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
 
 
 def _safe_locus_id(chrom: str, start: int, end: int) -> str:
@@ -46,6 +51,60 @@ def _interval_from_row(row: pd.Series, pad_bp: int) -> tuple[str, int, int]:
     return chrom, max(1, start), max(1, end)
 
 
+def _canonical_read_name(name: str) -> str:
+    n = str(name or "").strip()
+    if not n:
+        return ""
+    if n.startswith("@"):
+        n = n[1:]
+    n = n.split()[0]
+    if n.endswith("/1") or n.endswith("/2"):
+        n = n[:-2]
+    if re.search(r":[012]$", n):
+        n = n[:-2]
+    return n
+
+
+def _preferred_read_lookup(preferred_read_names: set[str] | None) -> set[str]:
+    if not preferred_read_names:
+        return set()
+    out: set[str] = set()
+    for name in preferred_read_names:
+        raw = str(name or "").strip()
+        if not raw:
+            continue
+        out.add(raw)
+        canon = _canonical_read_name(raw)
+        if canon:
+            out.add(canon)
+    return out
+
+
+def _is_primary_interval_read(read: pysam.AlignedSegment) -> bool:
+    if read.is_unmapped or read.is_secondary or read.is_supplementary:
+        return False
+    if read.query_sequence is None:
+        return False
+    return True
+
+
+def _read_matches_preferred(read: pysam.AlignedSegment, preferred_lookup: set[str]) -> bool:
+    if not preferred_lookup:
+        return False
+    qname = str(read.query_name or "")
+    pair_suffix = "1" if read.is_read1 else "2" if read.is_read2 else "0"
+    rid = f"{qname}:{pair_suffix}"
+    candidates = {
+        qname,
+        rid,
+        f"{qname}/1",
+        f"{qname}/2",
+        _canonical_read_name(qname),
+        _canonical_read_name(rid),
+    }
+    return any(x and x in preferred_lookup for x in candidates)
+
+
 def _write_interval_fastq(
     bam_path: Path,
     chrom: str,
@@ -55,26 +114,62 @@ def _write_interval_fastq(
     *,
     max_reads: int,
     non_perfect_only: bool = False,
+    preferred_read_names: set[str] | None = None,
 ) -> int:
     start0 = max(0, int(start_1based) - 1)
     end0 = max(start0 + 1, int(end_1based))
     written = 0
+    seen_ids: set[str] = set()
+    preferred_lookup = _preferred_read_lookup(preferred_read_names)
     out_fastq_gz.parent.mkdir(parents=True, exist_ok=True)
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam, gzip.open(out_fastq_gz, "wt", encoding="utf-8") as oh:
-        for read in bam.fetch(chrom, start0, end0):
-            if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                continue
-            if read.query_sequence is None:
-                continue
-            if non_perfect_only and not _is_non_perfect_primary_alignment(read):
-                continue
+    with gzip.open(out_fastq_gz, "wt", encoding="utf-8") as oh:
+        def _emit_read(read: pysam.AlignedSegment) -> bool:
+            nonlocal written
+            rid = f"{read.query_name}:{'1' if read.is_read1 else '2' if read.is_read2 else '0'}"
+            if rid in seen_ids:
+                return False
             seq = str(read.query_sequence)
             qual = read.qual if read.qual is not None else ("I" * len(seq))
-            rid = f"{read.query_name}:{'1' if read.is_read1 else '2' if read.is_read2 else '0'}"
             oh.write(f"@{rid}\n{seq}\n+\n{qual}\n")
+            seen_ids.add(rid)
             written += 1
-            if written >= int(max_reads):
-                break
+            return True
+
+        # Pass 0: force include locus-linked evidence read names first.
+        if preferred_lookup:
+            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+                for read in bam.fetch(chrom, start0, end0):
+                    if not _is_primary_interval_read(read):
+                        continue
+                    if not _read_matches_preferred(read, preferred_lookup):
+                        continue
+                    _emit_read(read)
+                    if written >= int(max_reads):
+                        break
+
+        # Pass 1: prioritize non-perfect/evidence-like reads.
+        if written < int(max_reads):
+            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+                for read in bam.fetch(chrom, start0, end0):
+                    if not _is_primary_interval_read(read):
+                        continue
+                    if not _is_non_perfect_primary_alignment(read):
+                        continue
+                    _emit_read(read)
+                    if written >= int(max_reads):
+                        break
+
+        # Pass 2: if full mode and under cap, backfill with clean/proper reads.
+        if (not non_perfect_only) and written < int(max_reads):
+            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+                for read in bam.fetch(chrom, start0, end0):
+                    if not _is_primary_interval_read(read):
+                        continue
+                    if _is_non_perfect_primary_alignment(read):
+                        continue
+                    _emit_read(read)
+                    if written >= int(max_reads):
+                        break
     return written
 
 
@@ -295,6 +390,37 @@ def _poly_at_max_run(seq: str) -> int:
     return best
 
 
+def _load_fasta_lengths(fasta_path: Path) -> dict[str, int]:
+    key = str(fasta_path.resolve())
+    with _MEI_FASTA_LENGTH_CACHE_LOCK:
+        cached = _MEI_FASTA_LENGTH_CACHE.get(key)
+        if cached is not None:
+            return cached
+    lengths: dict[str, int] = {}
+    try:
+        with pysam.FastaFile(str(fasta_path)) as fa:
+            for name, length in zip(fa.references, fa.lengths):
+                lengths[str(name)] = int(length)
+    except Exception:
+        lengths = {}
+    with _MEI_FASTA_LENGTH_CACHE_LOCK:
+        _MEI_FASTA_LENGTH_CACHE[key] = lengths
+    return lengths
+
+
+def _sort_hit_key(hit: dict[str, object]) -> tuple[int, int, int]:
+    return (int(hit.get("alnlen", 0)), int(hit.get("mapq", 0)), int(hit.get("nmatch", 0)))
+
+
+def _polyA_impute_threshold_for_family(mei_family: str) -> int:
+    fam = str(mei_family or "").upper()
+    if fam == "ALU":
+        return 15
+    if fam in {"LINE1", "SVA"}:
+        return 12
+    return int(_MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE)
+
+
 def _infer_breakpoint_from_alignments(
     mei_hit: dict[str, object],
     ref_hits: list[dict[str, object]],
@@ -507,10 +633,31 @@ def _sample_complexity_key(feat: dict[str, object]) -> tuple[int, int, int, int]
 def _choose_consensus_features(
     d_feat: dict[str, object], n_feat: dict[str, object]
 ) -> tuple[dict[str, object], str, dict[str, object], str]:
-    if int(d_feat.get("mei_aln_len", 0)) >= int(n_feat.get("mei_aln_len", 0)) and int(d_feat.get("mei_aln_len", 0)) > 0:
+    def _coord_ok(feat: dict[str, object]) -> bool:
+        s = int(feat.get("insertion_mei_start", -1))
+        e = int(feat.get("insertion_mei_end", -1))
+        return s > 0 and e > 0 and s >= e
+
+    def _pick_score(feat: dict[str, object]) -> tuple[int, int, int, int]:
+        left_aln = int(feat.get("left_support_mei_aln_len", 0))
+        right_aln = int(feat.get("right_support_mei_aln_len", 0))
+        mei_len = int(feat.get("mei_aln_len", 0))
+        side_anchors = int(left_aln >= _MIN_SIDE_ANCHOR_ALN_LEN) + int(right_aln >= _MIN_SIDE_ANCHOR_ALN_LEN)
+        coord_model = str(feat.get("coord_model", ""))
+        is_informative_model = 0 if coord_model in {"", "no_contigs", "no_mei_hits"} else 1
+        return (
+            1 if _coord_ok(feat) else 0,
+            side_anchors,
+            max(left_aln, right_aln, mei_len),
+            is_informative_model,
+        )
+
+    d_score = _pick_score(d_feat)
+    n_score = _pick_score(n_feat)
+    if d_score > (0, 0, 0, 0) and (n_score <= (0, 0, 0, 0) or d_score >= n_score):
         pick = d_feat
         pick_source = "disease"
-    elif int(n_feat.get("mei_aln_len", 0)) > 0:
+    elif n_score > (0, 0, 0, 0):
         pick = n_feat
         pick_source = "control"
     else:
@@ -556,15 +703,20 @@ def _extract_sample_assembly_features(
     minimap2_threads: int = 1,
 ) -> dict[str, object]:
     records = _iter_fasta_records(contigs_fasta)
+    seq_by_name = {name: seq for name, seq in records}
     if not records:
         return {
             "primary_contig_id": "",
             "mei_subfamily": "",
             "mei_family": "",
+            "mei_target_length": 0,
             "insertion_mei_start": -1,
             "insertion_mei_end": -1,
             "insertion_orientation": "",
             "insertion_length": 0,
+            "insertion_length_observed": 0,
+            "insertion_length_imputed": 0,
+            "insertion_length_confidence_tier": "undetermined",
             "polyA_max_run": 0,
             "breakpoint_pos": int(default_breakpoint_pos),
             "breakpoint_chrom": "",
@@ -577,6 +729,17 @@ def _extract_sample_assembly_features(
             "non_mei_partner_type": "",
             "breakpoint_side_status": "none",
             "top_contigs": "",
+            "mei_alignment_preset": "",
+            "left_support_contig_id": "",
+            "right_support_contig_id": "",
+            "left_support_mei_start": -1,
+            "left_support_mei_end": -1,
+            "right_support_mei_start": -1,
+            "right_support_mei_end": -1,
+            "left_support_mei_aln_len": 0,
+            "right_support_mei_aln_len": 0,
+            "coord_model": "no_contigs",
+            "coord_logic_version": int(_ASSEMBLY_FEATURE_SCHEMA_VERSION),
         }
 
     with tempfile.TemporaryDirectory(prefix="rtm_asm_parse_") as td:
@@ -584,7 +747,13 @@ def _extract_sample_assembly_features(
         with query_fa.open("w", encoding="utf-8") as oh:
             for name, seq in records:
                 oh.write(f">{name}\n{seq}\n")
-        mei_hits = _run_minimap2_paf(query_fa, mei_fasta, preset="asm5", threads=minimap2_threads)
+        mei_preset = "asm5"
+        mei_hits = _run_minimap2_paf(query_fa, mei_fasta, preset=mei_preset, threads=minimap2_threads)
+        if not mei_hits:
+            # Contigs can be short/chimeric around breakpoints; sr preset is more
+            # sensitive for recovering partial MEI-supporting alignments.
+            mei_preset = "sr"
+            mei_hits = _run_minimap2_paf(query_fa, mei_fasta, preset=mei_preset, threads=minimap2_threads)
         if reference_fasta is not None:
             ref_hits = _run_minimap2_paf(query_fa, reference_fasta, preset="asm5", threads=minimap2_threads)
         else:
@@ -596,10 +765,14 @@ def _extract_sample_assembly_features(
             "primary_contig_id": "",
             "mei_subfamily": "",
             "mei_family": "",
+            "mei_target_length": 0,
             "insertion_mei_start": -1,
             "insertion_mei_end": -1,
             "insertion_orientation": "",
             "insertion_length": 0,
+            "insertion_length_observed": 0,
+            "insertion_length_imputed": 0,
+            "insertion_length_confidence_tier": "undetermined",
             "polyA_max_run": int(poly),
             "breakpoint_pos": int(default_breakpoint_pos),
             "breakpoint_chrom": "",
@@ -612,14 +785,171 @@ def _extract_sample_assembly_features(
             "non_mei_partner_type": "",
             "breakpoint_side_status": "none",
             "top_contigs": "",
+            "mei_alignment_preset": mei_preset,
+            "left_support_contig_id": "",
+            "right_support_contig_id": "",
+            "left_support_mei_start": -1,
+            "left_support_mei_end": -1,
+            "right_support_mei_start": -1,
+            "right_support_mei_end": -1,
+            "left_support_mei_aln_len": 0,
+            "right_support_mei_aln_len": 0,
+            "coord_model": "no_mei_hits",
+            "coord_logic_version": int(_ASSEMBLY_FEATURE_SCHEMA_VERSION),
         }
 
     best = max(mei_hits, key=lambda h: (int(h["alnlen"]), int(h["mapq"]), int(h["nmatch"])))
-    contig_seq = dict(records).get(str(best["qname"]), "")
-    ins_len = max(0, int(best["qend"]) - int(best["qstart"]))
+    best_lo = int(best["tstart"]) + 1
+    best_hi = int(best["tend"])
+    mei_strand = str(best["strand"]) if str(best["strand"]) in {"+", "-"} else ""
+    left_cands: list[dict[str, object]] = []
+    right_cands: list[dict[str, object]] = []
+    for hit in mei_hits:
+        if int(hit.get("alnlen", 0)) < int(_MIN_SIDE_ANCHOR_ALN_LEN):
+            continue
+        side_status = _breakpoint_side_status(hit, ref_hits)
+        if side_status in {"left_only", "both"}:
+            left_cands.append(hit)
+        if side_status in {"right_only", "both"}:
+            right_cands.append(hit)
+    left_hit = max(left_cands, key=_sort_hit_key, default=None)
+    right_hit = max(right_cands, key=_sort_hit_key, default=None)
+
+    left_lo = int(left_hit.get("tstart", -1)) + 1 if left_hit is not None else -1
+    left_hi = int(left_hit.get("tend", -1)) if left_hit is not None else -1
+    right_lo = int(right_hit.get("tstart", -1)) + 1 if right_hit is not None else -1
+    right_hi = int(right_hit.get("tend", -1)) if right_hit is not None else -1
+
+    poly_max = max((_poly_at_max_run(seq) for _n, seq in records), default=0)
+    mei_lengths = _load_fasta_lengths(mei_fasta)
+    target_name = str(best.get("tname", ""))
+    target_len = int(mei_lengths.get(target_name, 0))
+    target_family = _family_from_target(target_name)
+    polyA_impute_threshold = _polyA_impute_threshold_for_family(target_family)
+    allow_left_anchor_impute = mei_strand == "+"
+    allow_right_anchor_impute = mei_strand == "-"
+    coord_model = "single_best_contig"
+    cx = _summarize_complex_topology(records, mei_hits, ref_hits, top_k=3)
+
+    if left_hit is not None and right_hit is not None:
+        fused_lo = min(left_lo, right_lo)
+        fused_hi = max(left_hi, right_hi)
+        if str(left_hit.get("qname", "")) == str(right_hit.get("qname", "")):
+            coord_model = "single_contig_both_sides"
+        else:
+            coord_model = "multi_contig_fused_sides"
+    elif left_hit is not None:
+        fused_lo = left_lo
+        fused_hi = left_hi
+        coord_model = "left_anchor_only"
+    elif right_hit is not None:
+        fused_lo = right_lo
+        fused_hi = right_hi
+        coord_model = "right_anchor_only"
+    else:
+        fused_lo = best_lo
+        fused_hi = best_hi
+        coord_model = "single_best_no_side_anchor"
+
+    observed_start = int(max(fused_lo, fused_hi))
+    observed_end = int(min(fused_lo, fused_hi))
+    observed_len = int(max(0, observed_start - observed_end + 1))
+
+    imputation_applied = False
+    imputation_reason = ""
+    complex_class = str(cx.get("complex_class", "unknown"))
+    complex_strict_poly_gate = poly_max >= int(max(polyA_impute_threshold, 18))
+    complex_anchor_gate = (allow_left_anchor_impute and left_hit is not None) or (
+        allow_right_anchor_impute and right_hit is not None
+    )
+
+    # Existing one-sided anchor + tail full-length imputation remains enabled.
+    if coord_model == "left_anchor_only" and allow_left_anchor_impute and poly_max >= int(polyA_impute_threshold) and target_len > 0:
+        fused_hi = max(fused_hi, target_len)
+        coord_model = "left_anchor_plus_polyA_full_3p_impute"
+        imputation_applied = True
+        imputation_reason = "one_sided_polyA"
+    elif (
+        coord_model == "right_anchor_only"
+        and allow_right_anchor_impute
+        and poly_max >= int(polyA_impute_threshold)
+        and target_len > 0
+    ):
+        fused_hi = max(fused_hi, target_len)
+        coord_model = "right_anchor_plus_polyA_full_3p_impute"
+        imputation_applied = True
+        imputation_reason = "one_sided_polyA"
+    # Strict complex-event imputation (explicitly without end-proximity gating).
+    elif (
+        complex_class == "mei_plus_sv"
+        and target_len > 0
+        and complex_strict_poly_gate
+        and complex_anchor_gate
+    ):
+        fused_hi = max(fused_hi, target_len)
+        coord_model = "complex_plus_polyA_full_3p_impute"
+        imputation_applied = True
+        imputation_reason = "complex_mei_plus_sv_polyA"
+
+    # MEI target coordinates are on the consensus reference axis. Keep project
+    # convention as 3'->5': start=high, end=low.
+    ins_start = int(max(fused_lo, fused_hi))
+    ins_end = int(min(fused_lo, fused_hi))
+    ins_len = int(max(0, ins_start - ins_end + 1))
+    imputed_len = int(max(ins_len, observed_len))
+    breakpoint_resolved_model = coord_model in {
+        "single_contig_both_sides",
+        "multi_contig_fused_sides",
+    }
+    if target_len <= 0 or observed_len <= 0:
+        length_confidence_tier = "undetermined"
+    elif observed_len >= max(1, int(target_len * 0.9)):
+        # A full-length MEI span on a single best contig without resolved two-sided
+        # breakpoint geometry is informative but not junction-resolved confidence.
+        # Reserve "high_conf" for two-sided breakpoint-resolved models.
+        if breakpoint_resolved_model:
+            length_confidence_tier = "full_length_high_conf"
+        else:
+            length_confidence_tier = "full_length_possible"
+    elif imputation_applied and imputed_len >= target_len:
+        if (
+            imputation_reason == "complex_mei_plus_sv_polyA"
+            and poly_max >= int(max(polyA_impute_threshold, 24))
+            and breakpoint_resolved_model
+        ):
+            length_confidence_tier = "full_length_high_conf"
+        else:
+            length_confidence_tier = "full_length_possible"
+    else:
+        is_3p_truncated = bool(target_len > 0 and int(ins_start) < int(target_len))
+        is_5p_truncated = bool(int(ins_end) > 1)
+        if is_3p_truncated and is_5p_truncated:
+            length_confidence_tier = "truncated_5p_3p"
+        elif is_5p_truncated:
+            length_confidence_tier = "truncated_5p"
+        elif is_3p_truncated:
+            length_confidence_tier = "truncated_3p"
+        else:
+            length_confidence_tier = "truncated"
     bp, bp_left_chrom, _bp_right_chrom, tsd_len = _infer_breakpoint_from_alignments(
         best, ref_hits, default_pos=default_breakpoint_pos
     )
+    # Rescue missed TSDs with strong side-anchor flanks chosen for coordinate model
+    # when the primary per-contig breakpoint inference does not yield a TSD.
+    if tsd_len < 4 and left_hit is not None and right_hit is not None:
+        try:
+            lchrom = str(left_hit.get("tname", ""))
+            rchrom = str(right_hit.get("tname", ""))
+            if lchrom and rchrom and lchrom == rchrom:
+                left_bp = int(left_hit.get("tend", 0))  # 1-based endpoint
+                right_bp = int(right_hit.get("tstart", 0)) + 1  # 1-based start
+                alt_tsd_len = int(right_bp - left_bp + 1) if right_bp >= left_bp else 0
+                if alt_tsd_len >= 4:
+                    bp = int((left_bp + right_bp) // 2)
+                    bp_left_chrom = lchrom
+                    tsd_len = alt_tsd_len
+        except Exception:
+            pass
     tsd_seq = ""
     if reference_fasta is not None and bp_left_chrom and tsd_len > 0 and tsd_len <= 50:
         try:
@@ -629,16 +959,19 @@ def _extract_sample_assembly_features(
                 tsd_seq = ref.fetch(bp_left_chrom, start0, end0).upper()
         except Exception:
             tsd_seq = ""
-    cx = _summarize_complex_topology(records, mei_hits, ref_hits, top_k=3)
     return {
         "primary_contig_id": str(best["qname"]),
         "mei_subfamily": str(best["tname"]),
         "mei_family": _family_from_target(str(best["tname"])),
-        "insertion_mei_start": int(best["tstart"]) + 1,
-        "insertion_mei_end": int(best["tend"]),
-        "insertion_orientation": str(best["strand"]) if str(best["strand"]) in {"+", "-"} else "",
-        "insertion_length": int(ins_len),
-        "polyA_max_run": int(_poly_at_max_run(contig_seq)),
+        "mei_target_length": int(target_len),
+        "insertion_mei_start": int(ins_start),
+        "insertion_mei_end": int(ins_end),
+        "insertion_orientation": mei_strand,
+        "insertion_length": int(imputed_len),
+        "insertion_length_observed": int(observed_len),
+        "insertion_length_imputed": int(imputed_len),
+        "insertion_length_confidence_tier": str(length_confidence_tier),
+        "polyA_max_run": int(poly_max),
         "breakpoint_pos": int(bp),
         "breakpoint_chrom": str(bp_left_chrom),
         "tsd_len": int(max(0, tsd_len)),
@@ -650,6 +983,17 @@ def _extract_sample_assembly_features(
         "non_mei_partner_type": str(cx.get("non_mei_partner_type", "")),
         "breakpoint_side_status": str(cx.get("breakpoint_side_status", _breakpoint_side_status(best, ref_hits))),
         "top_contigs": str(cx.get("top_contigs", "")),
+        "mei_alignment_preset": str(mei_preset),
+        "left_support_contig_id": str(left_hit.get("qname", "") if left_hit is not None else ""),
+        "right_support_contig_id": str(right_hit.get("qname", "") if right_hit is not None else ""),
+        "left_support_mei_start": int(left_hi if left_hit is not None else -1),
+        "left_support_mei_end": int(left_lo if left_hit is not None else -1),
+        "right_support_mei_start": int(right_hi if right_hit is not None else -1),
+        "right_support_mei_end": int(right_lo if right_hit is not None else -1),
+        "left_support_mei_aln_len": int(left_hit.get("alnlen", 0) if left_hit is not None else 0),
+        "right_support_mei_aln_len": int(right_hit.get("alnlen", 0) if right_hit is not None else 0),
+        "coord_model": str(coord_model),
+        "coord_logic_version": int(_ASSEMBLY_FEATURE_SCHEMA_VERSION),
     }
 
 
@@ -693,8 +1037,44 @@ def _process_single_locus(
     reuse_existing: bool,
     reuse_cache_only: bool,
     spades_exe: str | None,
+    disease_preferred_read_names_by_locus: dict[tuple[str, int, int], set[str]] | None = None,
+    control_preferred_read_names_by_locus: dict[tuple[str, int, int], set[str]] | None = None,
 ) -> tuple[dict[str, object], str]:
+    def _has_sideaware_feature_schema(feat: object) -> bool:
+        if not isinstance(feat, dict):
+            return False
+        required = {
+            "coord_model",
+            "left_support_contig_id",
+            "right_support_contig_id",
+            "left_support_mei_start",
+            "left_support_mei_end",
+            "right_support_mei_start",
+            "right_support_mei_end",
+            "left_support_mei_aln_len",
+            "right_support_mei_aln_len",
+            "mei_target_length",
+            "insertion_length_observed",
+            "insertion_length_imputed",
+            "insertion_length_confidence_tier",
+        }
+        if not required.issubset(set(feat.keys())):
+            return False
+        version = int(feat.get("coord_logic_version", 0) or 0)
+        return version >= int(_ASSEMBLY_FEATURE_SCHEMA_VERSION)
+
     as_row = pd.Series(row_data)
+    locus_key = (
+        str(as_row.get("chrom", "")),
+        int(as_row.get("window_start", 0)),
+        int(as_row.get("window_end", 0)),
+    )
+    disease_preferred_read_names = (
+        disease_preferred_read_names_by_locus.get(locus_key, set()) if disease_preferred_read_names_by_locus else set()
+    )
+    control_preferred_read_names = (
+        control_preferred_read_names_by_locus.get(locus_key, set()) if control_preferred_read_names_by_locus else set()
+    )
     fallback_bp = int(as_row.get("insertion_breakpoint_pos", 0) or 0)
     chrom, i_start, i_end = _interval_from_row(as_row, interval_pad_bp)
     stable_locus_id = _window_locus_id_from_row(as_row)
@@ -729,6 +1109,7 @@ def _process_single_locus(
     n_max = 0
     chosen_pad = int(interval_pad_bp)
     escalated_max_reads = 1000
+    cache_hit = False
 
     if reuse_existing and _has_assembled_cache(locus_dir, manifest, interval_pad_bp=interval_pad_bp):
         cached_pad = int(manifest.get("interval", {}).get("pad_bp", interval_pad_bp))
@@ -742,6 +1123,7 @@ def _process_single_locus(
         n_cc = int(manifest.get("control_contigs", 0))
         d_max = int(manifest.get("disease_max_contig_len", 0))
         n_max = int(manifest.get("control_max_contig_len", 0))
+        cache_hit = True
     elif manifest is None:
         manifest = _parse_existing_manifest(manifest_path)
 
@@ -771,6 +1153,7 @@ def _process_single_locus(
                     d_fq,
                     max_reads=int(phase_cap),
                     non_perfect_only=non_perfect_only,
+                    preferred_read_names=disease_preferred_read_names,
                 )
                 n_reads = _write_interval_fastq(
                     control_bam_path,
@@ -780,6 +1163,7 @@ def _process_single_locus(
                     n_fq,
                     max_reads=int(phase_cap),
                     non_perfect_only=non_perfect_only,
+                    preferred_read_names=control_preferred_read_names,
                 )
                 if d_reads == 0 and n_reads == 0:
                     status = "assembly_no_reads"
@@ -854,24 +1238,40 @@ def _process_single_locus(
 
     d_out = locus_dir / f"disease.spades.pad{int(chosen_pad)}"
     n_out = locus_dir / f"control.spades.pad{int(chosen_pad)}"
-    d_feat = _extract_sample_assembly_features(
-        contigs_fasta=d_out / "contigs.fasta",
-        mei_fasta=mei_fasta,
-        reference_fasta=reference_fasta,
-        default_breakpoint_pos=fallback_bp,
-        minimap2_threads=minimap2_threads,
-    )
-    n_feat = _extract_sample_assembly_features(
-        contigs_fasta=n_out / "contigs.fasta",
-        mei_fasta=mei_fasta,
-        reference_fasta=reference_fasta,
-        default_breakpoint_pos=fallback_bp,
-        minimap2_threads=minimap2_threads,
-    )
+    d_feat: dict[str, object]
+    n_feat: dict[str, object]
+    manifest_d_feat = manifest.get("disease_features", {}) if isinstance(manifest, dict) else {}
+    manifest_n_feat = manifest.get("control_features", {}) if isinstance(manifest, dict) else {}
+    if (
+        cache_hit
+        and isinstance(manifest_d_feat, dict)
+        and isinstance(manifest_n_feat, dict)
+        and _has_sideaware_feature_schema(manifest_d_feat)
+        and _has_sideaware_feature_schema(manifest_n_feat)
+    ):
+        # Reuse precomputed feature payloads from cache manifests to avoid
+        # per-locus minimap2 remapping when iterating on downstream annotation.
+        d_feat = manifest_d_feat
+        n_feat = manifest_n_feat
+    else:
+        d_feat = _extract_sample_assembly_features(
+            contigs_fasta=d_out / "contigs.fasta",
+            mei_fasta=mei_fasta,
+            reference_fasta=reference_fasta,
+            default_breakpoint_pos=fallback_bp,
+            minimap2_threads=minimap2_threads,
+        )
+        n_feat = _extract_sample_assembly_features(
+            contigs_fasta=n_out / "contigs.fasta",
+            mei_fasta=mei_fasta,
+            reference_fasta=reference_fasta,
+            default_breakpoint_pos=fallback_bp,
+            minimap2_threads=minimap2_threads,
+        )
     pick, pick_source, complex_pick, complex_source = _choose_consensus_features(d_feat, n_feat)
 
     adaptive_rerun_used = False
-    if _should_escalate_read_cap(
+    if (not cache_hit) and _should_escalate_read_cap(
         status=status,
         d_reads=d_reads,
         n_reads=n_reads,
@@ -890,6 +1290,7 @@ def _process_single_locus(
             current_end,
             d_fq_hi,
             max_reads=int(escalated_max_reads),
+            preferred_read_names=disease_preferred_read_names,
         )
         n_reads_hi = _write_interval_fastq(
             control_bam_path,
@@ -898,6 +1299,7 @@ def _process_single_locus(
             current_end,
             n_fq_hi,
             max_reads=int(escalated_max_reads),
+            preferred_read_names=control_preferred_read_names,
         )
         if d_reads_hi > 0 or n_reads_hi > 0:
             d_out_hi = locus_dir / f"disease.spades.pad{int(chosen_pad)}.cap{int(escalated_max_reads)}"
@@ -1006,10 +1408,14 @@ def _process_single_locus(
         "asm_tsd_len": int(pick.get("tsd_len", 0) if pick else 0),
         "asm_polyA_max_run": int(pick.get("polyA_max_run", 0) if pick else 0),
         "asm_insertion_length": int(pick.get("insertion_length", 0) if pick else 0),
+        "asm_insertion_length_observed": int(pick.get("insertion_length_observed", 0) if pick else 0),
+        "asm_insertion_length_imputed": int(pick.get("insertion_length_imputed", 0) if pick else 0),
+        "asm_insertion_length_confidence_tier": str(pick.get("insertion_length_confidence_tier", "undetermined") if pick else "undetermined"),
         "asm_insertion_mei_start": int(pick.get("insertion_mei_start", -1) if pick else -1),
         "asm_insertion_mei_end": int(pick.get("insertion_mei_end", -1) if pick else -1),
         "asm_mei_family": str(pick.get("mei_family", "") if pick else ""),
         "asm_mei_subfamily": str(pick.get("mei_subfamily", "") if pick else ""),
+        "asm_mei_target_length": int(pick.get("mei_target_length", 0) if pick else 0),
         "asm_insertion_orientation": str(pick.get("insertion_orientation", "") if pick else ""),
         "asm_complex_class": str(complex_pick.get("complex_class", "") if complex_pick else ""),
         "asm_non_mei_partner_chrom": str(complex_pick.get("non_mei_partner_chrom", "") if complex_pick else ""),
@@ -1018,6 +1424,17 @@ def _process_single_locus(
         "asm_breakpoint_side_status": str(complex_pick.get("breakpoint_side_status", "none") if complex_pick else "none"),
         "asm_complexity_source": complex_source,
         "asm_top_contigs": str(complex_pick.get("top_contigs", "") if complex_pick else ""),
+        "asm_mei_alignment_preset": str(pick.get("mei_alignment_preset", "") if pick else ""),
+        "asm_left_support_contig_id": str(pick.get("left_support_contig_id", "") if pick else ""),
+        "asm_right_support_contig_id": str(pick.get("right_support_contig_id", "") if pick else ""),
+        "asm_left_support_mei_start": int(pick.get("left_support_mei_start", -1) if pick else -1),
+        "asm_left_support_mei_end": int(pick.get("left_support_mei_end", -1) if pick else -1),
+        "asm_right_support_mei_start": int(pick.get("right_support_mei_start", -1) if pick else -1),
+        "asm_right_support_mei_end": int(pick.get("right_support_mei_end", -1) if pick else -1),
+        "asm_left_support_mei_aln_len": int(pick.get("left_support_mei_aln_len", 0) if pick else 0),
+        "asm_right_support_mei_aln_len": int(pick.get("right_support_mei_aln_len", 0) if pick else 0),
+        "asm_coord_model": str(pick.get("coord_model", "") if pick else ""),
+        "asm_coord_logic_version": int(pick.get("coord_logic_version", 0) if pick else 0),
         "asm_adaptive_read_cap_rerun": bool(adaptive_rerun_used),
         "asm_adaptive_read_cap_target": int(escalated_max_reads),
     }
@@ -1057,6 +1474,8 @@ def _resolve_locus_workers(
         return max(1, min(int(requested_workers), int(total_loci)))
 
     cpu_count = max(1, int(os.cpu_count() or 1))
+    cpu_headroom = 2
+    cpu_limited_workers = max(1, cpu_count - cpu_headroom)
     total_mem_gb = _detect_total_memory_gb()
     reserve_mem_gb = 12
     mem_per_worker_gb = max(1, int(spades_memory_gb))
@@ -1067,7 +1486,7 @@ def _resolve_locus_workers(
 
     # Protect against oversubscription when callers increase SPAdes threads.
     spades_thread_limited_workers = max(1, int(cpu_count / max(1, int(spades_threads))))
-    auto_workers = min(cpu_count, mem_limited_workers, spades_thread_limited_workers, int(total_loci))
+    auto_workers = min(cpu_limited_workers, mem_limited_workers, spades_thread_limited_workers, int(total_loci))
     return max(1, int(auto_workers))
 
 
@@ -1088,6 +1507,8 @@ def annotate_silver_with_local_assembly(
     locus_workers: int = 0,
     reuse_existing: bool = True,
     reuse_cache_only: bool = False,
+    disease_preferred_read_names_by_locus: dict[tuple[str, int, int], set[str]] | None = None,
+    control_preferred_read_names_by_locus: dict[tuple[str, int, int], set[str]] | None = None,
 ) -> pd.DataFrame:
     if candidates.empty:
         return pd.DataFrame(
@@ -1116,10 +1537,14 @@ def annotate_silver_with_local_assembly(
                 "asm_tsd_len",
                 "asm_polyA_max_run",
                 "asm_insertion_length",
+                "asm_insertion_length_observed",
+                "asm_insertion_length_imputed",
+                "asm_insertion_length_confidence_tier",
                 "asm_insertion_mei_start",
                 "asm_insertion_mei_end",
                 "asm_mei_family",
                 "asm_mei_subfamily",
+                "asm_mei_target_length",
                 "asm_insertion_orientation",
                 "asm_consensus_primary_contig_id",
                 "asm_complex_class",
@@ -1129,6 +1554,17 @@ def annotate_silver_with_local_assembly(
                 "asm_breakpoint_side_status",
                 "asm_complexity_source",
                 "asm_top_contigs",
+                "asm_mei_alignment_preset",
+                "asm_left_support_contig_id",
+                "asm_right_support_contig_id",
+                "asm_left_support_mei_start",
+                "asm_left_support_mei_end",
+                "asm_right_support_mei_start",
+                "asm_right_support_mei_end",
+                "asm_left_support_mei_aln_len",
+                "asm_right_support_mei_aln_len",
+                "asm_coord_model",
+                "asm_coord_logic_version",
                 "asm_adaptive_read_cap_rerun",
                 "asm_adaptive_read_cap_target",
             ]
@@ -1136,7 +1572,12 @@ def annotate_silver_with_local_assembly(
 
     assembly_cache_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
-    silver = candidates.loc[candidates.get("silver_stage_pass", False).fillna(False).astype(bool)].copy()
+    silver_stage = (
+        candidates["silver_stage_pass"]
+        if "silver_stage_pass" in candidates.columns
+        else pd.Series(False, index=candidates.index)
+    )
+    silver = candidates.loc[silver_stage.fillna(False).astype(bool)].copy()
     total_loci = int(len(silver))
     if total_loci == 0:
         return pd.DataFrame(rows)
@@ -1178,6 +1619,8 @@ def annotate_silver_with_local_assembly(
                 reuse_existing=reuse_existing,
                 reuse_cache_only=reuse_cache_only,
                 spades_exe=spades_exe,
+                disease_preferred_read_names_by_locus=disease_preferred_read_names_by_locus,
+                control_preferred_read_names_by_locus=control_preferred_read_names_by_locus,
             )
             rows.append(result)
             print(log_line, flush=True)
@@ -1203,6 +1646,8 @@ def annotate_silver_with_local_assembly(
                     reuse_existing=reuse_existing,
                     reuse_cache_only=reuse_cache_only,
                     spades_exe=spades_exe,
+                    disease_preferred_read_names_by_locus=disease_preferred_read_names_by_locus,
+                    control_preferred_read_names_by_locus=control_preferred_read_names_by_locus,
                 )
                 for idx, row_data in enumerate(row_records, start=1)
             ]
