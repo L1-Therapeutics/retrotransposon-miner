@@ -1327,7 +1327,12 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
     return pivot
 
 
-def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: Path | None = None) -> pd.DataFrame:
+def _infer_disease_insertion_metrics(
+    candidates: pd.DataFrame,
+    reference_fasta: Path | None = None,
+    split_disease: pd.DataFrame | None = None,
+    split_control: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     out = candidates.copy()
     for col in [
         "disease_L_mei_start",
@@ -1501,6 +1506,42 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
         return best_value
 
     if reference_fasta is not None:
+        def _build_clip_lookup(split_df: pd.DataFrame | None, *, max_probe_bp: int = 50) -> dict[tuple[str, int, int], dict[str, list[str]]]:
+            lookup: dict[tuple[str, int, int], dict[str, list[str]]] = {}
+            if split_df is None or split_df.empty:
+                return lookup
+            required = {"chrom", "window_start", "window_end", "clip_side", "clip_seq"}
+            if not required.issubset(set(split_df.columns)):
+                return lookup
+            work = split_df.loc[:, ["chrom", "window_start", "window_end", "clip_side", "clip_seq"]].copy()
+            work["clip_seq"] = work["clip_seq"].fillna("").astype(str)
+            work = work.loc[work["clip_seq"].str.len() >= 4].copy()
+            if work.empty:
+                return lookup
+            for row in work.itertuples(index=False):
+                chrom = str(getattr(row, "chrom", "") or "")
+                if not chrom:
+                    continue
+                try:
+                    ws = int(getattr(row, "window_start"))
+                    we = int(getattr(row, "window_end"))
+                except (TypeError, ValueError):
+                    continue
+                side = str(getattr(row, "clip_side", "") or "").strip().upper()
+                if side not in {"L", "R"}:
+                    continue
+                seq = str(getattr(row, "clip_seq", "") or "").upper()
+                if len(seq) < 4:
+                    continue
+                if side == "L":
+                    prox = seq[-int(max_probe_bp) :]
+                else:
+                    prox = seq[: int(max_probe_bp)]
+                key = (chrom, ws, we)
+                rec = lookup.setdefault(key, {"L": [], "R": []})
+                rec[side].append(prox)
+            return lookup
+
         with pysam.FastaFile(str(reference_fasta)) as ref:
             rescued = out.apply(
                 lambda r: _rescue_tsd_pair_with_reference(r, ref),
@@ -1528,6 +1569,208 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
         out.loc[replace_mask, "tsd_len_estimate"] = resc_len.loc[replace_mask].astype(int)
         out.loc[replace_mask, "tsd_evidence_source"] = (
             rescued.loc[replace_mask, "resc_tsd_evidence_source"].fillna("").astype(str)
+        )
+        out["tsd_detected"] = out["tsd_len_estimate"].fillna(0).astype(int) >= 4
+
+        disease_clip_lookup = _build_clip_lookup(split_disease)
+        control_clip_lookup = _build_clip_lookup(split_control)
+
+        def _best_match_stats(
+            window_seq: str,
+            motif: str,
+            center_idx: int,
+            *,
+            max_mismatch: int = 1,
+        ) -> tuple[int, int] | None:
+            if not motif or not window_seq:
+                return None
+            m = len(motif)
+            if m <= 0 or m > len(window_seq):
+                return None
+            best: tuple[int, int] | None = None
+            for i in range(0, len(window_seq) - m + 1):
+                mm = 0
+                w = window_seq[i : i + m]
+                for a, b in zip(w, motif):
+                    if a != b:
+                        mm += 1
+                        if mm > int(max_mismatch):
+                            break
+                if mm > int(max_mismatch):
+                    continue
+                dist = abs(int(i) - int(center_idx))
+                rank = (mm, dist)
+                if best is None or rank < best:
+                    best = rank
+            if best is None:
+                return None
+            return (int(best[1]), int(best[0]))
+
+        def _clip_exact_tsd_rescue(
+            row: pd.Series,
+            ref: pysam.FastaFile,
+            *,
+            min_len: int = 4,
+            max_len: int = 30,
+            flank_bp: int = 80,
+            max_mismatch: int = 1,
+            min_support_clips: int = 2,
+        ) -> tuple[int, int, int, str]:
+            chrom = str(row.get("chrom", "") or "").strip()
+            if not chrom:
+                return (0, 0, 0, "")
+            try:
+                ws = int(row.get("window_start", -1))
+                we = int(row.get("window_end", -1))
+            except (TypeError, ValueError):
+                return (0, 0, 0, "")
+            key = (chrom, ws, we)
+            if key not in disease_clip_lookup and key not in control_clip_lookup:
+                return (0, 0, 0, "")
+
+            best_key: tuple[int, int, int, int, int] | None = None
+            best_value: tuple[int, int, int, str] | None = None
+            event_ori = str(row.get("insertion_orientation", "") or "").strip()
+            if event_ori not in {"+", "-"}:
+                event_ori = str(_choose_consolidated_insertion_orientation(row) or "").strip()
+            for sample, sample_pri, lookup in (
+                ("disease", 0, disease_clip_lookup),
+                ("control", 1, control_clip_lookup),
+            ):
+                side_map = lookup.get(key, {})
+                for side, side_pri in (("L", 0), ("R", 1)):
+                    seqs = side_map.get(side, [])
+                    if not seqs:
+                        continue
+                    try:
+                        bp = int(row.get(f"{sample}_{side}_mei_breakpoint_mode", 0))
+                    except (TypeError, ValueError):
+                        bp = 0
+                    if bp <= 0:
+                        continue
+                    start0 = max(0, bp - int(flank_bp) - 1)
+                    end0 = max(start0 + 1, bp + int(flank_bp))
+                    try:
+                        window_seq = ref.fetch(chrom, start0, end0).upper()
+                    except Exception:
+                        continue
+                    center_idx = int(bp - 1 - start0)
+                    cand_votes: dict[tuple[int, int, str], int] = {}
+                    cand_rank: dict[tuple[int, int, str], tuple[int, int, int, int, int]] = {}
+                    for prox in seqs:
+                        if len(prox) < int(min_len):
+                            continue
+                        oriented_variants: list[str]
+                        if event_ori == "+":
+                            oriented_variants = [prox]
+                        elif event_ori == "-":
+                            oriented_variants = [_revcomp(prox)]
+                        else:
+                            oriented_variants = [prox, _revcomp(prox)]
+                        clip_best_key: tuple[int, int, str] | None = None
+                        clip_best_rank: tuple[int, int, int, int, int] | None = None
+                        for prox_oriented in oriented_variants:
+                            if len(prox_oriented) < int(min_len):
+                                continue
+                            max_l = min(int(max_len), len(prox_oriented))
+                            for L in range(max_l, int(min_len) - 1, -1):
+                                motif = prox_oriented[-L:] if side == "L" else prox_oriented[:L]
+                                if len(motif) != L or "N" in motif:
+                                    continue
+                                match = _best_match_stats(
+                                    window_seq,
+                                    motif,
+                                    center_idx,
+                                    max_mismatch=int(max_mismatch),
+                                )
+                                if match is None:
+                                    continue
+                                dist, mm = match
+                                if side == "L":
+                                    ll = int(bp)
+                                    rr = int(bp + L - 1)
+                                else:
+                                    ll = int(bp - L + 1)
+                                    rr = int(bp)
+                                if ll <= 0 or rr < ll:
+                                    continue
+                                if mm == 0:
+                                    src = f"tsd_{sample}_{side}_clip_exact_rescue"
+                                else:
+                                    src = f"tsd_{sample}_{side}_clip_near_exact_rescue"
+                                ckey = (ll, rr, src)
+                                crank = (-L, mm, dist, sample_pri, side_pri)
+                                if clip_best_rank is None or crank < clip_best_rank:
+                                    clip_best_rank = crank
+                                    clip_best_key = ckey
+                                break
+                        if clip_best_key is None:
+                            continue
+                        cand_votes[clip_best_key] = int(cand_votes.get(clip_best_key, 0)) + 1
+                        prev_rank = cand_rank.get(clip_best_key)
+                        if prev_rank is None or (clip_best_rank is not None and clip_best_rank < prev_rank):
+                            cand_rank[clip_best_key] = clip_best_rank if clip_best_rank is not None else (0, 0, 0, 0, 0)
+
+                    for ckey, votes in cand_votes.items():
+                        if int(votes) < int(min_support_clips):
+                            continue
+                        ll, rr, src = ckey
+                        L = int(rr - ll + 1)
+                        base_rank = cand_rank.get(ckey, (-L, 0, 0, sample_pri, side_pri))
+                        rank = (base_rank[0], -int(votes), base_rank[1], base_rank[2], sample_pri)
+                        if best_key is None or rank < best_key:
+                            best_key = rank
+                            best_value = (ll, rr, int(L), src)
+            if best_value is None:
+                return (0, 0, 0, "")
+            return best_value
+
+        clip_exact = out.apply(
+            lambda r: _clip_exact_tsd_rescue(r, ref),
+            axis=1,
+            result_type="expand",
+        )
+        clip_exact.columns = [
+            "clip_tsd_left_breakpoint",
+            "clip_tsd_right_breakpoint",
+            "clip_tsd_len_estimate",
+            "clip_tsd_evidence_source",
+        ]
+        clip_len = pd.to_numeric(clip_exact["clip_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
+        # Keep diagnostic columns so we can audit clip-rescue behavior on all loci.
+        out["clip_tsd_len_estimate"] = clip_len.astype(int)
+        out["clip_tsd_evidence_source"] = clip_exact["clip_tsd_evidence_source"].fillna("").astype(str)
+        cur_len = out["tsd_len_estimate"].fillna(0).astype(int)
+        cur_src = out["tsd_evidence_source"].fillna("").astype(str)
+        cur_is_primary_pair = cur_src.isin(["tsd_disease", "tsd_control"])
+        clip_is_primary_side = out["clip_tsd_evidence_source"].str.contains("_L_clip_|_R_clip_", regex=True)
+        clip_mask = (
+            (clip_len >= 4)
+            & (
+                (cur_len < 4)
+                | ((clip_len > cur_len) & (~cur_is_primary_pair))
+                | cur_src.str.contains("one_sided_polyA_rescue", regex=False)
+                | (
+                    (clip_len == cur_len)
+                    & clip_is_primary_side
+                    & cur_src.str.contains("seq_rescue", regex=False)
+                )
+            )
+        )
+        out["clip_tsd_applied"] = clip_mask.astype(bool)
+        out.loc[clip_mask, "tsd_left_breakpoint"] = (
+            pd.to_numeric(clip_exact.loc[clip_mask, "clip_tsd_left_breakpoint"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
+        out.loc[clip_mask, "tsd_right_breakpoint"] = (
+            pd.to_numeric(clip_exact.loc[clip_mask, "clip_tsd_right_breakpoint"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
+        out.loc[clip_mask, "tsd_len_estimate"] = clip_len.loc[clip_mask].astype(int)
+        out.loc[clip_mask, "tsd_evidence_source"] = (
+            clip_exact.loc[clip_mask, "clip_tsd_evidence_source"].fillna("").astype(str)
         )
         out["tsd_detected"] = out["tsd_len_estimate"].fillna(0).astype(int) >= 4
 
@@ -1565,16 +1808,24 @@ def _infer_disease_insertion_metrics(candidates: pd.DataFrame, reference_fasta: 
                 r_support = _to_int_safe(row.get(f"{sample}_R_mei_supported_reads", 0), 0)
                 l_poly = _to_int_safe(row.get(f"{sample}_L_poly_at_reads", 0), 0)
                 r_poly = _to_int_safe(row.get(f"{sample}_R_poly_at_reads", 0), 0)
+                # Side-level polyA counts come from MEI-hit subset and can be zero on
+                # polyA-collapsed flanks; add broader locus-level rescue proxies.
+                split_poly = _to_int_safe(row.get(f"split_{sample}_poly_tail_rescued_unique_reads", 0), 0)
+                disc_poly = _to_int_safe(row.get(f"discordant_{sample}_poly_tail_rescued_unique_reads", 0), 0)
+                poly_run = _to_int_safe(row.get(f"{sample}_poly_at_max_run", 0), 0)
+                any_poly = max(l_poly, r_poly, split_poly, disc_poly, 1 if poly_run >= 8 else 0)
                 sample_pri = 0 if sample == "disease" else 1
 
-                if l_bp > 0 and r_bp <= 0 and l_support >= 2 and r_poly >= 1:
+                # Allow one-sided rescue when the opposite side is absent/weak and
+                # there is any polyA-like signal at the locus.
+                if l_bp > 0 and r_support <= 1 and l_support >= 1 and any_poly >= 1:
                     # Left breakpoint is stable; opposite side appears polyA-collapsed.
                     ll = int(l_bp)
                     rr = int(l_bp + int(min_len) - 1)
                     candidates.append(
                         (sample_pri, -l_support, ll, rr, f"tsd_{sample}_L_one_sided_polyA_rescue")
                     )
-                if r_bp > 0 and l_bp <= 0 and r_support >= 2 and l_poly >= 1:
+                if r_bp > 0 and l_support <= 1 and r_support >= 1 and any_poly >= 1:
                     # Right breakpoint is stable; opposite side appears polyA-collapsed.
                     ll = int(r_bp - int(min_len) + 1)
                     rr = int(r_bp)
@@ -5720,7 +5971,12 @@ def annotate_candidate_loci_with_mei(
     )
 
     candidate = _add_local_depth_normalized_support(candidate)
-    candidate = _infer_disease_insertion_metrics(candidate, reference_fasta=reference_fasta)
+    candidate = _infer_disease_insertion_metrics(
+        candidate,
+        reference_fasta=reference_fasta,
+        split_disease=split_disease,
+        split_control=split_control,
+    )
     candidate = _compute_insertion_model_scores(candidate)
     candidate = _assign_bronze_silver_stages(candidate)
     if local_assembly and disease_bam_path is not None and control_bam_path is not None:
