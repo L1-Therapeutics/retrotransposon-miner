@@ -824,6 +824,7 @@ def _postprocess(
 
 
 def main() -> int:
+    default_outdir = os.environ.get("RTM_PUBLIC_DATA_DIR", str(Path.home() / "retrotransposon-workdir" / "data" / "public"))
     parser = argparse.ArgumentParser(description="Download public references/annotations for retrotransposon-miner")
     parser.add_argument(
         "--config",
@@ -832,7 +833,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--outdir",
-        default="data/public",
+        default=default_outdir,
         help="Base output directory",
     )
     parser.add_argument(

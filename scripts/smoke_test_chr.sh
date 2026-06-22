@@ -13,12 +13,14 @@ set -euo pipefail
 #     --control-bam <path-or-url> \
 #     --download-local \
 #     --chrom chr22 \
-#     --outdir smoke-test
+#     --outdir "$HOME/retrotransposon-workdir/results/smoke-test"
 
 DISEASE_BAM=""
 CONTROL_BAM=""
 CHROM="chr22"
-OUTDIR="smoke-test"
+RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
+RTM_RESULTS_DIR="${RTM_RESULTS_DIR:-${RTM_WORKDIR}/results}"
+OUTDIR="${RTM_RESULTS_DIR}/smoke-test"
 THREADS="${THREADS:-4}"
 DOWNLOAD_LOCAL="0"
 

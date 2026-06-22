@@ -18,6 +18,14 @@ commercial use.
 - Linux x86_64 VM (recommended for production runs)
 - `curl` (bootstrap script installs `micromamba` automatically if needed)
 
+## Recommended external working directory (EC2)
+
+Keep heavy data and run outputs outside the git checkout:
+
+```bash
+source scripts/use_external_workdir.sh
+```
+
 ## Create the environment (auto-installs package manager if missing)
 
 ```bash
@@ -44,8 +52,27 @@ bash scripts/validate_environment.sh
 
 This checks:
 - Required command-line tools (`samtools`, `bedtools`, `bcftools`, `bwa-mem2`)
-- Python runtime and key modules (`pysam`, `pandas`, `pyarrow`, `click`, `Bio`)
+- Python runtime and key modules (`matplotlib`, `ipykernel`, `pysam`, `pandas`, `pyarrow`, `click`, `Bio`)
 - Optional UCSC binary (`liftOver`)
+
+## JupyterLab on EC2 (local browser via SSH tunnel)
+
+`bootstrap_env.sh` now ensures `git` is present on Linux and provisions Jupyter
+support in the environment (`jupyterlab`, `ipykernel`, `matplotlib`).
+
+After activating `rtm-miner`, start JupyterLab on the EC2 host:
+
+```bash
+jupyter lab --no-browser --ip=127.0.0.1 --port=8888
+```
+
+From your local machine, open an SSH tunnel:
+
+```bash
+ssh -N -L 8888:127.0.0.1:8888 ec2-user@<ec2-host>
+```
+
+Then open the tokenized URL printed by Jupyter in your local browser.
 
 ## Install UCSC liftOver (optional but recommended)
 
@@ -146,7 +173,7 @@ Outputs:
 ```bash
 python3 scripts/download_public_data.py \
   --config resources/public_datasets.yaml \
-  --outdir data/public
+  --outdir "${RTM_PUBLIC_DATA_DIR}"
 ```
 
 This initial dataset pack includes:
@@ -183,7 +210,7 @@ Download only selected categories:
 ```bash
 python3 scripts/download_public_data.py \
   --categories reference liftover \
-  --outdir data/public
+  --outdir "${RTM_PUBLIC_DATA_DIR}"
 ```
 
 Skip post-processing if you only want raw downloads:
@@ -191,7 +218,7 @@ Skip post-processing if you only want raw downloads:
 ```bash
 python3 scripts/download_public_data.py \
   --skip-postprocess \
-  --outdir data/public
+  --outdir "${RTM_PUBLIC_DATA_DIR}"
 ```
 
 Force local BWA index build (disable prebuilt-hg38 index download):
@@ -199,7 +226,7 @@ Force local BWA index build (disable prebuilt-hg38 index download):
 ```bash
 python3 scripts/download_public_data.py \
   --no-prebuilt-bwa-index \
-  --outdir data/public
+  --outdir "${RTM_PUBLIC_DATA_DIR}"
 ```
 
 The dataset catalog now includes HPRC, 1KGP/MELT, GIAB index docs, ENCODE
@@ -218,12 +245,12 @@ test pair to each reference:
 
 ```bash
 bash scripts/reprocess_pair_dual_reference.sh \
-  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
-  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
-  --hg38-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
-  --hs1-fasta data/public/reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa \
+  --disease-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
+  --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
+  --hg38-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --hs1-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa" \
   --prefix seqc2_chr22 \
-  --outdir results/reprocessed_bams \
+  --outdir "${RTM_RESULTS_DIR}/reprocessed_bams" \
   --threads 16
 ```
 
@@ -236,23 +263,23 @@ way to convert BAM evidence between assemblies.
 To regenerate the same chr22 test BAM set reproducibly from scratch:
 
 ```bash
-python3 scripts/download_public_data.py --outdir data/public --threads 4
+python3 scripts/download_public_data.py --outdir "${RTM_PUBLIC_DATA_DIR}" --threads 4
 
 bash scripts/reprocess_pair_dual_reference.sh \
-  --disease-bam data/public/test_data/seqc2/chr22/disease.chr22.hg38.bam \
-  --control-bam data/public/test_data/seqc2/chr22/control.chr22.hg38.bam \
-  --hg38-fasta data/public/reference/hg38/Homo_sapiens_assembly38.fasta \
-  --hs1-fasta data/public/reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa \
+  --disease-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
+  --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
+  --hg38-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --hs1-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa" \
   --prefix seqc2_chr22 \
-  --outdir results/reprocessed_bams \
+  --outdir "${RTM_RESULTS_DIR}/reprocessed_bams" \
   --threads 16
 ```
 
 Expected test outputs:
-- `results/reprocessed_bams/hg38/seqc2_chr22.disease.hg38.bam`
-- `results/reprocessed_bams/hg38/seqc2_chr22.control.hg38.bam`
-- `results/reprocessed_bams/hs1/seqc2_chr22.disease.hs1.bam`
-- `results/reprocessed_bams/hs1/seqc2_chr22.control.hs1.bam`
+- `${RTM_RESULTS_DIR}/reprocessed_bams/hg38/seqc2_chr22.disease.hg38.bam`
+- `${RTM_RESULTS_DIR}/reprocessed_bams/hg38/seqc2_chr22.control.hg38.bam`
+- `${RTM_RESULTS_DIR}/reprocessed_bams/hs1/seqc2_chr22.disease.hs1.bam`
+- `${RTM_RESULTS_DIR}/reprocessed_bams/hs1/seqc2_chr22.control.hs1.bam`
 
 ## Quick smoke test on a small chromosome
 

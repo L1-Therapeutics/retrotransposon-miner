@@ -16,6 +16,38 @@ fi
 
 echo "Bootstrapping environment '${ENV_NAME}' from ${ENV_FILE}"
 
+ensure_system_git() {
+  if command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "WARN: git is missing and automatic install is only configured for Linux." >&2
+    return 0
+  fi
+
+  echo "git not found; attempting system install..."
+  if command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y git
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum install -y git
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y git
+  else
+    echo "WARN: no supported package manager found for git install." >&2
+    return 0
+  fi
+
+  if command -v git >/dev/null 2>&1; then
+    echo "git installed successfully"
+  else
+    echo "WARN: git installation attempted but git is still missing." >&2
+  fi
+}
+
+ensure_system_git
+
 create_or_update_with_mamba() {
   if mamba env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
     mamba env update -n "${ENV_NAME}" -f "${ENV_FILE}" --prune

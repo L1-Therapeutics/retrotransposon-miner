@@ -9,14 +9,18 @@ set -euo pipefail
 # This wrapper runs the same commands used in interactive development so the
 # workflow can be reproduced with one command.
 
+RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
+RTM_PUBLIC_DATA_DIR="${RTM_PUBLIC_DATA_DIR:-${RTM_WORKDIR}/data/public}"
+RTM_RESULTS_DIR="${RTM_RESULTS_DIR:-${RTM_WORKDIR}/results}"
+
 DISEASE_BAM=""
 CONTROL_BAM=""
 MEI_FASTA=""
 REFERENCE_FASTA=""
-RMSK_TABLE="data/public/annotation/hg38/repeats/rmsk.txt.gz"
+RMSK_TABLE="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz"
 G1K_MEI_VCF=""
 LR_MEI_VCF=""
-OUTDIR="results/mei_step1_hg38_chr22"
+OUTDIR="${RTM_RESULTS_DIR}/mei_step1_hg38_chr22"
 REGION="chr22"
 WINDOW_SIZE="200"
 G1K_SPLIT_PADDING_BP="200"
@@ -31,12 +35,12 @@ LOCAL_ASSEMBLY="1"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
-SEG_DUP_BED="data/public/annotation/hg38/segdup/genomicSuperDups.bed"
-MAPPABILITY_BEDGRAPH="data/public/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.bedGraph"
-MAPPABILITY_LOW_BED="data/public/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
-GAP_BED="data/public/annotation/hg38/masks/gap.txt.gz"
-BLACKLIST_BED="data/public/annotation/hg38/blacklist/ENCFF356LFX.bed.gz"
-JUNK_MERGED_BED="data/public/annotation/hg38/junk/junk_exclusion_merged.bed"
+SEG_DUP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/segdup/genomicSuperDups.bed"
+MAPPABILITY_BEDGRAPH="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+MAPPABILITY_LOW_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+GAP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/masks/gap.txt.gz"
+BLACKLIST_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/blacklist/ENCFF356LFX.bed.gz"
+JUNK_MERGED_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/junk/junk_exclusion_merged.bed"
 
 now_epoch() {
   date +%s
@@ -163,12 +167,12 @@ for f in "${DISEASE_BAM}" "${CONTROL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MA
 done
 if [[ ! -f "${MAPPABILITY_LOW_BED}" ]]; then
   echo "ERROR: required low-mappability BED not found: ${MAPPABILITY_LOW_BED}" >&2
-  echo "Re-run: python3 scripts/download_public_data.py --outdir data/public" >&2
+  echo "Re-run: python3 scripts/download_public_data.py --outdir ${RTM_PUBLIC_DATA_DIR}" >&2
   exit 1
 fi
 if [[ ! -f "${JUNK_MERGED_BED}" ]]; then
   echo "ERROR: required merged junk BED not found: ${JUNK_MERGED_BED}" >&2
-  echo "Re-run: python3 scripts/download_public_data.py --outdir data/public" >&2
+  echo "Re-run: python3 scripts/download_public_data.py --outdir ${RTM_PUBLIC_DATA_DIR}" >&2
   exit 1
 fi
 if [[ -n "${REFERENCE_FASTA}" ]] && [[ ! -f "${REFERENCE_FASTA}" ]]; then

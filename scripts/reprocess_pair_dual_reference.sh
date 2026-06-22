@@ -12,19 +12,21 @@ set -euo pipefail
 #
 # Example:
 #   bash scripts/reprocess_pair_dual_reference.sh \
-#     --disease-bam data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam \
-#     --control-bam data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam \
-#     --hg38-fasta data/public/reference/hg38/hg38.fa \
-#     --hs1-fasta data/public/reference/hs1/GCA_009914755.4_T2T-CHM13v2.0_genomic.fna \
+#     --disease-bam "$HOME/retrotransposon-workdir/data/public/test_data/seqc2/WGS_EA_T_1.bwa.dedup.bam" \
+#     --control-bam "$HOME/retrotransposon-workdir/data/public/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam" \
+#     --hg38-fasta "$HOME/retrotransposon-workdir/data/public/reference/hg38/hg38.fa" \
+#     --hs1-fasta "$HOME/retrotransposon-workdir/data/public/reference/hs1/GCA_009914755.4_T2T-CHM13v2.0_genomic.fna" \
 #     --prefix seqc2_chr22 \
-#     --outdir results/reprocessed_bams \
+#     --outdir "$HOME/retrotransposon-workdir/results/reprocessed_bams" \
 #     --threads 16
 
 DISEASE_BAM=""
 CONTROL_BAM=""
 HG38_FASTA=""
 HS1_FASTA=""
-OUTDIR="results/reprocessed_bams"
+RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
+RTM_RESULTS_DIR="${RTM_RESULTS_DIR:-${RTM_WORKDIR}/results}"
+OUTDIR="${RTM_RESULTS_DIR}/reprocessed_bams"
 THREADS="${THREADS:-8}"
 KEEP_FASTQ="0"
 PREFIX=""

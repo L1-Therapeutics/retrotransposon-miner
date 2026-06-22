@@ -5,6 +5,7 @@ echo "Validating retrotransposon-miner environment..."
 
 required_bins=(
   git
+  jupyter
   samtools
   bedtools
   minimap2
@@ -54,6 +55,8 @@ from importlib.util import find_spec
 import sys
 
 mods = [
+    "matplotlib",
+    "ipykernel",
     "pysam",
     "pandas",
     "pyarrow",
