@@ -161,6 +161,54 @@ def _align_clips_with_minimap2(
     clips = split_df.copy()
     clips = clips.loc[clips["clip_seq"].fillna("").astype(str).str.len() > 0].copy()
     clips["clip_id"] = [f"{sample}_{i}" for i in range(len(clips))]
+    def _trim_clip_for_coord_alignment(seq: str, side: str) -> str:
+        s = (seq or "").upper()
+        if not s:
+            return ""
+        best_start = -1
+        best_end = -1
+        best_len = 0
+        cur_start = -1
+        cur_base = ""
+        for i, ch in enumerate(s):
+            if ch not in {"A", "T"}:
+                if cur_start >= 0:
+                    run_len = i - cur_start
+                    if run_len > best_len:
+                        best_start, best_end, best_len = cur_start, i, run_len
+                    cur_start = -1
+                    cur_base = ""
+                continue
+            if cur_start < 0:
+                cur_start = i
+                cur_base = ch
+            elif ch != cur_base:
+                run_len = i - cur_start
+                if run_len > best_len:
+                    best_start, best_end, best_len = cur_start, i, run_len
+                cur_start = i
+                cur_base = ch
+        if cur_start >= 0:
+            run_len = len(s) - cur_start
+            if run_len > best_len:
+                best_start, best_end, best_len = cur_start, len(s), run_len
+        if best_len < 8:
+            return s
+        left = s[:best_start]
+        right = s[best_end:]
+        side_u = (side or "").upper()
+        preferred = right if side_u == "L" else left if side_u == "R" else (right if len(right) >= len(left) else left)
+        backup = left if preferred is right else right
+        if len(preferred) >= 12:
+            return preferred
+        if len(backup) >= 12:
+            return backup
+        joined = (left + right).strip()
+        return joined if len(joined) >= 12 else s
+    clips["clip_seq_coord"] = [
+        _trim_clip_for_coord_alignment(str(seq), str(side))
+        for seq, side in zip(clips["clip_seq"].fillna(""), clips["clip_side"].fillna(""))
+    ]
     if clips.empty:
         summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
         return clips, summary
@@ -169,6 +217,8 @@ def _align_clips_with_minimap2(
         tmp = Path(tmpdir)
         query_fa = tmp / "clips.fa"
         paf_path = tmp / "clips_vs_mei.paf"
+        query_coord_fa = tmp / "clips_coord.fa"
+        paf_coord_path = tmp / "clips_coord_vs_mei.paf"
 
         with query_fa.open("w", encoding="utf-8") as handle:
             for row in clips.itertuples(index=False):
@@ -198,6 +248,48 @@ def _align_clips_with_minimap2(
         out["target_len"] = out["target_len"].fillna(0).astype(int)
         out["alnlen"] = out["alnlen"].fillna(0).astype(int)
         out["mei_score"] = out["mei_score"].fillna(0.0).astype(float)
+
+        # Coordinate-only alignment path from poly-trimmed clips. This keeps raw
+        # clip alignment for support scoring but improves MEI-axis coordinate recovery.
+        with query_coord_fa.open("w", encoding="utf-8") as handle:
+            for row in clips.itertuples(index=False):
+                coord_seq = str(getattr(row, "clip_seq_coord", "") or "")
+                if len(coord_seq) < 8:
+                    continue
+                handle.write(f">{row.clip_id}\n{coord_seq}\n")
+        coord_hits = pd.DataFrame(columns=["qname", "target", "family", "target_strand", "target_start", "target_end", "target_len", "alnlen", "mapq", "pid", "qcov", "mei_score"])
+        if query_coord_fa.exists() and query_coord_fa.stat().st_size > 0:
+            proc_coord = subprocess.run(cmd[:-1] + [str(query_coord_fa)], check=True, capture_output=True, text=True)
+            paf_coord_path.write_text(proc_coord.stdout, encoding="utf-8")
+            coord_hits = _best_hits_from_paf(paf_coord_path)
+        coord_hits = coord_hits.rename(
+            columns={
+                "target": "target_coord",
+                "family": "family_coord",
+                "target_strand": "target_strand_coord",
+                "target_start": "target_start_coord",
+                "target_end": "target_end_coord",
+                "target_len": "target_len_coord",
+                "alnlen": "alnlen_coord",
+                "mapq": "mapq_coord",
+                "pid": "pid_coord",
+                "qcov": "qcov_coord",
+                "mei_score": "mei_score_coord",
+            }
+        )
+        out = out.merge(coord_hits, left_on="clip_id", right_on="qname", how="left", suffixes=("", "_coord_merge"))
+        out["mei_hit_coord"] = out["target_coord"].notna()
+        out["target_coord"] = out["target_coord"].fillna("")
+        out["target_strand_coord"] = out["target_strand_coord"].fillna("")
+        out["target_start_coord"] = out["target_start_coord"].fillna(0).astype(int)
+        out["target_end_coord"] = out["target_end_coord"].fillna(0).astype(int)
+        out["target_len_coord"] = out["target_len_coord"].fillna(0).astype(int)
+        out["alnlen_coord"] = out["alnlen_coord"].fillna(0).astype(int)
+        out["mapq_coord"] = out["mapq_coord"].fillna(0).astype(int)
+        out["pid_coord"] = out["pid_coord"].fillna(0.0).astype(float)
+        out["qcov_coord"] = out["qcov_coord"].fillna(0.0).astype(float)
+        out["family_coord"] = out["family_coord"].fillna("")
+        out["mei_score_coord"] = out["mei_score_coord"].fillna(0.0).astype(float)
 
     summary = ClipAlignmentSummary(
         sample=sample,
@@ -320,8 +412,190 @@ def _build_locus_read_name_map(df: pd.DataFrame) -> dict[tuple[str, int, int], s
     return dict(out)
 
 
-def _aggregate_side_metrics(df: pd.DataFrame, sample_prefix: str, side: str) -> pd.DataFrame:
-    side_df = df.loc[(df["clip_side"] == side) & (df["mei_hit"])].copy()
+def _add_candidate_support_info_fields(
+    candidates: pd.DataFrame,
+    *,
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+    discordant_disease: pd.DataFrame,
+    discordant_control: pd.DataFrame,
+    split_disease_mei: pd.DataFrame,
+    split_control_mei: pd.DataFrame,
+    discordant_disease_mei: pd.DataFrame,
+    discordant_control_mei: pd.DataFrame,
+) -> pd.DataFrame:
+    """Populate pre-assembly support strings using MEI-gated raw side counts.
+
+    For each sample/locus:
+    - if there is >=1 MEI-supporting read (split or discordant), count all
+      assigned SR/DPE reads on each side of the breakpoint as supporting.
+    - otherwise set support counts to zero.
+    """
+
+    out = candidates.copy()
+    key_cols = ["chrom", "window_start", "window_end"]
+    if out.empty:
+        out["disease_supporting_reads"] = ""
+        out["control_supporting_reads"] = ""
+        return out
+
+    if "insertion_breakpoint_pos" in out.columns:
+        bp_tbl = out.loc[:, key_cols + ["insertion_breakpoint_pos"]].copy()
+    else:
+        bp_tbl = out.loc[:, key_cols].copy()
+        bp_tbl["insertion_breakpoint_pos"] = 0
+    bp_tbl["insertion_breakpoint_pos"] = pd.to_numeric(bp_tbl["insertion_breakpoint_pos"], errors="coerce").fillna(0).astype(int)
+    midpoint = (bp_tbl["window_start"].astype(int) + bp_tbl["window_end"].astype(int)) // 2
+    bp_tbl["insertion_breakpoint_pos"] = bp_tbl["insertion_breakpoint_pos"].where(bp_tbl["insertion_breakpoint_pos"] > 0, midpoint)
+
+    def _counts_from_split(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        if df.empty or "read_name" not in df.columns:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_raw", f"{prefix}_sr_r_raw"])
+        cols = key_cols + ["read_name"]
+        if "clip_side" in df.columns:
+            cols.append("clip_side")
+        if "pos" in df.columns:
+            cols.append("pos")
+        work = df.loc[:, [c for c in cols if c in df.columns]].copy()
+        work["read_name"] = work["read_name"].fillna("").astype(str)
+        work = work.loc[work["read_name"].str.len() > 0].copy()
+        if work.empty:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_raw", f"{prefix}_sr_r_raw"])
+        work = work.merge(bp_tbl, on=key_cols, how="inner")
+        if work.empty:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_raw", f"{prefix}_sr_r_raw"])
+
+        if "clip_side" in work.columns:
+            side = work["clip_side"].fillna("").astype(str).str.upper().str[:1]
+            if "pos" in work.columns:
+                pos = pd.to_numeric(work["pos"], errors="coerce").fillna(work["insertion_breakpoint_pos"]).astype(int)
+                fallback = pd.Series(["L"] * len(work), index=work.index).where(pos <= work["insertion_breakpoint_pos"], "R")
+                side = side.where(side.isin(["L", "R"]), fallback)
+            else:
+                side = side.where(side.isin(["L", "R"]), "L")
+        elif "pos" in work.columns:
+            pos = pd.to_numeric(work["pos"], errors="coerce").fillna(work["insertion_breakpoint_pos"]).astype(int)
+            side = pd.Series(["L"] * len(work), index=work.index).where(pos <= work["insertion_breakpoint_pos"], "R")
+        else:
+            side = pd.Series(["L"] * len(work), index=work.index)
+        work["raw_side"] = side
+
+        agg = (
+            work.groupby(key_cols + ["raw_side"], as_index=False)["read_name"]
+            .nunique()
+            .pivot_table(index=key_cols, columns="raw_side", values="read_name", fill_value=0)
+            .reset_index()
+        )
+        agg.columns = [str(c) for c in agg.columns]
+        if "L" not in agg.columns:
+            agg["L"] = 0
+        if "R" not in agg.columns:
+            agg["R"] = 0
+        agg[f"{prefix}_sr_l_raw"] = pd.to_numeric(agg["L"], errors="coerce").fillna(0).astype(int)
+        agg[f"{prefix}_sr_r_raw"] = pd.to_numeric(agg["R"], errors="coerce").fillna(0).astype(int)
+        return agg[key_cols + [f"{prefix}_sr_l_raw", f"{prefix}_sr_r_raw"]]
+
+    def _counts_from_discordant(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        if df.empty or "read_name" not in df.columns or "pos" not in df.columns:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"])
+        work = df.loc[:, key_cols + ["read_name", "pos"]].copy()
+        work["read_name"] = work["read_name"].fillna("").astype(str)
+        work = work.loc[work["read_name"].str.len() > 0].copy()
+        if work.empty:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"])
+        work = work.merge(bp_tbl, on=key_cols, how="inner")
+        if work.empty:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"])
+        pos = pd.to_numeric(work["pos"], errors="coerce").fillna(work["insertion_breakpoint_pos"]).astype(int)
+        work["raw_side"] = pd.Series(["L"] * len(work), index=work.index).where(pos <= work["insertion_breakpoint_pos"], "R")
+        agg = (
+            work.groupby(key_cols + ["raw_side"], as_index=False)["read_name"]
+            .nunique()
+            .pivot_table(index=key_cols, columns="raw_side", values="read_name", fill_value=0)
+            .reset_index()
+        )
+        agg.columns = [str(c) for c in agg.columns]
+        if "L" not in agg.columns:
+            agg["L"] = 0
+        if "R" not in agg.columns:
+            agg["R"] = 0
+        agg[f"{prefix}_dpe_l_raw"] = pd.to_numeric(agg["L"], errors="coerce").fillna(0).astype(int)
+        agg[f"{prefix}_dpe_r_raw"] = pd.to_numeric(agg["R"], errors="coerce").fillna(0).astype(int)
+        return agg[key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"]]
+
+    def _mei_gate(split_mei_df: pd.DataFrame, disc_mei_df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        parts: list[pd.DataFrame] = []
+        for src in (split_mei_df, disc_mei_df):
+            if src.empty or "read_name" not in src.columns:
+                continue
+            work = src.loc[:, [c for c in key_cols + ["read_name"] if c in src.columns]].copy()
+            work["read_name"] = work["read_name"].fillna("").astype(str)
+            work = work.loc[work["read_name"].str.len() > 0].copy()
+            if not work.empty:
+                parts.append(work)
+        if not parts:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_has_mei_support"])
+        all_mei = pd.concat(parts, ignore_index=True)
+        gate = (
+            all_mei.groupby(key_cols, as_index=False)["read_name"]
+            .nunique()
+            .rename(columns={"read_name": f"{prefix}_mei_unique_reads"})
+        )
+        gate[f"{prefix}_has_mei_support"] = gate[f"{prefix}_mei_unique_reads"].astype(int) >= 1
+        return gate[key_cols + [f"{prefix}_has_mei_support"]]
+
+    for prefix, split_df, disc_df, split_mei_df, disc_mei_df in (
+        ("disease", split_disease, discordant_disease, split_disease_mei, discordant_disease_mei),
+        ("control", split_control, discordant_control, split_control_mei, discordant_control_mei),
+    ):
+        sr = _counts_from_split(split_df, prefix)
+        dpe = _counts_from_discordant(disc_df, prefix)
+        gate = _mei_gate(split_mei_df, disc_mei_df, prefix)
+        merged = (
+            bp_tbl.loc[:, key_cols]
+            .drop_duplicates()
+            .merge(sr, on=key_cols, how="left")
+            .merge(dpe, on=key_cols, how="left")
+            .merge(gate, on=key_cols, how="left")
+        )
+        has_mei_col = f"{prefix}_has_mei_support"
+        if has_mei_col in merged.columns:
+            has_mei_support = merged[has_mei_col].fillna(False).astype(bool)
+        else:
+            has_mei_support = pd.Series(False, index=merged.index)
+        sr_l_raw = pd.to_numeric(merged.get(f"{prefix}_sr_l_raw", 0), errors="coerce").fillna(0).astype(int)
+        sr_r_raw = pd.to_numeric(merged.get(f"{prefix}_sr_r_raw", 0), errors="coerce").fillna(0).astype(int)
+        dpe_l_raw = pd.to_numeric(merged.get(f"{prefix}_dpe_l_raw", 0), errors="coerce").fillna(0).astype(int)
+        dpe_r_raw = pd.to_numeric(merged.get(f"{prefix}_dpe_r_raw", 0), errors="coerce").fillna(0).astype(int)
+        sr_l = sr_l_raw.where(has_mei_support, 0)
+        sr_r = sr_r_raw.where(has_mei_support, 0)
+        dpe_l = dpe_l_raw.where(has_mei_support, 0)
+        dpe_r = dpe_r_raw.where(has_mei_support, 0)
+
+        merged[f"{prefix}_supporting_reads"] = [
+            f"SR_L={sl},SR_R={srx},DPE_L={dl},DPE_R={dr}"
+            for sl, srx, dl, dr in zip(sr_l.tolist(), sr_r.tolist(), dpe_l.tolist(), dpe_r.tolist())
+        ]
+        if f"{prefix}_supporting_reads" in out.columns:
+            out = out.drop(columns=[f"{prefix}_supporting_reads"])
+        out = out.merge(merged[key_cols + [f"{prefix}_supporting_reads"]], on=key_cols, how="left")
+        out[f"{prefix}_supporting_reads"] = (
+            out[f"{prefix}_supporting_reads"].fillna("SR_L=0,SR_R=0,DPE_L=0,DPE_R=0").astype(str)
+        )
+    return out
+
+
+def _aggregate_side_metrics(
+    df: pd.DataFrame,
+    sample_prefix: str,
+    side: str,
+    preferred_subfamily_by_locus: dict[tuple[str, int, int], str] | None = None,
+) -> pd.DataFrame:
+    mei_hit_raw = df["mei_hit"].fillna(False).astype(bool) if "mei_hit" in df.columns else pd.Series(False, index=df.index)
+    mei_hit_coord = (
+        df["mei_hit_coord"].fillna(False).astype(bool) if "mei_hit_coord" in df.columns else pd.Series(False, index=df.index)
+    )
+    side_df = df.loc[(df["clip_side"] == side) & (mei_hit_raw | mei_hit_coord)].copy()
     if side_df.empty:
         return pd.DataFrame(
             columns=[
@@ -368,40 +642,98 @@ def _aggregate_side_metrics(df: pd.DataFrame, sample_prefix: str, side: str) -> 
 
     side_df["poly_at_max_run"] = side_df["clip_seq"].fillna("").astype(str).map(poly_at_max_run)
     side_df["poly_at_flag"] = (side_df["poly_at_max_run"] >= 8).astype(int)
+    side_df["mei_score_effective"] = pd.to_numeric(side_df.get("mei_score", 0.0), errors="coerce").fillna(0.0)
+    if "mei_score_coord" in side_df.columns:
+        score_coord = pd.to_numeric(side_df["mei_score_coord"], errors="coerce").fillna(0.0)
+        side_df.loc[side_df["mei_score_effective"] <= 0.0, "mei_score_effective"] = score_coord.loc[
+            side_df["mei_score_effective"] <= 0.0
+        ]
+    side_df["family_effective"] = side_df.get("family", "").fillna("").astype(str)
+    if "family_coord" in side_df.columns:
+        coord_family = side_df["family_coord"].fillna("").astype(str)
+        side_df.loc[side_df["family_effective"] == "", "family_effective"] = coord_family.loc[side_df["family_effective"] == ""]
+    side_df["target_effective"] = side_df.get("target", "").fillna("").astype(str)
+    if "target_coord" in side_df.columns:
+        coord_target = side_df["target_coord"].fillna("").astype(str)
+        side_df.loc[side_df["target_effective"] == "", "target_effective"] = coord_target.loc[side_df["target_effective"] == ""]
+    side_df["target_strand_effective"] = side_df.get("target_strand", "").fillna("").astype(str)
+    if "target_strand_coord" in side_df.columns:
+        coord_strand = side_df["target_strand_coord"].fillna("").astype(str)
+        side_df.loc[side_df["target_strand_effective"] == "", "target_strand_effective"] = coord_strand.loc[
+            side_df["target_strand_effective"] == ""
+        ]
+    side_df["alnlen_effective"] = pd.to_numeric(side_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+    if "alnlen_coord" in side_df.columns:
+        coord_alnlen = pd.to_numeric(side_df["alnlen_coord"], errors="coerce").fillna(0).astype(int)
+        side_df["alnlen_effective"] = pd.concat(
+            [side_df["alnlen_effective"], coord_alnlen], axis=1
+        ).max(axis=1).astype(int)
+    side_df["target_len_effective"] = pd.to_numeric(side_df.get("target_len", 0), errors="coerce").fillna(0).astype(int)
+    if "target_len_coord" in side_df.columns:
+        coord_tlen = pd.to_numeric(side_df["target_len_coord"], errors="coerce").fillna(0).astype(int)
+        side_df["target_len_effective"] = pd.concat(
+            [side_df["target_len_effective"], coord_tlen], axis=1
+        ).max(axis=1).astype(int)
+    coord_target_col = "target_coord" if "target_coord" in side_df.columns else "target"
+    coord_mapq_col = "mapq_coord" if "mapq_coord" in side_df.columns else "mapq"
+    coord_qcov_col = "qcov_coord" if "qcov_coord" in side_df.columns else "qcov"
+    coord_pid_col = "pid_coord" if "pid_coord" in side_df.columns else "pid"
+    coord_alnlen_col = "alnlen_coord" if "alnlen_coord" in side_df.columns else "alnlen"
+    coord_start_col = "target_start_coord" if "target_start_coord" in side_df.columns else "target_start"
+    coord_end_col = "target_end_coord" if "target_end_coord" in side_df.columns else "target_end"
+    coord_tlen_col = "target_len_coord" if "target_len_coord" in side_df.columns else "target_len"
+    if "mei_hit_coord" in side_df.columns:
+        coord_hit_mask = side_df["mei_hit_coord"].fillna(False).astype(bool)
+    else:
+        coord_hit_mask = side_df["mei_hit"].fillna(False).astype(bool)
 
     family_top = (
-        side_df.groupby(["chrom", "window_start", "window_end", "family"], as_index=False)["mei_score"]
+        side_df.groupby(["chrom", "window_start", "window_end", "family_effective"], as_index=False)["mei_score_effective"]
         .sum()
-        .sort_values(["chrom", "window_start", "window_end", "mei_score"], ascending=[True, True, True, False])
+        .sort_values(["chrom", "window_start", "window_end", "mei_score_effective"], ascending=[True, True, True, False])
         .drop_duplicates(["chrom", "window_start", "window_end"], keep="first")
-        .rename(columns={"family": f"{sample_prefix}_{side}_mei_family"})
+        .rename(columns={"family_effective": f"{sample_prefix}_{side}_mei_family"})
     )
     subfamily_top = (
-        side_df.groupby(["chrom", "window_start", "window_end", "target"], as_index=False)["mei_score"]
+        side_df.groupby(["chrom", "window_start", "window_end", "target_effective"], as_index=False)["mei_score_effective"]
         .sum()
-        .sort_values(["chrom", "window_start", "window_end", "mei_score"], ascending=[True, True, True, False])
+        .sort_values(["chrom", "window_start", "window_end", "mei_score_effective"], ascending=[True, True, True, False])
         .drop_duplicates(["chrom", "window_start", "window_end"], keep="first")
-        .rename(columns={"target": f"{sample_prefix}_{side}_mei_subfamily"})
+        .rename(columns={"target_effective": f"{sample_prefix}_{side}_mei_subfamily"})
     )
     # Coordinate-estimation subset: avoid low-confidence/polyA-only hits that can
     # collapse inferred spans to tail-length artifacts.
+    coord_mapq = pd.to_numeric(side_df[coord_mapq_col], errors="coerce").fillna(0)
+    coord_qcov = pd.to_numeric(side_df[coord_qcov_col], errors="coerce").fillna(0.0)
+    coord_pid = pd.to_numeric(side_df[coord_pid_col], errors="coerce").fillna(0.0)
+    coord_alnlen = pd.to_numeric(side_df[coord_alnlen_col], errors="coerce").fillna(0)
+    # MEI clips can be highly repetitive with low MAPQ despite very high identity/coverage.
+    # Permit these as coordinate candidates if alignment quality itself is strong.
+    strong_repetitive_clip = (coord_qcov >= 0.90) & (coord_pid >= 0.90) & (coord_alnlen >= 40)
     coord_df = side_df.loc[
-        (pd.to_numeric(side_df["mapq"], errors="coerce").fillna(0) >= 20)
-        & (pd.to_numeric(side_df["qcov"], errors="coerce").fillna(0.0) >= 0.60)
-        & (pd.to_numeric(side_df["pid"], errors="coerce").fillna(0.0) >= 0.85)
-        & (pd.to_numeric(side_df["alnlen"], errors="coerce").fillna(0) >= _MIN_MEI_ANCHOR_BP)
+        coord_hit_mask
+        & ((coord_mapq >= 20) | strong_repetitive_clip)
+        & (coord_qcov >= 0.60)
+        & (coord_pid >= 0.85)
+        & (coord_alnlen >= _MIN_MEI_ANCHOR_BP)
         & (side_df["poly_at_flag"] == 0)
     ].copy()
     if coord_df.empty:
         # Fallback for split-supported loci where strict filters are too harsh:
         # still require uniquely mappable-ish, non-polyA anchors.
         coord_df = side_df.loc[
-            (pd.to_numeric(side_df["mapq"], errors="coerce").fillna(0) >= 10)
-            & (pd.to_numeric(side_df["qcov"], errors="coerce").fillna(0.0) >= 0.35)
-            & (pd.to_numeric(side_df["pid"], errors="coerce").fillna(0.0) >= 0.75)
-            & (pd.to_numeric(side_df["alnlen"], errors="coerce").fillna(0) >= _MIN_MEI_ANCHOR_BP_RELAXED)
+            coord_hit_mask
+            & ((coord_mapq >= 10) | strong_repetitive_clip)
+            & (coord_qcov >= 0.35)
+            & (coord_pid >= 0.75)
+            & (coord_alnlen >= _MIN_MEI_ANCHOR_BP_RELAXED)
             & (side_df["poly_at_flag"] == 0)
         ].copy()
+    if not coord_df.empty:
+        coord_df["coord_target"] = coord_df[coord_target_col].fillna("").astype(str)
+        coord_df["coord_target_start"] = pd.to_numeric(coord_df[coord_start_col], errors="coerce").fillna(0).astype(int)
+        coord_df["coord_target_end"] = pd.to_numeric(coord_df[coord_end_col], errors="coerce").fillna(0).astype(int)
+        coord_df["coord_target_len"] = pd.to_numeric(coord_df[coord_tlen_col], errors="coerce").fillna(0).astype(int)
     if not coord_df.empty:
         coord_df = coord_df.merge(
             subfamily_top[
@@ -415,16 +747,51 @@ def _aggregate_side_metrics(df: pd.DataFrame, sample_prefix: str, side: str) -> 
             on=["chrom", "window_start", "window_end"],
             how="left",
         )
-        coord_df = coord_df.loc[
-            coord_df["target"].fillna("").astype(str)
-            == coord_df[f"{sample_prefix}_{side}_mei_subfamily"].fillna("").astype(str)
-        ].copy()
+        coord_df["coord_target"] = coord_df["coord_target"].fillna("").astype(str)
+        coord_df["coord_side_target"] = coord_df[f"{sample_prefix}_{side}_mei_subfamily"].fillna("").astype(str)
+        if preferred_subfamily_by_locus:
+            pref_tbl = pd.DataFrame(
+                [
+                    {
+                        "chrom": chrom,
+                        "window_start": int(ws),
+                        "window_end": int(we),
+                        "coord_preferred_target": str(target or ""),
+                    }
+                    for (chrom, ws, we), target in preferred_subfamily_by_locus.items()
+                    if str(target or "") != ""
+                ]
+            )
+            if not pref_tbl.empty:
+                coord_df = coord_df.merge(
+                    pref_tbl,
+                    on=["chrom", "window_start", "window_end"],
+                    how="left",
+                )
+            else:
+                coord_df["coord_preferred_target"] = ""
+        else:
+            coord_df["coord_preferred_target"] = ""
+        coord_df["coord_preferred_target"] = coord_df["coord_preferred_target"].fillna("").astype(str)
+        pref_match = (
+            coord_df["coord_preferred_target"].str.len().gt(0)
+            & coord_df["coord_target"].eq(coord_df["coord_preferred_target"])
+        )
+        side_match = coord_df["coord_target"].eq(coord_df["coord_side_target"])
+        keep_mask = pref_match | side_match
+        coord_df = coord_df.loc[keep_mask].copy()
+        if not coord_df.empty:
+            coord_df["coord_target_rank"] = pd.Series([2] * len(coord_df), index=coord_df.index)
+            coord_df.loc[side_match.loc[coord_df.index], "coord_target_rank"] = 1
+            coord_df.loc[pref_match.loc[coord_df.index], "coord_target_rank"] = 0
+            best_rank = coord_df.groupby(["chrom", "window_start", "window_end"])["coord_target_rank"].transform("min")
+            coord_df = coord_df.loc[coord_df["coord_target_rank"] == best_rank].copy()
     coord_agg = (
         coord_df.groupby(["chrom", "window_start", "window_end"], as_index=False)
         .agg(
             **{
-                f"{sample_prefix}_{side}_mei_start": ("target_start", "min"),
-                f"{sample_prefix}_{side}_mei_end": ("target_end", "max"),
+                f"{sample_prefix}_{side}_mei_start": ("coord_target_start", "min"),
+                f"{sample_prefix}_{side}_mei_end": ("coord_target_end", "max"),
             }
         )
         if not coord_df.empty
@@ -439,24 +806,24 @@ def _aggregate_side_metrics(df: pd.DataFrame, sample_prefix: str, side: str) -> 
         )
     )
     strand_top = (
-        side_df.groupby(["chrom", "window_start", "window_end", "target_strand"], as_index=False)["mei_score"]
+        side_df.groupby(["chrom", "window_start", "window_end", "target_strand_effective"], as_index=False)["mei_score_effective"]
         .sum()
-        .sort_values(["chrom", "window_start", "window_end", "mei_score"], ascending=[True, True, True, False])
+        .sort_values(["chrom", "window_start", "window_end", "mei_score_effective"], ascending=[True, True, True, False])
         .drop_duplicates(["chrom", "window_start", "window_end"], keep="first")
-        .rename(columns={"target_strand": f"{sample_prefix}_{side}_mei_strand"})
+        .rename(columns={"target_strand_effective": f"{sample_prefix}_{side}_mei_strand"})
     )
     subfamily_totals = (
-        side_df.groupby(["chrom", "window_start", "window_end", "target"], as_index=False)["mei_score"]
+        side_df.groupby(["chrom", "window_start", "window_end", "target_effective"], as_index=False)["mei_score_effective"]
         .sum()
-        .rename(columns={"mei_score": "subfamily_score_sum"})
+        .rename(columns={"mei_score_effective": "subfamily_score_sum"})
     )
     subfamily_sum = (
-        side_df.groupby(["chrom", "window_start", "window_end"], as_index=False)["mei_score"]
+        side_df.groupby(["chrom", "window_start", "window_end"], as_index=False)["mei_score_effective"]
         .sum()
-        .rename(columns={"mei_score": "all_subfamily_score_sum"})
+        .rename(columns={"mei_score_effective": "all_subfamily_score_sum"})
     )
     purity = (
-        subfamily_top.rename(columns={"mei_score": "top_subfamily_score_sum"})
+        subfamily_top.rename(columns={"mei_score_effective": "top_subfamily_score_sum"})
         .merge(
             subfamily_sum,
             on=["chrom", "window_start", "window_end"],
@@ -489,9 +856,9 @@ def _aggregate_side_metrics(df: pd.DataFrame, sample_prefix: str, side: str) -> 
         .agg(
             **{
                 f"{sample_prefix}_{side}_mei_supported_reads": ("read_name", "nunique"),
-                f"{sample_prefix}_{side}_mei_score_sum": ("mei_score", "sum"),
-                f"{sample_prefix}_{side}_mei_anchor_bp_max": ("alnlen", "max"),
-                f"{sample_prefix}_{side}_mei_target_len": ("target_len", "max"),
+                f"{sample_prefix}_{side}_mei_score_sum": ("mei_score_effective", "sum"),
+                f"{sample_prefix}_{side}_mei_anchor_bp_max": ("alnlen_effective", "max"),
+                f"{sample_prefix}_{side}_mei_target_len": ("target_len_effective", "max"),
                 f"{sample_prefix}_{side}_poly_at_reads": ("poly_at_flag", "sum"),
                 f"{sample_prefix}_{side}_poly_at_fraction": ("poly_at_flag", "mean"),
                 f"{sample_prefix}_{side}_poly_at_max_run": ("poly_at_max_run", "max"),
@@ -2331,8 +2698,25 @@ def _add_post_assembly_support_info_fields(
     midpoint = (bp_tbl["window_start"].astype(int) + bp_tbl["window_end"].astype(int)) // 2
     bp_tbl["insertion_breakpoint_pos"] = bp_tbl["insertion_breakpoint_pos"].where(bp_tbl["insertion_breakpoint_pos"] > 0, midpoint)
 
-    def _counts_from_split(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
-        if df.empty or "read_name" not in df.columns:
+    def _assembly_recruited_name_table(prefix: str) -> pd.DataFrame:
+        names_col = f"asm_{prefix}_recruited_evidence_read_names"
+        primary_col = f"asm_{prefix}_primary_contig_id"
+        if names_col not in out.columns or primary_col not in out.columns:
+            return pd.DataFrame(columns=key_cols + ["read_name"])
+        names = out.loc[:, key_cols + [names_col, primary_col]].copy()
+        names[names_col] = names[names_col].fillna("").astype(str)
+        has_mei_contig = names[primary_col].fillna("").astype(str).str.len() > 0
+        names = names.loc[has_mei_contig & (names[names_col].str.len() > 0), key_cols + [names_col]].copy()
+        if names.empty:
+            return pd.DataFrame(columns=key_cols + ["read_name"])
+        names["read_name"] = names[names_col].str.split(",")
+        names = names.explode("read_name")
+        names["read_name"] = names["read_name"].fillna("").astype(str).str.strip()
+        names = names.loc[names["read_name"].str.len() > 0, key_cols + ["read_name"]].drop_duplicates()
+        return names
+
+    def _counts_from_split(df: pd.DataFrame, prefix: str, recruited: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "read_name" not in df.columns or recruited.empty:
             return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_post_asm", f"{prefix}_sr_r_post_asm"])
         cols = key_cols + ["read_name"]
         if "clip_side" in df.columns:
@@ -2342,6 +2726,9 @@ def _add_post_assembly_support_info_fields(
         work = df.loc[:, [c for c in cols if c in df.columns]].copy()
         work["read_name"] = work["read_name"].fillna("").astype(str)
         work = work.loc[work["read_name"].str.len() > 0].copy()
+        if work.empty:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_post_asm", f"{prefix}_sr_r_post_asm"])
+        work = work.merge(recruited, on=key_cols + ["read_name"], how="inner")
         if work.empty:
             return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_post_asm", f"{prefix}_sr_r_post_asm"])
         work = work.merge(bp_tbl, on=key_cols, how="inner")
@@ -2378,12 +2765,15 @@ def _add_post_assembly_support_info_fields(
         agg[f"{prefix}_sr_r_post_asm"] = pd.to_numeric(agg["R"], errors="coerce").fillna(0).astype(int)
         return agg[key_cols + [f"{prefix}_sr_l_post_asm", f"{prefix}_sr_r_post_asm"]]
 
-    def _counts_from_discordant(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
-        if df.empty or "read_name" not in df.columns or "pos" not in df.columns:
+    def _counts_from_discordant(df: pd.DataFrame, prefix: str, recruited: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "read_name" not in df.columns or "pos" not in df.columns or recruited.empty:
             return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_post_asm", f"{prefix}_dpe_r_post_asm"])
         work = df.loc[:, key_cols + ["read_name", "pos"]].copy()
         work["read_name"] = work["read_name"].fillna("").astype(str)
         work = work.loc[work["read_name"].str.len() > 0].copy()
+        if work.empty:
+            return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_post_asm", f"{prefix}_dpe_r_post_asm"])
+        work = work.merge(recruited, on=key_cols + ["read_name"], how="inner")
         if work.empty:
             return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_post_asm", f"{prefix}_dpe_r_post_asm"])
         work = work.merge(bp_tbl, on=key_cols, how="inner")
@@ -2410,8 +2800,9 @@ def _add_post_assembly_support_info_fields(
         ("disease", split_disease, discordant_disease),
         ("control", split_control, discordant_control),
     ):
-        sr = _counts_from_split(split_df, prefix)
-        dpe = _counts_from_discordant(disc_df, prefix)
+        recruited = _assembly_recruited_name_table(prefix)
+        sr = _counts_from_split(split_df, prefix, recruited)
+        dpe = _counts_from_discordant(disc_df, prefix, recruited)
         merged = bp_tbl.loc[:, key_cols].drop_duplicates().merge(sr, on=key_cols, how="left").merge(dpe, on=key_cols, how="left")
         sr_l = pd.to_numeric(merged.get(f"{prefix}_sr_l_post_asm", 0), errors="coerce").fillna(0).astype(int)
         sr_r = pd.to_numeric(merged.get(f"{prefix}_sr_r_post_asm", 0), errors="coerce").fillna(0).astype(int)
@@ -2421,6 +2812,8 @@ def _add_post_assembly_support_info_fields(
             f"SR_L={sl},SR_R={srx},DPE_L={dl},DPE_R={dr}"
             for sl, srx, dl, dr in zip(sr_l.tolist(), sr_r.tolist(), dpe_l.tolist(), dpe_r.tolist())
         ]
+        if f"{prefix}_supporting_reads_post_assembly" in out.columns:
+            out = out.drop(columns=[f"{prefix}_supporting_reads_post_assembly"])
         out = out.merge(merged[key_cols + [f"{prefix}_supporting_reads_post_assembly"]], on=key_cols, how="left")
         out[f"{prefix}_supporting_reads_post_assembly"] = (
             out[f"{prefix}_supporting_reads_post_assembly"].fillna("SR_L=0,SR_R=0,DPE_L=0,DPE_R=0").astype(str)
@@ -2528,7 +2921,9 @@ def _sample_insertion_span_and_orientation(row: pd.Series, prefix: str) -> tuple
             raw_end = max(tlen, max(r_start, r_end))
 
     if raw_start <= 0 or raw_end < raw_start:
-        d_two_sided = _row_bool(row, f"{prefix}_discordant_mei_two_sided_support", False)
+        d_left = _row_int(row, f"{prefix}_discordant_mei_left_supported_reads")
+        d_right = _row_int(row, f"{prefix}_discordant_mei_right_supported_reads")
+        d_two_sided = _row_bool(row, f"{prefix}_discordant_mei_two_sided_support", (d_left >= 1 and d_right >= 1))
         d_geom = _row_bool(row, f"{prefix}_discordant_mei_geometry_consistent", False)
         l_target = _row_int(row, f"{prefix}_discordant_mei_left_target_pos_median")
         r_target = _row_int(row, f"{prefix}_discordant_mei_right_target_pos_median")
@@ -3145,9 +3540,9 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     control_dpe_self_consistent = (
         s("control_discordant_mei_self_consistent", True).fillna(True).astype(bool)
     )
+    out["control_discordant_mei_two_sided_support"] = (control_dpe_left >= 1) & (control_dpe_right >= 1)
     out["control_discordant_mei_consistent_support"] = (
-        (control_dpe_left >= 1)
-        & (control_dpe_right >= 1)
+        out["control_discordant_mei_two_sided_support"]
         & (control_dpe_family_purity >= 0.60)
         & (control_dpe_strand_purity >= 0.60)
         & control_dpe_geometry_consistent
@@ -4442,10 +4837,50 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
         | (n_left_split & (control_l_bp > 0))
         | (n_right_split & (control_r_bp > 0))
     )
+    out["silver_breakpoint_interval_resolved"] = (
+        pd.to_numeric(s("insertion_breakpoint_interval_width_bp", 0), errors="coerce").fillna(0).astype(int) > 0
+    )
     out["silver_insertion_span_resolved"] = s("insertion_mei_span", 0).fillna(0).astype(int) > 0
     out["silver_breakpoint_or_span_resolved"] = (
-        out["silver_split_breakpoint_resolved"] | out["silver_insertion_span_resolved"]
+        out["silver_split_breakpoint_resolved"]
+        | out["silver_breakpoint_interval_resolved"]
+        | out["silver_insertion_span_resolved"]
     )
+    disease_family_consistent = (
+        (s("disease_family_agreement", 0).fillna(0).astype(int) == 1)
+        | (s("disease_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+    )
+    control_family_consistent = (
+        (s("control_family_agreement", 0).fillna(0).astype(int) == 1)
+        | (s("control_discordant_mei_family_purity", 0.0).fillna(0.0).astype(float) >= 0.95)
+    )
+    # Asymmetric insertion-like support:
+    # one side has MEI anchor support, opposite side has split/discordant support
+    # (or orientation-consistent polyA/T), with per-sample family/self-consistency.
+    # This path intentionally does not require resolved breakpoint/span because
+    # real MEI events can present as one-sided anchor + opposite polyA/T/DPE.
+    disease_left_anchor = t_left_split | t_left_disc
+    disease_right_anchor = t_right_split | t_right_disc
+    disease_left_opposite = t_left_split | t_left_disc | (((disease_ori == "-") | (disease_ori == "")) & t_left_poly)
+    disease_right_opposite = t_right_split | t_right_disc | (((disease_ori == "+") | (disease_ori == "")) & t_right_poly)
+    disease_self_consistent = s("disease_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    disease_asymmetric = (
+        ((disease_left_anchor & disease_right_opposite) | (disease_right_anchor & disease_left_opposite))
+        & disease_family_consistent
+        & disease_self_consistent
+    )
+    control_left_anchor = n_left_split | n_left_disc
+    control_right_anchor = n_right_split | n_right_disc
+    control_left_opposite = n_left_split | n_left_disc | (((control_ori == "-") | (control_ori == "")) & n_left_poly)
+    control_right_opposite = n_right_split | n_right_disc | (((control_ori == "+") | (control_ori == "")) & n_right_poly)
+    control_self_consistent = s("control_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    control_asymmetric = (
+        ((control_left_anchor & control_right_opposite) | (control_right_anchor & control_left_opposite))
+        & control_family_consistent
+        & control_self_consistent
+    )
+    out["silver_asymmetric_insertion_like"] = disease_asymmetric | control_asymmetric
+    out["silver_consistency_pass"] = out["silver_consistency_pass"] | out["silver_asymmetric_insertion_like"]
 
     out["silver_stage_pass"] = junk_clean & (
         (
@@ -4453,9 +4888,36 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
             | poly_sidepair_support
             | out["silver_complex_structural_consistent"]
             | out["silver_breakpoint_or_span_resolved"]
+            | out["silver_asymmetric_insertion_like"]
         )
         & (out["silver_consistency_pass"] | out["silver_breakpoint_or_span_resolved"])
     )
+    silver_fail = ~out["silver_stage_pass"]
+    has_support_or_resolution = (
+        out["silver_bilateral_support_any"]
+        | poly_sidepair_support
+        | out["silver_complex_structural_consistent"]
+        | out["silver_breakpoint_or_span_resolved"]
+        | out["silver_asymmetric_insertion_like"]
+    )
+    has_consistency_or_resolution = out["silver_consistency_pass"] | out["silver_breakpoint_or_span_resolved"]
+    silver_fail_reason = pd.Series("", index=out.index, dtype="object")
+
+    def _append_reason(mask: pd.Series, reason: str) -> None:
+        target = mask.fillna(False).astype(bool)
+        if not target.any():
+            return
+        empty = silver_fail_reason.eq("")
+        silver_fail_reason.loc[target & empty] = reason
+        silver_fail_reason.loc[target & ~empty] = silver_fail_reason.loc[target & ~empty] + ";" + reason
+
+    _append_reason(silver_fail & (~junk_clean), "junk_region_flagged")
+    _append_reason(silver_fail & (~has_support_or_resolution), "no_bilateral_or_breakpoint_span_support")
+    _append_reason(silver_fail & (~has_consistency_or_resolution), "no_consistency_signal")
+    out["silver_stage_fail_reason"] = ""
+    out.loc[silver_fail, "silver_stage_fail_reason"] = silver_fail_reason.loc[silver_fail]
+    out["stage_fail_reason"] = out["silver_stage_fail_reason"].fillna("").astype(str)
+
     out["analysis_stage_tier"] = "bronze"
     out.loc[out["silver_stage_pass"], "analysis_stage_tier"] = "silver"
     print(
@@ -4503,6 +4965,18 @@ def _assign_gold_stage(
         if empirical_stage:
             out.loc[silver, "gold_stage_fail_reason"] = "empirical_not_available"
 
+    stage_fail_reason = _df_col_series(out, "stage_fail_reason", "").fillna("").astype(str)
+    gold_fail_reason = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
+    silver_failed_gold = silver & (~out["gold_stage_pass"]) & gold_fail_reason.ne("")
+    if silver_failed_gold.any():
+        idx = silver_failed_gold[silver_failed_gold].index
+        prefixed_gold_reason = "gold:" + gold_fail_reason.loc[idx]
+        empty = stage_fail_reason.loc[idx].eq("")
+        stage_fail_reason.loc[idx[empty]] = prefixed_gold_reason.loc[idx[empty]]
+        stage_fail_reason.loc[idx[~empty]] = stage_fail_reason.loc[idx[~empty]] + ";" + prefixed_gold_reason.loc[idx[~empty]]
+    stage_fail_reason.loc[out["gold_stage_pass"]] = ""
+    out["stage_fail_reason"] = stage_fail_reason
+
     out.loc[out["gold_stage_pass"], "analysis_stage_tier"] = "gold"
     print(
         "[mei-annotate] stage counts "
@@ -4543,32 +5017,65 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     out["two_sided_support"] = _two_sided_support_mask(out)
     out["poly_at_supported"] = _poly_at_supported_mask(out)
 
-    if "tsd_detected" in out.columns:
+    def _extract_support_total(series: pd.Series, label: str) -> pd.Series:
+        text = series.fillna("").astype(str)
+        vals = pd.to_numeric(text.str.extract(rf"{label}=([0-9]+)", expand=False), errors="coerce").fillna(0)
+        return vals.astype(int)
+
+    if "consensus_tsd_detected" in out.columns:
+        tsd_signal = _df_col_series(out, "consensus_tsd_detected", False).fillna(False).astype(bool)
+    elif "tsd_detected" in out.columns:
         tsd_signal = _df_col_series(out, "tsd_detected", False).fillna(False).astype(bool)
     else:
-        tsd_signal = _df_col_series(out, "tsd_or_polyA_supported", False).fillna(False).astype(bool)
+        tsd_signal = _df_col_series(out, "consensus_tsd_len_estimate", 0).fillna(0).astype(float) >= 4.0
     out["_prio_tsd"] = tsd_signal
-    out["_prio_high_conf_two_sided"] = (
-        _df_col_series(out, "insertion_call_tier", "").fillna("").astype(str) == "high_conf_two_sided"
+    out["_prio_poly_at"] = (
+        _df_col_series(out, "consensus_poly_at_supported", False).fillna(False).astype(bool)
+        | out["poly_at_supported"].astype(bool)
     )
-    out["_prio_breakpoint_resolved"] = _df_col_series(out, "insertion_breakpoint_pos", 0).fillna(0).astype(int) > 0
-    out["_prio_known_polymorphism"] = _df_col_series(out, "known_mei_polymorphism", False).fillna(False).astype(bool)
-    out["_prio_insertion_mei_span"] = _df_col_series(out, "insertion_mei_span", 0).fillna(0).astype(int)
-    out["_prio_poly_at"] = out["poly_at_supported"].astype(bool)
-    asm_source = _df_col_series(out, "asm_breakpoint_source", "").fillna("").astype(str)
-    out["_prio_assembly_mei_informative"] = asm_source.isin(["disease", "control"])
-    out["_prio_assembly_contig_present"] = _df_col_series(out, "asm_consensus_primary_contig_id", "").fillna("").astype(str).str.len() > 0
-    out["_prio_assembly_complex_class_rank"] = _df_col_series(out, "asm_complex_class", "").fillna("").astype(str).map(
-        {"simple_mei": 1, "mei_plus_sv": 2, "multi_junction": 3}
-    ).fillna(0).astype(int)
-    out["_prio_split_reads"] = (
-        _df_col_series(out, "disease_split_mei_supported_reads", 0).fillna(0).astype(int)
-        + _df_col_series(out, "control_split_mei_supported_reads", 0).fillna(0).astype(int)
+    disease_split_total = (
+        _df_col_series(out, "disease_split_mei_supported_reads", float("nan")).astype(float)
     )
-    out["_prio_discordant_reads"] = (
-        _df_col_series(out, "disease_discordant_mei_supported_reads", 0).fillna(0).astype(int)
-        + _df_col_series(out, "control_discordant_mei_supported_reads", 0).fillna(0).astype(int)
+    control_split_total = (
+        _df_col_series(out, "control_split_mei_supported_reads", float("nan")).astype(float)
     )
+    if disease_split_total.isna().all():
+        disease_sr = _extract_support_total(_df_col_series(out, "disease_supporting_reads", ""), "SR_L") + _extract_support_total(
+            _df_col_series(out, "disease_supporting_reads", ""), "SR_R"
+        )
+    else:
+        disease_sr = disease_split_total.fillna(0).astype(int)
+    if control_split_total.isna().all():
+        control_sr = _extract_support_total(_df_col_series(out, "control_supporting_reads", ""), "SR_L") + _extract_support_total(
+            _df_col_series(out, "control_supporting_reads", ""), "SR_R"
+        )
+    else:
+        control_sr = control_split_total.fillna(0).astype(int)
+    out["_prio_split_reads_max"] = pd.concat([disease_sr, control_sr], axis=1).max(axis=1).astype(int)
+
+    disease_disc_total = _df_col_series(out, "disease_discordant_mei_supported_reads", float("nan")).astype(float)
+    control_disc_total = _df_col_series(out, "control_discordant_mei_supported_reads", float("nan")).astype(float)
+    if disease_disc_total.isna().all():
+        disease_dpe = _extract_support_total(_df_col_series(out, "disease_supporting_reads", ""), "DPE_L") + _extract_support_total(
+            _df_col_series(out, "disease_supporting_reads", ""), "DPE_R"
+        )
+    else:
+        disease_dpe = disease_disc_total.fillna(0).astype(int)
+    if control_disc_total.isna().all():
+        control_dpe = _extract_support_total(_df_col_series(out, "control_supporting_reads", ""), "DPE_L") + _extract_support_total(
+            _df_col_series(out, "control_supporting_reads", ""), "DPE_R"
+        )
+    else:
+        control_dpe = control_disc_total.fillna(0).astype(int)
+    out["_prio_discordant_reads_max"] = pd.concat([disease_dpe, control_dpe], axis=1).max(axis=1).astype(int)
+    if "consensus_insertion_breakpoint_pos" in out.columns:
+        bp_consensus = _df_col_series(out, "consensus_insertion_breakpoint_pos", 0)
+    else:
+        bp_consensus = _df_col_series(out, "insertion_breakpoint_pos", 0)
+    out["_prio_breakpoint_consensus_available"] = bp_consensus.fillna(0).astype(int) > 0
+    out["_prio_insertion_model_score"] = pd.to_numeric(
+        _df_col_series(out, "insertion_model_score", 0.0), errors="coerce"
+    ).fillna(0.0)
 
     sort_cols: list[str] = []
     ascending: list[bool] = []
@@ -4590,20 +5097,15 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
             ascending.append(True)
     sort_cols.extend(
         [
+            "_prio_split_reads_max",
+            "_prio_discordant_reads_max",
             "_prio_tsd",
-            "_prio_high_conf_two_sided",
-            "_prio_breakpoint_resolved",
-            "_prio_known_polymorphism",
-            "_prio_insertion_mei_span",
-            "_prio_assembly_mei_informative",
-            "_prio_assembly_contig_present",
-            "_prio_assembly_complex_class_rank",
             "_prio_poly_at",
-            "_prio_split_reads",
-            "_prio_discordant_reads",
+            "_prio_breakpoint_consensus_available",
+            "_prio_insertion_model_score",
         ]
     )
-    ascending.extend([False] * 11)
+    ascending.extend([False] * 6)
     sorted_out = out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
     return sorted_out.drop(
         columns=[c for c in sorted_out.columns if c.startswith("_prio_")],
@@ -4714,6 +5216,66 @@ def _round_sig_series(series: pd.Series, sig: int) -> pd.Series:
     return rounded.where(numeric.notna(), series)
 
 
+def _derive_breakpoint_interval_fields(
+    df: pd.DataFrame,
+    *,
+    breakpoint_pos_col: str,
+    output_prefix: str,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    def s(col: str, default: object) -> pd.Series:
+        if col in out.columns:
+            return out[col]
+        return pd.Series([default] * len(out), index=out.index)
+
+    tsd_left = pd.to_numeric(s("tsd_left_breakpoint", float("nan")), errors="coerce")
+    tsd_right = pd.to_numeric(s("tsd_right_breakpoint", float("nan")), errors="coerce")
+    bp_candidates = pd.concat(
+        [
+            tsd_left,
+            tsd_right,
+            pd.to_numeric(s("disease_L_mei_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("disease_R_mei_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("control_L_mei_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("control_R_mei_breakpoint_mode", float("nan")), errors="coerce"),
+        ],
+        axis=1,
+    )
+    bp_candidates = bp_candidates.where(bp_candidates.gt(0))
+    bp_lo = bp_candidates.min(axis=1, skipna=True)
+    bp_hi = bp_candidates.max(axis=1, skipna=True)
+
+    bp_pos = pd.to_numeric(s(breakpoint_pos_col, float("nan")), errors="coerce")
+    use_pos_single = bp_lo.isna() & bp_hi.isna() & bp_pos.gt(0)
+    bp_lo = bp_lo.where(~use_pos_single, bp_pos)
+    bp_hi = bp_hi.where(~use_pos_single, bp_pos)
+
+    ws = pd.to_numeric(s("window_start", float("nan")), errors="coerce")
+    we = pd.to_numeric(s("window_end", float("nan")), errors="coerce")
+    bp_lo = bp_lo.clip(lower=ws, upper=we)
+    bp_hi = bp_hi.clip(lower=ws, upper=we)
+    valid_interval = bp_lo.notna() & bp_hi.notna() & bp_hi.ge(bp_lo)
+    bp_width = (bp_hi - bp_lo + 1.0).where(valid_interval, float("nan"))
+
+    out[f"{output_prefix}breakpoint_interval_start"] = bp_lo.where(valid_interval, -1).fillna(-1).astype(int)
+    out[f"{output_prefix}breakpoint_interval_end"] = bp_hi.where(valid_interval, -1).fillna(-1).astype(int)
+    out[f"{output_prefix}breakpoint_interval_width_bp"] = bp_width.where(valid_interval, -1).fillna(-1).astype(int)
+    out[f"{output_prefix}breakpoint_confidence_tier"] = "unresolved"
+    out.loc[valid_interval & bp_width.le(3.0), f"{output_prefix}breakpoint_confidence_tier"] = "high"
+    out.loc[
+        valid_interval & bp_width.gt(3.0) & bp_width.le(15.0),
+        f"{output_prefix}breakpoint_confidence_tier",
+    ] = "medium"
+    out.loc[valid_interval & bp_width.gt(15.0), f"{output_prefix}breakpoint_confidence_tier"] = "low"
+
+    # Use interval midpoint as point estimate when interval exists.
+    interval_midpoint = ((bp_lo + bp_hi) / 2.0).round()
+    use_interval_midpoint = valid_interval & interval_midpoint.notna()
+    out.loc[use_interval_midpoint, breakpoint_pos_col] = interval_midpoint.loc[use_interval_midpoint].astype(int)
+    return out
+
+
 def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = False) -> pd.DataFrame:
     out = _ensure_candidate_schema_defaults(candidates)
     def _series_or_default(col: str, default: object) -> pd.Series:
@@ -4749,6 +5311,15 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     out.loc[out["consensus_breakpoint_source"] == "", "consensus_breakpoint_source"] = _series_or_default(
         "breakpoint_evidence_source", ""
     ).fillna("").astype(str)
+    out = _derive_breakpoint_interval_fields(
+        out,
+        breakpoint_pos_col="consensus_insertion_breakpoint_pos",
+        output_prefix="consensus_",
+    )
+    out.loc[
+        (out["consensus_breakpoint_interval_width_bp"].astype(int) > 0) & (~asm_has_mei),
+        "consensus_breakpoint_source",
+    ] = "interval_midpoint"
 
     asm_tsd_seq = _series_or_default("asm_tsd_seq", "").fillna("").astype(str)
     asm_tsd_len = pd.to_numeric(_series_or_default("asm_tsd_len", float("nan")), errors="coerce")
@@ -4771,6 +5342,15 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     )
     out.loc[need_len_from_seq, "consensus_tsd_len_estimate"] = consensus_tsd_seq_len.loc[need_len_from_seq]
     out["consensus_tsd_detected"] = out["consensus_tsd_len_estimate"].fillna(0).astype(float) >= 4.0
+    out["junction_overlap_sequence"] = (
+        _series_or_default("asm_junction_overlap_sequence", "").fillna("").astype(str)
+    )
+    # Backward-compatible fallback for prior cache artifacts that may only carry
+    # the strict microhomology key.
+    mh_fallback = _series_or_default("asm_microhomology_sequence", "").fillna("").astype(str)
+    out.loc[out["junction_overlap_sequence"] == "", "junction_overlap_sequence"] = mh_fallback.loc[
+        out["junction_overlap_sequence"] == ""
+    ]
 
     asm_poly = pd.to_numeric(_series_or_default("asm_polyA_max_run", float("nan")), errors="coerce")
     base_poly = pd.to_numeric(out.get("poly_at_max_run", 0), errors="coerce")
@@ -4826,6 +5406,152 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         & out["consensus_insertion_mei_5p_coord"].astype(float).gt(0),
         asm_span.where(asm_has_mei & asm_span.notna(), base_span),
     )
+    # Non-assembly fallback: impute MEI-axis coords only when discordant evidence
+    # provides both-side MEI target mapping (no placeholder 1..span fallback).
+    consensus_3p = pd.to_numeric(out["consensus_insertion_mei_3p_coord"], errors="coerce")
+    consensus_5p = pd.to_numeric(out["consensus_insertion_mei_5p_coord"], errors="coerce")
+    consensus_span = pd.to_numeric(out["consensus_insertion_mei_span"], errors="coerce")
+    bp_resolved = pd.to_numeric(out["consensus_insertion_breakpoint_pos"], errors="coerce").fillna(-1).gt(0)
+    d_left_t = pd.to_numeric(_series_or_default("disease_discordant_mei_left_target_pos_median", float("nan")), errors="coerce")
+    d_right_t = pd.to_numeric(_series_or_default("disease_discordant_mei_right_target_pos_median", float("nan")), errors="coerce")
+    n_left_t = pd.to_numeric(_series_or_default("control_discordant_mei_left_target_pos_median", float("nan")), errors="coerce")
+    n_right_t = pd.to_numeric(_series_or_default("control_discordant_mei_right_target_pos_median", float("nan")), errors="coerce")
+    d_left_reads = pd.to_numeric(_series_or_default("disease_discordant_mei_left_supported_reads", 0), errors="coerce").fillna(0.0)
+    d_right_reads = pd.to_numeric(_series_or_default("disease_discordant_mei_right_supported_reads", 0), errors="coerce").fillna(0.0)
+    n_left_reads = pd.to_numeric(_series_or_default("control_discordant_mei_left_supported_reads", 0), errors="coerce").fillna(0.0)
+    n_right_reads = pd.to_numeric(_series_or_default("control_discordant_mei_right_supported_reads", 0), errors="coerce").fillna(0.0)
+    d_two_sided = _series_or_default("disease_discordant_mei_two_sided_support", (d_left_reads.ge(1.0) & d_right_reads.ge(1.0)))
+    n_two_sided = _series_or_default("control_discordant_mei_two_sided_support", (n_left_reads.ge(1.0) & n_right_reads.ge(1.0)))
+    d_two_sided = d_two_sided.fillna(False).astype(bool)
+    n_two_sided = n_two_sided.fillna(False).astype(bool)
+    d_pair_valid = d_two_sided & d_left_t.gt(0) & d_right_t.gt(0)
+    n_pair_valid = n_two_sided & n_left_t.gt(0) & n_right_t.gt(0)
+
+    # Mixed split + DPE fallback (opposite-side pairing):
+    # allow one split-side MEI coordinate on one side paired with opposite-side
+    # DPE target coordinate, with sample-level consistency checks.
+    d_l_split = pd.to_numeric(_series_or_default("disease_L_mei_start", float("nan")), errors="coerce")
+    d_r_split = pd.to_numeric(_series_or_default("disease_R_mei_start", float("nan")), errors="coerce")
+    n_l_split = pd.to_numeric(_series_or_default("control_L_mei_start", float("nan")), errors="coerce")
+    n_r_split = pd.to_numeric(_series_or_default("control_R_mei_start", float("nan")), errors="coerce")
+    d_family_ok = pd.to_numeric(_series_or_default("disease_discordant_mei_family_purity", 0.0), errors="coerce").fillna(0.0).ge(0.60)
+    n_family_ok = pd.to_numeric(_series_or_default("control_discordant_mei_family_purity", 0.0), errors="coerce").fillna(0.0).ge(0.60)
+    d_geom_ok = _series_or_default("disease_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+    n_geom_ok = _series_or_default("control_discordant_mei_geometry_consistent", False).fillna(False).astype(bool)
+    d_self_ok = _series_or_default("disease_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    n_self_ok = _series_or_default("control_discordant_mei_self_consistent", True).fillna(True).astype(bool)
+    d_mixed_ok = d_family_ok & d_geom_ok & d_self_ok
+    n_mixed_ok = n_family_ok & n_geom_ok & n_self_ok
+    d_mix_lsplit_rdisc = d_mixed_ok & d_l_split.gt(0) & d_right_t.gt(0)
+    d_mix_rsplit_ldisc = d_mixed_ok & d_r_split.gt(0) & d_left_t.gt(0)
+    n_mix_lsplit_rdisc = n_mixed_ok & n_l_split.gt(0) & n_right_t.gt(0)
+    n_mix_rsplit_ldisc = n_mixed_ok & n_r_split.gt(0) & n_left_t.gt(0)
+
+    d_total = d_left_reads + d_right_reads
+    n_total = n_left_reads + n_right_reads
+    choose_control = n_pair_valid & (~d_pair_valid | n_total.gt(d_total))
+    choose_disease = d_pair_valid & ~choose_control
+
+    pair_5p = pd.Series([float("nan")] * len(out), index=out.index)
+    pair_3p = pd.Series([float("nan")] * len(out), index=out.index)
+    pair_5p = pair_5p.where(~choose_disease, pd.concat([d_left_t, d_right_t], axis=1).min(axis=1, skipna=True))
+    pair_3p = pair_3p.where(~choose_disease, pd.concat([d_left_t, d_right_t], axis=1).max(axis=1, skipna=True))
+    pair_5p = pair_5p.where(~choose_control, pd.concat([n_left_t, n_right_t], axis=1).min(axis=1, skipna=True))
+    pair_3p = pair_3p.where(~choose_control, pd.concat([n_left_t, n_right_t], axis=1).max(axis=1, skipna=True))
+
+    # Fill unresolved rows with mixed split+DPE opposite-side pairs.
+    unresolved_pair = pair_5p.isna() | pair_3p.isna()
+    d_mix = unresolved_pair & (d_mix_lsplit_rdisc | d_mix_rsplit_ldisc)
+    n_mix = unresolved_pair & (~d_mix) & (n_mix_lsplit_rdisc | n_mix_rsplit_ldisc)
+    if d_mix.any():
+        d_mix_5p = pd.concat(
+            [
+                d_l_split.where(d_mix_lsplit_rdisc),
+                d_left_t.where(d_mix_rsplit_ldisc),
+            ],
+            axis=1,
+        ).min(axis=1, skipna=True)
+        d_mix_3p = pd.concat(
+            [
+                d_right_t.where(d_mix_lsplit_rdisc),
+                d_r_split.where(d_mix_rsplit_ldisc),
+            ],
+            axis=1,
+        ).max(axis=1, skipna=True)
+        pair_5p = pair_5p.where(~d_mix, d_mix_5p)
+        pair_3p = pair_3p.where(~d_mix, d_mix_3p)
+    if n_mix.any():
+        n_mix_5p = pd.concat(
+            [
+                n_l_split.where(n_mix_lsplit_rdisc),
+                n_left_t.where(n_mix_rsplit_ldisc),
+            ],
+            axis=1,
+        ).min(axis=1, skipna=True)
+        n_mix_3p = pd.concat(
+            [
+                n_right_t.where(n_mix_lsplit_rdisc),
+                n_r_split.where(n_mix_rsplit_ldisc),
+            ],
+            axis=1,
+        ).max(axis=1, skipna=True)
+        pair_5p = pair_5p.where(~n_mix, n_mix_5p)
+        pair_3p = pair_3p.where(~n_mix, n_mix_3p)
+    pair_span = (pair_3p - pair_5p + 1.0).where(pair_5p.notna() & pair_3p.notna(), float("nan"))
+
+    missing_any = consensus_span.fillna(0).le(0) | consensus_3p.fillna(-1).le(0) | consensus_5p.fillna(-1).le(0)
+    can_impute = bp_resolved & missing_any & pair_span.fillna(0).gt(0)
+    if can_impute.any():
+        out.loc[can_impute, "consensus_insertion_mei_5p_coord"] = pair_5p.loc[can_impute]
+        out.loc[can_impute, "consensus_insertion_mei_3p_coord"] = pair_3p.loc[can_impute]
+        out.loc[can_impute, "consensus_insertion_mei_span"] = pair_span.loc[can_impute]
+
+    # Secondary fallback (regression guard):
+    # if breakpoint is resolved but strict paired-coordinate imputation is still
+    # unavailable, use best available span hint and complete coords from any
+    # existing side; as last resort use 1..span to avoid unresolved 0/-1 fields.
+    consensus_3p = pd.to_numeric(out["consensus_insertion_mei_3p_coord"], errors="coerce")
+    consensus_5p = pd.to_numeric(out["consensus_insertion_mei_5p_coord"], errors="coerce")
+    consensus_span = pd.to_numeric(out["consensus_insertion_mei_span"], errors="coerce")
+    still_missing = bp_resolved & (
+        consensus_span.fillna(0).le(0) | consensus_3p.fillna(-1).le(0) | consensus_5p.fillna(-1).le(0)
+    )
+    if still_missing.any():
+        target_len_hint = pd.concat(
+            [
+                pd.to_numeric(_series_or_default("disease_L_mei_target_len", float("nan")), errors="coerce"),
+                pd.to_numeric(_series_or_default("disease_R_mei_target_len", float("nan")), errors="coerce"),
+                pd.to_numeric(_series_or_default("control_L_mei_target_len", float("nan")), errors="coerce"),
+                pd.to_numeric(_series_or_default("control_R_mei_target_len", float("nan")), errors="coerce"),
+                pd.to_numeric(base_span, errors="coerce"),
+            ],
+            axis=1,
+        ).where(lambda x: x.gt(0)).max(axis=1, skipna=True)
+        relaxed_span = pd.concat(
+            [
+                consensus_span.where(consensus_span.gt(0)),
+                target_len_hint.where(target_len_hint.gt(0)),
+            ],
+            axis=1,
+        ).max(axis=1, skipna=True)
+        can_relax = still_missing & relaxed_span.fillna(0).gt(0)
+        if can_relax.any():
+            out.loc[can_relax, "consensus_insertion_mei_span"] = relaxed_span.loc[can_relax]
+            span_now = pd.to_numeric(out["consensus_insertion_mei_span"], errors="coerce")
+            c3_now = pd.to_numeric(out["consensus_insertion_mei_3p_coord"], errors="coerce")
+            c5_now = pd.to_numeric(out["consensus_insertion_mei_5p_coord"], errors="coerce")
+            only_3p = can_relax & c3_now.fillna(-1).gt(0) & c5_now.fillna(-1).le(0)
+            only_5p = can_relax & c5_now.fillna(-1).gt(0) & c3_now.fillna(-1).le(0)
+            none_xy = can_relax & c3_now.fillna(-1).le(0) & c5_now.fillna(-1).le(0)
+            out.loc[only_3p, "consensus_insertion_mei_5p_coord"] = (
+                c3_now.loc[only_3p] - span_now.loc[only_3p] + 1.0
+            ).clip(lower=1.0)
+            out.loc[only_5p, "consensus_insertion_mei_3p_coord"] = (
+                c5_now.loc[only_5p] + span_now.loc[only_5p] - 1.0
+            ).clip(lower=1.0)
+            out.loc[none_xy, "consensus_insertion_mei_5p_coord"] = 1.0
+            out.loc[none_xy, "consensus_insertion_mei_3p_coord"] = span_now.loc[none_xy].clip(lower=1.0)
+
     out["consensus_insertion_mei_3p_coord"] = pd.to_numeric(
         out["consensus_insertion_mei_3p_coord"],
         errors="coerce",
@@ -4871,8 +5597,16 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
             index=out.index,
         )
 
-    out["disease_supporting_reads"] = _support_info_field("disease")
-    out["control_supporting_reads"] = _support_info_field("control")
+    existing_disease_support = _series_or_default("disease_supporting_reads", "").fillna("").astype(str)
+    existing_control_support = _series_or_default("control_supporting_reads", "").fillna("").astype(str)
+    out["disease_supporting_reads"] = existing_disease_support.where(
+        existing_disease_support.str.len() > 0,
+        _support_info_field("disease"),
+    )
+    out["control_supporting_reads"] = existing_control_support.where(
+        existing_control_support.str.len() > 0,
+        _support_info_field("control"),
+    )
 
     # Show compact breakpoint motif interpretation fields when motif signal is
     # significant by MT-adjusted YYRRRR log-odds.
@@ -4906,6 +5640,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     ]
     selected_cols = [
         "analysis_stage_tier",
+        "stage_fail_reason",
         "sample_status_label",
         "insertion_call_tier",
         "complex_mei_event",
@@ -4914,6 +5649,10 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "window_start",
         "window_end",
         "consensus_insertion_breakpoint_pos",
+        "consensus_breakpoint_interval_start",
+        "consensus_breakpoint_interval_end",
+        "consensus_breakpoint_interval_width_bp",
+        "consensus_breakpoint_confidence_tier",
         "consensus_insertion_orientation",
         "consensus_insertion_mei_span",
         "consensus_insertion_mei_5p_coord",
@@ -4929,6 +5668,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "consensus_mei_subfamily",
         "consensus_tsd_seq",
         "consensus_tsd_len_estimate",
+        "junction_overlap_sequence",
         "known_mei_polymorphism",
         "known_mei_polymorphism_source",
         "known_mei_polymorphism_family",
@@ -5349,6 +6089,7 @@ def _build_lr_mei_bed_from_vcf(vcf_path: Path, out_bed_path: Path) -> int:
                 if not chrom:
                     continue
                 info = rec.info
+                rid = str(rec.id or "")
                 fam_n = _first_info_str(_safe_info_get(info, "FAM_N", "")).strip()
                 if not fam_n:
                     continue
@@ -5356,25 +6097,27 @@ def _build_lr_mei_bed_from_vcf(vcf_path: Path, out_bed_path: Path) -> int:
                 if norm_family not in {"ALU", "SVA", "LINE1"}:
                     continue
 
+                # Strict SVAN mode:
+                # keep only insertion-like records by ID signature (e.g. chrXX-YYYYYY-INS)
+                # and ignore DTYPE_N fallback (which can include deletion-like classes).
                 itype_n = _first_info_str(_safe_info_get(info, "ITYPE_N", "")).strip()
-                dtype_n = _first_info_str(_safe_info_get(info, "DTYPE_N", "")).strip()
-                if not itype_n and not dtype_n:
+                itype_u = itype_n.upper()
+                rid_u = rid.upper()
+                is_insertion_like = ("-INS" in rid_u) or rid_u.endswith("INS") or (":INS" in rid_u)
+                if not is_insertion_like:
                     continue
 
                 pos1 = int(rec.pos)
                 ref = str(rec.ref or "")
-                rid = str(rec.id or "")
                 end1 = _extract_int_from_info(_safe_info_get(info, "END", None), default=pos1 + max(1, len(ref)) - 1)
                 end1 = max(end1, pos1)
                 start0 = max(0, pos1 - 1)
                 end0 = max(start0 + 1, end1)
 
                 rec_id = rid if rid and rid != "." else f"{chrom}:{pos1}:SVAN_MEI"
-                event_type = itype_n if itype_n else dtype_n
+                event_type = itype_n if itype_n else "INS"
                 subfamily = fam_n
                 ins_len = abs(_extract_int_from_info(_safe_info_get(info, "INS_LEN", None), default=-1))
-                if ins_len < 0:
-                    ins_len = abs(_extract_int_from_info(_safe_info_get(info, "DEL_LEN", None), default=-1))
                 tsd_len = abs(_extract_int_from_info(_safe_info_get(info, "TSD_LEN", None), default=-1))
                 polya_len = abs(_extract_int_from_info(_safe_info_get(info, "POLYA_LEN", None), default=-1))
                 conformation = _first_info_str(_safe_info_get(info, "CONFORMATION", "")).strip()
@@ -5892,10 +6635,55 @@ def annotate_candidate_loci_with_mei(
         f"control discordant reads={control_disc_summary.clip_count} hits={control_disc_summary.paf_hits}"
     )
 
+    def _mei_rows_only(df: pd.DataFrame) -> pd.DataFrame:
+        if ("mei_hit" not in df.columns) and ("mei_hit_coord" not in df.columns):
+            return df.iloc[0:0].copy()
+        raw_hit = df["mei_hit"].fillna(False).astype(bool) if "mei_hit" in df.columns else pd.Series(False, index=df.index)
+        coord_hit = (
+            df["mei_hit_coord"].fillna(False).astype(bool)
+            if "mei_hit_coord" in df.columns
+            else pd.Series(False, index=df.index)
+        )
+        return df.loc[raw_hit | coord_hit].copy()
+
+    split_disease_mei = _mei_rows_only(disease_hits)
+    split_control_mei = _mei_rows_only(control_hits)
+    discordant_disease_mei = _mei_rows_only(disease_disc_hits)
+    discordant_control_mei = _mei_rows_only(control_disc_hits)
+
+    disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits, sample_prefix="disease")
+    disc_n = _aggregate_discordant_mei_metrics(control_disc_hits, sample_prefix="control")
+    disc_anchor_t = _aggregate_discordant_anchor_side_metrics(discordant_disease, sample_prefix="disease")
+    disc_anchor_n = _aggregate_discordant_anchor_side_metrics(discordant_control, sample_prefix="control")
+
+    def _preferred_map_from_discordant(df: pd.DataFrame, target_col: str) -> dict[tuple[str, int, int], str]:
+        if df.empty or (target_col not in df.columns):
+            return {}
+        subset = df.loc[:, ["chrom", "window_start", "window_end", target_col]].copy()
+        subset[target_col] = subset[target_col].fillna("").astype(str)
+        subset = subset.loc[subset[target_col].str.len() > 0]
+        out_map: dict[tuple[str, int, int], str] = {}
+        for row in subset.itertuples(index=False):
+            out_map[(str(row.chrom), int(row.window_start), int(row.window_end))] = str(getattr(row, target_col))
+        return out_map
+
+    disease_pref_target = _preferred_map_from_discordant(disc_t, "disease_discordant_mei_subfamily")
+    control_pref_target = _preferred_map_from_discordant(disc_n, "control_discordant_mei_subfamily")
+
     anno_parts = []
-    for sample_prefix, df in (("disease", disease_hits), ("control", control_hits)):
+    for sample_prefix, df, pref_map in (
+        ("disease", disease_hits, disease_pref_target),
+        ("control", control_hits, control_pref_target),
+    ):
         for side in ("L", "R"):
-            anno_parts.append(_aggregate_side_metrics(df, sample_prefix=sample_prefix, side=side))
+            anno_parts.append(
+                _aggregate_side_metrics(
+                    df,
+                    sample_prefix=sample_prefix,
+                    side=side,
+                    preferred_subfamily_by_locus=pref_map,
+                )
+            )
 
     for idx, part in enumerate(anno_parts):
         if part.empty:
@@ -5904,10 +6692,6 @@ def annotate_candidate_loci_with_mei(
         if (idx + 1) % 2 == 0:
             print(f"[mei-annotate] merged side metrics {idx + 1}/{len(anno_parts)}")
 
-    disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits, sample_prefix="disease")
-    disc_n = _aggregate_discordant_mei_metrics(control_disc_hits, sample_prefix="control")
-    disc_anchor_t = _aggregate_discordant_anchor_side_metrics(discordant_disease, sample_prefix="disease")
-    disc_anchor_n = _aggregate_discordant_anchor_side_metrics(discordant_control, sample_prefix="control")
     if not disc_t.empty:
         candidate = candidate.merge(disc_t, on=["chrom", "window_start", "window_end"], how="left")
     if not disc_n.empty:
@@ -5917,6 +6701,18 @@ def annotate_candidate_loci_with_mei(
     if not disc_anchor_n.empty:
         candidate = candidate.merge(disc_anchor_n, on=["chrom", "window_start", "window_end"], how="left")
     print("[mei-annotate] merged discordant MEI support metrics")
+
+    candidate = _add_candidate_support_info_fields(
+        candidate,
+        split_disease=split_disease,
+        split_control=split_control,
+        discordant_disease=discordant_disease,
+        discordant_control=discordant_control,
+        split_disease_mei=split_disease_mei,
+        split_control_mei=split_control_mei,
+        discordant_disease_mei=discordant_disease_mei,
+        discordant_control_mei=discordant_control_mei,
+    )
 
     for col in candidate.columns:
         if re.search(r"_mei_supported_reads$|_mei_start$|_mei_end$", col):
@@ -5976,6 +6772,11 @@ def annotate_candidate_loci_with_mei(
         reference_fasta=reference_fasta,
         split_disease=split_disease,
         split_control=split_control,
+    )
+    candidate = _derive_breakpoint_interval_fields(
+        candidate,
+        breakpoint_pos_col="insertion_breakpoint_pos",
+        output_prefix="insertion_",
     )
     candidate = _compute_insertion_model_scores(candidate)
     candidate = _assign_bronze_silver_stages(candidate)
