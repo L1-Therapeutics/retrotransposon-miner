@@ -9,6 +9,7 @@ dependencies:
   - jupyterlab>=4.2
   - ipykernel>=6.29
   - matplotlib>=3.9
+  - plotly>=6.0
 
   # Core BAM/CRAM and interval tooling
   - samtools>=1.20

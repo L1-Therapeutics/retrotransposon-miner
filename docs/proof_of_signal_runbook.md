@@ -26,6 +26,11 @@ source scripts/use_external_workdir.sh
 - RepeatMasker table (optional; nested insertion annotation), e.g.:
   - `${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz`
 
+Nested same-family/same-orientation annotation requires the UCSC RepeatMasker
+table schema (`rmsk.txt.gz`) containing `repName/repClass/repFamily/strand`.
+Do not pass the simplified `${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.bed`
+to `--rmsk-table` for MEI annotation runs.
+
 ## Prerequisites
 
 From repo root:
@@ -47,6 +52,7 @@ bash scripts/run_proof_of_signal.sh \
   --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz" \
   --outdir "${RTM_RESULTS_DIR}/mei_step1_hg38_chr22" \
   --region chr22 \
   --window-size 200 \
@@ -64,6 +70,7 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz" \
   --g1k-mei-vcf "${RTM_PUBLIC_DATA_DIR}/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz" \
   --outdir "${RTM_RESULTS_DIR}/mei_step1_hg38_chr22_g1k" \
   --region chr22 \
@@ -79,6 +86,7 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz" \
   --g1k-mei-vcf "${RTM_PUBLIC_DATA_DIR}/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz" \
   --lr-mei-vcf "${RTM_PUBLIC_DATA_DIR}/polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz" \
   --outdir "${RTM_RESULTS_DIR}/mei_step1_hg38_chr22_g1k_lr" \
@@ -98,6 +106,7 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz" \
   --g1k-mei-vcf "${RTM_PUBLIC_DATA_DIR}/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz" \
   --outdir "${RTM_RESULTS_DIR}/mei_step1_hg38_chr22_empirical" \
   --region chr22 \
@@ -131,6 +140,7 @@ bash scripts/run_proof_of_signal.sh \
   --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz" \
   --outdir "${RTM_RESULTS_DIR}/mei_step1_hg38_chr15" \
   --region chr15 \
   --window-size 200
@@ -144,6 +154,7 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/WGS_EA_N_1.bwa.dedup.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz" \
   --outdir "${RTM_RESULTS_DIR}/mei_step1_hg38_chr15" \
   --region chr15 \
   --window-size 200
@@ -157,7 +168,8 @@ RUN_IN_ENV=1 bash scripts/run_proof_of_signal.sh \
   --disease-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
   --control-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
-  --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta"
+  --reference-fasta "${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta" \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz"
 ```
 
 ## Outputs

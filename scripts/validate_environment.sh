@@ -56,6 +56,7 @@ import sys
 
 mods = [
     "matplotlib",
+    "plotly",
     "ipykernel",
     "pysam",
     "pandas",

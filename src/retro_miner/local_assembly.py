@@ -115,11 +115,12 @@ def _write_interval_fastq(
     max_reads: int,
     non_perfect_only: bool = False,
     preferred_read_names: set[str] | None = None,
-) -> int:
+) -> tuple[int, set[str]]:
     start0 = max(0, int(start_1based) - 1)
     end0 = max(start0 + 1, int(end_1based))
     written = 0
     seen_ids: set[str] = set()
+    emitted_qnames: set[str] = set()
     preferred_lookup = _preferred_read_lookup(preferred_read_names)
     out_fastq_gz.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(out_fastq_gz, "wt", encoding="utf-8") as oh:
@@ -132,6 +133,9 @@ def _write_interval_fastq(
             qual = read.qual if read.qual is not None else ("I" * len(seq))
             oh.write(f"@{rid}\n{seq}\n+\n{qual}\n")
             seen_ids.add(rid)
+            qname = str(read.query_name or "")
+            if qname:
+                emitted_qnames.add(qname)
             written += 1
             return True
 
@@ -170,7 +174,90 @@ def _write_interval_fastq(
                     _emit_read(read)
                     if written >= int(max_reads):
                         break
-    return written
+    return written, emitted_qnames
+
+
+def _read_recruited_qnames_from_fastq(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            for idx, line in enumerate(handle):
+                if idx % 4 != 0:
+                    continue
+                header = line.strip()
+                if not header.startswith("@"):
+                    continue
+                rid = header[1:].split()[0]
+                qname = rid.rsplit(":", 1)[0]
+                qname = str(qname).strip()
+                if not qname:
+                    continue
+                out.add(qname)
+    except Exception:
+        return set()
+    return out
+
+
+def _recruited_qnames_for_cache_hit(locus_dir: Path, sample: str, pad_bp: int, status: str) -> set[str]:
+    sample_txt = str(sample)
+    status_txt = str(status or "")
+    if "highcap" in status_txt:
+        path = locus_dir / f"{sample_txt}.pad{int(pad_bp)}.cap1000.fastq.gz"
+        return _read_recruited_qnames_from_fastq(path)
+    if status_txt.endswith("seed") or "_seed" in status_txt:
+        path = locus_dir / f"{sample_txt}.pad{int(pad_bp)}.seedcap200.fastq.gz"
+        return _read_recruited_qnames_from_fastq(path)
+    path = locus_dir / f"{sample_txt}.pad{int(pad_bp)}.fastq.gz"
+    return _read_recruited_qnames_from_fastq(path)
+
+
+def _extract_microhomology_sequence(
+    *,
+    mei_hit: dict[str, object],
+    left_hit: dict[str, object] | None,
+    right_hit: dict[str, object] | None,
+    seq_by_name: dict[str, str],
+    max_len: int = 25,
+    allow_homopolymer: bool = False,
+) -> str:
+    qname = str(mei_hit.get("qname", ""))
+    seq = str(seq_by_name.get(qname, "") or "")
+    if not qname or not seq:
+        return ""
+    m_qstart = int(mei_hit.get("qstart", 0))
+    m_qend = int(mei_hit.get("qend", 0))
+    if m_qstart < 0 or m_qend <= m_qstart:
+        return ""
+
+    candidates: list[str] = []
+    if left_hit is not None and str(left_hit.get("qname", "")) == qname:
+        left_qend = int(left_hit.get("qend", 0))
+        ov = left_qend - m_qstart
+        if ov > 0:
+            start = max(0, m_qstart)
+            end = min(len(seq), left_qend)
+            if end > start:
+                candidates.append(str(seq[start:end]).upper())
+    if right_hit is not None and str(right_hit.get("qname", "")) == qname:
+        right_qstart = int(right_hit.get("qstart", 0))
+        ov = m_qend - right_qstart
+        if ov > 0:
+            start = max(0, right_qstart)
+            end = min(len(seq), m_qend)
+            if end > start:
+                candidates.append(str(seq[start:end]).upper())
+    if not candidates:
+        return ""
+
+    best = max(candidates, key=len)
+    if len(best) > int(max_len):
+        best = best[: int(max_len)]
+    # Strict mode excludes pure homopolymer overlap.
+    if (not bool(allow_homopolymer)) and len(set(best)) <= 1:
+        return ""
+    return best
 
 
 def _is_non_perfect_primary_alignment(read: pysam.AlignedSegment) -> bool:
@@ -738,6 +825,8 @@ def _extract_sample_assembly_features(
             "right_support_mei_end": -1,
             "left_support_mei_aln_len": 0,
             "right_support_mei_aln_len": 0,
+            "microhomology_sequence": "",
+            "junction_overlap_sequence": "",
             "coord_model": "no_contigs",
             "coord_logic_version": int(_ASSEMBLY_FEATURE_SCHEMA_VERSION),
         }
@@ -794,6 +883,8 @@ def _extract_sample_assembly_features(
             "right_support_mei_end": -1,
             "left_support_mei_aln_len": 0,
             "right_support_mei_aln_len": 0,
+            "microhomology_sequence": "",
+            "junction_overlap_sequence": "",
             "coord_model": "no_mei_hits",
             "coord_logic_version": int(_ASSEMBLY_FEATURE_SCHEMA_VERSION),
         }
@@ -959,6 +1050,58 @@ def _extract_sample_assembly_features(
                 tsd_seq = ref.fetch(bp_left_chrom, start0, end0).upper()
         except Exception:
             tsd_seq = ""
+    microhomology_sequence = _extract_microhomology_sequence(
+        mei_hit=best,
+        left_hit=left_hit,
+        right_hit=right_hit,
+        seq_by_name=seq_by_name,
+        allow_homopolymer=False,
+    )
+    junction_overlap_sequence = _extract_microhomology_sequence(
+        mei_hit=best,
+        left_hit=left_hit,
+        right_hit=right_hit,
+        seq_by_name=seq_by_name,
+        allow_homopolymer=True,
+    )
+    if (
+        not microhomology_sequence
+        and reference_fasta is not None
+        and left_hit is not None
+        and right_hit is not None
+    ):
+        try:
+            lchrom = str(left_hit.get("tname", ""))
+            rchrom = str(right_hit.get("tname", ""))
+            if lchrom and rchrom and lchrom == rchrom:
+                left_bp = int(left_hit.get("tend", 0))  # 1-based endpoint
+                right_bp = int(right_hit.get("tstart", 0)) + 1  # 1-based start
+                if right_bp <= left_bp:
+                    mh_len = int(left_bp - right_bp + 1)
+                    if 1 <= mh_len <= 25:
+                        with pysam.FastaFile(str(reference_fasta)) as ref:
+                            start0 = max(0, int(right_bp) - 1)
+                            end0 = max(start0 + 1, int(left_bp))
+                            mh_seq = ref.fetch(lchrom, start0, end0).upper()
+                        if mh_seq and len(set(mh_seq)) > 1:
+                            microhomology_sequence = str(mh_seq)
+                        if mh_seq and not junction_overlap_sequence:
+                            junction_overlap_sequence = str(mh_seq)
+        except Exception:
+            pass
+    if not junction_overlap_sequence:
+        qname = str(best.get("qname", ""))
+        seq = str(seq_by_name.get(qname, "") or "")
+        if seq:
+            m_qstart = int(best.get("qstart", 0))
+            m_qend = int(best.get("qend", 0))
+            s0 = max(0, m_qstart - 8)
+            e0 = min(len(seq), m_qstart + 17)
+            seq_left = str(seq[s0:e0]).upper() if e0 > s0 else ""
+            s1 = max(0, m_qend - 17)
+            e1 = min(len(seq), m_qend + 8)
+            seq_right = str(seq[s1:e1]).upper() if e1 > s1 else ""
+            junction_overlap_sequence = seq_left if len(seq_left) >= len(seq_right) else seq_right
     return {
         "primary_contig_id": str(best["qname"]),
         "mei_subfamily": str(best["tname"]),
@@ -992,6 +1135,8 @@ def _extract_sample_assembly_features(
         "right_support_mei_end": int(right_lo if right_hit is not None else -1),
         "left_support_mei_aln_len": int(left_hit.get("alnlen", 0) if left_hit is not None else 0),
         "right_support_mei_aln_len": int(right_hit.get("alnlen", 0) if right_hit is not None else 0),
+        "microhomology_sequence": str(microhomology_sequence),
+        "junction_overlap_sequence": str(junction_overlap_sequence),
         "coord_model": str(coord_model),
         "coord_logic_version": int(_ASSEMBLY_FEATURE_SCHEMA_VERSION),
     }
@@ -1057,6 +1202,8 @@ def _process_single_locus(
             "insertion_length_observed",
             "insertion_length_imputed",
             "insertion_length_confidence_tier",
+            "microhomology_sequence",
+            "junction_overlap_sequence",
         }
         if not required.issubset(set(feat.keys())):
             return False
@@ -1103,6 +1250,8 @@ def _process_single_locus(
     current_end = i_end
     d_reads = 0
     n_reads = 0
+    d_recruited_evidence_read_names: set[str] = set()
+    n_recruited_evidence_read_names: set[str] = set()
     d_cc = 0
     n_cc = 0
     d_max = 0
@@ -1123,6 +1272,26 @@ def _process_single_locus(
         n_cc = int(manifest.get("control_contigs", 0))
         d_max = int(manifest.get("disease_max_contig_len", 0))
         n_max = int(manifest.get("control_max_contig_len", 0))
+        d_names_cached = manifest.get("disease_recruited_evidence_read_names", [])
+        n_names_cached = manifest.get("control_recruited_evidence_read_names", [])
+        if isinstance(d_names_cached, list):
+            d_recruited_evidence_read_names = {str(x).strip() for x in d_names_cached if str(x).strip()}
+        if isinstance(n_names_cached, list):
+            n_recruited_evidence_read_names = {str(x).strip() for x in n_names_cached if str(x).strip()}
+        if not d_recruited_evidence_read_names:
+            d_recruited_evidence_read_names = _recruited_qnames_for_cache_hit(
+                locus_dir=locus_dir,
+                sample="disease",
+                pad_bp=chosen_pad,
+                status=status,
+            )
+        if not n_recruited_evidence_read_names:
+            n_recruited_evidence_read_names = _recruited_qnames_for_cache_hit(
+                locus_dir=locus_dir,
+                sample="control",
+                pad_bp=chosen_pad,
+                status=status,
+            )
         cache_hit = True
     elif manifest is None:
         manifest = _parse_existing_manifest(manifest_path)
@@ -1145,7 +1314,7 @@ def _process_single_locus(
                 suffix = "" if phase_name == "full" else f".seedcap{int(phase_cap)}"
                 d_fq = locus_dir / f"disease.pad{int(pad)}{suffix}.fastq.gz"
                 n_fq = locus_dir / f"control.pad{int(pad)}{suffix}.fastq.gz"
-                d_reads = _write_interval_fastq(
+                d_reads, d_recruited_names_phase = _write_interval_fastq(
                     disease_bam_path,
                     chrom,
                     current_start,
@@ -1155,7 +1324,7 @@ def _process_single_locus(
                     non_perfect_only=non_perfect_only,
                     preferred_read_names=disease_preferred_read_names,
                 )
-                n_reads = _write_interval_fastq(
+                n_reads, n_recruited_names_phase = _write_interval_fastq(
                     control_bam_path,
                     chrom,
                     current_start,
@@ -1225,12 +1394,16 @@ def _process_single_locus(
                     retry_used = attempt > 1
                     status = "assembled_retry_seed" if retry_used else "assembled_seed"
                     err_msg = ""
+                    d_recruited_evidence_read_names = set(d_recruited_names_phase)
+                    n_recruited_evidence_read_names = set(n_recruited_names_phase)
                     assembled_from_attempt = True
                     break
 
                 retry_used = attempt > 1
                 status = "assembled_retry" if retry_used else "assembled"
                 err_msg = ""
+                d_recruited_evidence_read_names = set(d_recruited_names_phase)
+                n_recruited_evidence_read_names = set(n_recruited_names_phase)
                 assembled_from_attempt = True
                 break
             if assembled_from_attempt:
@@ -1283,7 +1456,7 @@ def _process_single_locus(
     ):
         d_fq_hi = locus_dir / f"disease.pad{int(chosen_pad)}.cap{int(escalated_max_reads)}.fastq.gz"
         n_fq_hi = locus_dir / f"control.pad{int(chosen_pad)}.cap{int(escalated_max_reads)}.fastq.gz"
-        d_reads_hi = _write_interval_fastq(
+        d_reads_hi, d_recruited_names_hi = _write_interval_fastq(
             disease_bam_path,
             chrom,
             current_start,
@@ -1292,7 +1465,7 @@ def _process_single_locus(
             max_reads=int(escalated_max_reads),
             preferred_read_names=disease_preferred_read_names,
         )
-        n_reads_hi = _write_interval_fastq(
+        n_reads_hi, n_recruited_names_hi = _write_interval_fastq(
             control_bam_path,
             chrom,
             current_start,
@@ -1345,6 +1518,8 @@ def _process_single_locus(
                         n_max = int(n_max_hi)
                         d_feat = d_feat_hi
                         n_feat = n_feat_hi
+                        d_recruited_evidence_read_names = set(d_recruited_names_hi)
+                        n_recruited_evidence_read_names = set(n_recruited_names_hi)
                         pick = pick_hi
                         pick_source = pick_source_hi
                         complex_pick = complex_pick_hi
@@ -1379,6 +1554,8 @@ def _process_single_locus(
         "complexity_source": complex_source,
         "adaptive_read_cap_rerun": adaptive_rerun_used,
         "adaptive_read_cap_target": int(escalated_max_reads),
+        "disease_recruited_evidence_read_names": sorted(d_recruited_evidence_read_names),
+        "control_recruited_evidence_read_names": sorted(n_recruited_evidence_read_names),
     }
     manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1433,10 +1610,14 @@ def _process_single_locus(
         "asm_right_support_mei_end": int(pick.get("right_support_mei_end", -1) if pick else -1),
         "asm_left_support_mei_aln_len": int(pick.get("left_support_mei_aln_len", 0) if pick else 0),
         "asm_right_support_mei_aln_len": int(pick.get("right_support_mei_aln_len", 0) if pick else 0),
+        "asm_microhomology_sequence": str(pick.get("microhomology_sequence", "") if pick else ""),
+        "asm_junction_overlap_sequence": str(pick.get("junction_overlap_sequence", "") if pick else ""),
         "asm_coord_model": str(pick.get("coord_model", "") if pick else ""),
         "asm_coord_logic_version": int(pick.get("coord_logic_version", 0) if pick else 0),
         "asm_adaptive_read_cap_rerun": bool(adaptive_rerun_used),
         "asm_adaptive_read_cap_target": int(escalated_max_reads),
+        "asm_disease_recruited_evidence_read_names": ",".join(sorted(d_recruited_evidence_read_names)),
+        "asm_control_recruited_evidence_read_names": ",".join(sorted(n_recruited_evidence_read_names)),
     }
     log_line = (
         f"[local-assembly] locus {idx}/{total_loci} complete status={status} "
@@ -1563,10 +1744,14 @@ def annotate_silver_with_local_assembly(
                 "asm_right_support_mei_end",
                 "asm_left_support_mei_aln_len",
                 "asm_right_support_mei_aln_len",
+                "asm_microhomology_sequence",
+                "asm_junction_overlap_sequence",
                 "asm_coord_model",
                 "asm_coord_logic_version",
                 "asm_adaptive_read_cap_rerun",
                 "asm_adaptive_read_cap_target",
+                "asm_disease_recruited_evidence_read_names",
+                "asm_control_recruited_evidence_read_names",
             ]
         )
 

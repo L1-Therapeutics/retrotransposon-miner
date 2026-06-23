@@ -7207,7 +7207,9 @@ def _choose_event_family(row: pd.Series) -> str:
 
 def _choose_event_orientation(row: pd.Series) -> str:
     candidates = [
+        str(row.get("consensus_insertion_orientation", "")),
         str(row.get("insertion_orientation", "")),
+        str(row.get("asm_insertion_orientation", "")),
         str(row.get("disease_insertion_orientation", "")),
         str(row.get("control_insertion_orientation", "")),
         str(row.get("disease_discordant_mei_strand", "")),
@@ -7224,8 +7226,9 @@ def _choose_event_orientation(row: pd.Series) -> str:
     return ""
 
 
-def _load_rmsk_interval_trees(rmsk_table_path: Path) -> dict[str, IntervalTree]:
+def _load_rmsk_interval_trees(rmsk_table_path: Path) -> tuple[dict[str, IntervalTree], int]:
     trees: dict[str, IntervalTree] = {}
+    intervals_with_family = 0
     opener = gzip.open if str(rmsk_table_path).endswith(".gz") else open
     with opener(rmsk_table_path, "rt", encoding="utf-8") as handle:
         for line in handle:
@@ -7275,7 +7278,15 @@ def _load_rmsk_interval_trees(rmsk_table_path: Path) -> dict[str, IntervalTree]:
                     "strand": strand,
                 },
             )
-    return trees
+            if _rmsk_interval_family_norm(
+                {
+                    "rep_name": rep_name,
+                    "rep_class": rep_class,
+                    "rep_family": rep_family,
+                }
+            ):
+                intervals_with_family += 1
+    return trees, intervals_with_family
 
 
 def _rmsk_interval_family_norm(data: dict[str, object]) -> str:
@@ -7299,7 +7310,13 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
     if out.empty:
         return out
 
-    trees = _load_rmsk_interval_trees(rmsk_table_path)
+    trees, intervals_with_family = _load_rmsk_interval_trees(rmsk_table_path)
+    if not trees or intervals_with_family == 0:
+        raise ValueError(
+            "RepeatMasker annotation lacks repName/repClass/repFamily fields required "
+            "for nested_same_class_orientation. Use a UCSC rmsk table (e.g. rmsk.txt.gz), "
+            "not a stripped 3-4 column BED."
+        )
     selected: list[dict[str, object]] = []
     for row in out.itertuples(index=False):
         as_row = pd.Series(row._asdict())
