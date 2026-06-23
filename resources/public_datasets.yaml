@@ -86,6 +86,14 @@ datasets:
     target_path: retrotransposon_db/dfam/dfam40.0.h5.gz
     required: true
 
+  - id: ucsc_repeatbrowser_hg38reps_fasta
+    category: retrotransposon_db
+    description: UCSC Repeat Browser hg38 consensus FASTA (includes L1PA/L1HS full-length consensus tracks)
+    source: UCSC Repeat Browser
+    url: https://hgdownload.soe.ucsc.edu/hubs/RepeatBrowser2020/hg38reps/hg38reps.fa
+    target_path: retrotransposon_db/ucsc_repeatbrowser/hg38reps.fa
+    required: true
+
   # -------------------------------------------------------------------------
   # Extended candidate resources (optional for now)
   # -------------------------------------------------------------------------

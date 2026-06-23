@@ -384,6 +384,16 @@ def build_candidate_loci_cmd(
     help="MEI reference FASTA (family/subfamily headers retained).",
 )
 @click.option(
+    "--mei-full-fasta",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Optional full-consensus MEI FASTA for coordinate normalization "
+        "(recommended: full-length L1HS/AluY/SVA canonical references). "
+        "If omitted, an auto-selected canonical subset is generated from --mei-fasta."
+    ),
+)
+@click.option(
     "--out-tsv",
     type=click.Path(dir_okay=False, path_type=Path),
     required=True,
@@ -656,6 +666,7 @@ def annotate_mei_support_cmd(
     evidence_dir: Path,
     candidate_loci: Path,
     mei_fasta: Path,
+    mei_full_fasta: Path | None,
     out_tsv: Path,
     reference_fasta: Path | None,
     disease_bam_depth: Path | None,
@@ -748,6 +759,7 @@ def annotate_mei_support_cmd(
         assembly_minimap2_threads=assembly_minimap2_threads,
         assembly_locus_workers=assembly_locus_workers,
         assembly_reuse_cache_only=assembly_reuse_cache_only,
+        mei_full_fasta=mei_full_fasta,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 

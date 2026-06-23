@@ -35,6 +35,7 @@ class Dataset:
 
 BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
 DFAM_CURATED_CONSENSUS_0_URL = "https://www.dfam.org/releases/current/families/FamDB/dfam40.curated.consensus.0.h5.gz"
+UCSC_REPEATBROWSER_HG38REPS_URL = "https://hgdownload.soe.ucsc.edu/hubs/RepeatBrowser2020/hg38reps/hg38reps.fa"
 
 
 def _load_config(config_path: Path) -> list[Dataset]:
@@ -678,6 +679,151 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
     }
 
 
+def _iter_fasta(path: Path):
+    header = None
+    seq_parts: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if header is not None:
+                    yield header, "".join(seq_parts).upper()
+                header = line[1:].split()[0]
+                seq_parts = []
+            else:
+                seq_parts.append(line)
+        if header is not None:
+            yield header, "".join(seq_parts).upper()
+
+
+def _mei_family_from_header(header: str) -> str:
+    u = (header or "").upper()
+    if "SVA" in u:
+        return "SVA"
+    if "ALU" in u:
+        return "ALU"
+    if "LINE/L1" in u or "L1" in u:
+        return "LINE1"
+    return "OTHER"
+
+
+def _normalize_dfam_subfamily_for_full(header: str) -> str:
+    base = (header or "").split("#", 1)[0]
+    # Dfam subset contains fragment-oriented labels (3end/5end/orf2/short).
+    # Convert to the corresponding full-length RepeatBrowser subfamily token.
+    base = re.sub(r"_(3end|5end|orf2)$", "", base, flags=re.IGNORECASE)
+    base = re.sub(r"_short_?$", "", base, flags=re.IGNORECASE)
+    return base
+
+
+def _build_mei_full_consensus_panel(outdir: Path, ds_map: dict[str, Dataset], timeout_sec: int, force: bool) -> dict[str, Any]:
+    dfam_subset = outdir / "retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta"
+    if not dfam_subset.exists():
+        return {"status": "skipped_missing_dfam_subset", "path": str(dfam_subset)}
+
+    ucsc_ds = ds_map.get("ucsc_repeatbrowser_hg38reps_fasta")
+    ucsc_rel = "retrotransposon_db/ucsc_repeatbrowser/hg38reps.fa"
+    ucsc_url = UCSC_REPEATBROWSER_HG38REPS_URL
+    if ucsc_ds is not None:
+        ucsc_rel = ucsc_ds.target_path
+        ucsc_url = ucsc_ds.url
+    ucsc_fa = outdir / ucsc_rel
+    _download_file(ucsc_url, ucsc_fa, timeout_sec=timeout_sec, force=force)
+    if not ucsc_fa.exists() or ucsc_fa.stat().st_size <= 0:
+        return {"status": "failed", "error": "missing_ucsc_repeatbrowser_fasta", "path": str(ucsc_fa)}
+
+    ucsc_sequences: dict[str, str] = {}
+    for hdr, seq in _iter_fasta(ucsc_fa):
+        if seq:
+            ucsc_sequences[hdr] = seq
+
+    out_dir = outdir / "retrotransposon_db/full_consensus"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    panel_fa = out_dir / "mei_full_canonical.panel.fa"
+    panel_meta = out_dir / "mei_full_canonical.panel.tsv"
+
+    min_line1_full_bp = 5000
+    selected_records: list[tuple[str, str, str, str, int]] = []
+    missing_records: list[tuple[str, str, str]] = []
+    excluded_short_line1: list[tuple[str, str, int]] = []
+    seen_norm: set[tuple[str, str]] = set()
+    for hdr, _seq in _iter_fasta(dfam_subset):
+        fam = _mei_family_from_header(hdr)
+        if fam not in {"ALU", "SVA", "LINE1"}:
+            continue
+        cls = hdr.split("#", 1)[1] if "#" in hdr else ""
+        norm = _normalize_dfam_subfamily_for_full(hdr)
+        if not norm:
+            continue
+        key = (fam, norm)
+        if key in seen_norm:
+            continue
+        seen_norm.add(key)
+        full_seq = ucsc_sequences.get(norm, "")
+        if not full_seq:
+            missing_records.append((hdr, norm, fam))
+            continue
+        if fam == "LINE1" and len(full_seq) < min_line1_full_bp:
+            excluded_short_line1.append((hdr, norm, len(full_seq)))
+            continue
+        out_hdr = f"{norm}_full#{cls}" if cls else f"{norm}_full"
+        selected_records.append((out_hdr, norm, hdr, fam, len(full_seq)))
+
+    if not selected_records:
+        return {
+            "status": "failed",
+            "error": "no_full_consensus_records_selected",
+            "dfam_subset": str(dfam_subset),
+            "ucsc_fasta": str(ucsc_fa),
+        }
+
+    with panel_fa.open("w", encoding="utf-8") as out_handle:
+        for out_hdr, norm, _src, _fam, _len in selected_records:
+            seq = ucsc_sequences[norm]
+            out_handle.write(f">{out_hdr}|source={norm}\n")
+            for i in range(0, len(seq), 60):
+                out_handle.write(seq[i : i + 60] + "\n")
+
+    with panel_meta.open("w", encoding="utf-8", newline="") as meta_handle:
+        writer = csv.writer(meta_handle, delimiter="\t")
+        writer.writerow(["output_header", "source_repeatbrowser", "source_dfam_header", "family", "length_bp"])
+        for rec in selected_records:
+            writer.writerow(rec)
+        writer.writerow([])
+        writer.writerow([f"#excluded_short_line1_lt_{min_line1_full_bp}bp"])
+        writer.writerow(["source_dfam_header", "normalized_repeatbrowser_name", "length_bp"])
+        for src_hdr, norm, bp in excluded_short_line1:
+            writer.writerow([src_hdr, norm, bp])
+        writer.writerow([])
+        writer.writerow(["#missing_dfam_subfamilies_not_found_in_repeatbrowser"])
+        writer.writerow(["source_dfam_header", "normalized_repeatbrowser_name", "family"])
+        for src_hdr, norm, fam in missing_records:
+            writer.writerow([src_hdr, norm, fam])
+
+    _run_cmd(["samtools", "faidx", str(panel_fa)], required=True)
+
+    line1_lengths = [r[4] for r in selected_records if r[3] == "LINE1"]
+    alu_lengths = [r[4] for r in selected_records if r[3] == "ALU"]
+    sva_lengths = [r[4] for r in selected_records if r[3] == "SVA"]
+    return {
+        "status": "prepared",
+        "panel_fasta": str(panel_fa),
+        "panel_fai": str(panel_fa.with_suffix(panel_fa.suffix + ".fai")),
+        "panel_metadata_tsv": str(panel_meta),
+        "selected_total": len(selected_records),
+        "selected_line1": len(line1_lengths),
+        "selected_alu": len(alu_lengths),
+        "selected_sva": len(sva_lengths),
+        "missing_total": len(missing_records),
+        "excluded_short_line1": len(excluded_short_line1),
+        "line1_min_full_bp_threshold": min_line1_full_bp,
+        "line1_length_min": min(line1_lengths) if line1_lengths else 0,
+        "line1_length_max": max(line1_lengths) if line1_lengths else 0,
+    }
+
+
 def _postprocess(
     outdir: Path,
     datasets: list[Dataset],
@@ -818,6 +964,10 @@ def _postprocess(
     run_step(
         "dfam_prepare_human_mei_fasta",
         lambda: _prepare_dfam_mei_library(outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force),
+    )
+    run_step(
+        "prepare_full_consensus_mei_panel",
+        lambda: _build_mei_full_consensus_panel(outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force),
     )
 
     return steps

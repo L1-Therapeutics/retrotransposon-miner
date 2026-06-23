@@ -52,7 +52,7 @@ bash scripts/validate_environment.sh
 
 This checks:
 - Required command-line tools (`samtools`, `bedtools`, `bcftools`, `bwa-mem2`)
-- Python runtime and key modules (`matplotlib`, `ipykernel`, `pysam`, `pandas`, `pyarrow`, `click`, `Bio`)
+- Python runtime and key modules (`matplotlib`, `plotly`, `ipykernel`, `pysam`, `pandas`, `pyarrow`, `click`, `Bio`)
 - Optional UCSC binary (`liftOver`)
 
 ## JupyterLab on EC2 (local browser via SSH tunnel)
@@ -187,9 +187,15 @@ This initial dataset pack includes:
 - 1000G ONT Vienna long-read SVAN cohort callset (v1.1, sequence-resolved MEI annotations)
 - hg38<->hs1 liftOver chains
 - Dfam FamDB archive (required; extract human families with `famdb.py`)
+- UCSC Repeat Browser consensus FASTA (`hg38reps.fa`)
 - Dfam-derived MEI FASTA library outputs:
   - `retrotransposon_db/dfam/dfam_human_curated.fasta`
   - `retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta`
+- Full-consensus MEI panel (automatically derived from Dfam subfamilies + UCSC full consensuses):
+  - `retrotransposon_db/full_consensus/mei_full_canonical.panel.fa`
+  - `retrotransposon_db/full_consensus/mei_full_canonical.panel.fa.fai`
+  - `retrotransposon_db/full_consensus/mei_full_canonical.panel.tsv`
+  - includes only LINE1 consensuses >=5kb in the full panel (short LINE1 fragments are excluded and logged in the TSV)
 - Public SEQC2 disease/control test BAMs (downloaded as chr22 slices)
 
 Post-download processing is automatic and includes:
@@ -199,7 +205,8 @@ Post-download processing is automatic and includes:
 - lifting hg38 BED resources to hs1/T2T via `liftOver`
 - downloading prebuilt BWA index files for hg38 and hs1 from AWS sources when available (fallback: local build)
 - cloning `Dfam-consortium/FamDB` (if needed), exporting curated human Dfam FASTA,
-  and generating a focused LINE1/Alu/SVA MEI FASTA subset
+  generating a focused LINE1/Alu/SVA MEI FASTA subset,
+  and constructing a full-consensus LINE1/Alu/SVA panel for coordinate-normalized remapping
 
 Storage planning:
 - Full whole-genome disease+control BAM remapping workflows can require ~300GB free disk.
