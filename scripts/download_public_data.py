@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -560,6 +561,196 @@ def _liftover_bed(in_bed: Path, chain_gz: Path, out_bed: Path, out_unmapped: Pat
     return {"status": "lifted", "ok": ok, "message": msg, "path": str(out_bed), "unmapped_path": str(out_unmapped)}
 
 
+def _extract_vcf_end_pos(pos1: int, ref: str, info_field: str) -> int:
+    default_end = int(pos1) + max(1, len(ref or "")) - 1
+    if not info_field or info_field == ".":
+        return max(default_end, pos1)
+    for token in info_field.split(";"):
+        if token.startswith("END="):
+            try:
+                return max(int(token[4:]), pos1)
+            except ValueError:
+                return max(default_end, pos1)
+    return max(default_end, pos1)
+
+
+def _replace_vcf_end_pos(info_field: str, end1: int) -> str:
+    target = f"END={int(end1)}"
+    if not info_field or info_field == ".":
+        return target
+    parts = info_field.split(";")
+    replaced = False
+    for i, token in enumerate(parts):
+        if token.startswith("END="):
+            parts[i] = target
+            replaced = True
+            break
+    if not replaced:
+        parts.append(target)
+    return ";".join(parts)
+
+
+def _vcf_chrom_sort_key(chrom: str) -> tuple[int, str]:
+    c = (chrom or "").strip()
+    if c.startswith("chr"):
+        core = c[3:]
+    else:
+        core = c
+    if core.isdigit():
+        n = int(core)
+        if 1 <= n <= 22:
+            return (n, c)
+    if core == "X":
+        return (23, c)
+    if core == "Y":
+        return (24, c)
+    if core in {"M", "MT"}:
+        return (25, c)
+    return (1000, c)
+
+
+def _liftover_lr_svan_vcf_hs1_to_hg38(
+    source_vcf_gz: Path,
+    chain_gz: Path,
+    out_vcf_gz: Path,
+    out_unmapped_bed: Path,
+    force: bool,
+) -> dict[str, Any]:
+    if not source_vcf_gz.exists():
+        return {"status": "skipped_missing_source", "source_path": str(source_vcf_gz)}
+    if out_vcf_gz.exists() and out_unmapped_bed.exists() and not force:
+        return {
+            "status": "skipped_exists",
+            "path": str(out_vcf_gz),
+            "unmapped_path": str(out_unmapped_bed),
+            "source_path": str(source_vcf_gz),
+        }
+
+    out_vcf_gz.parent.mkdir(parents=True, exist_ok=True)
+    out_unmapped_bed.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="rtm_lr_hs1_to_hg38_") as tmpdir:
+        tmp = Path(tmpdir)
+        query_bed = tmp / "lr_svan_hs1_intervals.bed"
+        mapped_bed = tmp / "lr_svan_hs1_to_hg38.mapped.bed"
+        unmapped_bed = tmp / "lr_svan_hs1_to_hg38.unmapped.bed"
+        lifted_vcf = tmp / "final-vcf.unphased.SVAN_1.3.hg38.vcf"
+
+        metadata_headers: list[str] = []
+        chrom_header = ""
+        variants: list[list[str]] = []
+        query_ids: list[str] = []
+
+        with gzip.open(source_vcf_gz, "rt", encoding="utf-8") as ih, query_bed.open("w", encoding="utf-8") as bh:
+            for line in ih:
+                if line.startswith("##"):
+                    metadata_headers.append(line)
+                    continue
+                if line.startswith("#CHROM"):
+                    chrom_header = line
+                    continue
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 8:
+                    continue
+                chrom = cols[0]
+                try:
+                    pos1 = int(cols[1])
+                except ValueError:
+                    continue
+                ref = cols[3]
+                end1 = _extract_vcf_end_pos(pos1=pos1, ref=ref, info_field=cols[7])
+                start0 = max(0, pos1 - 1)
+                end0 = max(start0 + 1, end1)
+                rid = f"v{len(variants)}"
+                bh.write(f"{chrom}\t{start0}\t{end0}\t{rid}\n")
+                variants.append(cols)
+                query_ids.append(rid)
+
+        if not chrom_header:
+            return {"status": "failed", "error": f"invalid_vcf_header: {source_vcf_gz}"}
+
+        _run_cmd(
+            ["liftOver", str(query_bed), str(chain_gz), str(mapped_bed), str(unmapped_bed)],
+            required=True,
+        )
+
+        mapped_coords: dict[str, tuple[str, int, int]] = {}
+        multi_mapped = 0
+        with mapped_bed.open("r", encoding="utf-8") as mh:
+            for line in mh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 4:
+                    continue
+                rid = parts[3]
+                try:
+                    start0 = int(parts[1])
+                    end0 = int(parts[2])
+                except ValueError:
+                    continue
+                if rid in mapped_coords:
+                    multi_mapped += 1
+                    continue
+                mapped_coords[rid] = (parts[0], start0, end0)
+
+        with lifted_vcf.open("w", encoding="utf-8") as oh:
+            saw_reference = False
+            saw_liftover_meta = False
+            for line in metadata_headers:
+                if line.startswith("##reference="):
+                    oh.write("##reference=GCF_000001405.39\n")
+                    saw_reference = True
+                    continue
+                if line.startswith("##rtm_liftover_source="):
+                    saw_liftover_meta = True
+                oh.write(line)
+            if not saw_reference:
+                oh.write("##reference=GCF_000001405.39\n")
+            if not saw_liftover_meta:
+                oh.write("##rtm_liftover_source=hs1_to_hg38_with_ucsc_liftOver\n")
+            oh.write(chrom_header)
+
+            lifted_rows: list[list[str]] = []
+            for rid, cols in zip(query_ids, variants, strict=False):
+                mapped = mapped_coords.get(rid)
+                if mapped is None:
+                    continue
+                new_chrom, new_start0, new_end0 = mapped
+                cols[0] = new_chrom
+                cols[1] = str(max(1, new_start0 + 1))
+                cols[7] = _replace_vcf_end_pos(cols[7], max(new_start0 + 1, new_end0))
+                lifted_rows.append(cols)
+
+            lifted_rows.sort(key=lambda row: (_vcf_chrom_sort_key(row[0]), int(row[1])))
+            for cols in lifted_rows:
+                oh.write("\t".join(cols) + "\n")
+            written = len(lifted_rows)
+
+        with out_vcf_gz.open("wb") as out_handle:
+            proc = subprocess.run(
+                ["bgzip", "-f", "-c", str(lifted_vcf)],
+                check=True,
+                stdout=out_handle,
+                stderr=subprocess.PIPE,
+            )
+            _ = proc
+
+        tabix_ok, tabix_msg = _run_cmd(["tabix", "-f", "-p", "vcf", str(out_vcf_gz)], required=False)
+        shutil.copy2(unmapped_bed, out_unmapped_bed)
+
+        return {
+            "status": "lifted",
+            "source_path": str(source_vcf_gz),
+            "path": str(out_vcf_gz),
+            "unmapped_path": str(out_unmapped_bed),
+            "records_total": len(variants),
+            "records_lifted": written,
+            "records_unmapped": max(0, len(variants) - written),
+            "multi_mapped_skipped": int(multi_mapped),
+            "tabix_indexed": bool(tabix_ok),
+            "tabix_message": tabix_msg,
+        }
+
+
 def _ensure_famdb_repo(famdb_tools_dir: Path, timeout_sec: int) -> tuple[str | None, str]:
     famdb_py = famdb_tools_dir / "famdb.py"
     if famdb_py.exists():
@@ -960,7 +1151,26 @@ def _postprocess(
             ),
         )
 
-    # 5) Prepare Dfam-derived MEI FASTA library (human curated + LINE1/Alu/SVA subset).
+    # 5) 1000G ONT Vienna SVAN is downloaded in hs1 coordinates; lift to hg38
+    # and keep the historical hg38 filename for annotation compatibility.
+    lr_ds = ds_map.get("lr_1kg_ont_vienna_svan_mei_vcf")
+    hs1_to_hg38_chain = ds_map.get("hs1_to_hg38_chain")
+    if lr_ds and hs1_to_hg38_chain:
+        lr_source_hs1_vcf = outdir / lr_ds.target_path
+        lr_lifted_hg38_vcf = outdir / "polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz"
+        lr_lifted_unmapped = outdir / "polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.unmapped.bed"
+        run_step(
+            "liftover_lr_1kg_ont_vienna_hs1_to_hg38_vcf",
+            lambda: _liftover_lr_svan_vcf_hs1_to_hg38(
+                source_vcf_gz=lr_source_hs1_vcf,
+                chain_gz=outdir / hs1_to_hg38_chain.target_path,
+                out_vcf_gz=lr_lifted_hg38_vcf,
+                out_unmapped_bed=lr_lifted_unmapped,
+                force=force,
+            ),
+        )
+
+    # 6) Prepare Dfam-derived MEI FASTA library (human curated + LINE1/Alu/SVA subset).
     run_step(
         "dfam_prepare_human_mei_fasta",
         lambda: _prepare_dfam_mei_library(outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force),
