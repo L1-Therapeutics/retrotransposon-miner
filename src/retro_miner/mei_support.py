@@ -2359,6 +2359,469 @@ def _infer_disease_insertion_metrics(
     # Strict TSD evidence threshold: 4 bp or longer.
     out["tsd_detected"] = out["tsd_len_estimate"] >= 4
 
+    def _build_poly_breakpoint_mode_table(
+        split_df: pd.DataFrame | None,
+        *,
+        prefix: str,
+        min_poly_run: int = 8,
+        min_poly_frac: float = 0.80,
+    ) -> pd.DataFrame:
+        key_cols = ["chrom", "window_start", "window_end"]
+        out_cols = key_cols + [
+            f"{prefix}_L_poly_breakpoint_mode",
+            f"{prefix}_R_poly_breakpoint_mode",
+            f"{prefix}_L_poly_breakpoint_support",
+            f"{prefix}_R_poly_breakpoint_support",
+        ]
+        if split_df is None or split_df.empty:
+            return pd.DataFrame(columns=out_cols)
+        required = set(key_cols + ["clip_side", "pos", "read_name"])
+        if not required.issubset(set(split_df.columns)):
+            return pd.DataFrame(columns=out_cols)
+
+        work = split_df.loc[:, key_cols + ["clip_side", "pos", "read_name"]].copy()
+        work["clip_side"] = work["clip_side"].fillna("").astype(str).str.upper().str[:1]
+        work = work.loc[work["clip_side"].isin(["L", "R"])].copy()
+        if work.empty:
+            return pd.DataFrame(columns=out_cols)
+        work["pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
+        work["read_name"] = work["read_name"].fillna("").astype(str)
+        work = work.loc[(work["pos"] > 0) & (work["read_name"].str.len() > 0)].copy()
+        if work.empty:
+            return pd.DataFrame(columns=out_cols)
+
+        poly_flag = pd.Series(False, index=work.index)
+        if "poly_tail_rescued" in split_df.columns:
+            poly_tail_rescued = split_df.loc[work.index, "poly_tail_rescued"].fillna(False).astype(bool)
+            poly_flag = poly_flag | poly_tail_rescued
+        if "clip_poly_at_run" in split_df.columns:
+            poly_run = pd.to_numeric(split_df.loc[work.index, "clip_poly_at_run"], errors="coerce").fillna(0).astype(int)
+            poly_flag = poly_flag | poly_run.ge(int(min_poly_run))
+        if "clip_poly_at_fraction" in split_df.columns:
+            poly_frac = pd.to_numeric(
+                split_df.loc[work.index, "clip_poly_at_fraction"],
+                errors="coerce",
+            ).fillna(0.0)
+            poly_flag = poly_flag | poly_frac.ge(float(min_poly_frac))
+        work = work.loc[poly_flag].copy()
+        if work.empty:
+            return pd.DataFrame(columns=out_cols)
+
+        pos_support = (
+            work.groupby(key_cols + ["clip_side", "pos"], as_index=False)["read_name"]
+            .nunique()
+            .rename(columns={"read_name": "support_reads"})
+            .sort_values(
+                key_cols + ["clip_side", "support_reads", "pos"],
+                ascending=[True, True, True, True, False, True],
+            )
+        )
+        modes = pos_support.drop_duplicates(key_cols + ["clip_side"], keep="first").copy()
+        modes = modes.rename(columns={"pos": "poly_breakpoint_mode"})
+
+        mode_pivot = (
+            modes.pivot_table(
+                index=key_cols,
+                columns="clip_side",
+                values="poly_breakpoint_mode",
+                aggfunc="first",
+            )
+            .reset_index()
+        )
+        support_pivot = (
+            modes.pivot_table(
+                index=key_cols,
+                columns="clip_side",
+                values="support_reads",
+                aggfunc="first",
+            )
+            .reset_index()
+        )
+        mode_pivot.columns = [str(c) for c in mode_pivot.columns]
+        support_pivot.columns = [str(c) for c in support_pivot.columns]
+        for side in ("L", "R"):
+            if side not in mode_pivot.columns:
+                mode_pivot[side] = 0
+            if side not in support_pivot.columns:
+                support_pivot[side] = 0
+        merged = mode_pivot.merge(support_pivot, on=key_cols, suffixes=("_mode", "_support"), how="outer")
+        for side in ("L", "R"):
+            merged[f"{prefix}_{side}_poly_breakpoint_mode"] = (
+                pd.to_numeric(merged.get(f"{side}_mode", 0), errors="coerce").fillna(0).astype(int)
+            )
+            merged[f"{prefix}_{side}_poly_breakpoint_support"] = (
+                pd.to_numeric(merged.get(f"{side}_support", 0), errors="coerce").fillna(0).astype(int)
+            )
+        return merged[out_cols]
+
+    key_cols = ["chrom", "window_start", "window_end"]
+    disease_poly_modes = _build_poly_breakpoint_mode_table(split_disease, prefix="disease")
+    control_poly_modes = _build_poly_breakpoint_mode_table(split_control, prefix="control")
+    for tbl in (disease_poly_modes, control_poly_modes):
+        if tbl.empty:
+            continue
+        out = out.merge(tbl, on=key_cols, how="left")
+    for col in [
+        "disease_L_poly_breakpoint_mode",
+        "disease_R_poly_breakpoint_mode",
+        "disease_L_poly_breakpoint_support",
+        "disease_R_poly_breakpoint_support",
+        "control_L_poly_breakpoint_mode",
+        "control_R_poly_breakpoint_mode",
+        "control_L_poly_breakpoint_support",
+        "control_R_poly_breakpoint_support",
+    ]:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+
+    def _build_split_breakpoint_mode_table(
+        split_df: pd.DataFrame | None,
+        *,
+        prefix: str,
+    ) -> pd.DataFrame:
+        key_cols = ["chrom", "window_start", "window_end"]
+        out_cols = key_cols + [
+            f"{prefix}_L_split_breakpoint_mode",
+            f"{prefix}_R_split_breakpoint_mode",
+            f"{prefix}_L_split_breakpoint_support",
+            f"{prefix}_R_split_breakpoint_support",
+            f"{prefix}_L_split_breakpoint_total_reads",
+            f"{prefix}_R_split_breakpoint_total_reads",
+        ]
+        if split_df is None or split_df.empty:
+            return pd.DataFrame(columns=out_cols)
+        required = set(key_cols + ["clip_side", "pos", "read_name"])
+        if not required.issubset(set(split_df.columns)):
+            return pd.DataFrame(columns=out_cols)
+
+        work = split_df.loc[:, key_cols + ["clip_side", "pos", "read_name"]].copy()
+        work["clip_side"] = work["clip_side"].fillna("").astype(str).str.upper().str[:1]
+        work = work.loc[work["clip_side"].isin(["L", "R"])].copy()
+        if work.empty:
+            return pd.DataFrame(columns=out_cols)
+        work["pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
+        work["read_name"] = work["read_name"].fillna("").astype(str)
+        work = work.loc[(work["pos"] > 0) & (work["read_name"].str.len() > 0)].copy()
+        if work.empty:
+            return pd.DataFrame(columns=out_cols)
+
+        pos_support = (
+            work.groupby(key_cols + ["clip_side", "pos"], as_index=False)["read_name"]
+            .nunique()
+            .rename(columns={"read_name": "support_reads"})
+            .sort_values(
+                key_cols + ["clip_side", "support_reads", "pos"],
+                ascending=[True, True, True, True, False, True],
+            )
+        )
+        modes = pos_support.drop_duplicates(key_cols + ["clip_side"], keep="first").copy()
+        modes = modes.rename(columns={"pos": "split_breakpoint_mode"})
+
+        side_totals = (
+            work.groupby(key_cols + ["clip_side"], as_index=False)["read_name"]
+            .nunique()
+            .rename(columns={"read_name": "total_reads"})
+        )
+
+        mode_pivot = (
+            modes.pivot_table(
+                index=key_cols,
+                columns="clip_side",
+                values="split_breakpoint_mode",
+                aggfunc="first",
+            )
+            .reset_index()
+        )
+        support_pivot = (
+            modes.pivot_table(
+                index=key_cols,
+                columns="clip_side",
+                values="support_reads",
+                aggfunc="first",
+            )
+            .reset_index()
+        )
+        total_pivot = (
+            side_totals.pivot_table(
+                index=key_cols,
+                columns="clip_side",
+                values="total_reads",
+                aggfunc="first",
+            )
+            .reset_index()
+        )
+        mode_pivot.columns = [str(c) for c in mode_pivot.columns]
+        support_pivot.columns = [str(c) for c in support_pivot.columns]
+        total_pivot.columns = [str(c) for c in total_pivot.columns]
+        for side in ("L", "R"):
+            if side not in mode_pivot.columns:
+                mode_pivot[side] = 0
+            if side not in support_pivot.columns:
+                support_pivot[side] = 0
+            if side not in total_pivot.columns:
+                total_pivot[side] = 0
+
+        merged = mode_pivot.merge(support_pivot, on=key_cols, suffixes=("_mode", "_support"), how="outer")
+        merged = merged.merge(total_pivot, on=key_cols, suffixes=("", "_total"), how="outer")
+        for side in ("L", "R"):
+            merged[f"{prefix}_{side}_split_breakpoint_mode"] = (
+                pd.to_numeric(merged.get(f"{side}_mode", 0), errors="coerce").fillna(0).astype(int)
+            )
+            merged[f"{prefix}_{side}_split_breakpoint_support"] = (
+                pd.to_numeric(merged.get(f"{side}_support", 0), errors="coerce").fillna(0).astype(int)
+            )
+            merged[f"{prefix}_{side}_split_breakpoint_total_reads"] = (
+                pd.to_numeric(merged.get(side, 0), errors="coerce").fillna(0).astype(int)
+            )
+        return merged[out_cols]
+
+    disease_split_modes = _build_split_breakpoint_mode_table(split_disease, prefix="disease")
+    control_split_modes = _build_split_breakpoint_mode_table(split_control, prefix="control")
+    for tbl in (disease_split_modes, control_split_modes):
+        if tbl.empty:
+            continue
+        out = out.merge(tbl, on=key_cols, how="left")
+    for col in [
+        "disease_L_split_breakpoint_mode",
+        "disease_R_split_breakpoint_mode",
+        "disease_L_split_breakpoint_support",
+        "disease_R_split_breakpoint_support",
+        "disease_L_split_breakpoint_total_reads",
+        "disease_R_split_breakpoint_total_reads",
+        "control_L_split_breakpoint_mode",
+        "control_R_split_breakpoint_mode",
+        "control_L_split_breakpoint_support",
+        "control_R_split_breakpoint_support",
+        "control_L_split_breakpoint_total_reads",
+        "control_R_split_breakpoint_total_reads",
+    ]:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+
+    def _split_gap_tsd_rescue(
+        row: pd.Series,
+        *,
+        min_len: int = 4,
+        max_len: int = 40,
+        min_side_support: int = 2,
+        min_total_support: int = 6,
+    ) -> tuple[int, int, int, str]:
+        def _to_int_safe(value: object, default: int = 0) -> int:
+            try:
+                if pd.isna(value):
+                    return int(default)
+                return int(float(value))
+            except (TypeError, ValueError):
+                return int(default)
+
+        if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
+            return (
+                _to_int_safe(row.get("tsd_left_breakpoint", 0), 0),
+                _to_int_safe(row.get("tsd_right_breakpoint", 0), 0),
+                _to_int_safe(row.get("tsd_len_estimate", 0), 0),
+                str(row.get("tsd_evidence_source", "") or ""),
+            )
+
+        any_mei_signal = max(
+            _to_int_safe(row.get("disease_mei_supported_reads", 0), 0),
+            _to_int_safe(row.get("control_mei_supported_reads", 0), 0),
+            _to_int_safe(row.get("disease_discordant_mei_supported_reads", 0), 0),
+            _to_int_safe(row.get("control_discordant_mei_supported_reads", 0), 0),
+            _to_int_safe(row.get("disease_split_mei_supported_reads", 0), 0),
+            _to_int_safe(row.get("control_split_mei_supported_reads", 0), 0),
+            _to_int_safe(row.get("disease_full_mei_supported_reads", 0), 0),
+            _to_int_safe(row.get("control_full_mei_supported_reads", 0), 0),
+        )
+        if any_mei_signal < 1:
+            return (0, 0, 0, "")
+
+        candidates: list[tuple[int, int, int, int, int, int, str]] = []
+        for sample in ("disease", "control"):
+            sample_pri = 0 if sample == "disease" else 1
+            l_mode = _to_int_safe(row.get(f"{sample}_L_split_breakpoint_mode", 0), 0)
+            r_mode = _to_int_safe(row.get(f"{sample}_R_split_breakpoint_mode", 0), 0)
+            l_support = _to_int_safe(row.get(f"{sample}_L_split_breakpoint_support", 0), 0)
+            r_support = _to_int_safe(row.get(f"{sample}_R_split_breakpoint_support", 0), 0)
+            if l_mode <= 0 or r_mode <= 0:
+                continue
+            if l_support < int(min_side_support) or r_support < int(min_side_support):
+                continue
+            total_support = int(l_support + r_support)
+            if total_support < int(min_total_support):
+                continue
+            if r_mode < l_mode:
+                continue
+            tsd_len = int(r_mode - l_mode + 1)
+            if tsd_len < int(min_len) or tsd_len > int(max_len):
+                continue
+            l_poly_support = _to_int_safe(row.get(f"{sample}_L_poly_breakpoint_support", 0), 0)
+            r_poly_support = _to_int_safe(row.get(f"{sample}_R_poly_breakpoint_support", 0), 0)
+            poly_support = int(l_poly_support + r_poly_support)
+            candidates.append(
+                (
+                    sample_pri,
+                    -total_support,
+                    -poly_support,
+                    -tsd_len,
+                    l_mode,
+                    r_mode,
+                    f"tsd_{sample}_split_clip_gap_rescue",
+                )
+            )
+        if not candidates:
+            return (0, 0, 0, "")
+        candidates.sort()
+        _sample_pri, _neg_total, _neg_poly, _neg_len, ll, rr, src = candidates[0]
+        return (int(ll), int(rr), int(rr - ll + 1), str(src))
+
+    gap_seed = out.apply(
+        lambda r: _split_gap_tsd_rescue(r),
+        axis=1,
+        result_type="expand",
+    )
+    gap_seed.columns = [
+        "gap_tsd_left_breakpoint",
+        "gap_tsd_right_breakpoint",
+        "gap_tsd_len_estimate",
+        "gap_tsd_evidence_source",
+    ]
+    gap_len = pd.to_numeric(gap_seed["gap_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
+    gap_mask = (out["tsd_len_estimate"].fillna(0).astype(int) < 4) & (gap_len >= 4)
+    out.loc[gap_mask, "tsd_left_breakpoint"] = (
+        pd.to_numeric(gap_seed.loc[gap_mask, "gap_tsd_left_breakpoint"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+    out.loc[gap_mask, "tsd_right_breakpoint"] = (
+        pd.to_numeric(gap_seed.loc[gap_mask, "gap_tsd_right_breakpoint"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+    out.loc[gap_mask, "tsd_len_estimate"] = gap_len.loc[gap_mask].astype(int)
+    out.loc[gap_mask, "tsd_evidence_source"] = (
+        gap_seed.loc[gap_mask, "gap_tsd_evidence_source"].fillna("").astype(str)
+    )
+    out["tsd_detected"] = out["tsd_len_estimate"].fillna(0).astype(int) >= 4
+
+    def _one_sided_polyA_tsd_bridge_rescue(
+        row: pd.Series,
+        *,
+        min_len: int = 4,
+        max_len: int = 40,
+    ) -> tuple[int, int, int, str]:
+        def _to_int_safe(value: object, default: int = 0) -> int:
+            try:
+                if pd.isna(value):
+                    return int(default)
+                return int(float(value))
+            except (TypeError, ValueError):
+                return int(default)
+
+        if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
+            return (
+                _to_int_safe(row.get("tsd_left_breakpoint", 0), 0),
+                _to_int_safe(row.get("tsd_right_breakpoint", 0), 0),
+                _to_int_safe(row.get("tsd_len_estimate", 0), 0),
+                str(row.get("tsd_evidence_source", "") or ""),
+            )
+
+        candidates: list[tuple[int, int, int, int, int, int, str]] = []
+        for sample in ("disease", "control"):
+            sample_pri = 0 if sample == "disease" else 1
+            l_bp = _to_int_safe(row.get(f"{sample}_L_mei_breakpoint_mode", 0), 0)
+            r_bp = _to_int_safe(row.get(f"{sample}_R_mei_breakpoint_mode", 0), 0)
+            l_support = _to_int_safe(row.get(f"{sample}_L_mei_supported_reads", 0), 0)
+            r_support = _to_int_safe(row.get(f"{sample}_R_mei_supported_reads", 0), 0)
+            l_poly_bp = _to_int_safe(row.get(f"{sample}_L_poly_breakpoint_mode", 0), 0)
+            r_poly_bp = _to_int_safe(row.get(f"{sample}_R_poly_breakpoint_mode", 0), 0)
+            l_poly_support = _to_int_safe(row.get(f"{sample}_L_poly_breakpoint_support", 0), 0)
+            r_poly_support = _to_int_safe(row.get(f"{sample}_R_poly_breakpoint_support", 0), 0)
+            l_poly = _to_int_safe(row.get(f"{sample}_L_poly_at_reads", 0), 0)
+            r_poly = _to_int_safe(row.get(f"{sample}_R_poly_at_reads", 0), 0)
+            split_poly = _to_int_safe(row.get(f"split_{sample}_poly_tail_rescued_unique_reads", 0), 0)
+            disc_poly = _to_int_safe(row.get(f"discordant_{sample}_poly_tail_rescued_unique_reads", 0), 0)
+            poly_run = _to_int_safe(row.get(f"{sample}_poly_at_max_run", 0), 0)
+            any_poly = max(l_poly, r_poly, split_poly, disc_poly, 1 if poly_run >= 8 else 0)
+            if any_poly < 1:
+                continue
+
+            if l_bp > 0 and r_support <= 1 and l_support >= 1:
+                if r_poly_bp > 0 and r_poly_bp >= l_bp and r_poly_support >= 1:
+                    ll = int(l_bp)
+                    rr = int(r_poly_bp)
+                    tsd_len = int(rr - ll + 1)
+                    if int(min_len) <= tsd_len <= int(max_len):
+                        support = int(l_support + r_poly_support)
+                        candidates.append(
+                            (
+                                sample_pri,
+                                0,
+                                -support,
+                                -tsd_len,
+                                ll,
+                                rr,
+                                f"tsd_{sample}_L_poly_mode_bridge_rescue",
+                            )
+                        )
+
+            if r_bp > 0 and l_support <= 1 and r_support >= 1:
+                if l_poly_bp > 0 and l_poly_bp <= r_bp and l_poly_support >= 1:
+                    ll = int(l_poly_bp)
+                    rr = int(r_bp)
+                    tsd_len = int(rr - ll + 1)
+                    if int(min_len) <= tsd_len <= int(max_len):
+                        support = int(r_support + l_poly_support)
+                        candidates.append(
+                            (
+                                sample_pri,
+                                0,
+                                -support,
+                                -tsd_len,
+                                ll,
+                                rr,
+                                f"tsd_{sample}_R_poly_mode_bridge_rescue",
+                            )
+                        )
+
+        if not candidates:
+            return (0, 0, 0, "")
+        candidates.sort()
+        _sample_pri, _fallback_rank, _neg_support, _neg_len, ll, rr, src = candidates[0]
+        if ll <= 0 or rr < ll:
+            return (0, 0, 0, "")
+        return (int(ll), int(rr), int(rr - ll + 1), str(src))
+
+    one_sided_seed = out.apply(
+        lambda r: _one_sided_polyA_tsd_bridge_rescue(r),
+        axis=1,
+        result_type="expand",
+    )
+    one_sided_seed.columns = [
+        "seed_tsd_left_breakpoint",
+        "seed_tsd_right_breakpoint",
+        "seed_tsd_len_estimate",
+        "seed_tsd_evidence_source",
+    ]
+    seed_len = pd.to_numeric(one_sided_seed["seed_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
+    seed_mask = (out["tsd_len_estimate"].fillna(0).astype(int) < 4) & (seed_len >= 4)
+    out.loc[seed_mask, "tsd_left_breakpoint"] = (
+        pd.to_numeric(one_sided_seed.loc[seed_mask, "seed_tsd_left_breakpoint"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+    out.loc[seed_mask, "tsd_right_breakpoint"] = (
+        pd.to_numeric(one_sided_seed.loc[seed_mask, "seed_tsd_right_breakpoint"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+    out.loc[seed_mask, "tsd_len_estimate"] = seed_len.loc[seed_mask].astype(int)
+    out.loc[seed_mask, "tsd_evidence_source"] = (
+        one_sided_seed.loc[seed_mask, "seed_tsd_evidence_source"].fillna("").astype(str)
+    )
+    out["tsd_detected"] = out["tsd_len_estimate"].fillna(0).astype(int) >= 4
+
     def _rescue_tsd_pair_with_reference(
         row: pd.Series,
         ref: pysam.FastaFile,
@@ -2728,32 +3191,11 @@ def _infer_disease_insertion_metrics(
                 r_bp = _to_int_safe(row.get(f"{sample}_R_mei_breakpoint_mode", 0), 0)
                 l_support = _to_int_safe(row.get(f"{sample}_L_mei_supported_reads", 0), 0)
                 r_support = _to_int_safe(row.get(f"{sample}_R_mei_supported_reads", 0), 0)
-                l_poly = _to_int_safe(row.get(f"{sample}_L_poly_at_reads", 0), 0)
-                r_poly = _to_int_safe(row.get(f"{sample}_R_poly_at_reads", 0), 0)
-                # Side-level polyA counts come from MEI-hit subset and can be zero on
-                # polyA-collapsed flanks; add broader locus-level rescue proxies.
-                split_poly = _to_int_safe(row.get(f"split_{sample}_poly_tail_rescued_unique_reads", 0), 0)
-                disc_poly = _to_int_safe(row.get(f"discordant_{sample}_poly_tail_rescued_unique_reads", 0), 0)
-                poly_run = _to_int_safe(row.get(f"{sample}_poly_at_max_run", 0), 0)
-                any_poly = max(l_poly, r_poly, split_poly, disc_poly, 1 if poly_run >= 8 else 0)
                 sample_pri = 0 if sample == "disease" else 1
 
-                # Allow one-sided rescue when the opposite side is absent/weak and
-                # there is any polyA-like signal at the locus.
-                if l_bp > 0 and r_support <= 1 and l_support >= 1 and any_poly >= 1:
-                    # Left breakpoint is stable; opposite side appears polyA-collapsed.
-                    ll = int(l_bp)
-                    rr = int(l_bp + int(min_len) - 1)
-                    candidates.append(
-                        (sample_pri, -l_support, ll, rr, f"tsd_{sample}_L_one_sided_polyA_rescue")
-                    )
-                if r_bp > 0 and l_support <= 1 and r_support >= 1 and any_poly >= 1:
-                    # Right breakpoint is stable; opposite side appears polyA-collapsed.
-                    ll = int(r_bp - int(min_len) + 1)
-                    rr = int(r_bp)
-                    candidates.append(
-                        (sample_pri, -r_support, ll, rr, f"tsd_{sample}_R_one_sided_polyA_rescue")
-                    )
+                # Disable fixed-length one-sided rescue; keep only interval-resolved
+                # rescues (split-gap/bridge/clip-exact) to avoid noisy 4 bp artifacts.
+                _ = sample_pri  # keep deterministic sample ordering if logic is re-enabled
 
             if not candidates:
                 return (0, 0, 0, "")
@@ -2993,6 +3435,41 @@ def _infer_disease_insertion_metrics(
             out["breakpoint_yyrrrr_logodds_shift1_max"] = yyrrrr_shift1_scores
             out["breakpoint_yyrrrr_best_offset"] = yyrrrr_best_offsets
             out["breakpoint_yyrrrr_logodds_shift1_mt_adj"] = yyrrrr_shift1_mt_adj_scores
+
+    # Guardrail: pure polyA/polyT-only TSDs from rescue heuristics are often
+    # reference-tail artifacts (especially in low-MEI-mapping contexts). Treat
+    # these as non-TSD and fall back to non-TSD breakpoint evidence.
+    tsd_src = out.get("tsd_evidence_source", "").fillna("").astype(str)
+    tsd_seq_s = out.get("tsd_seq", "").fillna("").astype(str).str.upper()
+    rescue_src = tsd_src.str.contains("_rescue", regex=False)
+    tsd_len_s = tsd_seq_s.str.len().astype(int)
+    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).astype(float)
+    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).astype(float)
+    dominant_poly_fraction = pd.concat([a_fraction, t_fraction], axis=1).max(axis=1)
+    longest_at_run = tsd_seq_s.str.findall(r"[AT]+").map(
+        lambda parts: max((len(p) for p in parts), default=0)
+    ).astype(int)
+    # Filter both strict polyA/T-only and near-pure A/T tails that contain only
+    # a tiny number of non-A/T bases (common alignment jitter around homopolymers).
+    poly_at_only_tsd = tsd_len_s.ge(4) & tsd_seq_s.str.fullmatch(r"[AT]+", na=False)
+    near_poly_at_tsd = tsd_len_s.ge(8) & dominant_poly_fraction.ge(0.90) & longest_at_run.ge(8)
+    poly_at_filter_mask = rescue_src & (poly_at_only_tsd | near_poly_at_tsd)
+    out["tsd_poly_at_filter_applied"] = poly_at_filter_mask.astype(bool)
+    if poly_at_filter_mask.any():
+        out.loc[poly_at_filter_mask, "tsd_left_breakpoint"] = 0
+        out.loc[poly_at_filter_mask, "tsd_right_breakpoint"] = 0
+        out.loc[poly_at_filter_mask, "tsd_len_estimate"] = 0
+        out.loc[poly_at_filter_mask, "tsd_seq"] = ""
+        out.loc[poly_at_filter_mask, "tsd_detected"] = False
+        out.loc[poly_at_filter_mask, "tsd_evidence_source"] = (
+            out.loc[poly_at_filter_mask, "tsd_evidence_source"].astype(str) + "_filtered_poly_at_only"
+        )
+        bp_fields = out.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
+        bp_fields.columns = ["insertion_breakpoint_pos", "breakpoint_evidence_source"]
+        out["insertion_breakpoint_pos"] = bp_fields["insertion_breakpoint_pos"].astype(int)
+        out["breakpoint_evidence_source"] = bp_fields["breakpoint_evidence_source"].fillna("").astype(str)
+    else:
+        out["tsd_detected"] = out["tsd_len_estimate"].fillna(0).astype(int) >= 4
 
     # Weighted coherence metrics for ranking (annotation-only, no hard filtering).
     out["disease_breakpoint_mode_fraction_weighted"] = (
@@ -5451,7 +5928,15 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
     out["silver_asymmetric_insertion_like"] = disease_asymmetric | control_asymmetric
     out["silver_consistency_pass"] = out["silver_consistency_pass"] | out["silver_asymmetric_insertion_like"]
 
-    out["silver_stage_pass"] = junk_clean & (
+    disease_any_mei = (
+        s("disease_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    ) | (s("disease_full_mei_supported_reads", 0).fillna(0).astype(float) >= 1)
+    control_any_mei = (
+        s("control_mei_supported_reads", 0).fillna(0).astype(float) >= 1
+    ) | (s("control_full_mei_supported_reads", 0).fillna(0).astype(float) >= 1)
+    out["silver_any_mei_support"] = disease_any_mei | control_any_mei
+
+    out["silver_stage_pass"] = junk_clean & out["silver_any_mei_support"] & (
         (
             out["silver_bilateral_support_any"]
             | poly_sidepair_support
@@ -5481,6 +5966,7 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
         silver_fail_reason.loc[target & ~empty] = silver_fail_reason.loc[target & ~empty] + ";" + reason
 
     _append_reason(silver_fail & (~junk_clean), "junk_region_flagged")
+    _append_reason(silver_fail & (~out["silver_any_mei_support"]), "no_mei_signal")
     _append_reason(silver_fail & (~has_support_or_resolution), "no_bilateral_or_breakpoint_span_support")
     _append_reason(silver_fail & (~has_consistency_or_resolution), "no_consistency_signal")
     out["silver_stage_fail_reason"] = ""

@@ -17,6 +17,70 @@ import pysam
 _XVFB_PROC: subprocess.Popen[bytes] | None = None
 
 
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def _igv_singleton_lock(
+    *,
+    lock_path: Path | None = None,
+    timeout_sec: float = 600.0,
+    poll_sec: float = 1.0,
+):
+    """Serialize IGV batch runs to avoid java.net.BindException port collisions."""
+    lock_file = lock_path or Path("/tmp/retro_miner_igv.lock")
+    start = time.monotonic()
+    owner_fd: int | None = None
+    while owner_fd is None:
+        try:
+            owner_fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(owner_fd, f"{os.getpid()}\t{int(time.time())}\n".encode("utf-8"))
+            break
+        except FileExistsError:
+            stale = False
+            try:
+                raw = lock_file.read_text(encoding="utf-8").strip()
+                owner_pid = int(raw.split("\t")[0]) if raw else 0
+                stale = not _pid_is_alive(owner_pid)
+            except Exception:
+                stale = True
+            if stale:
+                try:
+                    lock_file.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            if time.monotonic() - start >= float(timeout_sec):
+                raise RuntimeError(
+                    f"Timed out waiting for IGV singleton lock: {lock_file}. "
+                    "Another IGV batch run may still be active."
+                )
+            time.sleep(max(0.1, float(poll_sec)))
+    try:
+        yield
+    finally:
+        if owner_fd is not None:
+            try:
+                os.close(owner_fd)
+            except OSError:
+                pass
+        try:
+            if lock_file.exists():
+                raw = lock_file.read_text(encoding="utf-8").strip()
+                owner_pid = int(raw.split("\t")[0]) if raw else 0
+                if owner_pid == os.getpid():
+                    lock_file.unlink()
+        except Exception:
+            pass
+
+
 def _headless_display_help() -> str:
     return (
         "IGV requires a graphical display. On headless Linux run: "
@@ -428,6 +492,8 @@ def run_igv_batch(
     *,
     launcher: Path | None = None,
     timeout_sec: int | None = None,
+    bind_retry_attempts: int = 3,
+    bind_retry_sleep_sec: float = 2.0,
 ) -> None:
     igv = resolve_igv_launcher(launcher)
     cmd = _wrap_headless_command(igv, batch_script_path)
@@ -435,19 +501,39 @@ def run_igv_batch(
         if _find_xvfb_binary() is None:
             raise RuntimeError(_headless_display_help())
 
-    with _headless_display_env() as env:
-        result = subprocess.run(
-            cmd,
-            check=False,
-            timeout=timeout_sec,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-    combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
-    if result.returncode != 0 or "HeadlessException" in combined:
-        detail = combined.strip()[-2000:] if combined.strip() else f"exit code {result.returncode}"
-        raise RuntimeError(f"IGV batch run failed: {detail}")
+    max_attempts = max(1, int(bind_retry_attempts))
+    bind_sleep = max(0.1, float(bind_retry_sleep_sec))
+    last_detail = ""
+    with _igv_singleton_lock():
+        for attempt in range(1, max_attempts + 1):
+            with _headless_display_env() as env:
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    timeout=timeout_sec,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+            combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+            bind_error = ("java.net.BindException" in combined) or ("Address already in use" in combined)
+            headless_error = "HeadlessException" in combined
+            failed = (result.returncode != 0) or headless_error or bind_error
+            if not failed:
+                return
+            detail = combined.strip()[-2000:] if combined.strip() else f"exit code {result.returncode}"
+            last_detail = detail
+            if bind_error and attempt < max_attempts:
+                wait_sec = bind_sleep * float(attempt)
+                print(
+                    f"[igv-plots] transient BindException on attempt {attempt}/{max_attempts}; "
+                    f"retrying in {wait_sec:.1f}s",
+                    flush=True,
+                )
+                time.sleep(wait_sec)
+                continue
+            break
+    raise RuntimeError(f"IGV batch run failed: {last_detail}")
 
 
 def generate_gold_review_igv_plots(
