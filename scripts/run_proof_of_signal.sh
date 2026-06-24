@@ -22,6 +22,11 @@ G1K_MEI_VCF=""
 LR_MEI_VCF=""
 OUTDIR="${RTM_RESULTS_DIR}/mei_step1_hg38_chr22"
 REGION="chr22"
+CHR_ARG=""
+CHR_CONCURRENCY="6"
+CHR_ALL_MODE="0"
+# Default resume-safe behavior: skip chromosomes already complete in this outdir.
+SKIP_COMPLETE_EXISTING="1"
 WINDOW_SIZE="200"
 G1K_SPLIT_PADDING_BP="200"
 G1K_DPE_PADDING_MIN_BP="200"
@@ -46,8 +51,69 @@ now_epoch() {
   date +%s
 }
 
+normalize_chr_token() {
+  local raw="$1"
+  local t="${raw#chr}"
+  t="${t#CHR}"
+  case "${t}" in
+    X|x) echo "chrX" ;;
+    Y|y) echo "chrY" ;;
+    [0-9]|1[0-9]|2[0-2]) echo "chr${t}" ;;
+    *)
+      echo "ERROR: invalid chromosome token '${raw}' for --chr. Use 1-22,X,Y or chr1-chr22,chrX,chrY." >&2
+      return 1
+      ;;
+  esac
+}
+
+resolve_chr_list() {
+  local chr_arg="$1"
+  if [[ -z "${chr_arg}" ]]; then
+    # Backward-compatible single-region mode.
+    echo "${REGION}"
+    return 0
+  fi
+  if [[ "${chr_arg,,}" == "all" ]]; then
+    local i
+    for i in $(seq 1 22); do
+      echo "chr${i}"
+    done
+    echo "chrX"
+    echo "chrY"
+    return 0
+  fi
+  IFS=',' read -r -a raw_tokens <<< "${chr_arg}"
+  local tok=""
+  local norm=""
+  for tok in "${raw_tokens[@]}"; do
+    tok="${tok// /}"
+    if [[ -z "${tok}" ]]; then
+      continue
+    fi
+    norm="$(normalize_chr_token "${tok}")" || return 1
+    echo "${norm}"
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --chr)
+      CHR_ARG="$2"
+      shift 2
+      ;;
+    --chr_concurrency|--chr-concurrency)
+      CHR_CONCURRENCY="$2"
+      shift 2
+      ;;
+    --skip-complete|--skip-complete-in-outdir|--skip-complete-today)
+      # --skip-complete-today is kept as a backward-compatible alias.
+      SKIP_COMPLETE_EXISTING="1"
+      shift 1
+      ;;
+    --no-skip-complete)
+      SKIP_COMPLETE_EXISTING="0"
+      shift 1
+      ;;
     --disease-bam)
       DISEASE_BAM="$2"
       shift 2
@@ -152,6 +218,19 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   fi
 fi
 
+PYTHON_BIN="$(command -v "${PYTHON_BIN}")"
+
+if [[ "${RUN_IN_ENV}" == "0" ]]; then
+  PYTHON_BIN_DIR="$(cd "$(dirname "${PYTHON_BIN}")" && pwd)"
+  case ":${PATH}:" in
+    *":${PYTHON_BIN_DIR}:"*) ;;
+    *)
+      export PATH="${PYTHON_BIN_DIR}:${PATH}"
+      echo "[proof-of-signal] prepended python bin dir to PATH for subprocess tools: ${PYTHON_BIN_DIR}"
+      ;;
+  esac
+fi
+
 for required in "${DISEASE_BAM}" "${CONTROL_BAM}" "${MEI_FASTA}"; do
   if [[ -z "${required}" ]]; then
     echo "ERROR: missing required args: --disease-bam, --control-bam, --mei-fasta" >&2
@@ -196,6 +275,18 @@ if [[ -n "${EMPIRICAL_HIGHCONF_BED}" ]] && [[ ! -f "${EMPIRICAL_HIGHCONF_BED}" ]
   exit 1
 fi
 
+required_runtime_bins=(bedtools samtools)
+if [[ "${LOCAL_ASSEMBLY}" == "1" ]]; then
+  required_runtime_bins+=(minimap2 spades.py)
+fi
+for bin in "${required_runtime_bins[@]}"; do
+  if ! command -v "${bin}" >/dev/null 2>&1; then
+    echo "ERROR: required runtime tool not found on PATH: ${bin}" >&2
+    echo "Current PATH=${PATH}" >&2
+    exit 1
+  fi
+done
+
 mkdir -p "${OUTDIR}"
 
 run_cli() {
@@ -207,85 +298,297 @@ run_cli() {
   fi
 }
 
-stage_t0=$(now_epoch)
-echo "[proof-of-signal] stage=extract-split-evidence region=${REGION}"
-run_cli extract-split-evidence \
-  --disease-bam "${DISEASE_BAM}" \
-  --control-bam "${CONTROL_BAM}" \
-  --outdir "${OUTDIR}" \
-  --region "${REGION}" \
-  --min-mapq 20 \
-  --min-mapq-discordant 20 \
-  --min-clip-len 20
-echo "[proof-of-signal] stage=extract-split-evidence done elapsed=$(( $(now_epoch) - stage_t0 ))s"
+consolidate_all_chrom_outputs() {
+  local base_outdir="$1"
+  shift
+  local chr_list=("$@")
+  local basename="candidate_loci.mei.gold_review.tsv"
+  local inputs=()
+  local chr=""
+  for chr in "${chr_list[@]}"; do
+    local p="${base_outdir}/${chr}/${basename}"
+    if [[ -f "${p}" ]]; then
+      inputs+=("${p}")
+    fi
+  done
+  if [[ "${#inputs[@]}" -eq 0 ]]; then
+    echo "[proof-of-signal] no per-chrom gold review tables found to consolidate"
+    return 0
+  fi
+  local out_path="${base_outdir}/${basename}"
+  local inputs_joined
+  inputs_joined="$(printf "%s\n" "${inputs[@]}")"
+  export RTM_MERGE_INPUTS="${inputs_joined}"
+  export RTM_MERGE_OUTPUT="${out_path}"
+  if [[ "${RUN_IN_ENV}" == "1" ]]; then
+    micromamba run -n rtm-miner env PYTHONPATH=src "${PYTHON_BIN}" - <<'PY'
+import os
+from pathlib import Path
+import pandas as pd
+from retro_miner.mei_support import _prioritize_mei_candidates
 
-stage_t0=$(now_epoch)
-echo "[proof-of-signal] stage=build-candidate-loci window_size=${WINDOW_SIZE}"
-run_cli build-candidate-loci \
-  --evidence-dir "${OUTDIR}" \
-  --window-size "${WINDOW_SIZE}" \
-  --pseudocount 1.0 \
-  --segdup-bed "${SEG_DUP_BED}" \
-  --segdup-min-fraction 0.1 \
-  --mappability-bedgraph "${MAPPABILITY_BEDGRAPH}" \
-  --mappability-low-threshold 0.5 \
-  --mappability-min-fraction 0.5 \
-  --gap-bed "${GAP_BED}" \
-  --gap-min-fraction 0.1 \
-  --encode-blacklist-bed "${BLACKLIST_BED}" \
-  --encode-blacklist-min-fraction 0.1
-echo "[proof-of-signal] stage=build-candidate-loci done elapsed=$(( $(now_epoch) - stage_t0 ))s"
+inputs = [p for p in os.environ.get("RTM_MERGE_INPUTS", "").splitlines() if p.strip()]
+out_path = Path(os.environ["RTM_MERGE_OUTPUT"])
+if not inputs:
+    raise SystemExit(0)
 
-stage_t0=$(now_epoch)
-echo "[proof-of-signal] stage=annotate-mei-support"
-annotate_cmd=(
-  annotate-mei-support
-  --evidence-dir "${OUTDIR}"
-  --candidate-loci "${OUTDIR}/candidate_loci.tsv"
-  --mei-fasta "${MEI_FASTA}"
-  --disease-bam-depth "${DISEASE_BAM}"
-  --control-bam-depth "${CONTROL_BAM}"
-  --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
-  --empirical-exclude-segdup-bed "${SEG_DUP_BED}"
-  --empirical-exclude-mappability-bedgraph "${MAPPABILITY_LOW_BED}"
-  --empirical-exclude-mappability-threshold 0.5
-  --empirical-exclude-gap-bed "${GAP_BED}"
-  --empirical-exclude-blacklist-bed "${BLACKLIST_BED}"
-  --empirical-random-windows "${EMPIRICAL_RANDOM_WINDOWS}"
-  --empirical-random-scope "${EMPIRICAL_RANDOM_SCOPE}"
-  --empirical-random-seed "${EMPIRICAL_RANDOM_SEED}"
-)
-if [[ -n "${EMPIRICAL_HIGHCONF_BED}" ]]; then
-  annotate_cmd+=(--empirical-highconf-bed "${EMPIRICAL_HIGHCONF_BED}")
-fi
-if [[ -n "${REFERENCE_FASTA}" ]]; then
-  annotate_cmd+=(--reference-fasta "${REFERENCE_FASTA}")
-fi
-if [[ -n "${RMSK_TABLE}" ]]; then
-  annotate_cmd+=(--rmsk-table "${RMSK_TABLE}")
-fi
-if [[ -n "${G1K_MEI_VCF}" ]]; then
-  annotate_cmd+=(
-    --g1k-mei-vcf "${G1K_MEI_VCF}"
-    --g1k-split-padding-bp "${G1K_SPLIT_PADDING_BP}"
-    --g1k-dpe-padding-min-bp "${G1K_DPE_PADDING_MIN_BP}"
-    --g1k-dpe-padding-max-bp "${G1K_DPE_PADDING_MAX_BP}"
-    --g1k-dpe-padding-tlen-factor "${G1K_DPE_PADDING_TLEN_FACTOR}"
+frames = [pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False) for p in inputs]
+merged = pd.concat(frames, ignore_index=True)
+for col in merged.columns:
+    # Allow prioritizer to perform numeric coercions while preserving empty-string semantics.
+    merged[col] = merged[col].where(merged[col] != "", other=pd.NA)
+
+sorted_out = _prioritize_mei_candidates(merged, stage_first=True)
+for col in sorted_out.columns:
+    if sorted_out[col].dtype == bool:
+        sorted_out[col] = sorted_out[col].astype(int)
+sorted_out = sorted_out.fillna("")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+sorted_out.to_csv(out_path, sep="\t", index=False)
+PY
+  else
+    PYTHONPATH=src "${PYTHON_BIN}" - <<'PY'
+import os
+from pathlib import Path
+import pandas as pd
+from retro_miner.mei_support import _prioritize_mei_candidates
+
+inputs = [p for p in os.environ.get("RTM_MERGE_INPUTS", "").splitlines() if p.strip()]
+out_path = Path(os.environ["RTM_MERGE_OUTPUT"])
+if not inputs:
+    raise SystemExit(0)
+
+frames = [pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False) for p in inputs]
+merged = pd.concat(frames, ignore_index=True)
+for col in merged.columns:
+    # Allow prioritizer to perform numeric coercions while preserving empty-string semantics.
+    merged[col] = merged[col].where(merged[col] != "", other=pd.NA)
+
+sorted_out = _prioritize_mei_candidates(merged, stage_first=True)
+for col in sorted_out.columns:
+    if sorted_out[col].dtype == bool:
+        sorted_out[col] = sorted_out[col].astype(int)
+sorted_out = sorted_out.fillna("")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+sorted_out.to_csv(out_path, sep="\t", index=False)
+PY
+  fi
+  unset RTM_MERGE_INPUTS
+  unset RTM_MERGE_OUTPUT
+  echo "[proof-of-signal] consolidated ${basename} -> ${out_path}"
+}
+
+run_single_pipeline() {
+  local run_region="$1"
+  local run_outdir="$2"
+  local stage_t0
+  mkdir -p "${run_outdir}"
+
+  stage_t0=$(now_epoch)
+  echo "[proof-of-signal] stage=extract-split-evidence region=${run_region} outdir=${run_outdir}"
+  run_cli extract-split-evidence \
+    --disease-bam "${DISEASE_BAM}" \
+    --control-bam "${CONTROL_BAM}" \
+    --outdir "${run_outdir}" \
+    --region "${run_region}" \
+    --min-mapq 20 \
+    --min-mapq-discordant 20 \
+    --min-clip-len 20
+  echo "[proof-of-signal] stage=extract-split-evidence done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+
+  stage_t0=$(now_epoch)
+  echo "[proof-of-signal] stage=build-candidate-loci region=${run_region} window_size=${WINDOW_SIZE}"
+  run_cli build-candidate-loci \
+    --evidence-dir "${run_outdir}" \
+    --window-size "${WINDOW_SIZE}" \
+    --pseudocount 1.0 \
+    --segdup-bed "${SEG_DUP_BED}" \
+    --segdup-min-fraction 0.1 \
+    --mappability-bedgraph "${MAPPABILITY_BEDGRAPH}" \
+    --mappability-low-threshold 0.5 \
+    --mappability-min-fraction 0.5 \
+    --gap-bed "${GAP_BED}" \
+    --gap-min-fraction 0.1 \
+    --encode-blacklist-bed "${BLACKLIST_BED}" \
+    --encode-blacklist-min-fraction 0.1
+  echo "[proof-of-signal] stage=build-candidate-loci done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+
+  stage_t0=$(now_epoch)
+  echo "[proof-of-signal] stage=annotate-mei-support region=${run_region}"
+  annotate_cmd=(
+    annotate-mei-support
+    --evidence-dir "${run_outdir}"
+    --candidate-loci "${run_outdir}/candidate_loci.tsv"
+    --mei-fasta "${MEI_FASTA}"
+    --disease-bam-depth "${DISEASE_BAM}"
+    --control-bam-depth "${CONTROL_BAM}"
+    --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
+    --empirical-exclude-segdup-bed "${SEG_DUP_BED}"
+    --empirical-exclude-mappability-bedgraph "${MAPPABILITY_LOW_BED}"
+    --empirical-exclude-mappability-threshold 0.5
+    --empirical-exclude-gap-bed "${GAP_BED}"
+    --empirical-exclude-blacklist-bed "${BLACKLIST_BED}"
+    --empirical-random-windows "${EMPIRICAL_RANDOM_WINDOWS}"
+    --empirical-random-scope "${EMPIRICAL_RANDOM_SCOPE}"
+    --empirical-random-seed "${EMPIRICAL_RANDOM_SEED}"
   )
-fi
-if [[ -n "${LR_MEI_VCF}" ]]; then
-  annotate_cmd+=(--lr-mei-vcf "${LR_MEI_VCF}")
-fi
-if [[ "${LOCAL_ASSEMBLY}" == "1" ]]; then
-  annotate_cmd+=(--local-assembly)
-fi
-annotate_cmd+=(--out-tsv "${OUTDIR}/candidate_loci.mei.tsv")
-run_cli "${annotate_cmd[@]}"
-echo "[proof-of-signal] stage=annotate-mei-support done elapsed=$(( $(now_epoch) - stage_t0 ))s"
+  if [[ -n "${EMPIRICAL_HIGHCONF_BED}" ]]; then
+    annotate_cmd+=(--empirical-highconf-bed "${EMPIRICAL_HIGHCONF_BED}")
+  fi
+  if [[ -n "${REFERENCE_FASTA}" ]]; then
+    annotate_cmd+=(--reference-fasta "${REFERENCE_FASTA}")
+  fi
+  if [[ -n "${RMSK_TABLE}" ]]; then
+    annotate_cmd+=(--rmsk-table "${RMSK_TABLE}")
+  fi
+  if [[ -n "${G1K_MEI_VCF}" ]]; then
+    annotate_cmd+=(
+      --g1k-mei-vcf "${G1K_MEI_VCF}"
+      --g1k-split-padding-bp "${G1K_SPLIT_PADDING_BP}"
+      --g1k-dpe-padding-min-bp "${G1K_DPE_PADDING_MIN_BP}"
+      --g1k-dpe-padding-max-bp "${G1K_DPE_PADDING_MAX_BP}"
+      --g1k-dpe-padding-tlen-factor "${G1K_DPE_PADDING_TLEN_FACTOR}"
+    )
+  fi
+  if [[ -n "${LR_MEI_VCF}" ]]; then
+    annotate_cmd+=(--lr-mei-vcf "${LR_MEI_VCF}")
+  fi
+  if [[ "${LOCAL_ASSEMBLY}" == "1" ]]; then
+    annotate_cmd+=(--local-assembly)
+  fi
+  annotate_cmd+=(--out-tsv "${run_outdir}/candidate_loci.mei.tsv")
+  run_cli "${annotate_cmd[@]}"
+  echo "[proof-of-signal] stage=annotate-mei-support done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+}
 
-echo "[proof-of-signal] done"
-echo "  ${OUTDIR}/split_evidence.summary.tsv"
-echo "  ${OUTDIR}/candidate_loci.tsv"
-echo "  ${OUTDIR}/candidate_loci.mei.tsv"
-echo "  ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
-echo "  ${OUTDIR}/candidate_loci.mei.gold_review.igv/ (when reference + BAMs provided)"
+if ! [[ "${CHR_CONCURRENCY}" =~ ^[0-9]+$ ]] || [[ "${CHR_CONCURRENCY}" -lt 1 ]]; then
+  echo "ERROR: --chr_concurrency must be a positive integer." >&2
+  exit 1
+fi
+
+mapfile -t CHR_LIST < <(resolve_chr_list "${CHR_ARG}")
+if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
+  echo "ERROR: resolved empty chromosome list from --chr '${CHR_ARG}'." >&2
+  exit 1
+fi
+
+if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; then
+  filtered_chr_list=()
+  skipped_count=0
+  for chr in "${CHR_LIST[@]}"; do
+    chr_outdir="${OUTDIR}/${chr}"
+    chr_log="${OUTDIR}/logs/${chr}.log"
+    chr_gold="${chr_outdir}/candidate_loci.mei.gold_review.tsv"
+    if [[ -f "${chr_log}" ]] && [[ -f "${chr_gold}" ]]; then
+      if grep -q "stage=annotate-mei-support done region=${chr}" "${chr_log}"; then
+        echo "[proof-of-signal] skip-complete skipping ${chr} (already complete in outdir)"
+        skipped_count=$((skipped_count + 1))
+        continue
+      fi
+    fi
+    filtered_chr_list+=("${chr}")
+  done
+  if [[ "${skipped_count}" -gt 0 ]]; then
+    echo "[proof-of-signal] skip-complete skipped=${skipped_count} remaining=${#filtered_chr_list[@]}"
+  fi
+  CHR_LIST=("${filtered_chr_list[@]}")
+  if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
+    echo "[proof-of-signal] all requested chromosomes already complete in outdir; nothing to run"
+    exit 0
+  fi
+fi
+
+if [[ -n "${CHR_ARG}" ]] && [[ "${CHR_ARG,,}" == "all" ]]; then
+  CHR_ALL_MODE="1"
+fi
+
+if [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${LOCAL_ASSEMBLY}" == "1" ]] && [[ "${CHR_CONCURRENCY}" -gt 1 ]]; then
+  echo "ERROR: --chr_concurrency > 1 is not allowed when local assembly is enabled." >&2
+  echo "Use --chr_concurrency 1 or add --no-local-assembly." >&2
+  exit 1
+fi
+
+if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
+  REGION="${CHR_LIST[0]}"
+  run_single_pipeline "${REGION}" "${OUTDIR}"
+  echo "[proof-of-signal] done"
+  echo "  ${OUTDIR}/split_evidence.summary.tsv"
+  echo "  ${OUTDIR}/candidate_loci.tsv"
+  echo "  ${OUTDIR}/candidate_loci.mei.tsv"
+  echo "  ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
+  echo "  ${OUTDIR}/candidate_loci.mei.gold_review.igv/ (when reference + BAMs provided)"
+  exit 0
+fi
+
+BASE_OUTDIR="${OUTDIR}"
+LOG_DIR="${BASE_OUTDIR}/logs"
+mkdir -p "${LOG_DIR}"
+
+echo "[proof-of-signal] multi-chrom run chr_count=${#CHR_LIST[@]} chr_concurrency=${CHR_CONCURRENCY} base_outdir=${BASE_OUTDIR}"
+
+# Rolling worker queue:
+# - launch chromosomes until CHR_CONCURRENCY slots are full
+# - when any child exits, immediately free the slot and launch next chromosome
+# This avoids chunk-wide synchronization barriers and keeps workers busy.
+pids=()
+labels=()
+next_idx=0
+total="${#CHR_LIST[@]}"
+
+launch_next_chr() {
+  local chr="$1"
+  local chr_outdir="${BASE_OUTDIR}/${chr}"
+  local chr_log="${LOG_DIR}/${chr}.log"
+  echo "[proof-of-signal] launch ${chr} -> ${chr_outdir} (log=${chr_log})"
+  (
+    run_single_pipeline "${chr}" "${chr_outdir}"
+  ) >"${chr_log}" 2>&1 &
+  pids+=("$!")
+  labels+=("${chr}")
+}
+
+reap_finished_children() {
+  local remaining_pids=()
+  local remaining_labels=()
+  local idx
+  local pid
+  local chr
+  for idx in "${!pids[@]}"; do
+    pid="${pids[$idx]}"
+    chr="${labels[$idx]}"
+    if kill -0 "${pid}" 2>/dev/null; then
+      remaining_pids+=("${pid}")
+      remaining_labels+=("${chr}")
+      continue
+    fi
+    if wait "${pid}"; then
+      echo "[proof-of-signal] completed ${chr}"
+    else
+      echo "ERROR: chromosome run failed for ${chr}. See ${LOG_DIR}/${chr}.log" >&2
+      exit 1
+    fi
+  done
+  pids=("${remaining_pids[@]}")
+  labels=("${remaining_labels[@]}")
+}
+
+while [[ "${next_idx}" -lt "${total}" ]] || [[ "${#pids[@]}" -gt 0 ]]; do
+  while [[ "${next_idx}" -lt "${total}" ]] && [[ "${#pids[@]}" -lt "${CHR_CONCURRENCY}" ]]; do
+    launch_next_chr "${CHR_LIST[$next_idx]}"
+    next_idx=$((next_idx + 1))
+  done
+
+  reap_finished_children
+  if [[ "${#pids[@]}" -gt 0 ]]; then
+    sleep 2
+  fi
+done
+
+echo "[proof-of-signal] done multi-chrom"
+echo "  per-chrom outputs under: ${BASE_OUTDIR}/chr*/"
+echo "  logs under: ${LOG_DIR}/"
+if [[ "${CHR_ALL_MODE}" == "1" ]]; then
+  echo "[proof-of-signal] consolidating --chr all outputs into ${BASE_OUTDIR}"
+  consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${CHR_LIST[@]}"
+  echo "  consolidated gold review written to: ${BASE_OUTDIR}/candidate_loci.mei.gold_review.tsv"
+fi
