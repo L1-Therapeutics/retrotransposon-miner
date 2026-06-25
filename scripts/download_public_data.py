@@ -40,6 +40,10 @@ BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
 DFAM_CURATED_CONSENSUS_0_URL = "https://www.dfam.org/releases/current/families/FamDB/dfam40.curated.consensus.0.h5.gz"
 UCSC_REPEATBROWSER_HG38REPS_URL = "https://hgdownload.soe.ucsc.edu/hubs/RepeatBrowser2020/hg38reps/hg38reps.fa"
 SUPPORTED_REFERENCES = ("hg19", "hg38", "hs1")
+TEST_DATASET_IDS = {
+    "seqc2_disease_bam",
+    "seqc2_control_bam",
+}
 
 # Datasets grouped by their native coordinate build.
 REFERENCE_DATASET_IDS_BY_BUILD: dict[str, set[str]] = {
@@ -131,6 +135,10 @@ def _select_dataset_ids_for_references(selected_refs: tuple[str, ...]) -> set[st
             "ucsc_repeatbrowser_hg38reps_fasta",
         }
     )
+
+    # Always include chr22-sliced SEQC2 smoke-test pair.
+    # These are lightweight (remote-sliced), and are required for end-to-end validation.
+    ids.update(TEST_DATASET_IDS)
 
     # Equivalent polymorphism outputs for every selected target require source datasets + chains.
     if "hg38" in selected_refs:
