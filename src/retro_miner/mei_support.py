@@ -34,6 +34,61 @@ _MIN_MEI_ANCHOR_BP_RELAXED = 15
 _MIN_REPORTABLE_MEI_SPAN_BP = 20
 
 
+def _reference_contig_aliases(chrom: str) -> list[str]:
+    c = str(chrom or "").strip()
+    if not c:
+        return []
+    out: list[str] = [c]
+    low = c.lower()
+    if low.startswith("chr"):
+        bare = c[3:]
+        if bare:
+            out.append(bare)
+            if bare.lower() == "m":
+                out.extend(["MT", "mt", "M", "m"])
+    else:
+        out.append(f"chr{c}")
+        if low in {"m", "mt"}:
+            out.extend(["chrM", "chrm", "MT", "mt", "M"])
+    if low == "chrm":
+        out.extend(["MT", "mt", "M", "m"])
+    elif low == "mt":
+        out.extend(["chrM", "chrm", "M", "m"])
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for name in out:
+        if name in seen:
+            continue
+        seen.add(name)
+        dedup.append(name)
+    return dedup
+
+
+def _make_reference_fetcher(ref: pysam.FastaFile):
+    ref_names = set(ref.references)
+    resolved_cache: dict[str, str] = {}
+
+    def fetch(chrom: str, start0: int, end0: int) -> str:
+        c = str(chrom or "").strip()
+        if not c:
+            return ""
+        resolved = resolved_cache.get(c, "")
+        if not resolved:
+            for cand in _reference_contig_aliases(c):
+                if cand in ref_names:
+                    resolved = cand
+                    break
+            resolved_cache[c] = resolved
+        if not resolved:
+            return ""
+        try:
+            return ref.fetch(resolved, int(start0), int(end0)).upper()
+        except Exception:
+            return ""
+
+    return fetch
+
+
 def _load_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
     parquet_path = base_dir / f"{stem}.{sample}.parquet"
     tsv_path = base_dir / f"{stem}.{sample}.tsv"
@@ -502,6 +557,130 @@ def _poly_at_stats(seq: str) -> tuple[int, float, str]:
             cur = 0
             prev = ""
     return (int(best), float(at_bases) / float(len(s)), best_base)
+
+
+def _normalized_clip_seq(seq: str, *, max_len: int = 80) -> str:
+    s = "".join(ch for ch in (seq or "").upper() if ch in {"A", "C", "G", "T"})
+    if not s:
+        return ""
+    return s[: int(max_len)]
+
+
+def _clip_shannon_entropy(seq: str) -> float:
+    s = _normalized_clip_seq(seq)
+    if not s:
+        return 0.0
+    n = float(len(s))
+    counts = {b: s.count(b) for b in ("A", "C", "G", "T")}
+    ent = 0.0
+    for v in counts.values():
+        if v <= 0:
+            continue
+        p = float(v) / n
+        ent -= p * math.log2(p)
+    return float(ent)
+
+
+def _breakpoint_proximal_clip_seq(seq: str, side: str, *, max_len: int = 40) -> str:
+    s = _normalized_clip_seq(seq, max_len=200)
+    if not s:
+        return ""
+    side_u = (side or "").upper()
+    if side_u == "L":
+        # L-clips are left-anchored; breakpoint-proximal bases are near clip end.
+        return s[-int(max_len) :]
+    # R-clips are right-anchored; breakpoint-proximal bases are near clip start.
+    return s[: int(max_len)]
+
+
+def _is_informative_split_clip(seq: str, *, min_len: int = 20, min_non_at_fraction: float = 0.15, min_entropy: float = 1.20) -> bool:
+    s = _normalized_clip_seq(seq)
+    if len(s) < int(min_len):
+        return False
+    non_at = sum(1 for ch in s if ch in {"C", "G"})
+    non_at_fraction = float(non_at) / float(len(s))
+    if non_at_fraction < float(min_non_at_fraction):
+        return False
+    return _clip_shannon_entropy(s) >= float(min_entropy)
+
+
+def _pair_clip_similarity(a: str, b: str) -> float:
+    """Breakpoint-proximal basewise identity.
+
+    Compare only the overlapping breakpoint-proximal span. This reflects
+    "do reads agree at the same reference-relative offset?" rather than
+    generic global sequence similarity.
+    """
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n <= 0:
+        return 0.0
+    aa = a[:n]
+    bb = b[:n]
+    matches = sum(1 for x, y in zip(aa, bb) if x == y)
+    return float(matches) / float(n)
+
+
+def _clip_overlap_consistency_stats(group: pd.DataFrame) -> tuple[int, float, float]:
+    if group.empty:
+        return (0, 0.0, 0.0)
+    work = group.copy()
+    # Keep one representative clip per read (highest MEI score first) so one
+    # read with multiple alignments does not dominate overlap statistics.
+    if "read_name" in work.columns:
+        work["mei_score_effective"] = pd.to_numeric(work.get("mei_score_effective", 0.0), errors="coerce").fillna(0.0)
+        work = work.sort_values("mei_score_effective", ascending=False).drop_duplicates("read_name", keep="first")
+    work = work.head(40).copy()
+    side_hint = ""
+    if "clip_side" in work.columns and not work.empty:
+        side_hint = str(work["clip_side"].iloc[0] or "")
+    informative_rows = []
+    for row in work.itertuples(index=False):
+        seq = str(getattr(row, "clip_seq", "") or "")
+        side = str(getattr(row, "clip_side", side_hint) or side_hint)
+        if not _is_informative_split_clip(seq):
+            continue
+        prox = _breakpoint_proximal_clip_seq(seq, side)
+        if len(prox) < 12:
+            continue
+        pos_val = int(getattr(row, "pos", 0) or 0) if hasattr(row, "pos") else 0
+        informative_rows.append((pos_val, prox))
+    informative_reads = int(len(informative_rows))
+    if informative_reads < 2:
+        return (informative_reads, 0.0, 0.0)
+    pos_counts: dict[int, int] = defaultdict(int)
+    for p, _ in informative_rows:
+        pos_counts[int(p)] += 1
+    mode_support = max(pos_counts.values()) if pos_counts else 0
+    mode_fraction = float(mode_support) / float(informative_reads) if informative_reads > 0 else 0.0
+    sims: list[float] = []
+    ge20 = 0
+    total_pairs = 0
+    for i in range(informative_reads):
+        _, a = informative_rows[i]
+        for j in range(i + 1, informative_reads):
+            _, b = informative_rows[j]
+            raw_identity = _pair_clip_similarity(a, b)
+            # Random DNA baseline is 0.25; scale to [0,1] above chance.
+            sim = max(0.0, min(1.0, (raw_identity - 0.25) / 0.75))
+            sims.append(float(sim))
+            total_pairs += 1
+            if sim >= 0.20:
+                ge20 += 1
+    if not sims or total_pairs <= 0:
+        return (informative_reads, 0.0, 0.0)
+    sims_sorted = sorted(sims)
+    mid = len(sims_sorted) // 2
+    if len(sims_sorted) % 2 == 1:
+        median_sim = float(sims_sorted[mid])
+    else:
+        median_sim = float((sims_sorted[mid - 1] + sims_sorted[mid]) / 2.0)
+    frac_ge20 = float(ge20) / float(total_pairs)
+    # Penalize diffuse breakpoint-position clouds: real events usually have
+    # consistent split positions, noisy loci often do not.
+    median_sim = float(median_sim) * float(mode_fraction)
+    return (informative_reads, float(median_sim), float(frac_ge20))
 
 
 def _collect_indel_breakpoint_evidence(
@@ -1173,6 +1352,9 @@ def _aggregate_side_metrics(
                 f"{sample_prefix}_{side}_poly_at_reads",
                 f"{sample_prefix}_{side}_poly_at_fraction",
                 f"{sample_prefix}_{side}_poly_at_max_run",
+                f"{sample_prefix}_{side}_clip_overlap_informative_reads",
+                f"{sample_prefix}_{side}_clip_overlap_jaccard_median",
+                f"{sample_prefix}_{side}_clip_overlap_pair_ge20_fraction",
             ]
         )
 
@@ -1406,6 +1588,20 @@ def _aggregate_side_metrics(
         .nunique()
         .rename(columns={"pos": f"{sample_prefix}_{side}_mei_breakpoint_unique_positions"})
     )
+    overlap_rows: list[dict[str, object]] = []
+    for (chrom, ws, we), grp in side_df.groupby(["chrom", "window_start", "window_end"], sort=False):
+        informative_reads, jaccard_median, pair_ge20_fraction = _clip_overlap_consistency_stats(grp)
+        overlap_rows.append(
+            {
+                "chrom": str(chrom),
+                "window_start": int(ws),
+                "window_end": int(we),
+                f"{sample_prefix}_{side}_clip_overlap_informative_reads": int(informative_reads),
+                f"{sample_prefix}_{side}_clip_overlap_jaccard_median": float(jaccard_median),
+                f"{sample_prefix}_{side}_clip_overlap_pair_ge20_fraction": float(pair_ge20_fraction),
+            }
+        )
+    overlap_tbl = pd.DataFrame(overlap_rows)
     agg = (
         side_df.groupby(["chrom", "window_start", "window_end"], as_index=False)
         .agg(
@@ -1457,6 +1653,11 @@ def _aggregate_side_metrics(
             on=["chrom", "window_start", "window_end"],
             how="left",
         )
+        .merge(
+            overlap_tbl,
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
     )
     agg[f"{sample_prefix}_{side}_mei_breakpoint_mode_fraction"] = (
         agg["mode_support_reads"] / agg[f"{sample_prefix}_{side}_mei_supported_reads"]
@@ -1477,6 +1678,18 @@ def _aggregate_side_metrics(
         agg[f"{sample_prefix}_{side}_mei_target_len"],
         errors="coerce",
     ).fillna(0).astype(int)
+    agg[f"{sample_prefix}_{side}_clip_overlap_informative_reads"] = pd.to_numeric(
+        agg[f"{sample_prefix}_{side}_clip_overlap_informative_reads"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+    agg[f"{sample_prefix}_{side}_clip_overlap_jaccard_median"] = pd.to_numeric(
+        agg[f"{sample_prefix}_{side}_clip_overlap_jaccard_median"],
+        errors="coerce",
+    ).fillna(0.0).astype(float)
+    agg[f"{sample_prefix}_{side}_clip_overlap_pair_ge20_fraction"] = pd.to_numeric(
+        agg[f"{sample_prefix}_{side}_clip_overlap_pair_ge20_fraction"],
+        errors="coerce",
+    ).fillna(0.0).astype(float)
     agg = agg.drop(columns=["mode_support_reads"])
     return agg
 
@@ -2824,7 +3037,7 @@ def _infer_disease_insertion_metrics(
 
     def _rescue_tsd_pair_with_reference(
         row: pd.Series,
-        ref: pysam.FastaFile,
+        fetch_ref,
         *,
         shift_bp: int = 12,
         min_len: int = 4,
@@ -2870,10 +3083,7 @@ def _infer_disease_insertion_metrics(
                     tsd_len = int(rr - ll + 1)
                     if tsd_len < int(min_len) or tsd_len > int(max_len):
                         continue
-                    try:
-                        seq = ref.fetch(chrom, ll - 1, rr).upper()
-                    except Exception:
-                        continue
+                    seq = fetch_ref(chrom, ll - 1, rr)
                     if len(seq) != tsd_len or not seq:
                         continue
                     if "N" in seq:
@@ -2928,8 +3138,9 @@ def _infer_disease_insertion_metrics(
             return lookup
 
         with pysam.FastaFile(str(reference_fasta)) as ref:
+            fetch_ref = _make_reference_fetcher(ref)
             rescued = out.apply(
-                lambda r: _rescue_tsd_pair_with_reference(r, ref),
+                lambda r: _rescue_tsd_pair_with_reference(r, fetch_ref),
                 axis=1,
                 result_type="expand",
             )
@@ -2993,7 +3204,7 @@ def _infer_disease_insertion_metrics(
 
         def _clip_exact_tsd_rescue(
             row: pd.Series,
-            ref: pysam.FastaFile,
+            fetch_ref,
             *,
             min_len: int = 4,
             max_len: int = 30,
@@ -3035,9 +3246,8 @@ def _infer_disease_insertion_metrics(
                         continue
                     start0 = max(0, bp - int(flank_bp) - 1)
                     end0 = max(start0 + 1, bp + int(flank_bp))
-                    try:
-                        window_seq = ref.fetch(chrom, start0, end0).upper()
-                    except Exception:
+                    window_seq = fetch_ref(chrom, start0, end0)
+                    if not window_seq:
                         continue
                     center_idx = int(bp - 1 - start0)
                     cand_votes: dict[tuple[int, int, str], int] = {}
@@ -3111,7 +3321,7 @@ def _infer_disease_insertion_metrics(
             return best_value
 
         clip_exact = out.apply(
-            lambda r: _clip_exact_tsd_rescue(r, ref),
+            lambda r: _clip_exact_tsd_rescue(r, fetch_ref),
             axis=1,
             result_type="expand",
         )
@@ -3161,7 +3371,7 @@ def _infer_disease_insertion_metrics(
 
         def _one_sided_polyA_tsd_rescue(
             row: pd.Series,
-            ref: pysam.FastaFile,
+            fetch_ref,
             *,
             min_len: int = 4,
         ) -> tuple[int, int, int, str]:
@@ -3204,17 +3414,14 @@ def _infer_disease_insertion_metrics(
             for _sample_pri, _neg_support, ll, rr, src in candidates:
                 if ll <= 0 or rr < ll:
                     continue
-                try:
-                    seq = ref.fetch(chrom, ll - 1, rr).upper()
-                except Exception:
-                    continue
+                seq = fetch_ref(chrom, ll - 1, rr)
                 if len(seq) != int(min_len) or not seq or "N" in seq:
                     continue
                 return (ll, rr, int(min_len), src)
             return (0, 0, 0, "")
 
         one_sided = out.apply(
-            lambda r: _one_sided_polyA_tsd_rescue(r, ref),
+            lambda r: _one_sided_polyA_tsd_rescue(r, fetch_ref),
             axis=1,
             result_type="expand",
         )
@@ -3290,6 +3497,7 @@ def _infer_disease_insertion_metrics(
     out["breakpoint_yyrrrr_logodds_shift1_mt_adj"] = float("nan")
     if reference_fasta is not None:
         with pysam.FastaFile(str(reference_fasta)) as ref:
+            fetch_ref = _make_reference_fetcher(ref)
             seqs = []
             contexts_11bp: list[str] = []
             l1_hexamers: list[str] = []
@@ -3319,10 +3527,7 @@ def _infer_disease_insertion_metrics(
                     chrom = str(row.chrom)
                     start0 = int(getattr(row, "tsd_left_breakpoint", 0)) - 1
                     end0 = int(getattr(row, "tsd_right_breakpoint", 0))
-                    try:
-                        seqs.append(ref.fetch(chrom, start0, end0).upper())
-                    except Exception:
-                        seqs.append("")
+                    seqs.append(fetch_ref(chrom, start0, end0))
 
                 bp = int(getattr(row, "insertion_breakpoint_pos", 0))
                 if bp <= 0:
@@ -3355,14 +3560,8 @@ def _infer_disease_insertion_metrics(
                 # 6 bp motif window near cleavage preference (4 upstream + 2 downstream).
                 start0_6 = max(0, bp - 5)
                 end0_6 = max(start0_6 + 1, bp + 1)
-                try:
-                    ctx11 = ref.fetch(chrom, start0_11, end0_11).upper()
-                except Exception:
-                    ctx11 = ""
-                try:
-                    hex6 = ref.fetch(chrom, start0_6, end0_6).upper()
-                except Exception:
-                    hex6 = ""
+                ctx11 = fetch_ref(chrom, start0_11, end0_11)
+                hex6 = fetch_ref(chrom, start0_6, end0_6)
                 patt = f"{hex6[:4]}/{hex6[4:6]}" if len(hex6) == 6 else ""
                 oriented_hex6, oriented_ctx11, orientation_source = _orient_to_insertion_strand(
                     hexamer=hex6,
@@ -3452,7 +3651,10 @@ def _infer_disease_insertion_metrics(
     # Filter both strict polyA/T-only and near-pure A/T tails that contain only
     # a tiny number of non-A/T bases (common alignment jitter around homopolymers).
     poly_at_only_tsd = tsd_len_s.ge(4) & tsd_seq_s.str.fullmatch(r"[AT]+", na=False)
-    near_poly_at_tsd = tsd_len_s.ge(8) & dominant_poly_fraction.ge(0.90) & longest_at_run.ge(8)
+    # Keep rescue-derived TSDs conservative in low-complexity sequence:
+    # a long pure/poly-A/T-like signature with >=6bp dominant run is often a
+    # repeat-context artifact rather than a true short duplication footprint.
+    near_poly_at_tsd = tsd_len_s.ge(8) & dominant_poly_fraction.ge(0.90) & longest_at_run.ge(6)
     poly_at_filter_mask = rescue_src & (poly_at_only_tsd | near_poly_at_tsd)
     out["tsd_poly_at_filter_applied"] = poly_at_filter_mask.astype(bool)
     if poly_at_filter_mask.any():
@@ -3590,6 +3792,7 @@ def _recompute_breakpoint_sequence_metrics(candidates: pd.DataFrame, reference_f
     if reference_fasta is None:
         return out
     with pysam.FastaFile(str(reference_fasta)) as ref:
+        fetch_ref = _make_reference_fetcher(ref)
         contexts_11bp: list[str] = []
         l1_hexamers: list[str] = []
         l1_patterns: list[str] = []
@@ -3641,14 +3844,8 @@ def _recompute_breakpoint_sequence_metrics(candidates: pd.DataFrame, reference_f
             end0_11 = max(start0_11 + 1, bp + 5)
             start0_6 = max(0, bp - 5)
             end0_6 = max(start0_6 + 1, bp + 1)
-            try:
-                ctx11 = ref.fetch(chrom, start0_11, end0_11).upper()
-            except Exception:
-                ctx11 = ""
-            try:
-                hex6 = ref.fetch(chrom, start0_6, end0_6).upper()
-            except Exception:
-                hex6 = ""
+            ctx11 = fetch_ref(chrom, start0_11, end0_11)
+            hex6 = fetch_ref(chrom, start0_6, end0_6)
             patt = f"{hex6[:4]}/{hex6[4:6]}" if len(hex6) == 6 else ""
             oriented_hex6, oriented_ctx11, orientation_source = _orient_to_insertion_strand(
                 hexamer=hex6,
@@ -4471,6 +4668,40 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     motif_boost = s("breakpoint_l1_en_motif_like", False).fillna(False).astype(bool).astype(float)
     motif_logodds = s("breakpoint_yyrrrr_logodds_shift1_mt_adj", 0.0).astype(float).fillna(0.0)
     motif_logodds_scaled = (motif_logodds / 6.0).clip(lower=0.0, upper=1.0)
+    # Split-read overlap consistency across clipped sequences (k-mer Jaccard):
+    # true loci tend to have multiple clips with mutually consistent overlap,
+    # while slippage/noise loci often do not.
+    overlap_med_cols = [
+        "disease_L_clip_overlap_jaccard_median",
+        "disease_R_clip_overlap_jaccard_median",
+        "control_L_clip_overlap_jaccard_median",
+        "control_R_clip_overlap_jaccard_median",
+    ]
+    overlap_n_cols = [
+        "disease_L_clip_overlap_informative_reads",
+        "disease_R_clip_overlap_informative_reads",
+        "control_L_clip_overlap_informative_reads",
+        "control_R_clip_overlap_informative_reads",
+    ]
+    overlap_med_tbl = pd.concat([s(c, 0.0).astype(float).fillna(0.0) for c in overlap_med_cols], axis=1)
+    overlap_n_tbl = pd.concat([s(c, 0).astype(float).fillna(0.0) for c in overlap_n_cols], axis=1)
+    # Keep side-wise alignment between median and informative-read tables.
+    # The raw column names differ (jaccard_median vs informative_reads), so
+    # rename the mask columns to the median-table columns before where().
+    overlap_valid = overlap_n_tbl.copy()
+    overlap_valid.columns = overlap_med_tbl.columns
+    overlap_valid = overlap_valid >= 2.0
+    overlap_med_masked = overlap_med_tbl.where(overlap_valid, 0.0)
+    event_clip_overlap_consistency = overlap_med_masked.max(axis=1).fillna(0.0).clip(lower=0.0, upper=1.0)
+    event_clip_overlap_informative_reads_max = overlap_n_tbl.max(axis=1).fillna(0.0)
+    # One-good-side anchor: allow true asymmetric events where one side is
+    # consistently aligned but the opposite (often polyA/T-rich) side is noisy.
+    overlap_side_strong = ((overlap_n_tbl >= 3.0) & (overlap_med_masked >= 0.55)).any(axis=1)
+    overlap_side_very_strong = ((overlap_n_tbl >= 2.0) & (overlap_med_masked >= 0.70)).any(axis=1)
+    event_one_side_overlap_anchor = overlap_side_strong | overlap_side_very_strong
+    out["event_clip_overlap_consistency"] = event_clip_overlap_consistency
+    out["event_clip_overlap_informative_reads_max"] = event_clip_overlap_informative_reads_max.astype(int)
+    out["event_one_side_overlap_anchor"] = event_one_side_overlap_anchor.astype(bool)
 
     base_score = (
         0.20 * event_subfamily_purity
@@ -4484,6 +4715,7 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         + 0.05 * polyA_event
         + 0.03 * motif_boost
         + 0.02 * motif_logodds_scaled
+        + 0.08 * event_clip_overlap_consistency
     )
     base_score = (base_score + 0.05 * mapq_event).clip(lower=0.0, upper=1.0)
 
@@ -4659,6 +4891,21 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out["event_polyA_or_tsd_or_motif"] = (
         (tsd_boost >= 1.0) | (polyA_event >= 0.20) | (motif_boost >= 1.0) | (motif_logodds_scaled >= 0.25)
     )
+    tsd_poly_filtered = s("tsd_poly_at_filter_applied", False).fillna(False).astype(bool)
+    low_complexity_context = (polyA_event >= 0.20) | tsd_poly_filtered
+    one_side_overlap_rescue = (
+        event_one_side_overlap_anchor
+        & (
+            (tsd_boost >= 1.0)
+            | out["disease_discordant_mei_consistent_support"]
+            | out["control_discordant_mei_consistent_support"]
+        )
+    )
+    overlap_consistent_for_context = (
+        (~low_complexity_context)
+        | (event_clip_overlap_consistency >= 0.20)
+        | one_side_overlap_rescue
+    )
     out["event_quality_clean"] = (
         (s("junk_flag_count", 0).fillna(0).astype(int) == 0)
         & (mapq_event >= 0.30)
@@ -4674,6 +4921,7 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         & out["event_quality_clean"]
         & out["event_polyA_or_tsd_or_motif"]
         & (s("coherence_score", 0.0).astype(float) >= 0.55)
+        & overlap_consistent_for_context
     )
     provisional_one_sided = (
         (~high_conf_pass)
@@ -4685,6 +4933,11 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         )
         & out["event_family_consistent"]
         & (s("coherence_score", 0.0).astype(float) >= 0.50)
+        & (
+            (~low_complexity_context)
+            | (event_clip_overlap_consistency >= 0.12)
+            | one_side_overlap_rescue
+        )
     )
     complex_sidepair_event = (
         out["disease_mei_with_complex_sidepair"] | out["control_mei_with_complex_sidepair"]
@@ -4754,25 +5007,45 @@ def _consistent_family_mask(df: pd.DataFrame) -> pd.Series:
     return df.apply(_is_consistent, axis=1)
 
 
+def _depth_stats_for_interval(
+    bam: pysam.AlignmentFile,
+    chrom: str,
+    start_1based: int,
+    end_1based: int,
+) -> tuple[float, float]:
+    if end_1based < start_1based:
+        return (0.0, 0.0)
+    start0 = max(0, int(start_1based) - 1)
+    end0 = max(start0 + 1, int(end_1based))
+    try:
+        cov = bam.count_coverage(chrom, start0, end0, quality_threshold=0, read_callback="all")
+    except ValueError:
+        return (0.0, 0.0)
+    span = end0 - start0
+    if span <= 0:
+        return (0.0, 0.0)
+    depths = [a + c + g + t for a, c, g, t in zip(cov[0], cov[1], cov[2], cov[3])]
+    if not depths:
+        return (0.0, 0.0)
+    total_depth = float(sum(depths))
+    mean_depth = float(total_depth) / float(span)
+    peak_depth = float(max(depths))
+    return (mean_depth, peak_depth)
+
+
 def _mean_depth_for_interval(
     bam: pysam.AlignmentFile,
     chrom: str,
     start_1based: int,
     end_1based: int,
 ) -> float:
-    if end_1based < start_1based:
-        return 0.0
-    start0 = max(0, int(start_1based) - 1)
-    end0 = max(start0 + 1, int(end_1based))
-    try:
-        cov = bam.count_coverage(chrom, start0, end0, quality_threshold=0, read_callback="all")
-    except ValueError:
-        return 0.0
-    span = end0 - start0
-    if span <= 0:
-        return 0.0
-    total_depth = float(sum(cov[0]) + sum(cov[1]) + sum(cov[2]) + sum(cov[3]))
-    return float(total_depth) / float(span)
+    mean_depth, _ = _depth_stats_for_interval(
+        bam=bam,
+        chrom=chrom,
+        start_1based=start_1based,
+        end_1based=end_1based,
+    )
+    return mean_depth
 
 
 def _has_long_soft_clip(read: pysam.AlignedSegment, min_softclip: int = 20) -> bool:
@@ -4828,6 +5101,7 @@ def _context_quality_metrics_for_interval(
     except ValueError:
         return {
             "local_bam_mean_depth": 0.0,
+            "local_bam_peak_depth": 0.0,
             "context_non_sv_reads": 0.0,
             "context_mapq_mean": 0.0,
             "context_mapq_lt20_fraction": 0.0,
@@ -4850,8 +5124,12 @@ def _context_quality_metrics_for_interval(
     low_mapq_frac = float(sum(1 for q in mapqs if q < 20) / len(mapqs)) if mapqs else 0.0
     nm_mean = float(sum(nm_per_100bp) / len(nm_per_100bp)) if nm_per_100bp else 0.0
     nm_p90 = float(pd.Series(nm_per_100bp).quantile(0.9)) if nm_per_100bp else 0.0
+    mean_depth, peak_depth = _depth_stats_for_interval(
+        bam=bam, chrom=chrom, start_1based=start_1based, end_1based=end_1based
+    )
     return {
-        "local_bam_mean_depth": _mean_depth_for_interval(bam, chrom=chrom, start_1based=start_1based, end_1based=end_1based),
+        "local_bam_mean_depth": mean_depth,
+        "local_bam_peak_depth": peak_depth,
         "context_non_sv_reads": float(len(mapqs)),
         "context_mapq_mean": mapq_mean,
         "context_mapq_lt20_fraction": low_mapq_frac,
@@ -5352,6 +5630,8 @@ def _annotate_bam_depth_for_consistent_loci(
     out["depth_filter_pass"] = False
     out["disease_local_bam_mean_depth"] = 0.0
     out["control_local_bam_mean_depth"] = 0.0
+    out["disease_local_bam_peak_depth"] = 0.0
+    out["control_local_bam_peak_depth"] = 0.0
     out["disease_context_non_sv_reads"] = 0
     out["control_context_non_sv_reads"] = 0
     out["disease_context_mapq_mean"] = 0.0
@@ -5477,6 +5757,8 @@ def _annotate_bam_depth_for_consistent_loci(
             n_metrics = _context_quality_metrics_for_interval(control_bam, chrom=chrom, start_1based=start, end_1based=end)
             out.at[idx, "disease_local_bam_mean_depth"] = float(t_metrics["local_bam_mean_depth"])
             out.at[idx, "control_local_bam_mean_depth"] = float(n_metrics["local_bam_mean_depth"])
+            out.at[idx, "disease_local_bam_peak_depth"] = float(t_metrics.get("local_bam_peak_depth", 0.0))
+            out.at[idx, "control_local_bam_peak_depth"] = float(n_metrics.get("local_bam_peak_depth", 0.0))
             out.at[idx, "disease_context_non_sv_reads"] = int(t_metrics["context_non_sv_reads"])
             out.at[idx, "control_context_non_sv_reads"] = int(n_metrics["context_non_sv_reads"])
             out.at[idx, "disease_context_mapq_mean"] = float(t_metrics["context_mapq_mean"])
@@ -6020,6 +6302,43 @@ def _assign_gold_stage(
         if empirical_stage:
             out.loc[silver, "gold_stage_fail_reason"] = "empirical_not_available"
 
+    # Non-empirical depth-outlier guard for obvious pileup artifacts.
+    # Use a run-adaptive 3-sigma threshold and keep known overlaps exempt.
+    known_poly = _df_col_series(out, "known_mei_polymorphism", False).fillna(False).astype(bool)
+    d_depth_peak = pd.to_numeric(_df_col_series(out, "disease_local_bam_peak_depth", 0.0), errors="coerce").fillna(0.0)
+    c_depth_peak = pd.to_numeric(_df_col_series(out, "control_local_bam_peak_depth", 0.0), errors="coerce").fillna(0.0)
+    max_depth = pd.concat([d_depth_peak, c_depth_peak], axis=1).max(axis=1)
+    # Fallback for older outputs that may not carry peak-depth fields.
+    if float(max_depth.max()) <= 0.0:
+        d_depth_mean = pd.to_numeric(_df_col_series(out, "disease_local_bam_mean_depth", 0.0), errors="coerce").fillna(0.0)
+        c_depth_mean = pd.to_numeric(_df_col_series(out, "control_local_bam_mean_depth", 0.0), errors="coerce").fillna(0.0)
+        max_depth = pd.concat([d_depth_mean, c_depth_mean], axis=1).max(axis=1)
+    depth_ref = max_depth.loc[silver & max_depth.gt(0.0)]
+    if depth_ref.empty:
+        depth_ref = max_depth.loc[max_depth.gt(0.0)]
+    depth_mean = float(depth_ref.mean()) if not depth_ref.empty else 0.0
+    depth_sigma = float(depth_ref.std(ddof=0)) if not depth_ref.empty else 0.0
+    if depth_sigma > 1e-6:
+        depth_z = (max_depth - depth_mean) / depth_sigma
+        depth_outlier = depth_z >= 3.0
+    else:
+        depth_outlier = pd.Series(False, index=out.index)
+    # Depth-only artifact gate (user requested): reject extreme peak-depth
+    # outliers among silver loci, except known polymorphism overlaps.
+    depth_pileup_artifact = (
+        silver
+        & (~known_poly)
+        & depth_outlier
+    )
+    if depth_pileup_artifact.any():
+        out.loc[depth_pileup_artifact, "gold_stage_pass"] = False
+        prev = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
+        fail_tag = "depth_pileup_artifact"
+        need_append = depth_pileup_artifact & prev.ne("")
+        need_set = depth_pileup_artifact & prev.eq("")
+        out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
+        out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
+
     stage_fail_reason = _df_col_series(out, "stage_fail_reason", "").fillna("").astype(str)
     gold_fail_reason = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
     silver_failed_gold = silver & (~out["gold_stage_pass"]) & gold_fail_reason.ne("")
@@ -6135,6 +6454,34 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
         + 0.35 * (out["_prio_discordant_reads_max"].astype(float).map(math.log1p))
         + 0.15 * mei_mapped_frac
     )
+    # Down-rank low-complexity pileup artifacts:
+    # - strong A/T-rich/polyA signatures,
+    # - weak cross-read coherence,
+    # - very high support pileups that can arise in noisy simple-repeat contexts.
+    # Keep known polymorphisms exempt from this penalty.
+    tsd_seq_s = _df_col_series(out, "tsd_seq", "").fillna("").astype(str).str.upper()
+    tsd_len_s = tsd_seq_s.str.len().astype(int)
+    tsd_at_fraction = (
+        (tsd_seq_s.str.count("A") + tsd_seq_s.str.count("T")) / tsd_len_s.replace(0, pd.NA)
+    ).fillna(0.0).astype(float)
+    tsd_longest_at_run = tsd_seq_s.str.findall(r"[AT]+").map(lambda runs: max((len(run) for run in runs), default=0)).astype(int)
+    tsd_poly_filtered = _df_col_series(out, "tsd_poly_at_filter_applied", False).fillna(False).astype(bool)
+    poly_run = _df_col_series(out, "poly_at_max_run", 0).fillna(0).astype(int)
+    poly_reads = _df_col_series(out, "poly_at_reads", 0).fillna(0).astype(int)
+    coherence = _df_col_series(out, "coherence_score", 0.0).fillna(0.0).astype(float)
+    support_pileup = (out["_prio_split_reads_max"] + out["_prio_discordant_reads_max"]).astype(int)
+    complex_signal = _df_col_series(out, "complex_sv_signal_score", 0.0).fillna(0.0).astype(float)
+    known_poly = _df_col_series(out, "known_mei_polymorphism", False).fillna(False).astype(bool)
+    at_rich_tsd_like = tsd_len_s.ge(8) & tsd_at_fraction.ge(0.85) & tsd_longest_at_run.ge(6)
+    low_complexity_signature = tsd_poly_filtered | at_rich_tsd_like
+    out["low_complexity_noisy_artifact_flag"] = (
+        (~known_poly)
+        & (coherence < 0.45)
+        & (poly_run >= 30)
+        & (poly_reads >= 8)
+        & (support_pileup >= 35)
+        & (low_complexity_signature | (complex_signal >= 0.80))
+    )
     if "consensus_insertion_breakpoint_pos" in out.columns:
         bp_consensus = _df_col_series(out, "consensus_insertion_breakpoint_pos", 0)
     else:
@@ -6142,6 +6489,9 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     out["_prio_breakpoint_consensus_available"] = bp_consensus.fillna(0).astype(int) > 0
     out["_prio_insertion_model_score"] = pd.to_numeric(
         _df_col_series(out, "insertion_model_score", 0.0), errors="coerce"
+    ).fillna(0.0)
+    out["_prio_clip_overlap_consistency"] = pd.to_numeric(
+        _df_col_series(out, "event_clip_overlap_consistency", 0.0), errors="coerce"
     ).fillna(0.0)
 
     sort_cols: list[str] = []
@@ -6164,6 +6514,7 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
             ascending.append(True)
     sort_cols.extend(
         [
+            "low_complexity_noisy_artifact_flag",
             "read_support_heuristic_score",
             "_prio_mei_mapped_max",
             "_prio_split_reads_max",
@@ -6171,10 +6522,12 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
             "_prio_tsd",
             "_prio_poly_at",
             "_prio_breakpoint_consensus_available",
+            "_prio_clip_overlap_consistency",
             "_prio_insertion_model_score",
         ]
     )
-    ascending.extend([False] * 8)
+    # Artifact flag sorted ascending (False first), then strongest support.
+    ascending.extend([True] + [False] * 9)
     sorted_out = out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
     return sorted_out.drop(
         columns=[c for c in sorted_out.columns if c.startswith("_prio_")],

@@ -201,6 +201,22 @@ datasets:
     target_path: polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz.tbi
     required: true
 
+  - id: melt_1kg_mei_nstd144_hg19_vcf
+    category: mei_polymorphism
+    description: MELT-based 1000G MEI callset (dbVar nstd144, GRCh37/hg19)
+    source: NCBI dbVar
+    url: https://ftp.ncbi.nlm.nih.gov/pub/dbVar/data/Homo_sapiens/by_study/vcf/nstd144.GRCh37.variant_call.vcf.gz
+    target_path: polymorphism/hg19/melt/nstd144.GRCh37.variant_call.vcf.gz
+    required: true
+
+  - id: melt_1kg_mei_nstd144_hg19_vcf_tbi
+    category: mei_polymorphism
+    description: MELT-based 1000G MEI callset index (dbVar nstd144, GRCh37/hg19)
+    source: NCBI dbVar
+    url: https://ftp.ncbi.nlm.nih.gov/pub/dbVar/data/Homo_sapiens/by_study/vcf/nstd144.GRCh37.variant_call.vcf.gz.tbi
+    target_path: polymorphism/hg19/melt/nstd144.GRCh37.variant_call.vcf.gz.tbi
+    required: true
+
   - id: lr_1kg_ont_vienna_svan_mei_vcf
     category: mei_polymorphism
     description: 1000G ONT Vienna long-read SVAN annotation callset (v1.1)
@@ -288,5 +304,23 @@ datasets:
     source: NCBI SEQC2
     url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_N_1.bwa.dedup.bam
     target_path: test_data/seqc2/chr22/control.chr22.hg38.bam
+    region: chr22
+    required: true
+
+  - id: hg00100_shortread_highcov_cram
+    category: test_bam
+    description: 1000G HG00100 high-coverage Illumina CRAM sliced to chr22 during download
+    source: 1000 Genomes (high coverage short-read)
+    url: https://1000genomes.s3.amazonaws.com/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram
+    target_path: test_data/1kg_hg00100/chr22/hg00100.shortread.chr22.hg38.bam
+    region: chr22
+    required: true
+
+  - id: hg00100_longread_ont_hg38_cram
+    category: test_bam
+    description: 1KG-ONT-VIENNA HG00100 ONT hg38 CRAM sliced to chr22 during download
+    source: 1KG-ONT-VIENNA (long-read ONT)
+    url: https://1kg-ont-vienna.s3.eu-west-1.amazonaws.com/hg38/HG00100.hg38.cram
+    target_path: test_data/1kg_hg00100/chr22/hg00100.longread_ont.chr22.hg38.bam
     region: chr22
     required: true

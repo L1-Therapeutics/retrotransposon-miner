@@ -43,6 +43,8 @@ SUPPORTED_REFERENCES = ("hg19", "hg38", "hs1")
 TEST_DATASET_IDS = {
     "seqc2_disease_bam",
     "seqc2_control_bam",
+    "hg00100_shortread_highcov_cram",
+    "hg00100_longread_ont_hg38_cram",
 }
 
 # Datasets grouped by their native coordinate build.
@@ -64,6 +66,8 @@ REFERENCE_DATASET_IDS_BY_BUILD: dict[str, set[str]] = {
         "hg19_segmental_duplications",
         "hg19_mappability_100bp_bw",
         "hg19_gap",
+        "melt_1kg_mei_nstd144_hg19_vcf",
+        "melt_1kg_mei_nstd144_hg19_vcf_tbi",
     },
     "hs1": {
         "hs1_t2t_reference_fasta",
@@ -153,7 +157,9 @@ def _select_dataset_ids_for_references(selected_refs: tuple[str, ...]) -> set[st
                 "lr_1kg_ont_vienna_svan_mei_vcf_tbi",
                 "hs1_to_hg19_chain",
                 "hg38_to_hg19_chain",
-                # MELT and gnomAD hg19 projections use hg38 sources.
+                # Prefer direct GRCh37 MELT callset; keep hg38 source as fallback for liftOver.
+                "melt_1kg_mei_nstd144_hg19_vcf",
+                "melt_1kg_mei_nstd144_hg19_vcf_tbi",
                 "melt_1kg_mei_nstd144_vcf",
                 "melt_1kg_mei_nstd144_vcf_tbi",
                 "gnomad_v41_sv_non_neuro_bb",
@@ -254,7 +260,7 @@ def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> d
     }
 
 
-def _slice_remote_bam(url: str, region: str, out_bam: Path, threads: int, force: bool) -> dict[str, Any]:
+def _slice_remote_alignment(url: str, region: str, out_bam: Path, threads: int, force: bool) -> dict[str, Any]:
     out_bam.parent.mkdir(parents=True, exist_ok=True)
     if out_bam.exists() and Path(f"{out_bam}.bai").exists() and not force:
         return {"status": "skipped_exists", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
@@ -262,7 +268,7 @@ def _slice_remote_bam(url: str, region: str, out_bam: Path, threads: int, force:
     # Direct remote slicing avoids storing full-size BAM locally.
     _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)], required=True)
     _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
-    return {"status": "sliced_remote_bam", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
+    return {"status": "sliced_remote_alignment", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
 
 
 def _download_dataset(
@@ -278,8 +284,8 @@ def _download_dataset(
     last_err: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            if ds.region and ds.url.endswith(".bam"):
-                result = _slice_remote_bam(ds.url, ds.region, target, threads=threads, force=force)
+            if ds.region and (ds.url.endswith(".bam") or ds.url.endswith(".cram")):
+                result = _slice_remote_alignment(ds.url, ds.region, target, threads=threads, force=force)
             else:
                 result = _download_file(ds.url, target, timeout_sec=timeout_sec, force=force)
             break
@@ -787,6 +793,41 @@ def _vcf_chrom_sort_key(chrom: str) -> tuple[int, str]:
     return (1000, c)
 
 
+def _chain_source_has_chr_prefix(chain_gz: Path) -> bool:
+    try:
+        with gzip.open(chain_gz, "rt", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if not line.startswith("chain "):
+                    continue
+                parts = line.strip().split()
+                # chain header: chain score tName tSize tStrand ...
+                if len(parts) >= 3:
+                    return parts[2].startswith("chr")
+    except Exception:
+        # Conservative default aligned with UCSC chain naming conventions.
+        return True
+    # Conservative default when chain has no chain-header lines for some reason.
+    return True
+
+
+def _normalize_chrom_to_style(chrom: str, target_has_chr_prefix: bool) -> str:
+    c = (chrom or "").strip()
+    if not c:
+        return c
+    if target_has_chr_prefix:
+        if c.startswith("chr"):
+            return c
+        if c in {"M", "MT", "m", "mt"}:
+            return "chrM"
+        return f"chr{c}"
+    if c.startswith("chr"):
+        core = c[3:]
+        if core in {"M", "m"}:
+            return "MT"
+        return core
+    return c
+
+
 def _liftover_vcf_to_target(
     source_vcf_gz: Path,
     chain_gz: Path,
@@ -821,6 +862,7 @@ def _liftover_vcf_to_target(
         chrom_header = ""
         variants: list[list[str]] = []
         query_ids: list[str] = []
+        chain_source_has_chr = _chain_source_has_chr_prefix(chain_gz)
 
         with gzip.open(source_vcf_gz, "rt", encoding="utf-8") as ih, query_bed.open("w", encoding="utf-8") as bh:
             for line in ih:
@@ -833,7 +875,7 @@ def _liftover_vcf_to_target(
                 cols = line.rstrip("\n").split("\t")
                 if len(cols) < 8:
                     continue
-                chrom = cols[0]
+                chrom = _normalize_chrom_to_style(cols[0], target_has_chr_prefix=chain_source_has_chr)
                 try:
                     pos1 = int(cols[1])
                 except ValueError:
@@ -1633,23 +1675,53 @@ def _postprocess(
 
     # 6c) Project MELT 1KG MEI callset from hg38 to hg19 when available.
     melt_ds = ds_map.get("melt_1kg_mei_nstd144_vcf")
-    if want_hg19 and melt_ds and hg38_to_hg19_chain is not None:
-        melt_hg38_vcf = outdir / melt_ds.target_path
-        melt_hg19_vcf = outdir / "polymorphism/hg19/melt/nstd144.GRCh37.variant_call.vcf.gz"
-        melt_hg19_unmapped = outdir / "polymorphism/hg19/melt/nstd144.GRCh37.variant_call.unmapped.bed"
-        run_step(
-            "liftover_melt_1kg_hg38_to_hg19_vcf",
-            lambda: _liftover_vcf_to_target(
-                source_vcf_gz=melt_hg38_vcf,
-                chain_gz=hg38_to_hg19_chain,
-                out_vcf_gz=melt_hg19_vcf,
-                out_unmapped_bed=melt_hg19_unmapped,
-                force=force,
-                source_build="hg38",
-                target_build="hg19",
-                target_reference_meta="GCF_000001405.25",
-            ),
-        )
+    melt_hg19_ds = ds_map.get("melt_1kg_mei_nstd144_hg19_vcf")
+    if want_hg19:
+        if melt_hg19_ds is not None:
+            melt_hg19_vcf = outdir / melt_hg19_ds.target_path
+            if melt_hg19_vcf.exists():
+                steps.append(
+                    {
+                        "step": "hg19_melt_direct_vcf",
+                        "status": "present",
+                        "path": str(melt_hg19_vcf),
+                        "source": "direct_dbvar_grch37",
+                    }
+                )
+                print("[postprocess:done] hg19_melt_direct_vcf status=present", file=sys.stderr)
+            elif melt_ds and hg38_to_hg19_chain is not None:
+                melt_hg38_vcf = outdir / melt_ds.target_path
+                melt_hg19_unmapped = outdir / "polymorphism/hg19/melt/nstd144.GRCh37.variant_call.unmapped.bed"
+                run_step(
+                    "liftover_melt_1kg_hg38_to_hg19_vcf_fallback",
+                    lambda: _liftover_vcf_to_target(
+                        source_vcf_gz=melt_hg38_vcf,
+                        chain_gz=hg38_to_hg19_chain,
+                        out_vcf_gz=melt_hg19_vcf,
+                        out_unmapped_bed=melt_hg19_unmapped,
+                        force=force,
+                        source_build="hg38",
+                        target_build="hg19",
+                        target_reference_meta="GCF_000001405.25",
+                    ),
+                )
+        elif melt_ds and hg38_to_hg19_chain is not None:
+            melt_hg38_vcf = outdir / melt_ds.target_path
+            melt_hg19_vcf = outdir / "polymorphism/hg19/melt/nstd144.GRCh37.variant_call.vcf.gz"
+            melt_hg19_unmapped = outdir / "polymorphism/hg19/melt/nstd144.GRCh37.variant_call.unmapped.bed"
+            run_step(
+                "liftover_melt_1kg_hg38_to_hg19_vcf",
+                lambda: _liftover_vcf_to_target(
+                    source_vcf_gz=melt_hg38_vcf,
+                    chain_gz=hg38_to_hg19_chain,
+                    out_vcf_gz=melt_hg19_vcf,
+                    out_unmapped_bed=melt_hg19_unmapped,
+                    force=force,
+                    source_build="hg38",
+                    target_build="hg19",
+                    target_reference_meta="GCF_000001405.25",
+                ),
+            )
 
     if want_hs1 and melt_ds and chain_hg38_to_hs1 is not None:
         melt_hg38_vcf = outdir / melt_ds.target_path
