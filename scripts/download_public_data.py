@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import gzip
 import json
@@ -17,6 +18,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from socket import timeout as SocketTimeoutError
 from typing import Any
 
 import yaml
@@ -37,7 +39,36 @@ class Dataset:
 BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
 DFAM_CURATED_CONSENSUS_0_URL = "https://www.dfam.org/releases/current/families/FamDB/dfam40.curated.consensus.0.h5.gz"
 UCSC_REPEATBROWSER_HG38REPS_URL = "https://hgdownload.soe.ucsc.edu/hubs/RepeatBrowser2020/hg38reps/hg38reps.fa"
+SUPPORTED_REFERENCES = ("hg19", "hg38", "hs1")
 
+# Datasets grouped by their native coordinate build.
+REFERENCE_DATASET_IDS_BY_BUILD: dict[str, set[str]] = {
+    "hg38": {
+        "hg38_reference_fasta",
+        "hg38_repeatmasker_rmsk",
+        "hg38_segmental_duplications",
+        "hg38_mappability_100bp_bw",
+        "encode_blacklist_grch38",
+        "hg38_gap",
+        "gnomad_v41_sv_non_neuro_bb",
+        "melt_1kg_mei_nstd144_vcf",
+        "melt_1kg_mei_nstd144_vcf_tbi",
+    },
+    "hg19": {
+        "hg19_reference_fasta",
+        "hg19_repeatmasker_rmsk",
+        "hg19_segmental_duplications",
+        "hg19_mappability_100bp_bw",
+        "hg19_gap",
+    },
+    "hs1": {
+        "hs1_t2t_reference_fasta",
+        "hs1_repeatmasker_out",
+        "hs1_mappability_100bp_bw",
+        "lr_1kg_ont_vienna_svan_mei_vcf",
+        "lr_1kg_ont_vienna_svan_mei_vcf_tbi",
+    },
+}
 
 def _load_config(config_path: Path) -> list[Dataset]:
     with config_path.open("r", encoding="utf-8") as handle:
@@ -73,16 +104,107 @@ def _load_config(config_path: Path) -> list[Dataset]:
     return items
 
 
+def _resolve_selected_references(raw_refs: list[str] | None) -> tuple[str, ...]:
+    if not raw_refs:
+        return SUPPORTED_REFERENCES
+    norm = []
+    for ref in raw_refs:
+        r = ref.strip().lower()
+        if r not in SUPPORTED_REFERENCES:
+            raise ValueError(f"Unsupported reference '{ref}'. Expected one of: {', '.join(SUPPORTED_REFERENCES)}")
+        if r not in norm:
+            norm.append(r)
+    return tuple(norm)
+
+
+def _select_dataset_ids_for_references(selected_refs: tuple[str, ...]) -> set[str]:
+    ids: set[str] = set()
+
+    # Build-native datasets for selected targets.
+    for ref in selected_refs:
+        ids.update(REFERENCE_DATASET_IDS_BY_BUILD.get(ref, set()))
+
+    # MEI library + benchmark/helper resources are build-agnostic in this workflow.
+    ids.update(
+        {
+            "dfam_human_families_embl",
+            "ucsc_repeatbrowser_hg38reps_fasta",
+        }
+    )
+
+    # Equivalent polymorphism outputs for every selected target require source datasets + chains.
+    if "hg38" in selected_refs:
+        ids.add("lr_1kg_ont_vienna_svan_mei_vcf")
+        ids.add("lr_1kg_ont_vienna_svan_mei_vcf_tbi")
+        ids.add("hs1_to_hg38_chain")
+
+    if "hg19" in selected_refs:
+        ids.update(
+            {
+                "lr_1kg_ont_vienna_svan_mei_vcf",
+                "lr_1kg_ont_vienna_svan_mei_vcf_tbi",
+                "hs1_to_hg19_chain",
+                "hg38_to_hg19_chain",
+                # MELT and gnomAD hg19 projections use hg38 sources.
+                "melt_1kg_mei_nstd144_vcf",
+                "melt_1kg_mei_nstd144_vcf_tbi",
+                "gnomad_v41_sv_non_neuro_bb",
+                "hg38_repeatmasker_rmsk",
+                "hg38_segmental_duplications",
+                "hg38_mappability_100bp_bw",
+                "encode_blacklist_grch38",
+                "hg38_gap",
+            }
+        )
+
+    if "hs1" in selected_refs:
+        ids.update(
+            {
+                # MELT and gnomAD hs1 projections use hg38 sources.
+                "melt_1kg_mei_nstd144_vcf",
+                "melt_1kg_mei_nstd144_vcf_tbi",
+                "gnomad_v41_sv_non_neuro_bb",
+                "hg38_repeatmasker_rmsk",
+                "hg38_segmental_duplications",
+                "hg38_mappability_100bp_bw",
+                "encode_blacklist_grch38",
+                "hg38_gap",
+                "hg38_to_hs1_chain",
+            }
+        )
+
+    return ids
+
+
 def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists() and not force:
-        return {
-            "status": "skipped_exists",
-            "bytes": out_path.stat().st_size,
-            "path": str(out_path),
-            "url": url,
-        }
+        # Guard against previously interrupted/corrupted cached gzip files.
+        if out_path.suffix == ".gz":
+            try:
+                with gzip.open(out_path, "rb") as gh:
+                    _ = gh.read(1)
+            except Exception:  # noqa: BLE001
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+                # Continue to fresh download below.
+            else:
+                return {
+                    "status": "skipped_exists",
+                    "bytes": out_path.stat().st_size,
+                    "path": str(out_path),
+                    "url": url,
+                }
+        if out_path.exists():
+            return {
+                "status": "skipped_exists",
+                "bytes": out_path.stat().st_size,
+                "path": str(out_path),
+                "url": url,
+            }
 
     request = urllib.request.Request(
         url,
@@ -133,6 +255,54 @@ def _slice_remote_bam(url: str, region: str, out_bam: Path, threads: int, force:
     _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)], required=True)
     _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
     return {"status": "sliced_remote_bam", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
+
+
+def _download_dataset(
+    ds: Dataset,
+    target: Path,
+    timeout_sec: int,
+    threads: int,
+    force: bool,
+    retries: int,
+    retry_backoff_sec: float,
+) -> dict[str, Any]:
+    attempts = max(1, int(retries))
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if ds.region and ds.url.endswith(".bam"):
+                result = _slice_remote_bam(ds.url, ds.region, target, threads=threads, force=force)
+            else:
+                result = _download_file(ds.url, target, timeout_sec=timeout_sec, force=force)
+            break
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            TimeoutError,
+            SocketTimeoutError,
+            ConnectionError,
+        ) as err:
+            last_err = err
+            if attempt >= attempts:
+                raise
+            sleep_s = float(retry_backoff_sec) * (2 ** (attempt - 1))
+            time.sleep(max(0.0, sleep_s))
+    else:
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError(f"Download failed unexpectedly for dataset {ds.dataset_id}")
+
+    result.update(
+        {
+            "id": ds.dataset_id,
+            "category": ds.category,
+            "description": ds.description,
+            "source": ds.source,
+            "region": ds.region,
+            "required": ds.required,
+        }
+    )
+    return result
 
 
 def _run_cmd(cmd: list[str], required: bool = True) -> tuple[bool, str]:
@@ -609,12 +779,15 @@ def _vcf_chrom_sort_key(chrom: str) -> tuple[int, str]:
     return (1000, c)
 
 
-def _liftover_lr_svan_vcf_hs1_to_hg38(
+def _liftover_vcf_to_target(
     source_vcf_gz: Path,
     chain_gz: Path,
     out_vcf_gz: Path,
     out_unmapped_bed: Path,
     force: bool,
+    source_build: str,
+    target_build: str,
+    target_reference_meta: str,
 ) -> dict[str, Any]:
     if not source_vcf_gz.exists():
         return {"status": "skipped_missing_source", "source_path": str(source_vcf_gz)}
@@ -629,12 +802,12 @@ def _liftover_lr_svan_vcf_hs1_to_hg38(
     out_vcf_gz.parent.mkdir(parents=True, exist_ok=True)
     out_unmapped_bed.parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="rtm_lr_hs1_to_hg38_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix=f"rtm_vcf_{source_build}_to_{target_build}_") as tmpdir:
         tmp = Path(tmpdir)
-        query_bed = tmp / "lr_svan_hs1_intervals.bed"
-        mapped_bed = tmp / "lr_svan_hs1_to_hg38.mapped.bed"
-        unmapped_bed = tmp / "lr_svan_hs1_to_hg38.unmapped.bed"
-        lifted_vcf = tmp / "final-vcf.unphased.SVAN_1.3.hg38.vcf"
+        query_bed = tmp / f"variants_{source_build}_intervals.bed"
+        mapped_bed = tmp / f"variants_{source_build}_to_{target_build}.mapped.bed"
+        unmapped_bed = tmp / f"variants_{source_build}_to_{target_build}.unmapped.bed"
+        lifted_vcf = tmp / f"variants.{target_build}.vcf"
 
         metadata_headers: list[str] = []
         chrom_header = ""
@@ -697,16 +870,16 @@ def _liftover_lr_svan_vcf_hs1_to_hg38(
             saw_liftover_meta = False
             for line in metadata_headers:
                 if line.startswith("##reference="):
-                    oh.write("##reference=GCF_000001405.39\n")
+                    oh.write(f"##reference={target_reference_meta}\n")
                     saw_reference = True
                     continue
                 if line.startswith("##rtm_liftover_source="):
                     saw_liftover_meta = True
                 oh.write(line)
             if not saw_reference:
-                oh.write("##reference=GCF_000001405.39\n")
+                oh.write(f"##reference={target_reference_meta}\n")
             if not saw_liftover_meta:
-                oh.write("##rtm_liftover_source=hs1_to_hg38_with_ucsc_liftOver\n")
+                oh.write(f"##rtm_liftover_source={source_build}_to_{target_build}_with_ucsc_liftOver\n")
             oh.write(chrom_header)
 
             lifted_rows: list[list[str]] = []
@@ -1021,9 +1194,13 @@ def _postprocess(
     force: bool,
     timeout_sec: int,
     prefer_prebuilt_bwa_index: bool,
+    selected_references: tuple[str, ...],
 ) -> list[dict[str, Any]]:
     ds_map = {d.dataset_id: d for d in datasets}
     steps: list[dict[str, Any]] = []
+    want_hg38 = "hg38" in selected_references
+    want_hg19 = "hg19" in selected_references
+    want_hs1 = "hs1" in selected_references
 
     def run_step(step_name: str, fn):
         print(f"[postprocess:start] {step_name}", file=sys.stderr)
@@ -1041,7 +1218,7 @@ def _postprocess(
             raise
 
     # 1) Reference FASTA prep: decompress + index files (.fai and .dict).
-    for ref_id in ("hg38_reference_fasta", "hs1_t2t_reference_fasta"):
+    for ref_id in ("hg38_reference_fasta", "hg19_reference_fasta", "hs1_t2t_reference_fasta"):
         ds = ds_map.get(ref_id)
         if not ds:
             continue
@@ -1137,40 +1314,367 @@ def _postprocess(
     mei_bed = outdir / "polymorphism/hg38/gnomad/gnomad.v4.1.sv.non_neuro_controls.mei.bed"
     run_step("gnomad_extract_mei", lambda: _filter_mei_bed(gnomad_bed, mei_bed, force=force))
 
-    # 4) LiftOver hg38 resources to hs1 (T2T) where applicable.
-    chain_hg38_to_hs1 = outdir / ds_map["hg38_to_hs1_chain"].target_path
-    lift_inputs = [rmsk_bed, segdup_bed, mei_bed]
-    for bed_in in lift_inputs:
-        hs1_dir = Path(str(bed_in).replace("/hg38/", "/hs1/")).parent
-        out_bed = hs1_dir / bed_in.name.replace(".bed", ".hs1.bed")
-        out_unmapped = hs1_dir / bed_in.name.replace(".bed", ".hs1.unmapped.bed")
+    # 4) Prepare hg19 annotation/junk resources.
+    # Prefer direct hg19 downloads when available in config; otherwise liftOver from hg38.
+    hg38_to_hg19_ds = ds_map.get("hg38_to_hg19_chain")
+    hg38_to_hg19_chain = outdir / hg38_to_hg19_ds.target_path if hg38_to_hg19_ds else None
+    hg19_segdup_bed = outdir / "annotation/hg19/segdup/genomicSuperDups.bed"
+    hg19_low_map_bed = outdir / "annotation/hg19/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+    if want_hg19:
+        hg19_rmsk_ds = ds_map.get("hg19_repeatmasker_rmsk")
+        hg19_rmsk_bed = outdir / "annotation/hg19/repeats/rmsk.bed"
+        if hg19_rmsk_ds:
+            hg19_rmsk_gz = outdir / hg19_rmsk_ds.target_path
+            run_step("hg19_rmsk_to_bed", lambda: _convert_ucsc_txt_to_bed(hg19_rmsk_gz, hg19_rmsk_bed, force=force))
+        elif hg38_to_hg19_chain is not None:
+            run_step(
+                "liftover_hg38_rmsk_to_hg19",
+                lambda: _liftover_bed(
+                    rmsk_bed,
+                    hg38_to_hg19_chain,
+                    hg19_rmsk_bed,
+                    outdir / "annotation/hg19/repeats/rmsk.unmapped.bed",
+                    force=force,
+                ),
+            )
+
+        hg19_segdup_ds = ds_map.get("hg19_segmental_duplications")
+        if hg19_segdup_ds:
+            hg19_segdup_gz = outdir / hg19_segdup_ds.target_path
+            run_step("hg19_segdup_to_bed", lambda: _convert_ucsc_txt_to_bed(hg19_segdup_gz, hg19_segdup_bed, force=force))
+        elif hg38_to_hg19_chain is not None:
+            run_step(
+                "liftover_hg38_segdup_to_hg19",
+                lambda: _liftover_bed(
+                    segdup_bed,
+                    hg38_to_hg19_chain,
+                    hg19_segdup_bed,
+                    outdir / "annotation/hg19/segdup/genomicSuperDups.unmapped.bed",
+                    force=force,
+                ),
+            )
+
+        hg19_mapp_bw_ds = ds_map.get("hg19_mappability_100bp_bw")
+        hg19_mapp_bedgraph = outdir / "annotation/hg19/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+        if hg19_mapp_bw_ds:
+            hg19_mapp_bw = outdir / hg19_mapp_bw_ds.target_path
+            if hg19_mapp_bw.exists():
+                if not hg19_mapp_bedgraph.exists() or force:
+                    run_step(
+                        "hg19_mappability_bw_to_bedgraph",
+                        lambda: {
+                            "status": "converted"
+                            if _run_cmd(["bigWigToBedGraph", str(hg19_mapp_bw), str(hg19_mapp_bedgraph)], required=True)[0]
+                            else "failed",
+                            "path": str(hg19_mapp_bedgraph),
+                        },
+                    )
+                else:
+                    steps.append(
+                        {
+                            "step": "hg19_mappability_bw_to_bedgraph",
+                            "status": "skipped_exists",
+                            "path": str(hg19_mapp_bedgraph),
+                        }
+                    )
+                    print("[postprocess:done] hg19_mappability_bw_to_bedgraph status=skipped_exists", file=sys.stderr)
+            elif hg38_to_hg19_chain is not None:
+                run_step(
+                    "liftover_hg38_mappability_bedgraph_to_hg19",
+                    lambda: _liftover_bed(
+                        mappability_bedgraph,
+                        hg38_to_hg19_chain,
+                        hg19_mapp_bedgraph,
+                        outdir / "annotation/hg19/mappability/k100.Umap.MultiTrackMappability.unmapped.bed",
+                        force=force,
+                    ),
+                )
+        elif hg38_to_hg19_chain is not None:
+            run_step(
+                "liftover_hg38_mappability_bedgraph_to_hg19",
+                lambda: _liftover_bed(
+                    mappability_bedgraph,
+                    hg38_to_hg19_chain,
+                    hg19_mapp_bedgraph,
+                    outdir / "annotation/hg19/mappability/k100.Umap.MultiTrackMappability.unmapped.bed",
+                    force=force,
+                ),
+            )
+
+        if hg19_mapp_bedgraph.exists():
+            run_step(
+                "hg19_mappability_low_to_bed",
+                lambda: _derive_low_mappability_bed(
+                    src_bedgraph=hg19_mapp_bedgraph,
+                    dst_bed=hg19_low_map_bed,
+                    threshold=0.5,
+                    force=force,
+                ),
+            )
+        elif hg38_to_hg19_chain is not None:
+            run_step(
+                "liftover_hg38_low_mappability_to_hg19",
+                lambda: _liftover_bed(
+                    low_map_bed,
+                    hg38_to_hg19_chain,
+                    hg19_low_map_bed,
+                    outdir / "annotation/hg19/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.unmapped.bed",
+                    force=force,
+                ),
+            )
+
+        hg19_gap_ds = ds_map.get("hg19_gap")
+        hg19_gap_bed = outdir / "annotation/hg19/masks/gap.bed"
+        hg19_gap_bed_like: Path = hg19_gap_bed
+        if hg19_gap_ds:
+            hg19_gap_bed_like = outdir / hg19_gap_ds.target_path
+        elif hg38_to_hg19_chain is not None:
+            run_step(
+                "liftover_hg38_gap_to_hg19",
+                lambda: _liftover_bed(
+                    gap_bed,
+                    hg38_to_hg19_chain,
+                    hg19_gap_bed,
+                    outdir / "annotation/hg19/masks/gap.unmapped.bed",
+                    force=force,
+                ),
+            )
+
+        hg19_blacklist_ds = ds_map.get("encode_blacklist_hg19")
+        hg19_blacklist_bed = outdir / "annotation/hg19/blacklist/ENCFF356LFX.hg19.bed"
+        hg19_blacklist_bed_like: Path = hg19_blacklist_bed
+        if hg19_blacklist_ds:
+            hg19_blacklist_bed_like = outdir / hg19_blacklist_ds.target_path
+        elif hg38_to_hg19_chain is not None:
+            run_step(
+                "liftover_hg38_blacklist_to_hg19",
+                lambda: _liftover_bed(
+                    blacklist_bed,
+                    hg38_to_hg19_chain,
+                    hg19_blacklist_bed,
+                    outdir / "annotation/hg19/blacklist/ENCFF356LFX.hg19.unmapped.bed",
+                    force=force,
+                ),
+            )
+
+        if hg19_segdup_bed.exists() and hg19_low_map_bed.exists():
+            run_step(
+                "merge_hg19_junk_exclusion_bed",
+                lambda: _merge_junk_exclusion_bed(
+                    segdup_bed=hg19_segdup_bed,
+                    low_map_bed=hg19_low_map_bed,
+                    gap_bed_like=hg19_gap_bed_like,
+                    blacklist_bed_like=hg19_blacklist_bed_like,
+                    out_merged_bed=outdir / "annotation/hg19/junk/junk_exclusion_merged.bed",
+                    out_gap_bed=outdir / "annotation/hg19/masks/gap.bed",
+                    out_blacklist_bed=outdir / "annotation/hg19/blacklist/ENCFF356LFX.hg19.bed",
+                    force=force,
+                ),
+            )
+
+    # 5) LiftOver hg38 resources to hs1 (T2T) where applicable.
+    chain_hg38_to_hs1_ds = ds_map.get("hg38_to_hs1_chain")
+    chain_hg38_to_hs1 = outdir / chain_hg38_to_hs1_ds.target_path if chain_hg38_to_hs1_ds else None
+    hs1_segdup_bed = outdir / "annotation/hs1/segdup/genomicSuperDups.hs1.bed"
+    hs1_low_map_bed = outdir / "annotation/hs1/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+    if want_hs1 and chain_hg38_to_hs1 is not None:
+        lift_inputs = [rmsk_bed, segdup_bed, mei_bed]
+        for bed_in in lift_inputs:
+            hs1_dir = Path(str(bed_in).replace("/hg38/", "/hs1/")).parent
+            out_bed = hs1_dir / bed_in.name.replace(".bed", ".hs1.bed")
+            out_unmapped = hs1_dir / bed_in.name.replace(".bed", ".hs1.unmapped.bed")
+            run_step(
+                f"liftover_{bed_in.name}_to_hs1",
+                lambda bed_in=bed_in, out_bed=out_bed, out_unmapped=out_unmapped: _liftover_bed(
+                    bed_in, chain_hg38_to_hs1, out_bed, out_unmapped, force=force
+                ),
+            )
+
+        hs1_mapp_bw_ds = ds_map.get("hs1_mappability_100bp_bw")
+        hs1_mapp_bedgraph = outdir / "annotation/hs1/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+        if hs1_mapp_bw_ds:
+            hs1_mapp_bw = outdir / hs1_mapp_bw_ds.target_path
+            if not hs1_mapp_bedgraph.exists() or force:
+                run_step(
+                    "hs1_mappability_bw_to_bedgraph",
+                    lambda: {
+                        "status": "converted"
+                        if _run_cmd(["bigWigToBedGraph", str(hs1_mapp_bw), str(hs1_mapp_bedgraph)], required=True)[0]
+                        else "failed",
+                        "path": str(hs1_mapp_bedgraph),
+                    },
+                )
+            else:
+                steps.append(
+                    {"step": "hs1_mappability_bw_to_bedgraph", "status": "skipped_exists", "path": str(hs1_mapp_bedgraph)}
+                )
+                print("[postprocess:done] hs1_mappability_bw_to_bedgraph status=skipped_exists", file=sys.stderr)
+        else:
+            run_step(
+                "liftover_hg38_mappability_bedgraph_to_hs1",
+                lambda: _liftover_bed(
+                    mappability_bedgraph,
+                    chain_hg38_to_hs1,
+                    hs1_mapp_bedgraph,
+                    outdir / "annotation/hs1/mappability/k100.Umap.MultiTrackMappability.unmapped.bed",
+                    force=force,
+                ),
+            )
+        if hs1_mapp_bedgraph.exists():
+            run_step(
+                "hs1_mappability_low_to_bed",
+                lambda: _derive_low_mappability_bed(
+                    src_bedgraph=hs1_mapp_bedgraph,
+                    dst_bed=hs1_low_map_bed,
+                    threshold=0.5,
+                    force=force,
+                ),
+            )
+        else:
+            run_step(
+                "liftover_hg38_low_mappability_to_hs1",
+                lambda: _liftover_bed(
+                    low_map_bed,
+                    chain_hg38_to_hs1,
+                    hs1_low_map_bed,
+                    outdir / "annotation/hs1/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.unmapped.bed",
+                    force=force,
+                ),
+            )
+
+        hs1_gap_bed = outdir / "annotation/hs1/masks/gap.bed"
+        hs1_blacklist_bed = outdir / "annotation/hs1/blacklist/ENCFF356LFX.hs1.bed"
         run_step(
-            f"liftover_{bed_in.name}_to_hs1",
-            lambda bed_in=bed_in, out_bed=out_bed, out_unmapped=out_unmapped: _liftover_bed(
-                bed_in, chain_hg38_to_hs1, out_bed, out_unmapped, force=force
+            "liftover_hg38_gap_to_hs1",
+            lambda: _liftover_bed(
+                gap_bed,
+                chain_hg38_to_hs1,
+                hs1_gap_bed,
+                outdir / "annotation/hs1/masks/gap.unmapped.bed",
+                force=force,
             ),
         )
+        run_step(
+            "liftover_hg38_blacklist_to_hs1",
+            lambda: _liftover_bed(
+                blacklist_bed,
+                chain_hg38_to_hs1,
+                hs1_blacklist_bed,
+                outdir / "annotation/hs1/blacklist/ENCFF356LFX.hs1.unmapped.bed",
+                force=force,
+            ),
+        )
+        if hs1_segdup_bed.exists() and hs1_low_map_bed.exists():
+            run_step(
+                "merge_hs1_junk_exclusion_bed",
+                lambda: _merge_junk_exclusion_bed(
+                    segdup_bed=hs1_segdup_bed,
+                    low_map_bed=hs1_low_map_bed,
+                    gap_bed_like=hs1_gap_bed,
+                    blacklist_bed_like=hs1_blacklist_bed,
+                    out_merged_bed=outdir / "annotation/hs1/junk/junk_exclusion_merged.bed",
+                    out_gap_bed=hs1_gap_bed,
+                    out_blacklist_bed=hs1_blacklist_bed,
+                    force=force,
+                ),
+            )
 
-    # 5) 1000G ONT Vienna SVAN is downloaded in hs1 coordinates; lift to hg38
+    # 6) 1000G ONT Vienna SVAN is downloaded in hs1 coordinates; lift to hg38
     # and keep the historical hg38 filename for annotation compatibility.
     lr_ds = ds_map.get("lr_1kg_ont_vienna_svan_mei_vcf")
     hs1_to_hg38_chain = ds_map.get("hs1_to_hg38_chain")
-    if lr_ds and hs1_to_hg38_chain:
+    if want_hg38 and lr_ds and hs1_to_hg38_chain:
         lr_source_hs1_vcf = outdir / lr_ds.target_path
         lr_lifted_hg38_vcf = outdir / "polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz"
         lr_lifted_unmapped = outdir / "polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.unmapped.bed"
         run_step(
             "liftover_lr_1kg_ont_vienna_hs1_to_hg38_vcf",
-            lambda: _liftover_lr_svan_vcf_hs1_to_hg38(
+            lambda: _liftover_vcf_to_target(
                 source_vcf_gz=lr_source_hs1_vcf,
                 chain_gz=outdir / hs1_to_hg38_chain.target_path,
                 out_vcf_gz=lr_lifted_hg38_vcf,
                 out_unmapped_bed=lr_lifted_unmapped,
                 force=force,
+                source_build="hs1",
+                target_build="hg38",
+                target_reference_meta="GCF_000001405.39",
             ),
         )
 
-    # 6) Prepare Dfam-derived MEI FASTA library (human curated + LINE1/Alu/SVA subset).
+    # 6b) Also project the same Vienna SVAN callset to hg19 when chain is available.
+    hs1_to_hg19_chain = ds_map.get("hs1_to_hg19_chain")
+    if want_hg19 and lr_ds and hs1_to_hg19_chain:
+        lr_source_hs1_vcf = outdir / lr_ds.target_path
+        lr_lifted_hg19_vcf = outdir / "polymorphism/hg19/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz"
+        lr_lifted_hg19_unmapped = (
+            outdir / "polymorphism/hg19/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.unmapped.bed"
+        )
+        run_step(
+            "liftover_lr_1kg_ont_vienna_hs1_to_hg19_vcf",
+            lambda: _liftover_vcf_to_target(
+                source_vcf_gz=lr_source_hs1_vcf,
+                chain_gz=outdir / hs1_to_hg19_chain.target_path,
+                out_vcf_gz=lr_lifted_hg19_vcf,
+                out_unmapped_bed=lr_lifted_hg19_unmapped,
+                force=force,
+                source_build="hs1",
+                target_build="hg19",
+                target_reference_meta="GCF_000001405.25",
+            ),
+        )
+
+    # 6c) Project MELT 1KG MEI callset from hg38 to hg19 when available.
+    melt_ds = ds_map.get("melt_1kg_mei_nstd144_vcf")
+    if want_hg19 and melt_ds and hg38_to_hg19_chain is not None:
+        melt_hg38_vcf = outdir / melt_ds.target_path
+        melt_hg19_vcf = outdir / "polymorphism/hg19/melt/nstd144.GRCh37.variant_call.vcf.gz"
+        melt_hg19_unmapped = outdir / "polymorphism/hg19/melt/nstd144.GRCh37.variant_call.unmapped.bed"
+        run_step(
+            "liftover_melt_1kg_hg38_to_hg19_vcf",
+            lambda: _liftover_vcf_to_target(
+                source_vcf_gz=melt_hg38_vcf,
+                chain_gz=hg38_to_hg19_chain,
+                out_vcf_gz=melt_hg19_vcf,
+                out_unmapped_bed=melt_hg19_unmapped,
+                force=force,
+                source_build="hg38",
+                target_build="hg19",
+                target_reference_meta="GCF_000001405.25",
+            ),
+        )
+
+    if want_hs1 and melt_ds and chain_hg38_to_hs1 is not None:
+        melt_hg38_vcf = outdir / melt_ds.target_path
+        melt_hs1_vcf = outdir / "polymorphism/hs1/melt/nstd144.hs1.variant_call.vcf.gz"
+        melt_hs1_unmapped = outdir / "polymorphism/hs1/melt/nstd144.hs1.variant_call.unmapped.bed"
+        run_step(
+            "liftover_melt_1kg_hg38_to_hs1_vcf",
+            lambda: _liftover_vcf_to_target(
+                source_vcf_gz=melt_hg38_vcf,
+                chain_gz=chain_hg38_to_hs1,
+                out_vcf_gz=melt_hs1_vcf,
+                out_unmapped_bed=melt_hs1_unmapped,
+                force=force,
+                source_build="hg38",
+                target_build="hs1",
+                target_reference_meta="GCF_009914755.1",
+            ),
+        )
+
+    if want_hg19 and hg38_to_hg19_chain is not None:
+        gnomad_hg19_mei_bed = outdir / "polymorphism/hg19/gnomad/gnomad.v4.1.sv.non_neuro_controls.mei.bed"
+        run_step(
+            "liftover_gnomad_mei_hg38_to_hg19",
+            lambda: _liftover_bed(
+                mei_bed,
+                hg38_to_hg19_chain,
+                gnomad_hg19_mei_bed,
+                outdir / "polymorphism/hg19/gnomad/gnomad.v4.1.sv.non_neuro_controls.mei.unmapped.bed",
+                force=force,
+            ),
+        )
+
+    # 7) Prepare Dfam-derived MEI FASTA library (human curated + LINE1/Alu/SVA subset).
     run_step(
         "dfam_prepare_human_mei_fasta",
         lambda: _prepare_dfam_mei_library(outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force),
@@ -1203,6 +1707,12 @@ def main() -> int:
         help="Optional category filter, e.g. reference annotation liftover",
     )
     parser.add_argument(
+        "--references",
+        nargs="+",
+        default=None,
+        help="Reference builds to materialize (any of: hg19 hg38 hs1). Default: all.",
+    )
+    parser.add_argument(
         "--include-optional",
         action="store_true",
         help="Include datasets marked required: false",
@@ -1215,7 +1725,7 @@ def main() -> int:
     parser.add_argument(
         "--timeout-sec",
         type=int,
-        default=120,
+        default=300,
         help="Per-request timeout",
     )
     parser.add_argument(
@@ -1230,9 +1740,27 @@ def main() -> int:
         help="Thread count for slicing/indexing steps.",
     )
     parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=6,
+        help="Number of dataset downloads to run concurrently.",
+    )
+    parser.add_argument(
+        "--download-retries",
+        type=int,
+        default=3,
+        help="Retry attempts per dataset download on transient network failures.",
+    )
+    parser.add_argument(
+        "--download-retry-backoff-sec",
+        type=float,
+        default=2.0,
+        help="Initial retry backoff in seconds (exponential).",
+    )
+    parser.add_argument(
         "--skip-postprocess",
         action="store_true",
-        help="Skip post-download preparation (fasta indexing, conversion, hg38->hs1 liftOver).",
+        help="Skip post-download preparation (indexing, track conversion, and cross-reference liftOver).",
     )
     parser.add_argument(
         "--no-prebuilt-bwa-index",
@@ -1246,7 +1774,16 @@ def main() -> int:
     manifest_path = Path(args.manifest_path).resolve() if args.manifest_path else outdir / "manifest.json"
 
     datasets = _load_config(config_path)
+    selected_references = _resolve_selected_references(args.references)
+    selected_dataset_ids = _select_dataset_ids_for_references(selected_references)
     categories = set(args.categories) if args.categories else None
+    active_datasets = [
+        d
+        for d in datasets
+        if d.dataset_id in selected_dataset_ids
+        and (categories is None or d.category in categories)
+        and (d.required or args.include_optional)
+    ]
 
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -1254,6 +1791,7 @@ def main() -> int:
         "generated_at_unix": int(time.time()),
         "config": str(config_path),
         "outdir": str(outdir),
+        "selected_references": list(selected_references),
         "results": [],
         "postprocess": [],
         "summary": {},
@@ -1264,50 +1802,61 @@ def main() -> int:
         "This downloader uses chr22 remote slicing for test BAMs to reduce footprint.",
         file=sys.stderr,
     )
+    print(f"Selected references: {', '.join(selected_references)}", file=sys.stderr)
 
     failures = 0
-    for ds in datasets:
-        if categories is not None and ds.category not in categories:
-            continue
-        if not ds.required and not args.include_optional:
-            continue
+    download_workers = max(1, int(args.download_workers))
+    results_by_idx: list[dict[str, Any] | None] = [None] * len(active_datasets)
+    future_to_meta: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, Dataset, Path]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=download_workers) as executor:
+        for idx, ds in enumerate(active_datasets):
+            target = outdir / ds.target_path
+            print(f"[download] {ds.dataset_id} -> {target}", file=sys.stderr)
+            fut = executor.submit(
+                _download_dataset,
+                ds=ds,
+                target=target,
+                timeout_sec=args.timeout_sec,
+                threads=args.threads,
+                force=args.force,
+                retries=args.download_retries,
+                retry_backoff_sec=args.download_retry_backoff_sec,
+            )
+            future_to_meta[fut] = (idx, ds, target)
 
-        target = outdir / ds.target_path
-        print(f"[download] {ds.dataset_id} -> {target}", file=sys.stderr)
-        try:
-            if ds.region and ds.url.endswith(".bam"):
-                result = _slice_remote_bam(ds.url, ds.region, target, threads=args.threads, force=args.force)
-            else:
-                result = _download_file(ds.url, target, timeout_sec=args.timeout_sec, force=args.force)
-            result.update(
-                {
+        for fut in concurrent.futures.as_completed(future_to_meta):
+            idx, ds, target = future_to_meta[fut]
+            try:
+                result = fut.result()
+            except Exception as err:  # noqa: BLE001
+                failures += 1
+                result = {
                     "id": ds.dataset_id,
                     "category": ds.category,
                     "description": ds.description,
                     "source": ds.source,
-                    "region": ds.region,
                     "required": ds.required,
+                    "status": "failed",
+                    "error": str(err),
+                    "url": ds.url,
+                    "path": str(target),
                 }
-            )
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as err:
-            failures += 1
-            result = {
-                "id": ds.dataset_id,
-                "category": ds.category,
-                "description": ds.description,
-                "source": ds.source,
-                "required": ds.required,
-                "status": "failed",
-                "error": str(err),
-                "url": ds.url,
-                "path": str(target),
-            }
-            print(f"[error] {ds.dataset_id}: {err}", file=sys.stderr)
+                print(f"[error] {ds.dataset_id}: {err}", file=sys.stderr)
 
+            results_by_idx[idx] = result
+            print(
+                f"[download:{result.get('status', 'unknown')}] {ds.dataset_id} -> {target}",
+                file=sys.stderr,
+            )
+
+    for result in results_by_idx:
+        if result is None:
+            continue
         manifest["results"].append(result)
-        print(
-            f"[download:{result.get('status', 'unknown')}] {ds.dataset_id} -> {target}",
-            file=sys.stderr,
+    if len(manifest["results"]) != len(active_datasets):
+        raise RuntimeError(
+            "Internal error: manifest result count mismatch after concurrent download "
+            f"({len(manifest['results'])} vs {len(active_datasets)})."
         )
 
     if not args.skip_postprocess:
@@ -1332,10 +1881,11 @@ def main() -> int:
         try:
             manifest["postprocess"] = _postprocess(
                 outdir,
-                datasets,
+                active_datasets,
                 force=args.force,
                 timeout_sec=args.timeout_sec,
                 prefer_prebuilt_bwa_index=not args.no_prebuilt_bwa_index,
+                selected_references=selected_references,
             )
         except Exception as err:  # noqa: BLE001
             manifest["postprocess"].append({"step": "pipeline_postprocess", "status": "failed", "error": str(err)})

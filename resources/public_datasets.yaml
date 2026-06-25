@@ -14,6 +14,14 @@ datasets:
     target_path: reference/hg38/Homo_sapiens_assembly38.fasta
     required: true
 
+  - id: hg19_reference_fasta
+    category: reference
+    description: Broad hg19 reference FASTA with adjacent prebuilt BWA indexes
+    source: Broad/AWS
+    url: https://broad-references.s3.amazonaws.com/hg19/v0/Homo_sapiens_assembly19.fasta
+    target_path: reference/hg19/Homo_sapiens_assembly19.fasta
+    required: true
+
   - id: hs1_t2t_reference_fasta
     category: reference
     description: T2T CHM13 analysis-set FASTA with prebuilt BWA indexes (AWS Open Data)
@@ -38,12 +46,28 @@ datasets:
     target_path: annotation/hg38/repeats/rmsk.txt.gz
     required: true
 
+  - id: hg19_repeatmasker_rmsk
+    category: annotation
+    description: UCSC hg19 RepeatMasker table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/rmsk.txt.gz
+    target_path: annotation/hg19/repeats/rmsk.txt.gz
+    required: true
+
   - id: hg38_segmental_duplications
     category: annotation
     description: UCSC hg38 genomicSuperDups table dump
     source: UCSC
     url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/genomicSuperDups.txt.gz
     target_path: annotation/hg38/segdup/genomicSuperDups.txt.gz
+    required: true
+
+  - id: hg19_segmental_duplications
+    category: annotation
+    description: UCSC hg19 genomicSuperDups table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/genomicSuperDups.txt.gz
+    target_path: annotation/hg19/segdup/genomicSuperDups.txt.gz
     required: true
 
   - id: hg38_mappability_100bp_bw
@@ -53,6 +77,14 @@ datasets:
     url: https://hgdownload.soe.ucsc.edu/gbdb/hg38/hoffmanMappability/k100.Umap.MultiTrackMappability.bw
     target_path: annotation/hg38/mappability/k100.Umap.MultiTrackMappability.bw
     required: true
+
+  - id: hg19_mappability_100bp_bw
+    category: annotation
+    description: UCSC 100bp Umap multi-read mappability bigWig (hg19)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/gbdb/hg19/hoffmanMappability/k100.Umap.MultiTrackMappability.bw
+    target_path: annotation/hg19/mappability/k100.Umap.MultiTrackMappability.bw
+    required: false
 
   - id: gnomad_v41_sv_non_neuro_bb
     category: mei_polymorphism
@@ -70,12 +102,28 @@ datasets:
     target_path: liftover/hg38ToHs1.over.chain.gz
     required: true
 
+  - id: hg38_to_hg19_chain
+    category: liftover
+    description: liftOver chain hg38 -> hg19
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/liftOver/hg38ToHg19.over.chain.gz
+    target_path: liftover/hg38ToHg19.over.chain.gz
+    required: true
+
   - id: hs1_to_hg38_chain
     category: liftover
     description: liftOver chain hs1 (T2T) -> hg38
     source: UCSC
     url: https://hgdownload.soe.ucsc.edu/goldenPath/hs1/liftOver/hs1ToHg38.over.chain.gz
     target_path: liftover/hs1ToHg38.over.chain.gz
+    required: true
+
+  - id: hs1_to_hg19_chain
+    category: liftover
+    description: liftOver chain hs1 (T2T) -> hg19
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hs1/liftOver/hs1ToHg19.over.chain.gz
+    target_path: liftover/hs1ToHg19.over.chain.gz
     required: true
 
   - id: dfam_human_families_embl
@@ -199,6 +247,14 @@ datasets:
     source: UCSC
     url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/gap.txt.gz
     target_path: annotation/hg38/masks/gap.txt.gz
+    required: true
+
+  - id: hg19_gap
+    category: annotation
+    description: UCSC hg19 gap table dump (includes centromere/telomere gap types)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/gap.txt.gz
+    target_path: annotation/hg19/masks/gap.txt.gz
     required: true
 
   - id: mane_grch38_refseq_gtf

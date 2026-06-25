@@ -499,22 +499,19 @@ def build_candidate_loci_cmd(
 @click.option(
     "--empirical-exclude-merged-bed",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=Path("data/public/annotation/hg38/junk/junk_exclusion_merged.bed"),
-    show_default=True,
+    default=None,
     help="Pre-merged junk exclusion BED for empirical random-window sampling.",
 )
 @click.option(
     "--empirical-exclude-segdup-bed",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=Path("data/public/annotation/hg38/segdup/genomicSuperDups.bed"),
-    show_default=True,
+    default=None,
     help="Optional segdup BED to exclude from empirical random-window sampling.",
 )
 @click.option(
     "--empirical-exclude-mappability-bedgraph",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=Path("data/public/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"),
-    show_default=True,
+    default=None,
     help="Optional low-mappability mask (BED preferred; bedGraph also accepted) for empirical sampling exclusion.",
 )
 @click.option(
@@ -527,15 +524,13 @@ def build_candidate_loci_cmd(
 @click.option(
     "--empirical-exclude-gap-bed",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=Path("data/public/annotation/hg38/masks/gap.txt.gz"),
-    show_default=True,
+    default=None,
     help="Optional gap BED to exclude from empirical random-window sampling.",
 )
 @click.option(
     "--empirical-exclude-blacklist-bed",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=Path("data/public/annotation/hg38/blacklist/ENCFF356LFX.bed.gz"),
-    show_default=True,
+    default=None,
     help="Optional blacklist BED to exclude from empirical random-window sampling.",
 )
 @click.option(

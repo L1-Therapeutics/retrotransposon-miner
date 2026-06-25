@@ -17,10 +17,11 @@ DISEASE_BAM=""
 CONTROL_BAM=""
 MEI_FASTA=""
 REFERENCE_FASTA=""
-RMSK_TABLE="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz"
+RMSK_TABLE=""
 G1K_MEI_VCF=""
 LR_MEI_VCF=""
-OUTDIR="${RTM_RESULTS_DIR}/mei_step1_hg38_chr22"
+REFERENCE_BUILD="hg38"
+OUTDIR=""
 REGION="chr22"
 CHR_ARG=""
 CHR_CONCURRENCY="6"
@@ -40,12 +41,12 @@ LOCAL_ASSEMBLY="1"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
-SEG_DUP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/segdup/genomicSuperDups.bed"
-MAPPABILITY_BEDGRAPH="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.bedGraph"
-MAPPABILITY_LOW_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
-GAP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/masks/gap.txt.gz"
-BLACKLIST_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/blacklist/ENCFF356LFX.bed.gz"
-JUNK_MERGED_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/junk/junk_exclusion_merged.bed"
+SEG_DUP_BED="${SEG_DUP_BED:-}"
+MAPPABILITY_BEDGRAPH="${MAPPABILITY_BEDGRAPH:-}"
+MAPPABILITY_LOW_BED="${MAPPABILITY_LOW_BED:-}"
+GAP_BED="${GAP_BED:-}"
+BLACKLIST_BED="${BLACKLIST_BED:-}"
+JUNK_MERGED_BED="${JUNK_MERGED_BED:-}"
 
 now_epoch() {
   date +%s
@@ -75,7 +76,7 @@ resolve_chr_list() {
   fi
   if [[ "${chr_arg,,}" == "all" ]]; then
     local i
-    for i in $(seq 1 22); do
+    for i in $(seq 22 -1 1); do
       echo "chr${i}"
     done
     echo "chrX"
@@ -93,6 +94,81 @@ resolve_chr_list() {
     norm="$(normalize_chr_token "${tok}")" || return 1
     echo "${norm}"
   done
+}
+
+set_reference_build_defaults() {
+  case "${REFERENCE_BUILD}" in
+    hg38)
+      [[ -n "${REFERENCE_FASTA}" ]] || REFERENCE_FASTA="${RTM_PUBLIC_DATA_DIR}/reference/hg38/Homo_sapiens_assembly38.fasta"
+      [[ -n "${RMSK_TABLE}" ]] || RMSK_TABLE="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/repeats/rmsk.txt.gz"
+      [[ -n "${G1K_MEI_VCF}" ]] || G1K_MEI_VCF="${RTM_PUBLIC_DATA_DIR}/polymorphism/hg38/melt/nstd144.GRCh38.variant_call.vcf.gz"
+      [[ -n "${LR_MEI_VCF}" ]] || LR_MEI_VCF="${RTM_PUBLIC_DATA_DIR}/polymorphism/hg38/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz"
+      [[ -n "${SEG_DUP_BED}" ]] || SEG_DUP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/segdup/genomicSuperDups.bed"
+      [[ -n "${MAPPABILITY_BEDGRAPH}" ]] || MAPPABILITY_BEDGRAPH="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+      [[ -n "${MAPPABILITY_LOW_BED}" ]] || MAPPABILITY_LOW_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+      [[ -n "${GAP_BED}" ]] || GAP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/masks/gap.txt.gz"
+      [[ -n "${BLACKLIST_BED}" ]] || BLACKLIST_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/blacklist/ENCFF356LFX.bed.gz"
+      [[ -n "${JUNK_MERGED_BED}" ]] || JUNK_MERGED_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg38/junk/junk_exclusion_merged.bed"
+      ;;
+    hg19)
+      [[ -n "${REFERENCE_FASTA}" ]] || REFERENCE_FASTA="${RTM_PUBLIC_DATA_DIR}/reference/hg19/Homo_sapiens_assembly19.fasta"
+      [[ -n "${RMSK_TABLE}" ]] || RMSK_TABLE="${RTM_PUBLIC_DATA_DIR}/annotation/hg19/repeats/rmsk.txt.gz"
+      [[ -n "${G1K_MEI_VCF}" ]] || G1K_MEI_VCF="${RTM_PUBLIC_DATA_DIR}/polymorphism/hg19/melt/nstd144.GRCh37.variant_call.vcf.gz"
+      [[ -n "${LR_MEI_VCF}" ]] || LR_MEI_VCF="${RTM_PUBLIC_DATA_DIR}/polymorphism/hg19/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz"
+      [[ -n "${SEG_DUP_BED}" ]] || SEG_DUP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg19/segdup/genomicSuperDups.bed"
+      [[ -n "${MAPPABILITY_BEDGRAPH}" ]] || MAPPABILITY_BEDGRAPH="${RTM_PUBLIC_DATA_DIR}/annotation/hg19/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+      [[ -n "${MAPPABILITY_LOW_BED}" ]] || MAPPABILITY_LOW_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg19/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+      [[ -n "${GAP_BED}" ]] || GAP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg19/masks/gap.txt.gz"
+      [[ -n "${BLACKLIST_BED}" ]] || BLACKLIST_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg19/blacklist/ENCFF356LFX.hg19.bed"
+      [[ -n "${JUNK_MERGED_BED}" ]] || JUNK_MERGED_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hg19/junk/junk_exclusion_merged.bed"
+      ;;
+    hs1)
+      [[ -n "${REFERENCE_FASTA}" ]] || REFERENCE_FASTA="${RTM_PUBLIC_DATA_DIR}/reference/hs1/chm13v2.0_masked_DJ_5S_rDNA_PHR_PAR_wi_rCRS.fa"
+      [[ -n "${RMSK_TABLE}" ]] || RMSK_TABLE=""
+      [[ -n "${G1K_MEI_VCF}" ]] || G1K_MEI_VCF="${RTM_PUBLIC_DATA_DIR}/polymorphism/hs1/melt/nstd144.hs1.variant_call.vcf.gz"
+      [[ -n "${LR_MEI_VCF}" ]] || LR_MEI_VCF="${RTM_PUBLIC_DATA_DIR}/polymorphism/hs1/long_read_1kg_ont_vienna/final-vcf.unphased.SVAN_1.3.vcf.gz"
+      [[ -n "${SEG_DUP_BED}" ]] || SEG_DUP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/segdup/genomicSuperDups.hs1.bed"
+      [[ -n "${MAPPABILITY_BEDGRAPH}" ]] || MAPPABILITY_BEDGRAPH="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+      [[ -n "${MAPPABILITY_LOW_BED}" ]] || MAPPABILITY_LOW_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+      [[ -n "${GAP_BED}" ]] || GAP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/masks/gap.bed"
+      [[ -n "${BLACKLIST_BED}" ]] || BLACKLIST_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/blacklist/ENCFF356LFX.hs1.bed"
+      [[ -n "${JUNK_MERGED_BED}" ]] || JUNK_MERGED_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/junk/junk_exclusion_merged.bed"
+      ;;
+    *)
+      echo "ERROR: unsupported --reference-build '${REFERENCE_BUILD}'. Use hg19, hg38, or hs1." >&2
+      exit 1
+      ;;
+  esac
+}
+
+validate_reference_path_consistency() {
+  local label="$1"
+  local path="$2"
+  if [[ -z "${path}" ]]; then
+    return 0
+  fi
+  local p
+  p="$(echo "${path}" | tr '[:upper:]' '[:lower:]')"
+  case "${REFERENCE_BUILD}" in
+    hg38)
+      if [[ "${p}" == *"/hg19/"* ]] || [[ "${p}" == *"/hs1/"* ]] || [[ "${p}" == *"grch37"* ]] || [[ "${p}" == *"chm13"* ]]; then
+        echo "ERROR: ${label} appears to target a non-hg38 build while --reference-build=hg38: ${path}" >&2
+        exit 1
+      fi
+      ;;
+    hg19)
+      if [[ "${p}" == *"/hg38/"* ]] || [[ "${p}" == *"/hs1/"* ]] || [[ "${p}" == *"grch38"* ]] || [[ "${p}" == *"assembly38"* ]] || [[ "${p}" == *"chm13"* ]]; then
+        echo "ERROR: ${label} appears to target a non-hg19 build while --reference-build=hg19: ${path}" >&2
+        exit 1
+      fi
+      ;;
+    hs1)
+      if [[ "${p}" == *"/hg38/"* ]] || [[ "${p}" == *"/hg19/"* ]] || [[ "${p}" == *"grch38"* ]] || [[ "${p}" == *"grch37"* ]] || [[ "${p}" == *"assembly38"* ]] || [[ "${p}" == *"human_g1k_v37"* ]]; then
+        echo "ERROR: ${label} appears to target a non-hs1 build while --reference-build=hs1: ${path}" >&2
+        exit 1
+      fi
+      ;;
+  esac
 }
 
 while [[ $# -gt 0 ]]; do
@@ -148,6 +224,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --region)
       REGION="$2"
+      shift 2
+      ;;
+    --reference-build|--reference)
+      REFERENCE_BUILD="${2,,}"
       shift 2
       ;;
     --window-size)
@@ -209,6 +289,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+set_reference_build_defaults
+if [[ -z "${OUTDIR}" ]]; then
+  OUTDIR="${RTM_RESULTS_DIR}/mei_step1_${REFERENCE_BUILD}_chr22"
+fi
+validate_reference_path_consistency "reference FASTA" "${REFERENCE_FASTA}"
+validate_reference_path_consistency "RepeatMasker table" "${RMSK_TABLE}"
+validate_reference_path_consistency "1000G/MELT VCF" "${G1K_MEI_VCF}"
+validate_reference_path_consistency "long-read SVAN VCF" "${LR_MEI_VCF}"
+validate_reference_path_consistency "segdup BED" "${SEG_DUP_BED}"
+validate_reference_path_consistency "mappability track" "${MAPPABILITY_BEDGRAPH}"
+validate_reference_path_consistency "low-mappability mask" "${MAPPABILITY_LOW_BED}"
+validate_reference_path_consistency "gap track" "${GAP_BED}"
+validate_reference_path_consistency "blacklist track" "${BLACKLIST_BED}"
+validate_reference_path_consistency "merged junk BED" "${JUNK_MERGED_BED}"
+
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   if [[ "${PYTHON_BIN}" == "python" ]] && command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="python3"
@@ -246,12 +341,12 @@ for f in "${DISEASE_BAM}" "${CONTROL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MA
 done
 if [[ ! -f "${MAPPABILITY_LOW_BED}" ]]; then
   echo "ERROR: required low-mappability BED not found: ${MAPPABILITY_LOW_BED}" >&2
-  echo "Re-run: python3 scripts/download_public_data.py --outdir ${RTM_PUBLIC_DATA_DIR}" >&2
+  echo "Re-run: python3 scripts/download_public_data.py --references ${REFERENCE_BUILD} --outdir ${RTM_PUBLIC_DATA_DIR}" >&2
   exit 1
 fi
 if [[ ! -f "${JUNK_MERGED_BED}" ]]; then
   echo "ERROR: required merged junk BED not found: ${JUNK_MERGED_BED}" >&2
-  echo "Re-run: python3 scripts/download_public_data.py --outdir ${RTM_PUBLIC_DATA_DIR}" >&2
+  echo "Re-run: python3 scripts/download_public_data.py --references ${REFERENCE_BUILD} --outdir ${RTM_PUBLIC_DATA_DIR}" >&2
   exit 1
 fi
 if [[ -n "${REFERENCE_FASTA}" ]] && [[ ! -f "${REFERENCE_FASTA}" ]]; then

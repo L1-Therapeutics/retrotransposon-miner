@@ -173,19 +173,19 @@ Outputs:
 ```bash
 python3 scripts/download_public_data.py \
   --config resources/public_datasets.yaml \
+  --references hg38 hs1 \
+  --download-workers 4 \
   --outdir "${RTM_PUBLIC_DATA_DIR}"
 ```
 
-This initial dataset pack includes:
-- hg38 reference FASTA (Broad AWS)
-- T2T/hs1 reference FASTA (CHM13 analysis set on AWS)
+This dataset pack includes (for requested references plus required liftOver sources):
+- hg19/hg38/hs1 reference FASTAs (depending on `--references`)
 - FASTA index artifacts generated locally (`.fai`, `.dict`)
-- GENCODE annotation (v46, GRCh38)
-- RepeatMasker + segmental duplication tables (hg38)
-- UCSC 100bp mappability (`k100.Umap.MultiTrackMappability.bw`)
-- gnomAD SV polymorphism track (includes MEI classes)
-- 1000G ONT Vienna long-read SVAN cohort callset (v1.1, sequence-resolved MEI annotations)
-- hg38<->hs1 liftOver chains
+- RepeatMasker + segmental duplication + mappability + gap tracks for selected builds
+- gnomAD SV polymorphism track (source hg38; projected as needed)
+- 1000G MELT MEI VCF (source hg38; projected to selected builds as needed)
+- 1000G ONT Vienna long-read SVAN callset (source hs1; projected to selected builds as needed)
+- liftOver chains needed for selected build conversions
 - Dfam FamDB archive (required; extract human families with `famdb.py`)
 - UCSC Repeat Browser consensus FASTA (`hg38reps.fa`)
 - Dfam-derived MEI FASTA library outputs:
@@ -200,10 +200,10 @@ This initial dataset pack includes:
 
 Post-download processing is automatic and includes:
 - remote slicing of SEQC2 disease/control BAMs to `chr22` (no full BAM local copy)
-- converting selected hg38 resources to BED/BEDGRAPH
+- converting selected resources to BED/BEDGRAPH masks per target reference
 - extracting MEI-focused BED rows from gnomAD SV track
-- lifting hg38 BED resources to hs1/T2T via `liftOver`
-- downloading prebuilt BWA index files for hg38 and hs1 from AWS sources when available (fallback: local build)
+- lifting/inter-projecting resources across references (hg19/hg38/hs1) via `liftOver`
+- downloading prebuilt BWA index files for selected references when available (fallback: local build)
 - cloning `Dfam-consortium/FamDB` (if needed), exporting curated human Dfam FASTA,
   generating a focused LINE1/Alu/SVA MEI FASTA subset,
   and constructing a full-consensus LINE1/Alu/SVA panel for coordinate-normalized remapping
@@ -216,7 +216,17 @@ Download only selected categories:
 
 ```bash
 python3 scripts/download_public_data.py \
+  --references hg19 \
   --categories reference liftover \
+  --outdir "${RTM_PUBLIC_DATA_DIR}"
+```
+
+Download only a chosen reference ecosystem (plus dependencies/liftOver source inputs):
+
+```bash
+python3 scripts/download_public_data.py \
+  --references hg19 \
+  --download-workers 4 \
   --outdir "${RTM_PUBLIC_DATA_DIR}"
 ```
 
@@ -270,7 +280,7 @@ way to convert BAM evidence between assemblies.
 To regenerate the same chr22 test BAM set reproducibly from scratch:
 
 ```bash
-python3 scripts/download_public_data.py --outdir "${RTM_PUBLIC_DATA_DIR}" --threads 4
+python3 scripts/download_public_data.py --references hg38 hs1 --outdir "${RTM_PUBLIC_DATA_DIR}" --threads 4
 
 bash scripts/reprocess_pair_dual_reference.sh \
   --disease-bam "${RTM_PUBLIC_DATA_DIR}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
@@ -309,6 +319,17 @@ candidate loci generation, and MEI support annotation), see:
 
 - `docs/proof_of_signal_runbook.md`
 - `scripts/run_proof_of_signal.sh`
+
+Use `scripts/run_proof_of_signal.sh --reference-build <hg19|hg38|hs1>` so
+build-specific public data paths are selected automatically.
+
+If you call `retro_miner.cli annotate-mei-support` directly, pass explicit
+reference-specific values for:
+- `--empirical-exclude-merged-bed`
+- `--empirical-exclude-segdup-bed`
+- `--empirical-exclude-mappability-bedgraph`
+- `--empirical-exclude-gap-bed`
+- `--empirical-exclude-blacklist-bed`
 
 ## Project layout
 
