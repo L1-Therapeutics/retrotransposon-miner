@@ -1,5 +1,7 @@
 # retrotransposon-miner
 
+Short-read MEI detection and annotation pipeline for LINE-1, Alu, and SVA.
+
 `retrotransposon-miner` searches next-generation sequencing data for retrotransposon (mobile element insertion, MEI) events in the human genome.
 Retrotransposons are virus-like elements that can activate under stress and are implicated in disease biology.
 
@@ -145,6 +147,26 @@ For whole-genome runs, use at least `r6i.4xlarge`.
 Use the main workflow wrapper:
 
 - `scripts/run_candidate_discovery_and_annotation.sh`
+
+Important: these quickstart commands do not download reference/public inputs automatically.
+
+Step 0: download public/reference data first using the provided script:
+
+```bash
+conda activate rtm-miner || micromamba activate rtm-miner
+python3 scripts/download_public_data.py \
+  --references hg38 \
+  --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}"
+```
+
+If you plan to run both GRCh38 and hs1 workflows:
+
+```bash
+conda activate rtm-miner || micromamba activate rtm-miner
+python3 scripts/download_public_data.py \
+  --references hg38 hs1 \
+  --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}"
+```
 
 Tumor/normal chr22 quickstart (SEQC2 public test pair):
 
@@ -321,6 +343,6 @@ Contributions are welcome and encouraged.
 
 - Contribution guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Community standards: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
-- Contact: open a GitHub issue/discussion, or email `william@l1tx.com`.
+- Contact: open a GitHub issue/discussion first, or email `william [at] l1tx [dot] com`.
 
 If you submit code, please include clear validation steps and update documentation when behavior changes.
