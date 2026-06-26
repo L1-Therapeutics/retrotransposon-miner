@@ -5,6 +5,12 @@ Retrotransposons are virus-like elements that can activate under stress and are 
 
 The pipeline detects multiple MEI classes and outputs a candidate insertion table annotated with evidence and context useful for triage.
 
+## Repository Metadata
+
+- Repository description: `Retrotransposon MEI caller for short-read WGS with split-read + discordant-pair evidence, candidate ranking, MEI annotation, and IGV snapshot review workflows.`
+- GitHub topics: `retrotransposon`, `mobile-element-insertion`, `mei`, `line1`, `alu`, `sva`, `genomics`, `bioinformatics`, `structural-variation`, `nextflow`, `igv`, `jupyterlab`, `aws`, `ec2`.
+- Search keywords: `retrotransposon detection`, `mobile element insertion calling`, `LINE-1 insertion`, `Alu insertion`, `SVA insertion`, `short-read MEI pipeline`, `tumor normal MEI`, `germline MEI`, `IGV MEI review`.
+
 ## What This Tool Can Do
 
 - Detect MEI candidates from short-read data using split-read and discordant paired-end evidence.
@@ -133,6 +139,36 @@ SVA insertion present in 1000 Genomes short-read data but not reported in matche
 ## Getting Started on EC2 (Up and Running)
 
 For whole-genome runs, use at least `r6i.4xlarge`.
+
+### Quickstart Runs (chr22)
+
+Use the main workflow wrapper:
+
+- `scripts/run_candidate_discovery_and_annotation.sh`
+
+Tumor/normal chr22 quickstart (SEQC2 public test pair):
+
+```bash
+bash scripts/run_candidate_discovery_and_annotation.sh \
+  --reference-build hg38 \
+  --disease-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
+  --control-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
+  --mei-fasta "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
+  --chr chr22 \
+  --outdir "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22"
+```
+
+HG0001-style germline/control chr22 quickstart (replace with your BAM path):
+
+```bash
+bash scripts/run_candidate_discovery_and_annotation.sh \
+  --reference-build hg38 \
+  --disease-bam "/path/to/HG0001.chr22.hg38.bam" \
+  --control-bam "/path/to/HG0001.chr22.hg38.bam" \
+  --mei-fasta "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
+  --chr chr22 \
+  --outdir "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_hg0001_chr22"
+```
 
 ### Quick Start
 
@@ -285,5 +321,6 @@ Contributions are welcome and encouraged.
 
 - Contribution guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Community standards: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+- Contact: open a GitHub issue/discussion, or email `william@l1tx.com`.
 
 If you submit code, please include clear validation steps and update documentation when behavior changes.

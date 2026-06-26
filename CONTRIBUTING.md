@@ -8,6 +8,7 @@ Thanks for your interest in contributing.
 - Propose features with concrete use cases.
 - Improve documentation, examples, and reproducibility notes.
 - Submit code fixes and enhancements via pull requests.
+- For questions/support, open an issue (or discussion if enabled) or email `william@l1tx.com`.
 
 ## Before You Start
 
