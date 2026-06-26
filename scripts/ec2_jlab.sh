@@ -24,6 +24,16 @@ awsq() {
   aws --region "${REGION}" "$@"
 }
 
+imds_get() {
+  local path="$1"
+  local token
+  token="$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)"
+  [[ -n "${token}" ]] || return 1
+  curl -fsS "http://169.254.169.254/latest/${path}" \
+    -H "X-aws-ec2-metadata-token: ${token}" 2>/dev/null
+}
+
 get_latest_al2023_ami() {
   awsq ssm get-parameter \
     --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
@@ -93,10 +103,45 @@ ensure_security_group() {
 }
 
 get_instance_id() {
-  awsq ec2 describe-instances \
-    --filters Name=tag:Name,Values="${INSTANCE_NAME}" Name=instance-state-name,Values=pending,running,stopping,stopped \
-    --query 'Reservations[].Instances[].InstanceId' \
-    --output text | awk 'NF{print $1; exit}'
+  # Primary: explicit Name-tag match used by bootstrap lifecycle.
+  local iid
+  iid="$(
+    awsq ec2 describe-instances \
+      --filters Name=tag:Name,Values="${INSTANCE_NAME}" Name=instance-state-name,Values=pending,running,stopping,stopped \
+      --query 'Reservations[].Instances[].InstanceId' \
+      --output text 2>/dev/null | awk 'NF{print $1; exit}'
+  )"
+  if [[ -n "${iid}" && "${iid}" != "None" ]]; then
+    echo "${iid}"
+    return 0
+  fi
+
+  # Fallback 1: resolve the configured SSH alias host IP and map it to an instance.
+  local host_ip=""
+  if command -v ssh >/dev/null 2>&1; then
+    host_ip="$(ssh -G "${HOST_ALIAS}" 2>/dev/null | awk '$1=="hostname"{print $2; exit}' || true)"
+  fi
+  if [[ -n "${host_ip}" ]]; then
+    iid="$(
+      awsq ec2 describe-instances \
+        --filters Name=ip-address,Values="${host_ip}" Name=instance-state-name,Values=pending,running,stopping,stopped \
+        --query 'Reservations[].Instances[].InstanceId' \
+        --output text 2>/dev/null | awk 'NF{print $1; exit}'
+    )"
+    if [[ -n "${iid}" && "${iid}" != "None" ]]; then
+      echo "${iid}"
+      return 0
+    fi
+  fi
+
+  # Fallback 2: when running on EC2, use current instance metadata.
+  iid="$(imds_get "meta-data/instance-id" || true)"
+  if [[ -n "${iid}" ]]; then
+    echo "${iid}"
+    return 0
+  fi
+
+  return 1
 }
 
 ensure_instance() {
@@ -140,10 +185,14 @@ start_instance() {
 
 stop_instance() {
   local iid
-  iid="$(get_instance_id)"
+  iid="$(get_instance_id || true)"
   [[ -n "${iid}" ]] || { log "No instance found."; exit 1; }
   log "Stopping ${iid}"
-  awsq ec2 stop-instances --instance-ids "${iid}" >/dev/null
+  if ! awsq ec2 stop-instances --instance-ids "${iid}" >/dev/null 2>&1; then
+    log "Unable to stop via EC2 API with current credentials."
+    log "If you're currently on this EC2 host, use: sudo shutdown -h now"
+    exit 1
+  fi
   awsq ec2 wait instance-stopped --instance-ids "${iid}"
   log "Instance stopped."
 }
