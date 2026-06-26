@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# End-to-end proof-of-signal pipeline (chr22-oriented starter flow):
+# End-to-end candidate-discovery-and-annotation pipeline (chr22-oriented starter flow):
 # 1) extract split + discordant evidence
 # 2) build candidate loci with junk-region flags
 # 3) annotate MEI family/subfamily support from clipped reads
@@ -37,6 +37,9 @@ EMPIRICAL_RANDOM_WINDOWS="1000"
 EMPIRICAL_RANDOM_SCOPE="chromosome"
 EMPIRICAL_RANDOM_SEED="13"
 EMPIRICAL_HIGHCONF_BED=""
+# Keep empirical gating enabled by default so noisy repeat-context loci are
+# filtered from gold-stage outputs unless explicitly disabled.
+EMPIRICAL_STAGE="1"
 LOCAL_ASSEMBLY="1"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
@@ -266,6 +269,14 @@ while [[ $# -gt 0 ]]; do
       EMPIRICAL_HIGHCONF_BED="$2"
       shift 2
       ;;
+    --empirical-stage)
+      EMPIRICAL_STAGE="1"
+      shift 1
+      ;;
+    --no-empirical-stage)
+      EMPIRICAL_STAGE="0"
+      shift 1
+      ;;
     --local-assembly)
       LOCAL_ASSEMBLY="1"
       shift 1
@@ -321,7 +332,7 @@ if [[ "${RUN_IN_ENV}" == "0" ]]; then
     *":${PYTHON_BIN_DIR}:"*) ;;
     *)
       export PATH="${PYTHON_BIN_DIR}:${PATH}"
-      echo "[proof-of-signal] prepended python bin dir to PATH for subprocess tools: ${PYTHON_BIN_DIR}"
+      echo "[candidate-pipeline] prepended python bin dir to PATH for subprocess tools: ${PYTHON_BIN_DIR}"
       ;;
   esac
 fi
@@ -407,7 +418,7 @@ consolidate_all_chrom_outputs() {
     fi
   done
   if [[ "${#inputs[@]}" -eq 0 ]]; then
-    echo "[proof-of-signal] no per-chrom gold review tables found to consolidate"
+    echo "[candidate-pipeline] no per-chrom gold review tables found to consolidate"
     return 0
   fi
   local out_path="${base_outdir}/${basename}"
@@ -470,7 +481,7 @@ PY
   fi
   unset RTM_MERGE_INPUTS
   unset RTM_MERGE_OUTPUT
-  echo "[proof-of-signal] consolidated ${basename} -> ${out_path}"
+  echo "[candidate-pipeline] consolidated ${basename} -> ${out_path}"
 }
 
 run_single_pipeline() {
@@ -480,7 +491,7 @@ run_single_pipeline() {
   mkdir -p "${run_outdir}"
 
   stage_t0=$(now_epoch)
-  echo "[proof-of-signal] stage=extract-split-evidence region=${run_region} outdir=${run_outdir}"
+  echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir}"
   run_cli extract-split-evidence \
     --disease-bam "${DISEASE_BAM}" \
     --control-bam "${CONTROL_BAM}" \
@@ -489,10 +500,10 @@ run_single_pipeline() {
     --min-mapq 20 \
     --min-mapq-discordant 20 \
     --min-clip-len 20
-  echo "[proof-of-signal] stage=extract-split-evidence done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+  echo "[candidate-pipeline] stage=extract-split-evidence done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
 
   stage_t0=$(now_epoch)
-  echo "[proof-of-signal] stage=build-candidate-loci region=${run_region} window_size=${WINDOW_SIZE}"
+  echo "[candidate-pipeline] stage=build-candidate-loci region=${run_region} window_size=${WINDOW_SIZE}"
   run_cli build-candidate-loci \
     --evidence-dir "${run_outdir}" \
     --window-size "${WINDOW_SIZE}" \
@@ -506,10 +517,10 @@ run_single_pipeline() {
     --gap-min-fraction 0.1 \
     --encode-blacklist-bed "${BLACKLIST_BED}" \
     --encode-blacklist-min-fraction 0.1
-  echo "[proof-of-signal] stage=build-candidate-loci done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+  echo "[candidate-pipeline] stage=build-candidate-loci done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
 
   stage_t0=$(now_epoch)
-  echo "[proof-of-signal] stage=annotate-mei-support region=${run_region}"
+  echo "[candidate-pipeline] stage=annotate-mei-support region=${run_region}"
   annotate_cmd=(
     annotate-mei-support
     --evidence-dir "${run_outdir}"
@@ -527,6 +538,11 @@ run_single_pipeline() {
     --empirical-random-scope "${EMPIRICAL_RANDOM_SCOPE}"
     --empirical-random-seed "${EMPIRICAL_RANDOM_SEED}"
   )
+  if [[ "${EMPIRICAL_STAGE}" == "1" ]]; then
+    annotate_cmd+=(--empirical-stage)
+  else
+    annotate_cmd+=(--no-empirical-stage)
+  fi
   if [[ -n "${EMPIRICAL_HIGHCONF_BED}" ]]; then
     annotate_cmd+=(--empirical-highconf-bed "${EMPIRICAL_HIGHCONF_BED}")
   fi
@@ -553,7 +569,7 @@ run_single_pipeline() {
   fi
   annotate_cmd+=(--out-tsv "${run_outdir}/candidate_loci.mei.tsv")
   run_cli "${annotate_cmd[@]}"
-  echo "[proof-of-signal] stage=annotate-mei-support done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+  echo "[candidate-pipeline] stage=annotate-mei-support done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
 }
 
 if ! [[ "${CHR_CONCURRENCY}" =~ ^[0-9]+$ ]] || [[ "${CHR_CONCURRENCY}" -lt 1 ]]; then
@@ -576,7 +592,7 @@ if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; th
     chr_gold="${chr_outdir}/candidate_loci.mei.gold_review.tsv"
     if [[ -f "${chr_log}" ]] && [[ -f "${chr_gold}" ]]; then
       if grep -q "stage=annotate-mei-support done region=${chr}" "${chr_log}"; then
-        echo "[proof-of-signal] skip-complete skipping ${chr} (already complete in outdir)"
+        echo "[candidate-pipeline] skip-complete skipping ${chr} (already complete in outdir)"
         skipped_count=$((skipped_count + 1))
         continue
       fi
@@ -584,11 +600,11 @@ if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; th
     filtered_chr_list+=("${chr}")
   done
   if [[ "${skipped_count}" -gt 0 ]]; then
-    echo "[proof-of-signal] skip-complete skipped=${skipped_count} remaining=${#filtered_chr_list[@]}"
+    echo "[candidate-pipeline] skip-complete skipped=${skipped_count} remaining=${#filtered_chr_list[@]}"
   fi
   CHR_LIST=("${filtered_chr_list[@]}")
   if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
-    echo "[proof-of-signal] all requested chromosomes already complete in outdir; nothing to run"
+    echo "[candidate-pipeline] all requested chromosomes already complete in outdir; nothing to run"
     exit 0
   fi
 fi
@@ -606,7 +622,7 @@ fi
 if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   REGION="${CHR_LIST[0]}"
   run_single_pipeline "${REGION}" "${OUTDIR}"
-  echo "[proof-of-signal] done"
+  echo "[candidate-pipeline] done"
   echo "  ${OUTDIR}/split_evidence.summary.tsv"
   echo "  ${OUTDIR}/candidate_loci.tsv"
   echo "  ${OUTDIR}/candidate_loci.mei.tsv"
@@ -619,7 +635,7 @@ BASE_OUTDIR="${OUTDIR}"
 LOG_DIR="${BASE_OUTDIR}/logs"
 mkdir -p "${LOG_DIR}"
 
-echo "[proof-of-signal] multi-chrom run chr_count=${#CHR_LIST[@]} chr_concurrency=${CHR_CONCURRENCY} base_outdir=${BASE_OUTDIR}"
+echo "[candidate-pipeline] multi-chrom run chr_count=${#CHR_LIST[@]} chr_concurrency=${CHR_CONCURRENCY} base_outdir=${BASE_OUTDIR}"
 
 # Rolling worker queue:
 # - launch chromosomes until CHR_CONCURRENCY slots are full
@@ -634,7 +650,7 @@ launch_next_chr() {
   local chr="$1"
   local chr_outdir="${BASE_OUTDIR}/${chr}"
   local chr_log="${LOG_DIR}/${chr}.log"
-  echo "[proof-of-signal] launch ${chr} -> ${chr_outdir} (log=${chr_log})"
+  echo "[candidate-pipeline] launch ${chr} -> ${chr_outdir} (log=${chr_log})"
   (
     run_single_pipeline "${chr}" "${chr_outdir}"
   ) >"${chr_log}" 2>&1 &
@@ -657,7 +673,7 @@ reap_finished_children() {
       continue
     fi
     if wait "${pid}"; then
-      echo "[proof-of-signal] completed ${chr}"
+      echo "[candidate-pipeline] completed ${chr}"
     else
       echo "ERROR: chromosome run failed for ${chr}. See ${LOG_DIR}/${chr}.log" >&2
       exit 1
@@ -679,11 +695,11 @@ while [[ "${next_idx}" -lt "${total}" ]] || [[ "${#pids[@]}" -gt 0 ]]; do
   fi
 done
 
-echo "[proof-of-signal] done multi-chrom"
+echo "[candidate-pipeline] done multi-chrom"
 echo "  per-chrom outputs under: ${BASE_OUTDIR}/chr*/"
 echo "  logs under: ${LOG_DIR}/"
 if [[ "${CHR_ALL_MODE}" == "1" ]]; then
-  echo "[proof-of-signal] consolidating --chr all outputs into ${BASE_OUTDIR}"
+  echo "[candidate-pipeline] consolidating --chr all outputs into ${BASE_OUTDIR}"
   consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${CHR_LIST[@]}"
   echo "  consolidated gold review written to: ${BASE_OUTDIR}/candidate_loci.mei.gold_review.tsv"
 fi

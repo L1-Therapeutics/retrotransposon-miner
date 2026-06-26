@@ -5,7 +5,7 @@ set -euo pipefail
 # - Streams unindexed S3 BAMs
 # - Keeps only chr22 alignments locally
 # - Indexes chr22 BAMs
-# - Runs proof-of-signal with no local assembly
+# - Runs candidate discovery + annotation with no local assembly
 # - Runs at most 4 pairs in parallel
 
 S3_PREFIX="${S3_PREFIX:-s3://l1tx-neurofibroma/synapse/syn4984617}"
@@ -99,7 +99,7 @@ run_one_pair() {
     echo "[batch] index control chr22 bam"
     samtools index -@ "${SAMTOOLS_THREADS}" "${pair_data_dir}/${control_bam_name%.bam}.chr22.bam"
 
-    echo "[batch] run proof-of-signal pair=${pair_id}"
+    echo "[batch] run candidate discovery + annotation pair=${pair_id}"
     RUN_IN_ENV=1 \
     SEG_DUP_BED="${SEG_DUP_BED}" \
     MAPPABILITY_BEDGRAPH="${MAPPABILITY_BEDGRAPH}" \
@@ -107,7 +107,7 @@ run_one_pair() {
     GAP_BED="${GAP_BED}" \
     BLACKLIST_BED="${BLACKLIST_BED}" \
     JUNK_MERGED_BED="${JUNK_MERGED_BED}" \
-    bash "${REPO_DIR}/scripts/run_proof_of_signal.sh" \
+    bash "${REPO_DIR}/scripts/run_candidate_discovery_and_annotation.sh" \
       --reference-build hg19 \
       --disease-bam "${pair_data_dir}/${disease_bam_name%.bam}.chr22.bam" \
       --control-bam "${pair_data_dir}/${control_bam_name%.bam}.chr22.bam" \
