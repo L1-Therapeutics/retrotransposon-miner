@@ -7,12 +7,6 @@ Retrotransposons are virus-like elements that can activate under stress and are 
 
 The pipeline detects multiple MEI classes and outputs a candidate insertion table annotated with evidence and context useful for triage.
 
-## Repository Metadata
-
-- Repository description: `Retrotransposon MEI caller for short-read WGS with split-read + discordant-pair evidence, candidate ranking, MEI annotation, and IGV snapshot review workflows.`
-- GitHub topics: `retrotransposon`, `mobile-element-insertion`, `mei`, `line1`, `alu`, `sva`, `genomics`, `bioinformatics`, `structural-variation`, `nextflow`, `igv`, `jupyterlab`, `aws`, `ec2`.
-- Search keywords: `retrotransposon detection`, `mobile element insertion calling`, `LINE-1 insertion`, `Alu insertion`, `SVA insertion`, `short-read MEI pipeline`, `tumor normal MEI`, `germline MEI`, `IGV MEI review`.
-
 ## What This Tool Can Do
 
 - Detect MEI candidates from short-read data using split-read and discordant paired-end evidence.
@@ -346,3 +340,9 @@ Contributions are welcome and encouraged.
 - Contact: open a GitHub issue/discussion first, or email `william [at] l1tx [dot] com`.
 
 If you submit code, please include clear validation steps and update documentation when behavior changes.
+
+## Repository Metadata
+
+- Repository description: `Retrotransposon MEI caller for short-read WGS with split-read + discordant-pair evidence, candidate ranking, MEI annotation, and IGV snapshot review workflows.`
+- GitHub topics: `retrotransposon`, `mobile-element-insertion`, `mei`, `line1`, `alu`, `sva`, `genomics`, `bioinformatics`, `structural-variation`, `nextflow`, `igv`, `jupyterlab`, `aws`, `ec2`.
+- Search keywords: `retrotransposon detection`, `mobile element insertion calling`, `LINE-1 insertion`, `Alu insertion`, `SVA insertion`, `short-read MEI pipeline`, `tumor normal MEI`, `germline MEI`, `IGV MEI review`.
