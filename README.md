@@ -93,10 +93,12 @@ Evidence includes a LINE-1 insertion, target site duplication (TSD) sequence `GA
 
 ### GRCh38 chr22:17567258-17567931 - full-length Alu known from long-read data
 
-![GRCh38 chr22:17567258-17567931 known long-read Alu](docs/examples/grch38_hg00100_known_longread_alu_chr22_17567258_17567931.png)
+![GRCh38 chr22:17567258-17567931 known long-read Alu zoom](docs/examples/grch38_hg00100_known_longread_alu_chr22_17567258_17567931_technical.gif)
 
 Full-length Alu insertion previously reported only from long-read sequencing (`chr22-18235412-INS->s898803>s907604>s907605>s907606>s898804-358`).  
 TSD sequence `TATCCTTGCTTTTAT` and a 12 bp polyA signal are present (negative-strand orientation), with additional A-rich sequence that may have reduced prior short-read detectability.
+
+An outreach-oriented GIF without the final annotation panel is available at `docs/examples/grch38_hg00100_known_longread_alu_chr22_17567258_17567931_outreach.gif`. Both GIFs are 1080×1080 (LinkedIn/iPhone friendly) and pause on the final frame. Regenerate with `python scripts/make_locus_zoom_gif.py`.
 
 ### GRCh38 chr22:19222954-19223820 - control-only LINE-1 with probable tumor deletion context
 
