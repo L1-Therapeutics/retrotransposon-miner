@@ -44,7 +44,6 @@ TEST_DATASET_IDS = {
     "seqc2_disease_bam",
     "seqc2_control_bam",
     "hg00100_shortread_highcov_cram",
-    "hg00100_longread_ont_hg38_cram",
 }
 
 # Datasets grouped by their native coordinate build.

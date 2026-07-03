@@ -315,12 +315,3 @@ datasets:
     target_path: test_data/1kg_hg00100/chr22/hg00100.shortread.chr22.hg38.bam
     region: chr22
     required: true
-
-  - id: hg00100_longread_ont_hg38_cram
-    category: test_bam
-    description: 1KG-ONT-VIENNA HG00100 ONT hg38 CRAM sliced to chr22 during download
-    source: 1KG-ONT-VIENNA (long-read ONT)
-    url: https://1kg-ont-vienna.s3.eu-west-1.amazonaws.com/hg38/HG00100.hg38.cram
-    target_path: test_data/1kg_hg00100/chr22/hg00100.longread_ont.chr22.hg38.bam
-    region: chr22
-    required: true
