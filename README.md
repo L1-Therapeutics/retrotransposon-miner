@@ -90,7 +90,7 @@ See [`docs/EXAMPLES.md`](docs/EXAMPLES.md) for additional annotated IGV review s
 
 ### Illumina
 
-<video src="docs/examples/retrotransposon.mp4" controls width="640"></video>
+![Illumina chr22 retrotransposon insertion example](docs/examples/retrotransposon.gif)
 
 The gif shows screenshots from random sections of chromosome 22 in a healthy individual. Grey bars represent unmutated DNA, and colors indicate either a mutation or errors in sequencing. The final screenshot shows a barcode-like signature indicating a retrotransposon insertion at one location. This insertion was not previously reported in this individual in published studies using the same data.
 
