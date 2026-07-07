@@ -49,6 +49,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 - Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. For larger runs, `r6i.4xlarge` or greater is recommended, and local assembly/candidate processing support parallel execution.
 - Artificial intelligence/machine learning (AI/ML) genotyping confidence models are still under active development.
 - Reverse-transcribed pseudogene insertion support is not yet added.
+- Support for species other than *Homo sapiens* (for example, *Mus musculus*) is not yet implemented.
 - Long-read native calling is not yet supported.
 - Single-cell sequencing data is not yet supported.
 - Other short-read platforms (for example, Ultima Genomics) are not yet validated/supported.
