@@ -99,6 +99,112 @@ The gif shows screenshots from random sections of chromosome 22 in a healthy ind
 
 For whole-genome runs, use at least `r6i.4xlarge`.
 
+The EC2 helper script (`scripts/ec2_jlab.sh`) works with **any existing EC2 instance** in your AWS account. Instance IDs and names are **not hardcoded in the repository**; each user binds their own instance locally to `.ec2-instance.env` (gitignored).
+
+Run `./scripts/ec2_jlab.sh help` for the full command list.
+
+### Quick Start (Bring Your Own EC2)
+
+From your local machine:
+
+```bash
+git clone https://github.com/<org>/retrotransposon-miner.git
+cd retrotransposon-miner
+chmod +x scripts/ec2_jlab.sh
+./scripts/ec2_jlab.sh list-instances
+./scripts/ec2_jlab.sh use <instance-id-or-name>
+./scripts/ec2_jlab.sh up
+ssh retro-ec2
+```
+
+One-shot bind, start, and SSH config:
+
+```bash
+./scripts/ec2_jlab.sh up <instance-id-or-name>
+./scripts/ec2_jlab.sh connect
+```
+
+After the instance is running:
+- Secure Shell (SSH): `ssh retro-ec2`
+- JupyterLab (after `start-jlab` + `start-tunnel`): `http://127.0.0.1:8890/lab?token=<printed-token>`
+
+### Create a New EC2 Instance
+
+Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab):
+
+```bash
+./scripts/ec2_jlab.sh bootstrap
+```
+
+`start-instance`, `stop-instance`, and `reboot-instance` operate on the **bound** instance only and do not create new instances.
+
+### EC2 CLI Reference
+
+| Command | Description |
+|---|---|
+| `list-instances` | List EC2 instances in the configured region |
+| `use <instance-id-or-name>` | Bind an instance (by ID or `Name` tag) and update SSH config |
+| `up [instance-id-or-name]` | Bind (optional), start, refresh SSH config |
+| `connect [instance-id-or-name]` | `up` + SSH |
+| `status` | Show bound instance state |
+| `start-instance` | Start the bound instance |
+| `stop-instance` | Stop the bound instance |
+| `reboot-instance` | Reboot the bound instance |
+| `bootstrap` | Create and configure a new EC2 instance |
+| `start-jlab` / `stop-jlab` / `start-tunnel` | JupyterLab lifecycle |
+| `help` | Show usage |
+
+Optional environment variables:
+
+- `REGION` — AWS region (default: from `aws configure`, else `us-east-1`)
+- `INSTANCE_ID` / `INSTANCE_NAME` — override bound instance without editing `.ec2-instance.env`
+- `HOST_ALIAS` — SSH config alias (default: `retro-ec2`)
+- `SSH_USER` — SSH login user (auto-detected from AMI if unset; e.g. `ec2-user`, `ubuntu`)
+- `KEY_PATH` — path to PEM for the instance key pair
+- `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r6i.4xlarge`)
+
+Binding is saved to `.ec2-instance.env` in the repo checkout. Rebind anytime with `use`.
+
+### Prerequisites
+
+Local tools:
+- `aws` command-line interface (CLI) v2 (`aws configure` complete)
+- `ssh`
+- `curl`
+- `git`
+
+Identity and Access Management (IAM) permissions:
+
+For bring-your-own-EC2 (`use`, `up`, `connect`, lifecycle commands):
+- `ec2:Describe*`
+- `ec2:StartInstances`
+- `ec2:StopInstances`
+- `ec2:RebootInstances`
+- `ec2:AuthorizeSecurityGroupIngress` (SSH proxy refreshes your current IP on connect)
+
+Additional permissions for `bootstrap` (new instance provisioning):
+- `ec2:RunInstances`
+- `ec2:CreateTags`
+- `ec2:CreateKeyPair`
+- `ec2:CreateSecurityGroup`
+- `ec2:AllocateAddress`
+- `ec2:AssociateAddress`
+- `ec2:DescribeAddresses`
+- `ec2:DescribeVpcs`
+- `ec2:DescribeSubnets`
+- `ssm:GetParameter` (Amazon Linux AMI lookup)
+- `iam:PassRole` (if attaching an instance profile)
+
+### What `scripts/ec2_jlab.sh` Does
+
+- Binds to any existing EC2 instance by ID or `Name` tag (`use`).
+- Saves the binding locally in `.ec2-instance.env` (not committed to git).
+- Starts, stops, and reboots the bound instance without creating new ones.
+- Writes SSH aliases (`retro-ec2`, `jlab`) into local `~/.ssh/config`.
+- Refreshes SSH security group ingress for your current public IP on connect.
+- Optionally creates a new instance (`bootstrap`), key pair, security group, and Elastic IP.
+- Starts JupyterLab remotely and tunnels it locally.
+
 ### Quickstart Runs (chr22)
 
 Use the main workflow wrapper:
@@ -147,78 +253,6 @@ bash scripts/run_candidate_discovery_and_annotation.sh \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --chr chr22 \
   --outdir "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_hg0001_chr22"
-```
-
-### Quick Start
-
-From your local machine:
-
-```bash
-git clone https://github.com/<org>/retrotransposon-miner.git
-cd retrotransposon-miner
-chmod +x scripts/ec2_jlab.sh
-./scripts/ec2_jlab.sh bootstrap
-```
-
-After bootstrap:
-- Secure Shell (SSH) to instance: `ssh retro-ec2`
-- Open JupyterLab locally: `http://127.0.0.1:8890/lab?token=<printed-token>`
-
-### Prerequisites
-
-Local tools:
-- `aws` command-line interface (CLI) v2 (`aws configure` complete)
-- `ssh`
-- `curl`
-- `git`
-
-Identity and Access Management (IAM) permissions:
-- `ec2:Describe*`
-- `ec2:RunInstances`
-- `ec2:StartInstances`
-- `ec2:StopInstances`
-- `ec2:RebootInstances`
-- `ec2:CreateTags`
-- `ec2:CreateKeyPair`
-- `ec2:DeleteKeyPair` (optional)
-- `ec2:CreateSecurityGroup`
-- `ec2:AuthorizeSecurityGroupIngress`
-- `ec2:AllocateAddress`
-- `ec2:AssociateAddress`
-- `ec2:DescribeAddresses`
-- `ec2:DescribeVpcs`
-- `ec2:DescribeSubnets`
-- `ssm:GetParameter` (Amazon Linux machine image (AMI) lookup)
-- `iam:PassRole` (if attaching an instance profile)
-
-### What `scripts/ec2_jlab.sh` Does
-
-- Creates/reuses an EC2 instance by `Name` tag.
-- Creates/reuses local Secure Shell (SSH) key material.
-- Creates/reuses a security group with SSH access limited to your current public Internet Protocol (IP) address.
-- Starts instance and waits for health checks.
-- Allocates/associates an Elastic IP.
-- Writes SSH aliases (`retro-ec2`, `jlab`) into local `~/.ssh/config`.
-- Starts JupyterLab remotely and tunnel locally.
-
-### Provision and Operate
-
-```bash
-cd retrotransposon-miner
-./scripts/ec2_jlab.sh bootstrap
-./scripts/ec2_jlab.sh status
-./scripts/ec2_jlab.sh stop-instance
-./scripts/ec2_jlab.sh start-instance
-./scripts/ec2_jlab.sh reboot-instance
-./scripts/ec2_jlab.sh start-jlab
-./scripts/ec2_jlab.sh stop-jlab
-./scripts/ec2_jlab.sh start-tunnel
-```
-
-Secure Shell (SSH):
-
-```bash
-ssh retro-ec2
 ```
 
 ### Sync Repository on Virtual Machine (VM)
@@ -284,7 +318,9 @@ python3 scripts/download_public_data.py \
 ### Notes
 
 - Designed for headless Linux execution with optional Integrative Genomics Viewer (IGV) snapshot generation.
-- If your public IP changes, rerun `bootstrap` to refresh security group ingress.
+- Instance bindings are local (`.ec2-instance.env`); nothing instance-specific is committed to git.
+- If your public IP changes, SSH connect refreshes security group ingress automatically via `ec2_jlab.sh`.
+- Set `KEY_PATH` if your PEM is not in `~/.ssh/` or the default search paths.
 - For production use, review security hardening, key lifecycle, and cost controls.
 
 ## License
