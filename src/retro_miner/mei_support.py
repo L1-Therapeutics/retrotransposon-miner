@@ -858,6 +858,161 @@ def _build_supporting_reads_detail_table(
     return pd.DataFrame(rows)
 
 
+def _aggregate_detail_mei_extents(detail: pd.DataFrame) -> pd.DataFrame:
+    """Per-locus min/max MEI consensus coords from supporting-read detail rows.
+
+    Matches the plot-path footprint: min/max over SR ``mei_start/end`` and DPE
+    ``mate_mei_start/end`` (and any direct ``mei_*`` hits) for disease and
+    control samples separately, plus a combined locus extent.
+
+    Also emits per-side SR extents (``{sample}_{L|R}_detail_mei_start/end``) so
+    gold/annotation rebuilds can restore zeroed L/R aggregated coords.
+    """
+    key_cols = ["chrom", "window_start", "window_end"]
+    empty_cols = key_cols + [
+        "disease_detail_mei_start_min",
+        "disease_detail_mei_end_max",
+        "control_detail_mei_start_min",
+        "control_detail_mei_end_max",
+        "detail_mei_start_min",
+        "detail_mei_end_max",
+        "disease_L_detail_mei_start",
+        "disease_L_detail_mei_end",
+        "disease_R_detail_mei_start",
+        "disease_R_detail_mei_end",
+        "control_L_detail_mei_start",
+        "control_L_detail_mei_end",
+        "control_R_detail_mei_start",
+        "control_R_detail_mei_end",
+    ]
+    if detail is None or detail.empty:
+        return pd.DataFrame(columns=empty_cols)
+    required = set(key_cols + ["sample", "mei_start", "mei_end", "mate_mei_start", "mate_mei_end"])
+    if not required.issubset(set(detail.columns)):
+        return pd.DataFrame(columns=empty_cols)
+
+    work = detail.loc[:, list(required | {"mei_hit", "mate_mei_hit", "evidence_type", "anchor_side"})].copy()
+    work["sample"] = work["sample"].fillna("").astype(str).str.lower()
+    work = work.loc[work["sample"].isin(["disease", "control"])].copy()
+    if work.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    mei_hit = (
+        work["mei_hit"].fillna(False).astype(bool)
+        if "mei_hit" in work.columns
+        else pd.Series(True, index=work.index)
+    )
+    mate_hit = (
+        work["mate_mei_hit"].fillna(False).astype(bool)
+        if "mate_mei_hit" in work.columns
+        else pd.Series(True, index=work.index)
+    )
+    mei_start = pd.to_numeric(work["mei_start"], errors="coerce").fillna(0).astype(int).where(mei_hit, 0)
+    mei_end = pd.to_numeric(work["mei_end"], errors="coerce").fillna(0).astype(int).where(mei_hit, 0)
+    mate_start = (
+        pd.to_numeric(work["mate_mei_start"], errors="coerce").fillna(0).astype(int).where(mate_hit, 0)
+    )
+    mate_end = pd.to_numeric(work["mate_mei_end"], errors="coerce").fillna(0).astype(int).where(mate_hit, 0)
+    work["extent_lo"] = pd.concat(
+        [mei_start.where(mei_start.gt(0)), mate_start.where(mate_start.gt(0))],
+        axis=1,
+    ).min(axis=1, skipna=True)
+    work["extent_hi"] = pd.concat(
+        [mei_end.where(mei_end.gt(0)), mate_end.where(mate_end.gt(0))],
+        axis=1,
+    ).max(axis=1, skipna=True)
+    work = work.loc[work["extent_lo"].gt(0) & work["extent_hi"].ge(work["extent_lo"])].copy()
+    if work.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    per_sample = (
+        work.groupby(key_cols + ["sample"], as_index=False)
+        .agg(extent_lo=("extent_lo", "min"), extent_hi=("extent_hi", "max"))
+    )
+    disease = per_sample.loc[per_sample["sample"].eq("disease"), key_cols + ["extent_lo", "extent_hi"]].rename(
+        columns={"extent_lo": "disease_detail_mei_start_min", "extent_hi": "disease_detail_mei_end_max"}
+    )
+    control = per_sample.loc[per_sample["sample"].eq("control"), key_cols + ["extent_lo", "extent_hi"]].rename(
+        columns={"extent_lo": "control_detail_mei_start_min", "extent_hi": "control_detail_mei_end_max"}
+    )
+    combined = (
+        work.groupby(key_cols, as_index=False)
+        .agg(detail_mei_start_min=("extent_lo", "min"), detail_mei_end_max=("extent_hi", "max"))
+    )
+    out = combined.merge(disease, on=key_cols, how="left").merge(control, on=key_cols, how="left")
+
+    # Per-side SR extents (used to restore zeroed disease/control_L/R_mei_start/end).
+    if "evidence_type" in work.columns and "anchor_side" in work.columns:
+        sr = work.loc[
+            work["evidence_type"].astype(str).str.upper().eq("SR")
+            & work["anchor_side"].astype(str).str.upper().isin(["L", "R"])
+        ].copy()
+        if not sr.empty:
+            sr["anchor_side"] = sr["anchor_side"].astype(str).str.upper().str[:1]
+            side_agg = (
+                sr.groupby(key_cols + ["sample", "anchor_side"], as_index=False)
+                .agg(extent_lo=("extent_lo", "min"), extent_hi=("extent_hi", "max"))
+            )
+            for sample in ("disease", "control"):
+                for side in ("L", "R"):
+                    part = side_agg.loc[
+                        side_agg["sample"].eq(sample) & side_agg["anchor_side"].eq(side),
+                        key_cols + ["extent_lo", "extent_hi"],
+                    ].rename(
+                        columns={
+                            "extent_lo": f"{sample}_{side}_detail_mei_start",
+                            "extent_hi": f"{sample}_{side}_detail_mei_end",
+                        }
+                    )
+                    out = out.merge(part, on=key_cols, how="left")
+
+    for col in empty_cols:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out.loc[:, empty_cols]
+
+
+def _merge_detail_mei_extents(candidates: pd.DataFrame, detail: pd.DataFrame | None) -> pd.DataFrame:
+    """Attach detail-derived MEI extents onto candidate rows when available.
+
+    When aggregated ``{sample}_{L|R}_mei_start/end`` are zero/missing but detail
+    SR extents exist, restore those L/R fields from detail (same min/max the
+    plots use).
+    """
+    if detail is None or detail.empty or candidates.empty:
+        return candidates
+    extents = _aggregate_detail_mei_extents(detail)
+    if extents.empty:
+        return candidates
+    out = candidates.copy()
+    drop_cols = [c for c in extents.columns if c not in {"chrom", "window_start", "window_end"} and c in out.columns]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+    out = out.merge(extents, on=["chrom", "window_start", "window_end"], how="left")
+
+    for sample in ("disease", "control"):
+        for side in ("L", "R"):
+            start_col = f"{sample}_{side}_mei_start"
+            end_col = f"{sample}_{side}_mei_end"
+            d_start = f"{sample}_{side}_detail_mei_start"
+            d_end = f"{sample}_{side}_detail_mei_end"
+            if d_start not in out.columns or d_end not in out.columns:
+                continue
+            if start_col not in out.columns:
+                out[start_col] = 0
+            if end_col not in out.columns:
+                out[end_col] = 0
+            cur_start = pd.to_numeric(out[start_col], errors="coerce").fillna(0)
+            cur_end = pd.to_numeric(out[end_col], errors="coerce").fillna(0)
+            new_start = pd.to_numeric(out[d_start], errors="coerce")
+            new_end = pd.to_numeric(out[d_end], errors="coerce")
+            replace = cur_start.le(0) & new_start.gt(0) & new_end.ge(new_start)
+            if replace.any():
+                out.loc[replace, start_col] = new_start.loc[replace]
+                out.loc[replace, end_col] = new_end.loc[replace]
+    return out
+
+
 def _assign_rows_to_candidate_loci(split_df: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
     if split_df.empty or candidates.empty:
         return pd.DataFrame(columns=list(split_df.columns) + ["window_start", "window_end"])
@@ -1766,16 +1921,37 @@ def _aggregate_side_metrics(
         side_df["target_len_effective"] = pd.concat(
             [side_df["target_len_effective"], coord_tlen], axis=1
         ).max(axis=1).astype(int)
-    coord_target_col = "target_coord" if "target_coord" in side_df.columns else "target"
-    coord_mapq_col = "mapq_coord" if "mapq_coord" in side_df.columns else "mapq"
-    coord_qcov_col = "qcov_coord" if "qcov_coord" in side_df.columns else "qcov"
-    coord_pid_col = "pid_coord" if "pid_coord" in side_df.columns else "pid"
-    coord_alnlen_col = "alnlen_coord" if "alnlen_coord" in side_df.columns else "alnlen"
-    coord_start_col = "target_start_coord" if "target_start_coord" in side_df.columns else "target_start"
-    coord_end_col = "target_end_coord" if "target_end_coord" in side_df.columns else "target_end"
-    coord_tlen_col = "target_len_coord" if "target_len_coord" in side_df.columns else "target_len"
+    # Prefer per-row coord-remap fields only when they carry a real hit; otherwise
+    # fall back to the primary target_* columns. Blindly selecting *_coord when the
+    # column exists (even if all zeros) previously zeroed L/R mei_start/end despite
+    # valid split-read MEI mappings.
+    def _coalesce_coord_numeric(primary: str, coord: str) -> pd.Series:
+        base = pd.to_numeric(side_df.get(primary, 0), errors="coerce").fillna(0)
+        if coord in side_df.columns:
+            alt = pd.to_numeric(side_df[coord], errors="coerce").fillna(0)
+            return alt.where(alt.gt(0), base)
+        return base
+
+    def _coalesce_coord_string(primary: str, coord: str) -> pd.Series:
+        base = side_df.get(primary, pd.Series("", index=side_df.index)).fillna("").astype(str)
+        if coord in side_df.columns:
+            alt = side_df[coord].fillna("").astype(str)
+            return alt.where(alt.str.len().gt(0), base)
+        return base
+
+    side_df["coord_target"] = _coalesce_coord_string("target", "target_coord")
+    side_df["coord_target_start"] = _coalesce_coord_numeric("target_start", "target_start_coord").astype(int)
+    side_df["coord_target_end"] = _coalesce_coord_numeric("target_end", "target_end_coord").astype(int)
+    side_df["coord_target_len"] = _coalesce_coord_numeric("target_len", "target_len_coord").astype(int)
+    side_df["coord_mapq"] = _coalesce_coord_numeric("mapq", "mapq_coord")
+    side_df["coord_qcov"] = _coalesce_coord_numeric("qcov", "qcov_coord")
+    side_df["coord_pid"] = _coalesce_coord_numeric("pid", "pid_coord")
+    side_df["coord_alnlen"] = _coalesce_coord_numeric("alnlen", "alnlen_coord").astype(int)
     if "mei_hit_coord" in side_df.columns:
-        coord_hit_mask = side_df["mei_hit_coord"].fillna(False).astype(bool)
+        coord_hit_mask = (
+            side_df["mei_hit"].fillna(False).astype(bool)
+            | side_df["mei_hit_coord"].fillna(False).astype(bool)
+        )
     else:
         coord_hit_mask = side_df["mei_hit"].fillna(False).astype(bool)
 
@@ -1794,38 +1970,47 @@ def _aggregate_side_metrics(
         .rename(columns={"target_effective": f"{sample_prefix}_{side}_mei_subfamily"})
     )
     # Coordinate-estimation subset: avoid low-confidence/polyA-only hits that can
-    # collapse inferred spans to tail-length artifacts.
-    coord_mapq = pd.to_numeric(side_df[coord_mapq_col], errors="coerce").fillna(0)
-    coord_qcov = pd.to_numeric(side_df[coord_qcov_col], errors="coerce").fillna(0.0)
-    coord_pid = pd.to_numeric(side_df[coord_pid_col], errors="coerce").fillna(0.0)
-    coord_alnlen = pd.to_numeric(side_df[coord_alnlen_col], errors="coerce").fillna(0)
+    # collapse inferred spans to tail-length artifacts. Prefer non-poly clips, but
+    # do not hard-drop poly-containing clips that still have a real MEI alignment
+    # (common at the 3' junction where the softclip includes the polyA tail).
+    coord_mapq = side_df["coord_mapq"]
+    coord_qcov = side_df["coord_qcov"]
+    coord_pid = side_df["coord_pid"]
+    coord_alnlen = side_df["coord_alnlen"]
+    has_mei_coords = side_df["coord_target_start"].gt(0) & side_df["coord_target_end"].ge(
+        side_df["coord_target_start"]
+    )
     # MEI clips can be highly repetitive with low MAPQ despite very high identity/coverage.
     # Permit these as coordinate candidates if alignment quality itself is strong.
     strong_repetitive_clip = (coord_qcov >= 0.90) & (coord_pid >= 0.90) & (coord_alnlen >= 40)
-    coord_df = side_df.loc[
+    quality_ok_strict = (
         coord_hit_mask
+        & has_mei_coords
         & ((coord_mapq >= 20) | strong_repetitive_clip)
         & (coord_qcov >= 0.60)
         & (coord_pid >= 0.85)
         & (coord_alnlen >= _MIN_MEI_ANCHOR_BP)
-        & (side_df["poly_at_flag"] == 0)
-    ].copy()
+    )
+    quality_ok_relaxed = (
+        coord_hit_mask
+        & has_mei_coords
+        & ((coord_mapq >= 10) | strong_repetitive_clip)
+        & (coord_qcov >= 0.35)
+        & (coord_pid >= 0.75)
+        & (coord_alnlen >= _MIN_MEI_ANCHOR_BP_RELAXED)
+    )
+    non_poly = side_df["poly_at_flag"] == 0
+    coord_df = side_df.loc[quality_ok_strict & non_poly].copy()
     if coord_df.empty:
-        # Fallback for split-supported loci where strict filters are too harsh:
-        # still require uniquely mappable-ish, non-polyA anchors.
-        coord_df = side_df.loc[
-            coord_hit_mask
-            & ((coord_mapq >= 10) | strong_repetitive_clip)
-            & (coord_qcov >= 0.35)
-            & (coord_pid >= 0.75)
-            & (coord_alnlen >= _MIN_MEI_ANCHOR_BP_RELAXED)
-            & (side_df["poly_at_flag"] == 0)
-        ].copy()
+        coord_df = side_df.loc[quality_ok_relaxed & non_poly].copy()
+    if coord_df.empty:
+        # Keep poly-tailed junction clips with otherwise strong MEI mappings.
+        coord_df = side_df.loc[quality_ok_strict].copy()
+    if coord_df.empty:
+        coord_df = side_df.loc[quality_ok_relaxed].copy()
     if not coord_df.empty:
-        coord_df["coord_target"] = coord_df[coord_target_col].fillna("").astype(str)
-        coord_df["coord_target_start"] = pd.to_numeric(coord_df[coord_start_col], errors="coerce").fillna(0).astype(int)
-        coord_df["coord_target_end"] = pd.to_numeric(coord_df[coord_end_col], errors="coerce").fillna(0).astype(int)
-        coord_df["coord_target_len"] = pd.to_numeric(coord_df[coord_tlen_col], errors="coerce").fillna(0).astype(int)
+        # Columns already coalesced above.
+        pass
     if not coord_df.empty:
         coord_df = coord_df.merge(
             subfamily_top[
@@ -1839,7 +2024,6 @@ def _aggregate_side_metrics(
             on=["chrom", "window_start", "window_end"],
             how="left",
         )
-        coord_df["coord_target"] = coord_df["coord_target"].fillna("").astype(str)
         coord_df["coord_side_target"] = coord_df[f"{sample_prefix}_{side}_mei_subfamily"].fillna("").astype(str)
         if preferred_subfamily_by_locus:
             pref_tbl = pd.DataFrame(
@@ -7228,6 +7412,20 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     n_sr_lo = pd.concat([n_l_sr_start, n_l_sr_end, n_r_sr_start, n_r_sr_end], axis=1).min(axis=1, skipna=True)
     n_sr_hi = pd.concat([n_l_sr_start, n_l_sr_end, n_r_sr_start, n_r_sr_end], axis=1).max(axis=1, skipna=True)
 
+    # Prefer supporting-read detail min/max (same footprint used by read-architecture
+    # plots). Aggregated L/R start fields and DPE medians often under-call span.
+    d_detail_lo = pd.to_numeric(_series_or_default("disease_detail_mei_start_min", float("nan")), errors="coerce")
+    d_detail_hi = pd.to_numeric(_series_or_default("disease_detail_mei_end_max", float("nan")), errors="coerce")
+    n_detail_lo = pd.to_numeric(_series_or_default("control_detail_mei_start_min", float("nan")), errors="coerce")
+    n_detail_hi = pd.to_numeric(_series_or_default("control_detail_mei_end_max", float("nan")), errors="coerce")
+    combined_detail_lo = pd.to_numeric(_series_or_default("detail_mei_start_min", float("nan")), errors="coerce")
+    combined_detail_hi = pd.to_numeric(_series_or_default("detail_mei_end_max", float("nan")), errors="coerce")
+    d_detail_ok = d_detail_lo.gt(0) & d_detail_hi.ge(d_detail_lo)
+    n_detail_ok = n_detail_lo.gt(0) & n_detail_hi.ge(n_detail_lo)
+    combined_detail_ok = combined_detail_lo.gt(0) & combined_detail_hi.ge(combined_detail_lo)
+    d_detail_span = (d_detail_hi - d_detail_lo + 1.0).where(d_detail_ok, 0.0)
+    n_detail_span = (n_detail_hi - n_detail_lo + 1.0).where(n_detail_ok, 0.0)
+
     d_left_t_early = pd.to_numeric(
         _series_or_default("disease_discordant_mei_left_target_pos_median", float("nan")), errors="coerce"
     )
@@ -7323,7 +7521,20 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     raw_start = pd.Series([float("nan")] * len(out), index=out.index)
     raw_end = pd.Series([float("nan")] * len(out), index=out.index)
 
+    # 0) Supporting-read detail footprint (min/max of all mapped SR+DPE MEI coords).
+    choose_n_detail = n_detail_ok & (~d_detail_ok | n_detail_span.gt(d_detail_span))
+    choose_d_detail = d_detail_ok & ~choose_n_detail
+    raw_start = raw_start.where(~choose_d_detail, d_detail_lo)
+    raw_end = raw_end.where(~choose_d_detail, d_detail_hi)
+    raw_start = raw_start.where(~choose_n_detail, n_detail_lo)
+    raw_end = raw_end.where(~choose_n_detail, n_detail_hi)
+    unresolved = raw_start.isna() | raw_end.isna()
+    choose_combined_detail = unresolved & combined_detail_ok
+    raw_start = raw_start.where(~choose_combined_detail, combined_detail_lo)
+    raw_end = raw_end.where(~choose_combined_detail, combined_detail_hi)
+
     # 1) Bilateral split-read footprint = full mapped extent (min start, max end).
+    unresolved = raw_start.isna() | raw_end.isna()
     d_sr_support = (
         pd.to_numeric(_series_or_default("disease_L_mei_supported_reads", 0), errors="coerce").fillna(0.0)
         + pd.to_numeric(_series_or_default("disease_R_mei_supported_reads", 0), errors="coerce").fillna(0.0)
@@ -7332,8 +7543,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         pd.to_numeric(_series_or_default("control_L_mei_supported_reads", 0), errors="coerce").fillna(0.0)
         + pd.to_numeric(_series_or_default("control_R_mei_supported_reads", 0), errors="coerce").fillna(0.0)
     )
-    choose_n_sr = n_sr_bilateral & (~d_sr_bilateral | n_sr_support.gt(d_sr_support))
-    choose_d_sr = d_sr_bilateral & ~choose_n_sr
+    choose_n_sr = unresolved & n_sr_bilateral & (~d_sr_bilateral | n_sr_support.gt(d_sr_support))
+    choose_d_sr = unresolved & d_sr_bilateral & ~choose_n_sr
     raw_start = raw_start.where(~choose_d_sr, d_sr_lo)
     raw_end = raw_end.where(~choose_d_sr, d_sr_hi)
     raw_start = raw_start.where(~choose_n_sr, n_sr_lo)
@@ -8925,6 +9136,7 @@ def annotate_candidate_loci_with_mei(
         detail_parquet = out_path.with_name("supporting_reads_detail.mei.parquet")
         supporting_reads_detail.to_csv(detail_tsv, sep="\t", index=False)
         supporting_reads_detail.to_parquet(detail_parquet, index=False)
+        candidate = _merge_detail_mei_extents(candidate, supporting_reads_detail)
         print(f"[mei-annotate] wrote supporting read detail table to {detail_tsv}")
     full_consensus_fasta = _resolve_full_consensus_fasta(
         mei_fasta=mei_fasta,
