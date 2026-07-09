@@ -503,6 +503,361 @@ def _align_discordant_reads_with_minimap2(
     return out, summary
 
 
+def _fetch_discordant_mate_sequences(
+    discordant_df: pd.DataFrame,
+    bam_path: Path | None,
+) -> pd.DataFrame:
+    """Attach mate_seq to discordant rows, using evidence column or BAM fallback."""
+    if discordant_df.empty:
+        return discordant_df.copy()
+
+    out = discordant_df.copy()
+    if "mate_seq" not in out.columns:
+        out["mate_seq"] = ""
+    if "mate_ref_start" not in out.columns:
+        out["mate_ref_start"] = 0
+    if "mate_ref_end" not in out.columns:
+        out["mate_ref_end"] = 0
+
+    out["mate_seq"] = out["mate_seq"].fillna("").astype(str)
+    out["mate_ref_start"] = pd.to_numeric(out["mate_ref_start"], errors="coerce").fillna(0).astype(int)
+    out["mate_ref_end"] = pd.to_numeric(out["mate_ref_end"], errors="coerce").fillna(0).astype(int)
+
+    if bam_path is None or not bam_path.exists():
+        return out
+
+    need_fetch = out.loc[
+        (out["mate_seq"].str.len() == 0)
+        & (out["mate_chrom"].fillna("").astype(str) != "*")
+        & (pd.to_numeric(out["mate_pos"], errors="coerce").fillna(0).astype(int) > 0)
+    ].copy()
+    if need_fetch.empty:
+        return out
+
+    fetched: dict[str, tuple[str, int, int]] = {}
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for rec in need_fetch.itertuples(index=False):
+            qname = str(rec.read_name)
+            if qname in fetched:
+                continue
+            mate_chrom = str(rec.mate_chrom)
+            mate_pos = int(rec.mate_pos)
+            start0 = max(0, mate_pos - 1)
+            end0 = start0 + 500
+            for mate_read in bam.fetch(mate_chrom, start0, end0):
+                if mate_read.query_name != qname:
+                    continue
+                if mate_read.is_secondary or mate_read.is_supplementary:
+                    continue
+                if mate_read.is_unmapped:
+                    continue
+                seq = mate_read.query_sequence or ""
+                if not seq:
+                    continue
+                fetched[qname] = (
+                    seq,
+                    int(mate_read.reference_start) + 1 if mate_read.reference_start is not None else 0,
+                    int(mate_read.reference_end) if mate_read.reference_end is not None else 0,
+                )
+                break
+
+    if not fetched:
+        return out
+
+    for qname, (seq, mstart, mend) in fetched.items():
+        mask = out["read_name"].astype(str) == qname
+        out.loc[mask, "mate_seq"] = seq
+        out.loc[mask, "mate_ref_start"] = mstart
+        out.loc[mask, "mate_ref_end"] = mend
+    return out
+
+
+def _align_discordant_mates_with_minimap2(
+    discordant_df: pd.DataFrame,
+    mei_fasta: Path,
+    sample: str,
+    bam_path: Path | None = None,
+) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
+    """Map discordant mates to the MEI consensus axis (interchrom/large-insert pairs)."""
+    enriched = _fetch_discordant_mate_sequences(discordant_df, bam_path)
+    mates = enriched.loc[enriched["mate_seq"].fillna("").astype(str).str.len() >= 30].copy()
+    if mates.empty:
+        summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
+        return mates, summary
+
+    mates["mate_query_id"] = [f"{sample}_mate_{i}" for i in range(len(mates))]
+    mate_query = mates.copy()
+    mate_query["read_seq"] = mate_query["mate_seq"].fillna("").astype(str)
+    if "discordant_reasons" not in mate_query.columns:
+        mate_query["discordant_reasons"] = "interchrom"
+    else:
+        mate_query["discordant_reasons"] = mate_query["discordant_reasons"].fillna("interchrom").astype(str)
+        mate_query.loc[mate_query["discordant_reasons"].str.len() == 0, "discordant_reasons"] = "interchrom"
+    hits, summary = _align_discordant_reads_with_minimap2(mate_query, mei_fasta, sample=sample)
+    keep_cols = [
+        "read_name",
+        "mate_query_id",
+        "mei_hit",
+        "target",
+        "family",
+        "target_strand",
+        "target_start",
+        "target_end",
+        "target_len",
+        "alnlen",
+        "mei_score",
+    ]
+    keep_cols = [c for c in keep_cols if c in hits.columns]
+    hits = hits.loc[:, keep_cols].rename(
+        columns={
+            "mei_hit": "mate_mei_hit",
+            "target": "mate_mei_target",
+            "family": "mate_mei_family",
+            "target_strand": "mate_mei_strand",
+            "target_start": "mate_mei_start",
+            "target_end": "mate_mei_end",
+            "target_len": "mate_mei_target_len",
+            "alnlen": "mate_mei_alnlen",
+            "mei_score": "mate_mei_score",
+        }
+    )
+    out = enriched.merge(hits.drop(columns=["mate_query_id"], errors="ignore"), on="read_name", how="left")
+    for col in [
+        "mate_mei_hit",
+        "mate_mei_start",
+        "mate_mei_end",
+        "mate_mei_target_len",
+        "mate_mei_alnlen",
+        "mate_mei_score",
+    ]:
+        if col not in out.columns:
+            if col == "mate_mei_hit":
+                out[col] = False
+            elif col in {"mate_mei_start", "mate_mei_end", "mate_mei_target_len", "mate_mei_alnlen"}:
+                out[col] = 0
+            else:
+                out[col] = 0.0
+    out["mate_mei_hit"] = out["mate_mei_hit"].fillna(False).astype(bool)
+    out["mate_mei_start"] = pd.to_numeric(out["mate_mei_start"], errors="coerce").fillna(0).astype(int)
+    out["mate_mei_end"] = pd.to_numeric(out["mate_mei_end"], errors="coerce").fillna(0).astype(int)
+    out["mate_mei_score"] = pd.to_numeric(out["mate_mei_score"], errors="coerce").fillna(0.0).astype(float)
+    return out, summary
+
+
+def _enrich_discordant_anchor_hits_with_mate_mei(
+    anchor_hits: pd.DataFrame,
+    mate_hits: pd.DataFrame,
+) -> pd.DataFrame:
+    """Promote mate MEI mappings into discordant anchor hit rows for metrics/MEI_MAPPED."""
+    if anchor_hits.empty:
+        return anchor_hits.copy()
+    out = anchor_hits.copy()
+    if mate_hits.empty or "mate_mei_hit" not in mate_hits.columns:
+        return out
+
+    merge_keys = [
+        c for c in ["read_name", "chrom", "window_start", "window_end"] if c in out.columns and c in mate_hits.columns
+    ]
+    mate_cols = [
+        c
+        for c in [
+            "mate_mei_hit",
+            "mate_mei_start",
+            "mate_mei_end",
+            "mate_mei_target",
+            "mate_mei_family",
+            "mate_mei_strand",
+            "mate_mei_score",
+        ]
+        if c in mate_hits.columns
+    ]
+    if not merge_keys or not mate_cols:
+        return out
+
+    merged = out.merge(
+        mate_hits.loc[:, merge_keys + mate_cols].drop_duplicates(merge_keys),
+        on=merge_keys,
+        how="left",
+    )
+    anchor_hit = merged["mei_hit"].fillna(False).astype(bool) if "mei_hit" in merged.columns else pd.Series(False, index=merged.index)
+    mate_hit = merged["mate_mei_hit"].fillna(False).astype(bool)
+    use_mate = (~anchor_hit) & mate_hit
+    if use_mate.any():
+        if "target_start" in merged.columns:
+            merged.loc[use_mate, "target_start"] = merged.loc[use_mate, "mate_mei_start"]
+        if "target_end" in merged.columns:
+            merged.loc[use_mate, "target_end"] = merged.loc[use_mate, "mate_mei_end"]
+        if "target" in merged.columns and "mate_mei_target" in merged.columns:
+            merged.loc[use_mate, "target"] = merged.loc[use_mate, "mate_mei_target"]
+        if "family" in merged.columns and "mate_mei_family" in merged.columns:
+            merged.loc[use_mate, "family"] = merged.loc[use_mate, "mate_mei_family"]
+        if "target_strand" in merged.columns and "mate_mei_strand" in merged.columns:
+            merged.loc[use_mate, "target_strand"] = merged.loc[use_mate, "mate_mei_strand"]
+        if "mei_score" in merged.columns and "mate_mei_score" in merged.columns:
+            merged.loc[use_mate, "mei_score"] = merged.loc[use_mate, "mate_mei_score"]
+        if "mei_hit" in merged.columns:
+            merged.loc[use_mate, "mei_hit"] = True
+    if "mei_hit" in merged.columns:
+        merged["mei_hit"] = merged["mei_hit"].fillna(False).astype(bool) | mate_hit
+    return merged
+
+
+def _enrich_split_hits_with_mate_positions(
+    split_hits: pd.DataFrame,
+    bam_path: Path | None,
+) -> pd.DataFrame:
+    """Attach mate_chrom/mate_pos to split hits from evidence columns or BAM fallback."""
+    if split_hits.empty:
+        return split_hits.copy()
+
+    out = split_hits.copy()
+    if "mate_chrom" not in out.columns:
+        out["mate_chrom"] = ""
+    if "mate_pos" not in out.columns:
+        out["mate_pos"] = 0
+    out["mate_chrom"] = out["mate_chrom"].fillna("").astype(str)
+    out["mate_pos"] = pd.to_numeric(out["mate_pos"], errors="coerce").fillna(0).astype(int)
+
+    if bam_path is None or not bam_path.exists():
+        return out
+
+    need_fetch = out.loc[(out["mate_chrom"].isin({"", "*"})) | (out["mate_pos"] <= 0)].copy()
+    if need_fetch.empty:
+        return out
+
+    fetched: dict[str, tuple[str, int]] = {}
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for rec in need_fetch.itertuples(index=False):
+            qname = str(rec.read_name)
+            if qname in fetched:
+                continue
+            chrom = str(rec.chrom)
+            pos = int(rec.pos)
+            if chrom not in bam.references:
+                continue
+            start0 = max(0, pos - 1)
+            end0 = start0 + 500
+            for read in bam.fetch(chrom, start0, end0):
+                if read.query_name != qname:
+                    continue
+                if read.is_secondary or read.is_supplementary:
+                    continue
+                if not read.is_paired or read.mate_is_unmapped:
+                    continue
+                mate_chrom = "*"
+                mate_pos = 0
+                if read.next_reference_id >= 0:
+                    mate_chrom = bam.get_reference_name(read.next_reference_id)
+                    mate_pos = read.next_reference_start + 1
+                fetched[qname] = (mate_chrom, mate_pos)
+                break
+
+    for qname, (mate_chrom, mate_pos) in fetched.items():
+        mask = out["read_name"].astype(str) == qname
+        out.loc[mask, "mate_chrom"] = mate_chrom
+        out.loc[mask, "mate_pos"] = mate_pos
+    return out
+
+
+def _build_supporting_reads_detail_table(
+    *,
+    split_hits: pd.DataFrame,
+    discordant_hits: pd.DataFrame,
+    discordant_mate_hits: pd.DataFrame,
+    sample: str,
+) -> pd.DataFrame:
+    """Flatten per-read coordinates for architecture plots and review."""
+    rows: list[dict[str, object]] = []
+
+    if not split_hits.empty:
+        for rec in split_hits.itertuples(index=False):
+            mei_hit = bool(getattr(rec, "mei_hit", False)) or bool(getattr(rec, "mei_hit_coord", False))
+            if not mei_hit:
+                continue
+            start_col = (
+                "target_start_coord"
+                if int(getattr(rec, "target_start_coord", 0) or 0) > 0
+                else "target_start"
+            )
+            end_col = (
+                "target_end_coord"
+                if int(getattr(rec, "target_end_coord", 0) or 0) > 0
+                else "target_end"
+            )
+            rows.append(
+                {
+                    "sample": sample,
+                    "evidence_type": "SR",
+                    "read_name": str(rec.read_name),
+                    "chrom": str(rec.chrom),
+                    "window_start": int(rec.window_start),
+                    "window_end": int(rec.window_end),
+                    "anchor_side": str(rec.clip_side),
+                    "genomic_pos": int(rec.pos),
+                    "mate_chrom": str(getattr(rec, "mate_chrom", "") or ""),
+                    "mate_genomic_pos": int(getattr(rec, "mate_pos", 0) or 0),
+                    "mei_start": int(getattr(rec, start_col)),
+                    "mei_end": int(getattr(rec, end_col)),
+                    "mate_mei_start": 0,
+                    "mate_mei_end": 0,
+                    "mei_hit": True,
+                    "mate_mei_hit": False,
+                }
+            )
+
+    disc = discordant_mate_hits if not discordant_mate_hits.empty else discordant_hits
+    if not disc.empty:
+        mid_cache: dict[tuple[str, int, int], int] = {}
+        for rec in disc.itertuples(index=False):
+            key = (str(rec.chrom), int(rec.window_start), int(rec.window_end))
+            if key not in mid_cache:
+                mid_cache[key] = (int(rec.window_start) + int(rec.window_end)) // 2
+            anchor_side = "L" if int(rec.pos) <= mid_cache[key] else "R"
+            rows.append(
+                {
+                    "sample": sample,
+                    "evidence_type": "DPE",
+                    "read_name": str(rec.read_name),
+                    "chrom": str(rec.chrom),
+                    "window_start": int(rec.window_start),
+                    "window_end": int(rec.window_end),
+                    "anchor_side": anchor_side,
+                    "genomic_pos": int(rec.pos),
+                    "mate_chrom": str(getattr(rec, "mate_chrom", "")),
+                    "mate_genomic_pos": int(getattr(rec, "mate_pos", 0) or 0),
+                    "mei_start": int(getattr(rec, "target_start", 0) or 0),
+                    "mei_end": int(getattr(rec, "target_end", 0) or 0),
+                    "mate_mei_start": int(getattr(rec, "mate_mei_start", 0) or 0),
+                    "mate_mei_end": int(getattr(rec, "mate_mei_end", 0) or 0),
+                    "mei_hit": bool(getattr(rec, "mei_hit", False)),
+                    "mate_mei_hit": bool(getattr(rec, "mate_mei_hit", False)),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "sample",
+                "evidence_type",
+                "read_name",
+                "chrom",
+                "window_start",
+                "window_end",
+                "anchor_side",
+                "genomic_pos",
+                "mate_chrom",
+                "mate_genomic_pos",
+                "mei_start",
+                "mei_end",
+                "mate_mei_start",
+                "mate_mei_end",
+                "mei_hit",
+                "mate_mei_hit",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
 def _assign_rows_to_candidate_loci(split_df: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
     if split_df.empty or candidates.empty:
         return pd.DataFrame(columns=list(split_df.columns) + ["window_start", "window_end"])
@@ -8235,6 +8590,8 @@ def annotate_candidate_loci_with_mei(
     reference_fasta: Path | None = None,
     disease_bam_path: Path | None = None,
     control_bam_path: Path | None = None,
+    disease_mate_bam_path: Path | None = None,
+    control_mate_bam_path: Path | None = None,
     rmsk_table_path: Path | None = None,
     g1k_mei_vcf: Path | None = None,
     lr_mei_vcf: Path | None = None,
@@ -8310,6 +8667,45 @@ def annotate_candidate_loci_with_mei(
     control_disc_hits, control_disc_summary = _align_discordant_reads_with_minimap2(
         discordant_control, mei_fasta, sample="control"
     )
+    disease_disc_mate_hits, disease_disc_mate_summary = _align_discordant_mates_with_minimap2(
+        discordant_disease,
+        mei_fasta,
+        sample="disease_mate",
+        bam_path=disease_mate_bam_path or disease_bam_path,
+    )
+    control_disc_mate_hits, control_disc_mate_summary = _align_discordant_mates_with_minimap2(
+        discordant_control,
+        mei_fasta,
+        sample="control_mate",
+        bam_path=control_mate_bam_path or control_bam_path,
+    )
+    disease_disc_hits = _enrich_discordant_anchor_hits_with_mate_mei(disease_disc_hits, disease_disc_mate_hits)
+    control_disc_hits = _enrich_discordant_anchor_hits_with_mate_mei(control_disc_hits, control_disc_mate_hits)
+    disease_hits = _enrich_split_hits_with_mate_positions(disease_hits, disease_bam_path)
+    control_hits = _enrich_split_hits_with_mate_positions(control_hits, control_bam_path)
+    supporting_reads_detail = pd.concat(
+        [
+            _build_supporting_reads_detail_table(
+                split_hits=disease_hits,
+                discordant_hits=disease_disc_hits,
+                discordant_mate_hits=disease_disc_mate_hits,
+                sample="disease",
+            ),
+            _build_supporting_reads_detail_table(
+                split_hits=control_hits,
+                discordant_hits=control_disc_hits,
+                discordant_mate_hits=control_disc_mate_hits,
+                sample="control",
+            ),
+        ],
+        ignore_index=True,
+    )
+    if not supporting_reads_detail.empty:
+        detail_tsv = out_path.with_name("supporting_reads_detail.mei.tsv")
+        detail_parquet = out_path.with_name("supporting_reads_detail.mei.parquet")
+        supporting_reads_detail.to_csv(detail_tsv, sep="\t", index=False)
+        supporting_reads_detail.to_parquet(detail_parquet, index=False)
+        print(f"[mei-annotate] wrote supporting read detail table to {detail_tsv}")
     full_consensus_fasta = _resolve_full_consensus_fasta(
         mei_fasta=mei_fasta,
         out_dir=out_path.parent,
@@ -8367,6 +8763,8 @@ def annotate_candidate_loci_with_mei(
         f"control clips={control_summary.clip_count} hits={control_summary.paf_hits}; "
         f"disease discordant reads={disease_disc_summary.clip_count} hits={disease_disc_summary.paf_hits}; "
         f"control discordant reads={control_disc_summary.clip_count} hits={control_disc_summary.paf_hits}; "
+        f"disease discordant mates={disease_disc_mate_summary.clip_count} mei_hits={disease_disc_mate_summary.paf_hits}; "
+        f"control discordant mates={control_disc_mate_summary.clip_count} mei_hits={control_disc_mate_summary.paf_hits}; "
         f"disease full clips={disease_summary_full.clip_count} hits={disease_summary_full.paf_hits}; "
         f"control full clips={control_summary_full.clip_count} hits={control_summary_full.paf_hits}; "
         f"disease full discordant reads={disease_disc_summary_full.clip_count} hits={disease_disc_summary_full.paf_hits}; "

@@ -291,20 +291,22 @@ datasets:
 
   - id: seqc2_disease_bam
     category: test_bam
-    description: SEQC2 disease WGS BAM sliced to chr22 during download
+    description: SEQC2 disease WGS BAM sliced to chr22 plus interchrom discordant mates
     source: NCBI SEQC2
     url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_T_1.bwa.dedup.bam
     target_path: test_data/seqc2/chr22/disease.chr22.hg38.bam
     region: chr22
+    include_discordant_mates: true
     required: true
 
   - id: seqc2_control_bam
     category: test_bam
-    description: SEQC2 control WGS BAM sliced to chr22 during download
+    description: SEQC2 control WGS BAM sliced to chr22 plus interchrom discordant mates
     source: NCBI SEQC2
     url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS/WGS_EA_N_1.bwa.dedup.bam
     target_path: test_data/seqc2/chr22/control.chr22.hg38.bam
     region: chr22
+    include_discordant_mates: true
     required: true
 
   - id: hg00100_shortread_highcov_cram

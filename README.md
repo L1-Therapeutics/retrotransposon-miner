@@ -219,8 +219,12 @@ Step 0: download public/reference data first using the provided script:
 conda activate rtm-miner || micromamba activate rtm-miner
 python3 scripts/download_public_data.py \
   --references hg38 \
+  --categories test_bam \
   --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}"
 ```
+
+SEQC2 chr22 test BAMs are sliced to chr22 **plus interchrom discordant mates** (needed for
+discordant-mate MEI minimap alignment). Re-download with `--force` after updating the downloader.
 
 If you plan to run both GRCh38 and hs1 workflows:
 
@@ -233,14 +237,50 @@ python3 scripts/download_public_data.py \
 
 Tumor/normal chr22 quickstart (SEQC2 public test pair):
 
+Local assembly is **off by default** (faster; sufficient for minimap mate mapping and
+`supporting_reads_detail.mei.tsv`). Pass `--local-assembly` when you need `asm_*`
+breakpoint/TSD fields from per-locus SPAdes.
+
 ```bash
-bash scripts/run_candidate_discovery_and_annotation.sh \
+RUN_IN_ENV=1 bash scripts/run_candidate_discovery_and_annotation.sh \
   --reference-build hg38 \
   --disease-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
   --control-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
+  --disease-mate-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
+  --control-mate-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
   --mei-fasta "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
   --chr chr22 \
   --outdir "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22"
+```
+
+For SEQC2 chr22 BAMs built with `include_discordant_mates`, point `--disease-mate-bam` /
+`--control-mate-bam` at the same files as `--disease-bam` / `--control-bam`.
+
+Re-run annotation only (reuse existing `split_evidence.*` / `candidate_loci.tsv` after code or
+BAM changes that affect minimap mate alignment). Local assembly stays off unless you pass
+`--local-assembly`:
+
+```bash
+RUN_IN_ENV=1 bash scripts/run_candidate_discovery_and_annotation.sh \
+  --reference-build hg38 \
+  --annotate-only \
+  --disease-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
+  --control-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
+  --disease-mate-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/disease.chr22.hg38.bam" \
+  --control-mate-bam "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/test_data/seqc2/chr22/control.chr22.hg38.bam" \
+  --mei-fasta "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta" \
+  --chr chr22 \
+  --outdir "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/mei_step1_hg38_chr22"
+```
+
+Pipeline outputs include `supporting_reads_detail.mei.tsv` (per-read anchor/mate MEI coords for
+architecture plots). Example plot for one gold locus:
+
+```bash
+python scripts/plot_locus_read_architecture.py \
+  --gold-review-tsv "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/candidate_loci.mei.gold_review.tsv" \
+  --chrom chr22 --pos 49029650 --sample disease \
+  --out-png "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/plots/read_arch_chr22_49029650.png"
 ```
 
 HG0001-style germline/control chr22 quickstart (replace with your BAM path):
