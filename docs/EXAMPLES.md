@@ -69,6 +69,8 @@ The read-architecture plot shows split-read (SR) and discordant paired-end (DPE)
 SVA insertion present in 1000 Genomes short-read data but not reported in matched long-read data (`nssv14064350`, MELT).  
 Breakpoint at `chr22:49029650` (interval `49029645-49029656`), TSD `AAGAAAACTCCT`, and a 19 bp polyA/polyT run.
 
-![GRCh38 chr22:49029238-49029720 SVA read architecture](examples/grch38_sva_read_arch_chr22_49029238_49029720.png)
+### SVA insertion (GRCh38 chr22:49029650)
 
-Read-architecture view of the same SVA locus (`SVA_F` / `SVA_D`), showing dense SR and DPE support on both flanks into the forward-oriented MEI consensus.
+<img src="examples/grch38_sva_read_arch_chr22_49029238_49029720.png" alt="GRCh38 chr22 SVA read architecture" width="1470" />
+
+Known SVA insertion (`nssv14064350`) with two-sided SR/DPE support into a forward-oriented SVA consensus. Black segments map to chr22 flanks; orange segments map to the SVA consensus (`SVA_F` / `SVA_D`).

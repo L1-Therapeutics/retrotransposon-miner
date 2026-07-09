@@ -253,12 +253,9 @@ def _insertion_span_from_evidence(
     if melt_len > 0:
         return 1, melt_len, melt_len, "g1k_melt_length"
 
-    family = str(row.get("consensus_mei_family", "") or row.get("mei_family", "")).upper()
-    family_defaults = {"ALU": 300, "SVA": 450, "LINE-1": 500, "L1": 500, "LINE1": 500}
-    for key, default in family_defaults.items():
-        if key in family:
-            return 1, default, default, f"family_default_{key}"
-    return 1, 200, 200, "fallback"
+    # Last-resort axis width when no SR/DPE/consensus evidence exists.
+    # Same default for ALU/SVA/LINE1 — do not invent family-specific spans.
+    return 1, 300, 300, "mei_default"
 
 
 def _load_locus_row(gold_tsv: Path, chrom: str, pos: int) -> pd.Series:
