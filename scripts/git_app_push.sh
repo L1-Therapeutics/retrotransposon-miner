@@ -250,8 +250,26 @@ if [[ -z "${BODY}" ]]; then
   BODY="$(default_pr_body "${BASE_BRANCH}")"
 fi
 
+push_head_to_branch() {
+  local target_branch="$1"
+  git push -u "${push_url}" "HEAD:refs/heads/${target_branch}"
+}
+
 echo "Pushing HEAD -> origin/${BRANCH}"
-git push -u "${push_url}" "HEAD:refs/heads/${BRANCH}"
+if ! push_head_to_branch "${BRANCH}" 2>/tmp/rtm_git_app_push.err; then
+  if grep -q "Changes must be made through a pull request\|protected branch\|GH013" /tmp/rtm_git_app_push.err; then
+    fallback="feat/$(slugify "$(git log -1 --pretty=%s)")-$(date +%Y%m%d-%H%M%S)"
+    echo "Branch origin/${BRANCH} is protected; falling back to origin/${fallback}" >&2
+    cat /tmp/rtm_git_app_push.err >&2 || true
+    BRANCH="${fallback}"
+    push_head_to_branch "${BRANCH}"
+  else
+    cat /tmp/rtm_git_app_push.err >&2 || true
+    exit 1
+  fi
+fi
+rm -f /tmp/rtm_git_app_push.err
+
 # Keep local tracking pointed at the writable remote branch we just pushed.
 git branch --set-upstream-to="origin/${BRANCH}" >/dev/null 2>&1 || true
 # Ensure the remote-tracking ref exists locally for subsequent commands.
