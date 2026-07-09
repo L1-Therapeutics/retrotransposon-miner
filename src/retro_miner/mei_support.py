@@ -858,15 +858,135 @@ def _build_supporting_reads_detail_table(
     return pd.DataFrame(rows)
 
 
-def _aggregate_detail_mei_extents(detail: pd.DataFrame) -> pd.DataFrame:
+def _robust_coord_extent(lo_values: pd.Series, hi_values: pd.Series) -> tuple[float, float]:
+    """Return outlier-resistant min/max MEI coords for one locus/sample group.
+
+    Uses Tukey fences (k=3) on the pooled start/end endpoints when enough
+    points exist; otherwise falls back to raw min/max. This keeps true full-
+    length SVA/LINE1 footprints while dropping rare off-target mates that can
+    inflate an Alu-sized insertion to >1 kb.
+    """
+    pts = pd.concat(
+        [
+            pd.to_numeric(lo_values, errors="coerce"),
+            pd.to_numeric(hi_values, errors="coerce"),
+        ],
+        ignore_index=True,
+    )
+    pts = pts[pts.gt(0)].astype(float)
+    if pts.empty:
+        return float("nan"), float("nan")
+    if len(pts) < 8:
+        return float(pts.min()), float(pts.max())
+    q1 = float(pts.quantile(0.25))
+    q3 = float(pts.quantile(0.75))
+    iqr = max(q3 - q1, 1.0)
+    lo_fence = q1 - 3.0 * iqr
+    hi_fence = q3 + 3.0 * iqr
+    kept = pts[(pts >= lo_fence) & (pts <= hi_fence)]
+    if kept.empty:
+        return float(pts.min()), float(pts.max())
+    return float(kept.min()), float(kept.max())
+
+
+def _candidate_mei_target_lengths(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Per-locus consensus MEI target length used to keep on-target mappings only.
+
+    Prefer assembly consensus target length when present. Side-level
+    ``*_mei_target_len`` values can come from off-family hits (e.g. LINE1 3294
+    on an Alu locus) and must not override the assembled element.
+    """
+    key_cols = ["chrom", "window_start", "window_end"]
+    if candidates is None or candidates.empty or not set(key_cols).issubset(candidates.columns):
+        return pd.DataFrame(columns=key_cols + ["mei_target_length"])
+    fallback_cols = [
+        "disease_L_mei_target_len",
+        "disease_R_mei_target_len",
+        "control_L_mei_target_len",
+        "control_R_mei_target_len",
+        "disease_full_L_mei_target_len",
+        "disease_full_R_mei_target_len",
+        "control_full_L_mei_target_len",
+        "control_full_R_mei_target_len",
+    ]
+    work = candidates.loc[:, key_cols].copy()
+    asm = (
+        pd.to_numeric(candidates["asm_mei_target_length"], errors="coerce")
+        if "asm_mei_target_length" in candidates.columns
+        else pd.Series(float("nan"), index=candidates.index)
+    )
+    present = [c for c in fallback_cols if c in candidates.columns]
+    if present:
+        fallback = pd.concat(
+            [pd.to_numeric(candidates[c], errors="coerce") for c in present],
+            axis=1,
+        )
+        fallback_len = fallback.where(fallback.gt(0)).max(axis=1, skipna=True)
+    else:
+        fallback_len = pd.Series(float("nan"), index=candidates.index)
+    work["mei_target_length"] = asm.where(asm.gt(0), fallback_len)
+    return (
+        work.groupby(key_cols, as_index=False)["mei_target_length"]
+        .max()
+        .loc[:, key_cols + ["mei_target_length"]]
+    )
+
+
+def _keep_on_target_mei_interval(
+    start: pd.Series,
+    end: pd.Series,
+    target_length: pd.Series,
+    *,
+    slack: int = 50,
+) -> tuple[pd.Series, pd.Series]:
+    """Zero intervals that fall outside the consensus target element.
+
+    When ``target_length`` is known, only keep mappings with both endpoints in
+    ``[1, target_length + slack]``. Slack covers minor end overhangs (e.g. SVA
+    1378 vs consensus 1375) without admitting wrong-element mates (e.g. Alu
+    mate at 1330-1462 against a ~312 bp target).
+    """
+    start_n = pd.to_numeric(start, errors="coerce").fillna(0).astype(int)
+    end_n = pd.to_numeric(end, errors="coerce").fillna(0).astype(int)
+    tlen = pd.to_numeric(target_length, errors="coerce")
+    has_tlen = tlen.gt(0).fillna(False)
+    max_pos = (tlen + float(slack)).where(has_tlen, float("inf"))
+    on_target = start_n.gt(0) & end_n.ge(start_n) & (~has_tlen | (start_n.le(max_pos) & end_n.le(max_pos)))
+    return start_n.where(on_target, 0), end_n.where(on_target, 0)
+
+
+def _on_target_extent_ok(
+    lo: pd.Series,
+    hi: pd.Series,
+    target_length: pd.Series,
+    *,
+    slack: int = 50,
+) -> pd.Series:
+    """True when both extent endpoints map within the consensus target element."""
+    lo_n = pd.to_numeric(lo, errors="coerce")
+    hi_n = pd.to_numeric(hi, errors="coerce")
+    tlen = pd.to_numeric(target_length, errors="coerce")
+    has_tlen = tlen.gt(0).fillna(False)
+    max_pos = (tlen + float(slack)).where(has_tlen, float("inf"))
+    return lo_n.gt(0) & hi_n.ge(lo_n) & (~has_tlen | (lo_n.le(max_pos) & hi_n.le(max_pos)))
+
+
+def _aggregate_detail_mei_extents(
+    detail: pd.DataFrame,
+    target_lengths: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Per-locus min/max MEI consensus coords from supporting-read detail rows.
 
-    Matches the plot-path footprint: min/max over SR ``mei_start/end`` and DPE
-    ``mate_mei_start/end`` (and any direct ``mei_*`` hits) for disease and
-    control samples separately, plus a combined locus extent.
+    Matches the plot-path footprint: robust min/max over SR ``mei_start/end``
+    and DPE ``mate_mei_start/end`` (and any direct ``mei_*`` hits) for disease
+    and control samples separately, plus a combined locus extent.
+
+    Only intervals that map within the consensus target element length are
+    included when that length is known.
 
     Also emits per-side SR extents (``{sample}_{L|R}_detail_mei_start/end``) so
-    gold/annotation rebuilds can restore zeroed L/R aggregated coords.
+    gold/annotation rebuilds can restore zeroed L/R aggregated coords, and
+    per-sample mapped-read counts for sample selection.
     """
     key_cols = ["chrom", "window_start", "window_end"]
     empty_cols = key_cols + [
@@ -876,6 +996,8 @@ def _aggregate_detail_mei_extents(detail: pd.DataFrame) -> pd.DataFrame:
         "control_detail_mei_end_max",
         "detail_mei_start_min",
         "detail_mei_end_max",
+        "disease_detail_mei_mapped_reads",
+        "control_detail_mei_mapped_reads",
         "disease_L_detail_mei_start",
         "disease_L_detail_mei_end",
         "disease_R_detail_mei_start",
@@ -891,11 +1013,22 @@ def _aggregate_detail_mei_extents(detail: pd.DataFrame) -> pd.DataFrame:
     if not required.issubset(set(detail.columns)):
         return pd.DataFrame(columns=empty_cols)
 
-    work = detail.loc[:, list(required | {"mei_hit", "mate_mei_hit", "evidence_type", "anchor_side"})].copy()
+    work = detail.loc[
+        :, list(required | {"mei_hit", "mate_mei_hit", "evidence_type", "anchor_side", "read_name"})
+    ].copy()
     work["sample"] = work["sample"].fillna("").astype(str).str.lower()
     work = work.loc[work["sample"].isin(["disease", "control"])].copy()
     if work.empty:
         return pd.DataFrame(columns=empty_cols)
+
+    if target_lengths is not None and not target_lengths.empty and "mei_target_length" in target_lengths.columns:
+        work = work.merge(
+            target_lengths.loc[:, key_cols + ["mei_target_length"]],
+            on=key_cols,
+            how="left",
+        )
+    else:
+        work["mei_target_length"] = float("nan")
 
     mei_hit = (
         work["mei_hit"].fillna(False).astype(bool)
@@ -913,6 +1046,8 @@ def _aggregate_detail_mei_extents(detail: pd.DataFrame) -> pd.DataFrame:
         pd.to_numeric(work["mate_mei_start"], errors="coerce").fillna(0).astype(int).where(mate_hit, 0)
     )
     mate_end = pd.to_numeric(work["mate_mei_end"], errors="coerce").fillna(0).astype(int).where(mate_hit, 0)
+    mei_start, mei_end = _keep_on_target_mei_interval(mei_start, mei_end, work["mei_target_length"])
+    mate_start, mate_end = _keep_on_target_mei_interval(mate_start, mate_end, work["mei_target_length"])
     work["extent_lo"] = pd.concat(
         [mei_start.where(mei_start.gt(0)), mate_start.where(mate_start.gt(0))],
         axis=1,
@@ -925,20 +1060,53 @@ def _aggregate_detail_mei_extents(detail: pd.DataFrame) -> pd.DataFrame:
     if work.empty:
         return pd.DataFrame(columns=empty_cols)
 
-    per_sample = (
-        work.groupby(key_cols + ["sample"], as_index=False)
-        .agg(extent_lo=("extent_lo", "min"), extent_hi=("extent_hi", "max"))
+    rows: list[dict[str, object]] = []
+    for (chrom, ws, we, sample), grp in work.groupby(key_cols + ["sample"], sort=False):
+        lo, hi = _robust_coord_extent(grp["extent_lo"], grp["extent_hi"])
+        n_reads = (
+            grp["read_name"].fillna("").astype(str).nunique()
+            if "read_name" in grp.columns
+            else int(len(grp))
+        )
+        rows.append(
+            {
+                "chrom": chrom,
+                "window_start": int(ws),
+                "window_end": int(we),
+                "sample": sample,
+                "extent_lo": lo,
+                "extent_hi": hi,
+                "mapped_reads": int(n_reads),
+            }
+        )
+    per_sample = pd.DataFrame(rows)
+    disease = per_sample.loc[per_sample["sample"].eq("disease"), key_cols + ["extent_lo", "extent_hi", "mapped_reads"]].rename(
+        columns={
+            "extent_lo": "disease_detail_mei_start_min",
+            "extent_hi": "disease_detail_mei_end_max",
+            "mapped_reads": "disease_detail_mei_mapped_reads",
+        }
     )
-    disease = per_sample.loc[per_sample["sample"].eq("disease"), key_cols + ["extent_lo", "extent_hi"]].rename(
-        columns={"extent_lo": "disease_detail_mei_start_min", "extent_hi": "disease_detail_mei_end_max"}
+    control = per_sample.loc[per_sample["sample"].eq("control"), key_cols + ["extent_lo", "extent_hi", "mapped_reads"]].rename(
+        columns={
+            "extent_lo": "control_detail_mei_start_min",
+            "extent_hi": "control_detail_mei_end_max",
+            "mapped_reads": "control_detail_mei_mapped_reads",
+        }
     )
-    control = per_sample.loc[per_sample["sample"].eq("control"), key_cols + ["extent_lo", "extent_hi"]].rename(
-        columns={"extent_lo": "control_detail_mei_start_min", "extent_hi": "control_detail_mei_end_max"}
-    )
-    combined = (
-        work.groupby(key_cols, as_index=False)
-        .agg(detail_mei_start_min=("extent_lo", "min"), detail_mei_end_max=("extent_hi", "max"))
-    )
+    combined_rows: list[dict[str, object]] = []
+    for (chrom, ws, we), grp in work.groupby(key_cols, sort=False):
+        lo, hi = _robust_coord_extent(grp["extent_lo"], grp["extent_hi"])
+        combined_rows.append(
+            {
+                "chrom": chrom,
+                "window_start": int(ws),
+                "window_end": int(we),
+                "detail_mei_start_min": lo,
+                "detail_mei_end_max": hi,
+            }
+        )
+    combined = pd.DataFrame(combined_rows)
     out = combined.merge(disease, on=key_cols, how="left").merge(control, on=key_cols, how="left")
 
     # Per-side SR extents (used to restore zeroed disease/control_L/R_mei_start/end).
@@ -949,10 +1117,23 @@ def _aggregate_detail_mei_extents(detail: pd.DataFrame) -> pd.DataFrame:
         ].copy()
         if not sr.empty:
             sr["anchor_side"] = sr["anchor_side"].astype(str).str.upper().str[:1]
-            side_agg = (
-                sr.groupby(key_cols + ["sample", "anchor_side"], as_index=False)
-                .agg(extent_lo=("extent_lo", "min"), extent_hi=("extent_hi", "max"))
-            )
+            side_rows: list[dict[str, object]] = []
+            for (chrom, ws, we, sample, side), grp in sr.groupby(
+                key_cols + ["sample", "anchor_side"], sort=False
+            ):
+                lo, hi = _robust_coord_extent(grp["extent_lo"], grp["extent_hi"])
+                side_rows.append(
+                    {
+                        "chrom": chrom,
+                        "window_start": int(ws),
+                        "window_end": int(we),
+                        "sample": sample,
+                        "anchor_side": side,
+                        "extent_lo": lo,
+                        "extent_hi": hi,
+                    }
+                )
+            side_agg = pd.DataFrame(side_rows)
             for sample in ("disease", "control"):
                 for side in ("L", "R"):
                     part = side_agg.loc[
@@ -981,7 +1162,10 @@ def _merge_detail_mei_extents(candidates: pd.DataFrame, detail: pd.DataFrame | N
     """
     if detail is None or detail.empty or candidates.empty:
         return candidates
-    extents = _aggregate_detail_mei_extents(detail)
+    extents = _aggregate_detail_mei_extents(
+        detail,
+        target_lengths=_candidate_mei_target_lengths(candidates),
+    )
     if extents.empty:
         return candidates
     out = candidates.copy()
@@ -7425,6 +7609,40 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     combined_detail_ok = combined_detail_lo.gt(0) & combined_detail_hi.ge(combined_detail_lo)
     d_detail_span = (d_detail_hi - d_detail_lo + 1.0).where(d_detail_ok, 0.0)
     n_detail_span = (n_detail_hi - n_detail_lo + 1.0).where(n_detail_ok, 0.0)
+    d_detail_reads = pd.to_numeric(
+        _series_or_default("disease_detail_mei_mapped_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    n_detail_reads = pd.to_numeric(
+        _series_or_default("control_detail_mei_mapped_reads", 0), errors="coerce"
+    ).fillna(0.0)
+
+    # Consensus target length: only keep footprint sources that map onto this
+    # element (drops off-family DPE mates / medians that inflate Alu spans).
+    target_length = pd.to_numeric(_series_or_default("asm_mei_target_length", float("nan")), errors="coerce")
+    if "mei_target_length" in out.columns:
+        target_length = target_length.where(
+            target_length.gt(0),
+            pd.to_numeric(out["mei_target_length"], errors="coerce"),
+        )
+    fallback_tlen = pd.concat(
+        [
+            pd.to_numeric(_series_or_default("disease_L_mei_target_len", float("nan")), errors="coerce"),
+            pd.to_numeric(_series_or_default("disease_R_mei_target_len", float("nan")), errors="coerce"),
+            pd.to_numeric(_series_or_default("control_L_mei_target_len", float("nan")), errors="coerce"),
+            pd.to_numeric(_series_or_default("control_R_mei_target_len", float("nan")), errors="coerce"),
+        ],
+        axis=1,
+    ).where(lambda x: x.gt(0)).max(axis=1, skipna=True)
+    # Prefer asm; only fall back when asm is missing. Do not take max(asm, side)
+    # because side lengths can be off-family (LINE1 3294 on an Alu call).
+    target_length = target_length.where(target_length.gt(0), fallback_tlen)
+    d_detail_ok = d_detail_ok & _on_target_extent_ok(d_detail_lo, d_detail_hi, target_length)
+    n_detail_ok = n_detail_ok & _on_target_extent_ok(n_detail_lo, n_detail_hi, target_length)
+    combined_detail_ok = combined_detail_ok & _on_target_extent_ok(
+        combined_detail_lo, combined_detail_hi, target_length
+    )
+    d_sr_bilateral = d_sr_bilateral & _on_target_extent_ok(d_sr_lo, d_sr_hi, target_length)
+    n_sr_bilateral = n_sr_bilateral & _on_target_extent_ok(n_sr_lo, n_sr_hi, target_length)
 
     d_left_t_early = pd.to_numeric(
         _series_or_default("disease_discordant_mei_left_target_pos_median", float("nan")), errors="coerce"
@@ -7490,13 +7708,25 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         & n_left_t_early.gt(0)
         & n_right_t_early.gt(0)
     )
-    d_dpe_extent_ok = d_dpe_bilateral & d_dpe_extent_lo.gt(0) & d_dpe_extent_hi.ge(d_dpe_extent_lo)
-    n_dpe_extent_ok = n_dpe_bilateral & n_dpe_extent_lo.gt(0) & n_dpe_extent_hi.ge(n_dpe_extent_lo)
+    d_dpe_extent_ok = (
+        d_dpe_bilateral
+        & d_dpe_extent_lo.gt(0)
+        & d_dpe_extent_hi.ge(d_dpe_extent_lo)
+        & _on_target_extent_ok(d_dpe_extent_lo, d_dpe_extent_hi, target_length)
+    )
+    n_dpe_extent_ok = (
+        n_dpe_bilateral
+        & n_dpe_extent_lo.gt(0)
+        & n_dpe_extent_hi.ge(n_dpe_extent_lo)
+        & _on_target_extent_ok(n_dpe_extent_lo, n_dpe_extent_hi, target_length)
+    )
     # Median-based DPE footprint is only a last resort (orientation signal, not span).
     d_dpe_lo = pd.concat([d_left_t_early, d_right_t_early], axis=1).min(axis=1, skipna=True)
     d_dpe_hi = pd.concat([d_left_t_early, d_right_t_early], axis=1).max(axis=1, skipna=True)
     n_dpe_lo = pd.concat([n_left_t_early, n_right_t_early], axis=1).min(axis=1, skipna=True)
     n_dpe_hi = pd.concat([n_left_t_early, n_right_t_early], axis=1).max(axis=1, skipna=True)
+    d_dpe_bilateral = d_dpe_bilateral & _on_target_extent_ok(d_dpe_lo, d_dpe_hi, target_length)
+    n_dpe_bilateral = n_dpe_bilateral & _on_target_extent_ok(n_dpe_lo, n_dpe_hi, target_length)
 
     # Drop per-sample insertion coords that were previously copied from assembly.
     asm_polluted_disease = (
@@ -7515,14 +7745,35 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         & control_start.eq(asm_mei_start)
         & control_end.eq(asm_mei_end)
     )
-    disease_pair_valid = disease_start.gt(0) & disease_end.gt(0) & ~asm_polluted_disease
-    control_pair_valid = control_start.gt(0) & control_end.gt(0) & ~asm_polluted_control
+    disease_pair_lo = pd.concat([disease_start, disease_end], axis=1).min(axis=1, skipna=True)
+    disease_pair_hi = pd.concat([disease_start, disease_end], axis=1).max(axis=1, skipna=True)
+    control_pair_lo = pd.concat([control_start, control_end], axis=1).min(axis=1, skipna=True)
+    control_pair_hi = pd.concat([control_start, control_end], axis=1).max(axis=1, skipna=True)
+    disease_pair_valid = (
+        disease_start.gt(0)
+        & disease_end.gt(0)
+        & ~asm_polluted_disease
+        & _on_target_extent_ok(disease_pair_lo, disease_pair_hi, target_length)
+    )
+    control_pair_valid = (
+        control_start.gt(0)
+        & control_end.gt(0)
+        & ~asm_polluted_control
+        & _on_target_extent_ok(control_pair_lo, control_pair_hi, target_length)
+    )
 
     raw_start = pd.Series([float("nan")] * len(out), index=out.index)
     raw_end = pd.Series([float("nan")] * len(out), index=out.index)
 
     # 0) Supporting-read detail footprint (min/max of all mapped SR+DPE MEI coords).
-    choose_n_detail = n_detail_ok & (~d_detail_ok | n_detail_span.gt(d_detail_span))
+    # Prefer the sample with more mapped MEI-supporting reads; only use span as a
+    # tie-breaker. Choosing the larger span alone let a single off-target control
+    # DPE mate inflate Alu footprints (e.g. 197-1462).
+    choose_n_detail = n_detail_ok & (
+        ~d_detail_ok
+        | n_detail_reads.gt(d_detail_reads)
+        | (n_detail_reads.eq(d_detail_reads) & n_detail_span.gt(d_detail_span))
+    )
     choose_d_detail = d_detail_ok & ~choose_n_detail
     raw_start = raw_start.where(~choose_d_detail, d_detail_lo)
     raw_end = raw_end.where(~choose_d_detail, d_detail_hi)
@@ -7727,17 +7978,21 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         consensus_span.fillna(0).le(0) | consensus_3p.fillna(-1).le(0) | consensus_5p.fillna(-1).le(0)
     )
     if still_missing.any():
-        target_len_hint = pd.concat(
-            [
-                pd.to_numeric(_series_or_default("asm_mei_target_length", float("nan")), errors="coerce"),
-                pd.to_numeric(_series_or_default("disease_L_mei_target_len", float("nan")), errors="coerce"),
-                pd.to_numeric(_series_or_default("disease_R_mei_target_len", float("nan")), errors="coerce"),
-                pd.to_numeric(_series_or_default("control_L_mei_target_len", float("nan")), errors="coerce"),
-                pd.to_numeric(_series_or_default("control_R_mei_target_len", float("nan")), errors="coerce"),
-                pd.to_numeric(base_span, errors="coerce"),
-            ],
-            axis=1,
-        ).where(lambda x: x.gt(0)).max(axis=1, skipna=True)
+        target_len_hint = pd.to_numeric(
+            _series_or_default("asm_mei_target_length", float("nan")), errors="coerce"
+        )
+        if target_len_hint.fillna(0).le(0).any():
+            side_hint = pd.concat(
+                [
+                    pd.to_numeric(_series_or_default("disease_L_mei_target_len", float("nan")), errors="coerce"),
+                    pd.to_numeric(_series_or_default("disease_R_mei_target_len", float("nan")), errors="coerce"),
+                    pd.to_numeric(_series_or_default("control_L_mei_target_len", float("nan")), errors="coerce"),
+                    pd.to_numeric(_series_or_default("control_R_mei_target_len", float("nan")), errors="coerce"),
+                    pd.to_numeric(base_span, errors="coerce"),
+                ],
+                axis=1,
+            ).where(lambda x: x.gt(0)).max(axis=1, skipna=True)
+            target_len_hint = target_len_hint.where(target_len_hint.gt(0), side_hint)
         relaxed_span = pd.concat(
             [
                 consensus_span.where(consensus_span.gt(0)),
