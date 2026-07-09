@@ -19,6 +19,7 @@ venv/
 # Data and temporary outputs
 data/
 results/
+workdir-results/
 tmp/
 *.bam
 *.bai
