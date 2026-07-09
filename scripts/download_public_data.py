@@ -33,6 +33,7 @@ class Dataset:
     url: str
     target_path: str
     region: str | None = None
+    include_discordant_mates: bool = False
     required: bool = True
 
 
@@ -105,6 +106,7 @@ def _load_config(config_path: Path) -> list[Dataset]:
                 url=row["url"],
                 target_path=row["target_path"],
                 region=row.get("region"),
+                include_discordant_mates=bool(row.get("include_discordant_mates", False)),
                 required=bool(row.get("required", True)),
             )
         )
@@ -270,6 +272,87 @@ def _slice_remote_alignment(url: str, region: str, out_bam: Path, threads: int, 
     return {"status": "sliced_remote_alignment", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
 
 
+def _collect_interchrom_mate_qnames(region_bam: Path, region: str) -> list[str]:
+    """Return read names whose mates map outside the sliced region chromosome."""
+    import pysam
+
+    region_chrom = region.split(":", 1)[0]
+    qnames: set[str] = set()
+    with pysam.AlignmentFile(str(region_bam), "rb") as bam:
+        for read in bam.fetch(region=region):
+            if not read.is_paired or read.is_unmapped or read.mate_is_unmapped:
+                continue
+            if read.is_qcfail or read.is_duplicate or read.is_secondary or read.is_supplementary:
+                continue
+            if read.next_reference_id < 0:
+                continue
+            mate_chrom = bam.get_reference_name(read.next_reference_id)
+            if mate_chrom != region_chrom:
+                qnames.add(read.query_name)
+    return sorted(qnames)
+
+
+def _slice_remote_alignment_with_mates(
+    url: str,
+    region: str,
+    out_bam: Path,
+    threads: int,
+    force: bool,
+) -> dict[str, Any]:
+    """Slice a region, then pull in discordant mates from other chromosomes via the remote BAM."""
+    out_bam.parent.mkdir(parents=True, exist_ok=True)
+    if out_bam.exists() and Path(f"{out_bam}.bai").exists() and not force:
+        return {
+            "status": "skipped_exists",
+            "path": str(out_bam),
+            "bytes": out_bam.stat().st_size,
+            "region": region,
+            "include_discordant_mates": True,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="rtm_slice_mates_") as tmpdir:
+        tmp = Path(tmpdir)
+        region_bam = tmp / "region.bam"
+        mates_bam = tmp / "mates.bam"
+        names_tsv = tmp / "mate_qnames.txt"
+        merged_bam = tmp / "merged.bam"
+
+        _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(region_bam)], required=True)
+        _run_cmd(["samtools", "index", "-@", str(threads), str(region_bam)], required=True)
+        mate_qnames = _collect_interchrom_mate_qnames(region_bam, region)
+        if mate_qnames:
+            names_tsv.write_text("\n".join(mate_qnames) + "\n", encoding="utf-8")
+            _run_cmd(
+                [
+                    "samtools",
+                    "view",
+                    "-@", str(threads),
+                    "-b",
+                    "-N",
+                    str(names_tsv),
+                    url,
+                    "-o",
+                    str(mates_bam),
+                ],
+                required=True,
+            )
+            _run_cmd(["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)], required=True)
+            shutil.copy2(merged_bam, out_bam)
+        else:
+            shutil.copy2(region_bam, out_bam)
+
+        _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
+
+    return {
+        "status": "sliced_remote_alignment_with_mates",
+        "path": str(out_bam),
+        "bytes": out_bam.stat().st_size,
+        "region": region,
+        "include_discordant_mates": True,
+        "mate_qnames": len(mate_qnames),
+    }
+
+
 def _download_dataset(
     ds: Dataset,
     target: Path,
@@ -284,7 +367,10 @@ def _download_dataset(
     for attempt in range(1, attempts + 1):
         try:
             if ds.region and (ds.url.endswith(".bam") or ds.url.endswith(".cram")):
-                result = _slice_remote_alignment(ds.url, ds.region, target, threads=threads, force=force)
+                if ds.include_discordant_mates:
+                    result = _slice_remote_alignment_with_mates(ds.url, ds.region, target, threads=threads, force=force)
+                else:
+                    result = _slice_remote_alignment(ds.url, ds.region, target, threads=threads, force=force)
             else:
                 result = _download_file(ds.url, target, timeout_sec=timeout_sec, force=force)
             break
@@ -1878,7 +1964,8 @@ def main() -> int:
 
     print(
         "Storage note: full-BAM workflows (whole disease+control remap) may require ~300GB free disk. "
-        "This downloader uses chr22 remote slicing for test BAMs to reduce footprint.",
+        "This downloader uses chr22 remote slicing for test BAMs to reduce footprint. "
+        "SEQC2 test BAMs also include interchrom discordant mate reads needed for MEI_MAPPED.",
         file=sys.stderr,
     )
     print(f"Selected references: {', '.join(selected_references)}", file=sys.stderr)

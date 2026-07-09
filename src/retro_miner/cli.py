@@ -29,6 +29,18 @@ def check_env() -> None:
 @cli.command("extract-split-evidence")
 @click.option("--disease-bam", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--control-bam", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option(
+    "--disease-mate-bam",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional full-genome BAM for resolving interchrom discordant mate sequences (disease).",
+)
+@click.option(
+    "--control-mate-bam",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional full-genome BAM for resolving interchrom discordant mate sequences (control).",
+)
 @click.option("--outdir", type=click.Path(file_okay=False, path_type=Path), required=True)
 @click.option("--region", default="chr22", show_default=True, help="Region to scan, e.g. chr22 or chr1:1-1000000.")
 @click.option(
@@ -115,6 +127,13 @@ def check_env() -> None:
     help="Minimum |TLEN| structural context for discordant-anchor polyA/polyT rescue.",
 )
 @click.option(
+    "--discordant-mate-fetch-window-bp",
+    default=500,
+    show_default=True,
+    type=int,
+    help="Fetch window around mate_pos when resolving discordant mate sequences.",
+)
+@click.option(
     "--require-strong-discordant-reason/--allow-weak-discordant-only",
     default=True,
     show_default=True,
@@ -127,6 +146,8 @@ def check_env() -> None:
 def extract_split_evidence_cmd(
     disease_bam: Path,
     control_bam: Path,
+    disease_mate_bam: Path | None,
+    control_mate_bam: Path | None,
     outdir: Path,
     region: str,
     regions: str | None,
@@ -143,6 +164,7 @@ def extract_split_evidence_cmd(
     discordant_poly_tail_rescue_min_run: int,
     discordant_poly_tail_rescue_min_frac: float,
     discordant_poly_tail_rescue_min_abs_tlen: int,
+    discordant_mate_fetch_window_bp: int,
     require_strong_discordant_reason: bool,
 ) -> None:
     """Extract split-read MEI evidence and optional discordant evidence."""
@@ -155,7 +177,15 @@ def extract_split_evidence_cmd(
 
     split_summaries: list[ExtractionSummary] = []
     discordant_summaries: dict[str, ExtractionSummary] = {}
-    for sample, bam in (("disease", disease_bam), ("control", control_bam)):
+    sample_bams = {
+        "disease": disease_bam,
+        "control": control_bam,
+    }
+    sample_mate_bams = {
+        "disease": disease_mate_bam,
+        "control": control_mate_bam,
+    }
+    for sample, bam in sample_bams.items():
         sample_t0 = time.monotonic()
         click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
         split_summary = extract_split_evidence(
@@ -191,12 +221,16 @@ def extract_split_evidence_cmd(
                 poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
                 poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
                 require_strong_discordant_reason=require_strong_discordant_reason,
+                mate_bam_path=sample_mate_bams.get(sample),
+                mate_fetch_window_bp=discordant_mate_fetch_window_bp,
             )
             discordant_summaries[sample] = discordant_summary
             click.echo(
                 f"[done-discordant] sample={sample} scanned={discordant_summary.total_reads_scanned} "
                 f"passing={discordant_summary.passing_reads} discordant_rows={discordant_summary.discordant_evidence_rows} "
                 f"insert_threshold={discordant_summary.insert_size_threshold} "
+                f"mate_seq_fetched={discordant_summary.mate_seq_fetched_rows} "
+                f"mate_seq_missing_interchrom={discordant_summary.mate_seq_missing_interchrom_rows} "
                 f"weak_only_filtered={discordant_summary.weak_only_discordant_filtered_rows} "
                 f"elapsed={time.monotonic() - disc_t0:.1f}s"
             )
@@ -416,6 +450,18 @@ def build_candidate_loci_cmd(
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
     help="Optional control BAM path for local BAM-depth controlization on consistent/junk-clean loci.",
+)
+@click.option(
+    "--disease-mate-bam",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional full-genome disease BAM for discordant mate-seq fallback during annotation.",
+)
+@click.option(
+    "--control-mate-bam",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional full-genome control BAM for discordant mate-seq fallback during annotation.",
 )
 @click.option(
     "--rmsk-table",
@@ -666,6 +712,8 @@ def annotate_mei_support_cmd(
     reference_fasta: Path | None,
     disease_bam_depth: Path | None,
     control_bam_depth: Path | None,
+    disease_mate_bam: Path | None,
+    control_mate_bam: Path | None,
     rmsk_table: Path | None,
     g1k_mei_vcf: Path | None,
     lr_mei_vcf: Path | None,
@@ -717,6 +765,8 @@ def annotate_mei_support_cmd(
         reference_fasta=reference_fasta,
         disease_bam_path=disease_bam_depth,
         control_bam_path=control_bam_depth,
+        disease_mate_bam_path=disease_mate_bam,
+        control_mate_bam_path=control_mate_bam,
         rmsk_table_path=rmsk_table,
         g1k_mei_vcf=g1k_mei_vcf,
         lr_mei_vcf=lr_mei_vcf,

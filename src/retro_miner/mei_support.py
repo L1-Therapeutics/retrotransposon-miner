@@ -503,6 +503,361 @@ def _align_discordant_reads_with_minimap2(
     return out, summary
 
 
+def _fetch_discordant_mate_sequences(
+    discordant_df: pd.DataFrame,
+    bam_path: Path | None,
+) -> pd.DataFrame:
+    """Attach mate_seq to discordant rows, using evidence column or BAM fallback."""
+    if discordant_df.empty:
+        return discordant_df.copy()
+
+    out = discordant_df.copy()
+    if "mate_seq" not in out.columns:
+        out["mate_seq"] = ""
+    if "mate_ref_start" not in out.columns:
+        out["mate_ref_start"] = 0
+    if "mate_ref_end" not in out.columns:
+        out["mate_ref_end"] = 0
+
+    out["mate_seq"] = out["mate_seq"].fillna("").astype(str)
+    out["mate_ref_start"] = pd.to_numeric(out["mate_ref_start"], errors="coerce").fillna(0).astype(int)
+    out["mate_ref_end"] = pd.to_numeric(out["mate_ref_end"], errors="coerce").fillna(0).astype(int)
+
+    if bam_path is None or not bam_path.exists():
+        return out
+
+    need_fetch = out.loc[
+        (out["mate_seq"].str.len() == 0)
+        & (out["mate_chrom"].fillna("").astype(str) != "*")
+        & (pd.to_numeric(out["mate_pos"], errors="coerce").fillna(0).astype(int) > 0)
+    ].copy()
+    if need_fetch.empty:
+        return out
+
+    fetched: dict[str, tuple[str, int, int]] = {}
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for rec in need_fetch.itertuples(index=False):
+            qname = str(rec.read_name)
+            if qname in fetched:
+                continue
+            mate_chrom = str(rec.mate_chrom)
+            mate_pos = int(rec.mate_pos)
+            start0 = max(0, mate_pos - 1)
+            end0 = start0 + 500
+            for mate_read in bam.fetch(mate_chrom, start0, end0):
+                if mate_read.query_name != qname:
+                    continue
+                if mate_read.is_secondary or mate_read.is_supplementary:
+                    continue
+                if mate_read.is_unmapped:
+                    continue
+                seq = mate_read.query_sequence or ""
+                if not seq:
+                    continue
+                fetched[qname] = (
+                    seq,
+                    int(mate_read.reference_start) + 1 if mate_read.reference_start is not None else 0,
+                    int(mate_read.reference_end) if mate_read.reference_end is not None else 0,
+                )
+                break
+
+    if not fetched:
+        return out
+
+    for qname, (seq, mstart, mend) in fetched.items():
+        mask = out["read_name"].astype(str) == qname
+        out.loc[mask, "mate_seq"] = seq
+        out.loc[mask, "mate_ref_start"] = mstart
+        out.loc[mask, "mate_ref_end"] = mend
+    return out
+
+
+def _align_discordant_mates_with_minimap2(
+    discordant_df: pd.DataFrame,
+    mei_fasta: Path,
+    sample: str,
+    bam_path: Path | None = None,
+) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
+    """Map discordant mates to the MEI consensus axis (interchrom/large-insert pairs)."""
+    enriched = _fetch_discordant_mate_sequences(discordant_df, bam_path)
+    mates = enriched.loc[enriched["mate_seq"].fillna("").astype(str).str.len() >= 30].copy()
+    if mates.empty:
+        summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
+        return mates, summary
+
+    mates["mate_query_id"] = [f"{sample}_mate_{i}" for i in range(len(mates))]
+    mate_query = mates.copy()
+    mate_query["read_seq"] = mate_query["mate_seq"].fillna("").astype(str)
+    if "discordant_reasons" not in mate_query.columns:
+        mate_query["discordant_reasons"] = "interchrom"
+    else:
+        mate_query["discordant_reasons"] = mate_query["discordant_reasons"].fillna("interchrom").astype(str)
+        mate_query.loc[mate_query["discordant_reasons"].str.len() == 0, "discordant_reasons"] = "interchrom"
+    hits, summary = _align_discordant_reads_with_minimap2(mate_query, mei_fasta, sample=sample)
+    keep_cols = [
+        "read_name",
+        "mate_query_id",
+        "mei_hit",
+        "target",
+        "family",
+        "target_strand",
+        "target_start",
+        "target_end",
+        "target_len",
+        "alnlen",
+        "mei_score",
+    ]
+    keep_cols = [c for c in keep_cols if c in hits.columns]
+    hits = hits.loc[:, keep_cols].rename(
+        columns={
+            "mei_hit": "mate_mei_hit",
+            "target": "mate_mei_target",
+            "family": "mate_mei_family",
+            "target_strand": "mate_mei_strand",
+            "target_start": "mate_mei_start",
+            "target_end": "mate_mei_end",
+            "target_len": "mate_mei_target_len",
+            "alnlen": "mate_mei_alnlen",
+            "mei_score": "mate_mei_score",
+        }
+    )
+    out = enriched.merge(hits.drop(columns=["mate_query_id"], errors="ignore"), on="read_name", how="left")
+    for col in [
+        "mate_mei_hit",
+        "mate_mei_start",
+        "mate_mei_end",
+        "mate_mei_target_len",
+        "mate_mei_alnlen",
+        "mate_mei_score",
+    ]:
+        if col not in out.columns:
+            if col == "mate_mei_hit":
+                out[col] = False
+            elif col in {"mate_mei_start", "mate_mei_end", "mate_mei_target_len", "mate_mei_alnlen"}:
+                out[col] = 0
+            else:
+                out[col] = 0.0
+    out["mate_mei_hit"] = out["mate_mei_hit"].fillna(False).astype(bool)
+    out["mate_mei_start"] = pd.to_numeric(out["mate_mei_start"], errors="coerce").fillna(0).astype(int)
+    out["mate_mei_end"] = pd.to_numeric(out["mate_mei_end"], errors="coerce").fillna(0).astype(int)
+    out["mate_mei_score"] = pd.to_numeric(out["mate_mei_score"], errors="coerce").fillna(0.0).astype(float)
+    return out, summary
+
+
+def _enrich_discordant_anchor_hits_with_mate_mei(
+    anchor_hits: pd.DataFrame,
+    mate_hits: pd.DataFrame,
+) -> pd.DataFrame:
+    """Promote mate MEI mappings into discordant anchor hit rows for metrics/MEI_MAPPED."""
+    if anchor_hits.empty:
+        return anchor_hits.copy()
+    out = anchor_hits.copy()
+    if mate_hits.empty or "mate_mei_hit" not in mate_hits.columns:
+        return out
+
+    merge_keys = [
+        c for c in ["read_name", "chrom", "window_start", "window_end"] if c in out.columns and c in mate_hits.columns
+    ]
+    mate_cols = [
+        c
+        for c in [
+            "mate_mei_hit",
+            "mate_mei_start",
+            "mate_mei_end",
+            "mate_mei_target",
+            "mate_mei_family",
+            "mate_mei_strand",
+            "mate_mei_score",
+        ]
+        if c in mate_hits.columns
+    ]
+    if not merge_keys or not mate_cols:
+        return out
+
+    merged = out.merge(
+        mate_hits.loc[:, merge_keys + mate_cols].drop_duplicates(merge_keys),
+        on=merge_keys,
+        how="left",
+    )
+    anchor_hit = merged["mei_hit"].fillna(False).astype(bool) if "mei_hit" in merged.columns else pd.Series(False, index=merged.index)
+    mate_hit = merged["mate_mei_hit"].fillna(False).astype(bool)
+    use_mate = (~anchor_hit) & mate_hit
+    if use_mate.any():
+        if "target_start" in merged.columns:
+            merged.loc[use_mate, "target_start"] = merged.loc[use_mate, "mate_mei_start"]
+        if "target_end" in merged.columns:
+            merged.loc[use_mate, "target_end"] = merged.loc[use_mate, "mate_mei_end"]
+        if "target" in merged.columns and "mate_mei_target" in merged.columns:
+            merged.loc[use_mate, "target"] = merged.loc[use_mate, "mate_mei_target"]
+        if "family" in merged.columns and "mate_mei_family" in merged.columns:
+            merged.loc[use_mate, "family"] = merged.loc[use_mate, "mate_mei_family"]
+        if "target_strand" in merged.columns and "mate_mei_strand" in merged.columns:
+            merged.loc[use_mate, "target_strand"] = merged.loc[use_mate, "mate_mei_strand"]
+        if "mei_score" in merged.columns and "mate_mei_score" in merged.columns:
+            merged.loc[use_mate, "mei_score"] = merged.loc[use_mate, "mate_mei_score"]
+        if "mei_hit" in merged.columns:
+            merged.loc[use_mate, "mei_hit"] = True
+    if "mei_hit" in merged.columns:
+        merged["mei_hit"] = merged["mei_hit"].fillna(False).astype(bool) | mate_hit
+    return merged
+
+
+def _enrich_split_hits_with_mate_positions(
+    split_hits: pd.DataFrame,
+    bam_path: Path | None,
+) -> pd.DataFrame:
+    """Attach mate_chrom/mate_pos to split hits from evidence columns or BAM fallback."""
+    if split_hits.empty:
+        return split_hits.copy()
+
+    out = split_hits.copy()
+    if "mate_chrom" not in out.columns:
+        out["mate_chrom"] = ""
+    if "mate_pos" not in out.columns:
+        out["mate_pos"] = 0
+    out["mate_chrom"] = out["mate_chrom"].fillna("").astype(str)
+    out["mate_pos"] = pd.to_numeric(out["mate_pos"], errors="coerce").fillna(0).astype(int)
+
+    if bam_path is None or not bam_path.exists():
+        return out
+
+    need_fetch = out.loc[(out["mate_chrom"].isin({"", "*"})) | (out["mate_pos"] <= 0)].copy()
+    if need_fetch.empty:
+        return out
+
+    fetched: dict[str, tuple[str, int]] = {}
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for rec in need_fetch.itertuples(index=False):
+            qname = str(rec.read_name)
+            if qname in fetched:
+                continue
+            chrom = str(rec.chrom)
+            pos = int(rec.pos)
+            if chrom not in bam.references:
+                continue
+            start0 = max(0, pos - 1)
+            end0 = start0 + 500
+            for read in bam.fetch(chrom, start0, end0):
+                if read.query_name != qname:
+                    continue
+                if read.is_secondary or read.is_supplementary:
+                    continue
+                if not read.is_paired or read.mate_is_unmapped:
+                    continue
+                mate_chrom = "*"
+                mate_pos = 0
+                if read.next_reference_id >= 0:
+                    mate_chrom = bam.get_reference_name(read.next_reference_id)
+                    mate_pos = read.next_reference_start + 1
+                fetched[qname] = (mate_chrom, mate_pos)
+                break
+
+    for qname, (mate_chrom, mate_pos) in fetched.items():
+        mask = out["read_name"].astype(str) == qname
+        out.loc[mask, "mate_chrom"] = mate_chrom
+        out.loc[mask, "mate_pos"] = mate_pos
+    return out
+
+
+def _build_supporting_reads_detail_table(
+    *,
+    split_hits: pd.DataFrame,
+    discordant_hits: pd.DataFrame,
+    discordant_mate_hits: pd.DataFrame,
+    sample: str,
+) -> pd.DataFrame:
+    """Flatten per-read coordinates for architecture plots and review."""
+    rows: list[dict[str, object]] = []
+
+    if not split_hits.empty:
+        for rec in split_hits.itertuples(index=False):
+            mei_hit = bool(getattr(rec, "mei_hit", False)) or bool(getattr(rec, "mei_hit_coord", False))
+            if not mei_hit:
+                continue
+            start_col = (
+                "target_start_coord"
+                if int(getattr(rec, "target_start_coord", 0) or 0) > 0
+                else "target_start"
+            )
+            end_col = (
+                "target_end_coord"
+                if int(getattr(rec, "target_end_coord", 0) or 0) > 0
+                else "target_end"
+            )
+            rows.append(
+                {
+                    "sample": sample,
+                    "evidence_type": "SR",
+                    "read_name": str(rec.read_name),
+                    "chrom": str(rec.chrom),
+                    "window_start": int(rec.window_start),
+                    "window_end": int(rec.window_end),
+                    "anchor_side": str(rec.clip_side),
+                    "genomic_pos": int(rec.pos),
+                    "mate_chrom": str(getattr(rec, "mate_chrom", "") or ""),
+                    "mate_genomic_pos": int(getattr(rec, "mate_pos", 0) or 0),
+                    "mei_start": int(getattr(rec, start_col)),
+                    "mei_end": int(getattr(rec, end_col)),
+                    "mate_mei_start": 0,
+                    "mate_mei_end": 0,
+                    "mei_hit": True,
+                    "mate_mei_hit": False,
+                }
+            )
+
+    disc = discordant_mate_hits if not discordant_mate_hits.empty else discordant_hits
+    if not disc.empty:
+        mid_cache: dict[tuple[str, int, int], int] = {}
+        for rec in disc.itertuples(index=False):
+            key = (str(rec.chrom), int(rec.window_start), int(rec.window_end))
+            if key not in mid_cache:
+                mid_cache[key] = (int(rec.window_start) + int(rec.window_end)) // 2
+            anchor_side = "L" if int(rec.pos) <= mid_cache[key] else "R"
+            rows.append(
+                {
+                    "sample": sample,
+                    "evidence_type": "DPE",
+                    "read_name": str(rec.read_name),
+                    "chrom": str(rec.chrom),
+                    "window_start": int(rec.window_start),
+                    "window_end": int(rec.window_end),
+                    "anchor_side": anchor_side,
+                    "genomic_pos": int(rec.pos),
+                    "mate_chrom": str(getattr(rec, "mate_chrom", "")),
+                    "mate_genomic_pos": int(getattr(rec, "mate_pos", 0) or 0),
+                    "mei_start": int(getattr(rec, "target_start", 0) or 0),
+                    "mei_end": int(getattr(rec, "target_end", 0) or 0),
+                    "mate_mei_start": int(getattr(rec, "mate_mei_start", 0) or 0),
+                    "mate_mei_end": int(getattr(rec, "mate_mei_end", 0) or 0),
+                    "mei_hit": bool(getattr(rec, "mei_hit", False)),
+                    "mate_mei_hit": bool(getattr(rec, "mate_mei_hit", False)),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "sample",
+                "evidence_type",
+                "read_name",
+                "chrom",
+                "window_start",
+                "window_end",
+                "anchor_side",
+                "genomic_pos",
+                "mate_chrom",
+                "mate_genomic_pos",
+                "mei_start",
+                "mei_end",
+                "mate_mei_start",
+                "mate_mei_end",
+                "mei_hit",
+                "mate_mei_hit",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
 def _assign_rows_to_candidate_loci(split_df: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
     if split_df.empty or candidates.empty:
         return pd.DataFrame(columns=list(split_df.columns) + ["window_start", "window_end"])
@@ -1516,8 +1871,14 @@ def _aggregate_side_metrics(
         )
         side_match = coord_df["coord_target"].eq(coord_df["coord_side_target"])
         keep_mask = pref_match | side_match
-        coord_df = coord_df.loc[keep_mask].copy()
-        if not coord_df.empty:
+        filtered = coord_df.loc[keep_mask].copy()
+        # If preferred/side-subfamily filtering removes every hit (common for
+        # multi-subfamily SVA/L1 loci), keep the unfiltered coordinate set so
+        # 5'/3' footprint estimation is not left empty.
+        if filtered.empty:
+            coord_df = coord_df.copy()
+        else:
+            coord_df = filtered
             coord_df["coord_target_rank"] = pd.Series([2] * len(coord_df), index=coord_df.index)
             coord_df.loc[side_match.loc[coord_df.index], "coord_target_rank"] = 1
             coord_df.loc[pref_match.loc[coord_df.index], "coord_target_rank"] = 0
@@ -1828,6 +2189,13 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         .median()
         .rename(columns={"target_mid": "target_mid_median"})
     )
+    side_target_extent = (
+        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)
+        .agg(
+            target_start_min=("target_start", "min"),
+            target_end_max=("target_end", "max"),
+        )
+    )
     side_mid_pivot = (
         side_target_mid.pivot_table(
             index=["chrom", "window_start", "window_end"],
@@ -1846,6 +2214,43 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         columns={
             "L": f"{sample_prefix}_discordant_mei_left_target_pos_median",
             "R": f"{sample_prefix}_discordant_mei_right_target_pos_median",
+        }
+    )
+    side_extent_start = (
+        side_target_extent.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values="target_start_min",
+            aggfunc="first",
+        )
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    side_extent_end = (
+        side_target_extent.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values="target_end_max",
+            aggfunc="first",
+        )
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    for side_col in ("L", "R"):
+        if side_col not in side_extent_start.columns:
+            side_extent_start[side_col] = 0
+        if side_col not in side_extent_end.columns:
+            side_extent_end[side_col] = 0
+    side_extent_start = side_extent_start.rename(
+        columns={
+            "L": f"{sample_prefix}_discordant_mei_left_target_start_min",
+            "R": f"{sample_prefix}_discordant_mei_right_target_start_min",
+        }
+    )
+    side_extent_end = side_extent_end.rename(
+        columns={
+            "L": f"{sample_prefix}_discordant_mei_left_target_end_max",
+            "R": f"{sample_prefix}_discordant_mei_right_target_end_max",
         }
     )
 
@@ -2177,6 +2582,32 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
             how="left",
         )
         .merge(
+            side_extent_start[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_target_start_min",
+                    f"{sample_prefix}_discordant_mei_right_target_start_min",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        .merge(
+            side_extent_end[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_target_end_max",
+                    f"{sample_prefix}_discordant_mei_right_target_end_max",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        .merge(
             side_subfamily_pivot[
                 [
                     "chrom",
@@ -2243,6 +2674,13 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     agg[f"{sample_prefix}_discordant_mei_right_target_pos_median"] = (
         agg[f"{sample_prefix}_discordant_mei_right_target_pos_median"].fillna(0).astype(float)
     )
+    for extent_col in (
+        f"{sample_prefix}_discordant_mei_left_target_start_min",
+        f"{sample_prefix}_discordant_mei_right_target_start_min",
+        f"{sample_prefix}_discordant_mei_left_target_end_max",
+        f"{sample_prefix}_discordant_mei_right_target_end_max",
+    ):
+        agg[extent_col] = pd.to_numeric(agg.get(extent_col, 0), errors="coerce").fillna(0).astype(int)
     agg[f"{sample_prefix}_discordant_mei_left_subfamily"] = (
         agg[f"{sample_prefix}_discordant_mei_left_subfamily"].fillna("").astype(str)
     )
@@ -3759,30 +4197,9 @@ def _apply_assembly_refinement_overrides(candidates: pd.DataFrame) -> pd.DataFra
         pd.concat([picked_poly, base_poly], axis=1).max(axis=1).fillna(0).astype(int)
     )
 
-    asm_orient = s("asm_insertion_orientation", "").fillna("").astype(str)
-    out["insertion_orientation"] = asm_orient.where(asm_has_mei & asm_orient.isin(["+", "-"]), s("insertion_orientation", "").fillna("").astype(str))
-
-    asm_span = pd.to_numeric(s("asm_insertion_length", float("nan")), errors="coerce")
-    out["insertion_mei_span"] = asm_span.where(asm_has_mei & asm_span.notna(), s("insertion_mei_span", 0)).fillna(0).astype(int)
-
-    asm_start = pd.to_numeric(s("asm_insertion_mei_start", float("nan")), errors="coerce")
-    asm_end = pd.to_numeric(s("asm_insertion_mei_end", float("nan")), errors="coerce")
-    out["disease_insertion_mei_start"] = asm_start.where(
-        asm_has_mei & (asm_source == "disease") & asm_start.gt(0),
-        s("disease_insertion_mei_start", 0),
-    ).fillna(0).astype(int)
-    out["disease_insertion_mei_end"] = asm_end.where(
-        asm_has_mei & (asm_source == "disease") & asm_end.gt(0),
-        s("disease_insertion_mei_end", 0),
-    ).fillna(0).astype(int)
-    out["control_insertion_mei_start"] = asm_start.where(
-        asm_has_mei & (asm_source == "control") & asm_start.gt(0),
-        s("control_insertion_mei_start", 0),
-    ).fillna(0).astype(int)
-    out["control_insertion_mei_end"] = asm_end.where(
-        asm_has_mei & (asm_source == "control") & asm_end.gt(0),
-        s("control_insertion_mei_end", 0),
-    ).fillna(0).astype(int)
+    # Do not override insertion orientation or MEI 5'/3' coords from local
+    # assembly: contigs often fail to span the element and can invert/truncate
+    # the footprint. Keep SR/DPE-derived orientation and coordinates.
 
     return out
 
@@ -6445,14 +6862,12 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     disease_mei_mapped = _extract_support_total(_df_col_series(out, "disease_supporting_reads", ""), "MEI_MAPPED")
     control_mei_mapped = _extract_support_total(_df_col_series(out, "control_supporting_reads", ""), "MEI_MAPPED")
     out["_prio_mei_mapped_max"] = pd.concat([disease_mei_mapped, control_mei_mapped], axis=1).max(axis=1).astype(int)
-    support_total = (out["_prio_split_reads_max"] + out["_prio_discordant_reads_max"]).astype(float)
-    mei_mapped_frac = (out["_prio_mei_mapped_max"].astype(float) / support_total.where(support_total > 0, 1.0)).clip(
-        lower=0.0, upper=1.0
-    )
+    # Prefer true MEI-mapped support over raw SR/DPE pileups (which can be complex SVs).
+    # MEI_MAPPED dominates; SR/DPE are secondary tie-breakers only.
     out["read_support_heuristic_score"] = (
-        0.50 * (out["_prio_split_reads_max"].astype(float).map(math.log1p))
-        + 0.35 * (out["_prio_discordant_reads_max"].astype(float).map(math.log1p))
-        + 0.15 * mei_mapped_frac
+        1.00 * (out["_prio_mei_mapped_max"].astype(float).map(math.log1p))
+        + 0.20 * (out["_prio_split_reads_max"].astype(float).map(math.log1p))
+        + 0.10 * (out["_prio_discordant_reads_max"].astype(float).map(math.log1p))
     )
     # Down-rank low-complexity pileup artifacts:
     # - strong A/T-rich/polyA signatures,
@@ -6515,8 +6930,8 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     sort_cols.extend(
         [
             "low_complexity_noisy_artifact_flag",
-            "read_support_heuristic_score",
             "_prio_mei_mapped_max",
+            "read_support_heuristic_score",
             "_prio_split_reads_max",
             "_prio_discordant_reads_max",
             "_prio_tsd",
@@ -6526,7 +6941,7 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
             "_prio_insertion_model_score",
         ]
     )
-    # Artifact flag sorted ascending (False first), then strongest support.
+    # Artifact flag sorted ascending (False first), then MEI_MAPPED-first support.
     ascending.extend([True] + [False] * 9)
     sorted_out = out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
     return sorted_out.drop(
@@ -6725,8 +7140,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     bp_pos = _series_or_default("insertion_breakpoint_pos", 0).fillna(0).astype(int)
     out["insertion_breakpoint_pos"] = bp_pos.where(bp_pos > 0, -1)
 
-    # Assembly-preferred consensus fields (non-destructive): use assembly-derived
-    # values when present, else fall back to current evidence-derived fields.
+    # Assembly-preferred consensus fields for breakpoint/TSD/polyA only.
+    # MEI 5'/3' coords and orientation are set from SR/DPE below (not assembly).
     asm_bp = pd.to_numeric(_series_or_default("asm_consensus_breakpoint_pos", float("nan")), errors="coerce")
     out["consensus_insertion_breakpoint_pos"] = asm_bp.where(asm_has_mei & asm_bp.notna(), out["insertion_breakpoint_pos"]).astype(int)
     out["consensus_breakpoint_source"] = asm_source.copy()
@@ -6782,6 +7197,9 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     )
     out["consensus_poly_at_supported"] = out["consensus_poly_at_max_run"].fillna(0).astype(float) >= 8.0
 
+    # MEI 5'/3' coords and orientation come from split reads first, then DPE.
+    # Local assembly is intentionally excluded: contigs rarely span the full MEI
+    # and previously truncated/inverted consensus footprints (e.g. SVA stubs).
     asm_span = pd.to_numeric(_series_or_default("asm_insertion_length", float("nan")), errors="coerce")
     base_span = pd.to_numeric(_series_or_default("insertion_mei_span", float("nan")), errors="coerce")
     asm_mei_start = pd.to_numeric(_series_or_default("asm_insertion_mei_start", float("nan")), errors="coerce")
@@ -6790,24 +7208,181 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     control_start = pd.to_numeric(_series_or_default("control_insertion_mei_start", float("nan")), errors="coerce")
     disease_end = pd.to_numeric(_series_or_default("disease_insertion_mei_end", float("nan")), errors="coerce")
     control_end = pd.to_numeric(_series_or_default("control_insertion_mei_end", float("nan")), errors="coerce")
-    asm_pair_valid = asm_has_mei & asm_mei_start.gt(0) & asm_mei_end.gt(0)
-    disease_pair_valid = disease_start.gt(0) & disease_end.gt(0)
-    control_pair_valid = control_start.gt(0) & control_end.gt(0)
+
+    d_l_sr_start = pd.to_numeric(_series_or_default("disease_L_mei_start", float("nan")), errors="coerce")
+    d_l_sr_end = pd.to_numeric(_series_or_default("disease_L_mei_end", float("nan")), errors="coerce")
+    d_r_sr_start = pd.to_numeric(_series_or_default("disease_R_mei_start", float("nan")), errors="coerce")
+    d_r_sr_end = pd.to_numeric(_series_or_default("disease_R_mei_end", float("nan")), errors="coerce")
+    n_l_sr_start = pd.to_numeric(_series_or_default("control_L_mei_start", float("nan")), errors="coerce")
+    n_l_sr_end = pd.to_numeric(_series_or_default("control_L_mei_end", float("nan")), errors="coerce")
+    n_r_sr_start = pd.to_numeric(_series_or_default("control_R_mei_start", float("nan")), errors="coerce")
+    n_r_sr_end = pd.to_numeric(_series_or_default("control_R_mei_end", float("nan")), errors="coerce")
+    d_sr_bilateral = (
+        d_l_sr_start.gt(0) & d_l_sr_end.ge(d_l_sr_start) & d_r_sr_start.gt(0) & d_r_sr_end.ge(d_r_sr_start)
+    )
+    n_sr_bilateral = (
+        n_l_sr_start.gt(0) & n_l_sr_end.ge(n_l_sr_start) & n_r_sr_start.gt(0) & n_r_sr_end.ge(n_r_sr_start)
+    )
+    d_sr_lo = pd.concat([d_l_sr_start, d_l_sr_end, d_r_sr_start, d_r_sr_end], axis=1).min(axis=1, skipna=True)
+    d_sr_hi = pd.concat([d_l_sr_start, d_l_sr_end, d_r_sr_start, d_r_sr_end], axis=1).max(axis=1, skipna=True)
+    n_sr_lo = pd.concat([n_l_sr_start, n_l_sr_end, n_r_sr_start, n_r_sr_end], axis=1).min(axis=1, skipna=True)
+    n_sr_hi = pd.concat([n_l_sr_start, n_l_sr_end, n_r_sr_start, n_r_sr_end], axis=1).max(axis=1, skipna=True)
+
+    d_left_t_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_target_pos_median", float("nan")), errors="coerce"
+    )
+    d_right_t_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_target_pos_median", float("nan")), errors="coerce"
+    )
+    n_left_t_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_target_pos_median", float("nan")), errors="coerce"
+    )
+    n_right_t_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_target_pos_median", float("nan")), errors="coerce"
+    )
+    d_left_start_min = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_target_start_min", float("nan")), errors="coerce"
+    )
+    d_right_start_min = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_target_start_min", float("nan")), errors="coerce"
+    )
+    d_left_end_max = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_target_end_max", float("nan")), errors="coerce"
+    )
+    d_right_end_max = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_target_end_max", float("nan")), errors="coerce"
+    )
+    n_left_start_min = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_target_start_min", float("nan")), errors="coerce"
+    )
+    n_right_start_min = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_target_start_min", float("nan")), errors="coerce"
+    )
+    n_left_end_max = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_target_end_max", float("nan")), errors="coerce"
+    )
+    n_right_end_max = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_target_end_max", float("nan")), errors="coerce"
+    )
+    d_left_reads_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    d_right_reads_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    n_left_reads_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    n_right_reads_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    d_dpe_extent_lo = pd.concat([d_left_start_min, d_right_start_min], axis=1).min(axis=1, skipna=True)
+    d_dpe_extent_hi = pd.concat([d_left_end_max, d_right_end_max], axis=1).max(axis=1, skipna=True)
+    n_dpe_extent_lo = pd.concat([n_left_start_min, n_right_start_min], axis=1).min(axis=1, skipna=True)
+    n_dpe_extent_hi = pd.concat([n_left_end_max, n_right_end_max], axis=1).max(axis=1, skipna=True)
+    d_dpe_bilateral = (
+        d_left_reads_early.ge(1.0)
+        & d_right_reads_early.ge(1.0)
+        & d_left_t_early.gt(0)
+        & d_right_t_early.gt(0)
+    )
+    n_dpe_bilateral = (
+        n_left_reads_early.ge(1.0)
+        & n_right_reads_early.ge(1.0)
+        & n_left_t_early.gt(0)
+        & n_right_t_early.gt(0)
+    )
+    d_dpe_extent_ok = d_dpe_bilateral & d_dpe_extent_lo.gt(0) & d_dpe_extent_hi.ge(d_dpe_extent_lo)
+    n_dpe_extent_ok = n_dpe_bilateral & n_dpe_extent_lo.gt(0) & n_dpe_extent_hi.ge(n_dpe_extent_lo)
+    # Median-based DPE footprint is only a last resort (orientation signal, not span).
+    d_dpe_lo = pd.concat([d_left_t_early, d_right_t_early], axis=1).min(axis=1, skipna=True)
+    d_dpe_hi = pd.concat([d_left_t_early, d_right_t_early], axis=1).max(axis=1, skipna=True)
+    n_dpe_lo = pd.concat([n_left_t_early, n_right_t_early], axis=1).min(axis=1, skipna=True)
+    n_dpe_hi = pd.concat([n_left_t_early, n_right_t_early], axis=1).max(axis=1, skipna=True)
+
+    # Drop per-sample insertion coords that were previously copied from assembly.
+    asm_polluted_disease = (
+        asm_has_mei
+        & (asm_source == "disease")
+        & disease_start.gt(0)
+        & asm_mei_start.gt(0)
+        & disease_start.eq(asm_mei_start)
+        & disease_end.eq(asm_mei_end)
+    )
+    asm_polluted_control = (
+        asm_has_mei
+        & (asm_source == "control")
+        & control_start.gt(0)
+        & asm_mei_start.gt(0)
+        & control_start.eq(asm_mei_start)
+        & control_end.eq(asm_mei_end)
+    )
+    disease_pair_valid = disease_start.gt(0) & disease_end.gt(0) & ~asm_polluted_disease
+    control_pair_valid = control_start.gt(0) & control_end.gt(0) & ~asm_polluted_control
+
     raw_start = pd.Series([float("nan")] * len(out), index=out.index)
     raw_end = pd.Series([float("nan")] * len(out), index=out.index)
-    raw_start = raw_start.where(~asm_pair_valid, asm_mei_start)
-    raw_end = raw_end.where(~asm_pair_valid, asm_mei_end)
-    disease_pick = (~asm_pair_valid) & disease_pair_valid
+
+    # 1) Bilateral split-read footprint = full mapped extent (min start, max end).
+    d_sr_support = (
+        pd.to_numeric(_series_or_default("disease_L_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(_series_or_default("disease_R_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+    )
+    n_sr_support = (
+        pd.to_numeric(_series_or_default("control_L_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(_series_or_default("control_R_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+    )
+    choose_n_sr = n_sr_bilateral & (~d_sr_bilateral | n_sr_support.gt(d_sr_support))
+    choose_d_sr = d_sr_bilateral & ~choose_n_sr
+    raw_start = raw_start.where(~choose_d_sr, d_sr_lo)
+    raw_end = raw_end.where(~choose_d_sr, d_sr_hi)
+    raw_start = raw_start.where(~choose_n_sr, n_sr_lo)
+    raw_end = raw_end.where(~choose_n_sr, n_sr_hi)
+
+    # 2) Bilateral DPE full mapped extent (not medians) when SR footprint missing.
+    unresolved = raw_start.isna() | raw_end.isna()
+    d_dpe_support = d_left_reads_early + d_right_reads_early
+    n_dpe_support = n_left_reads_early + n_right_reads_early
+    choose_n_dpe_ext = unresolved & n_dpe_extent_ok & (~d_dpe_extent_ok | n_dpe_support.gt(d_dpe_support))
+    choose_d_dpe_ext = unresolved & d_dpe_extent_ok & ~choose_n_dpe_ext
+    raw_start = raw_start.where(~choose_d_dpe_ext, d_dpe_extent_lo)
+    raw_end = raw_end.where(~choose_d_dpe_ext, d_dpe_extent_hi)
+    raw_start = raw_start.where(~choose_n_dpe_ext, n_dpe_extent_lo)
+    raw_end = raw_end.where(~choose_n_dpe_ext, n_dpe_extent_hi)
+
+    # 3) Previously fused per-sample insertion coords (SR/DPE), excluding asm copies.
+    unresolved = raw_start.isna() | raw_end.isna()
+    disease_pick = unresolved & disease_pair_valid
     raw_start = raw_start.where(~disease_pick, disease_start)
     raw_end = raw_end.where(~disease_pick, disease_end)
-    control_pick = (~asm_pair_valid) & (~disease_pair_valid) & control_pair_valid
+    unresolved = raw_start.isna() | raw_end.isna()
+    control_pick = unresolved & control_pair_valid
     raw_start = raw_start.where(~control_pick, control_start)
     raw_end = raw_end.where(~control_pick, control_end)
 
+    # 4) Last resort: DPE side medians (orientation signal only; underestimates span).
+    unresolved = raw_start.isna() | raw_end.isna()
+    choose_n_dpe = unresolved & n_dpe_bilateral & (~d_dpe_bilateral | n_dpe_support.gt(d_dpe_support))
+    choose_d_dpe = unresolved & d_dpe_bilateral & ~choose_n_dpe
+    raw_start = raw_start.where(~choose_d_dpe, d_dpe_lo)
+    raw_end = raw_end.where(~choose_d_dpe, d_dpe_hi)
+    raw_start = raw_start.where(~choose_n_dpe, n_dpe_lo)
+    raw_end = raw_end.where(~choose_n_dpe, n_dpe_hi)
+
+    # Orientation: SR/DPE consolidated call only (never assembly).
+    # Footprint stays strictly min-max of mapped SR/DPE coords (no target_len expansion).
+    consolidated_orient = out.apply(_choose_consolidated_insertion_orientation, axis=1)
+    read_orient = _series_or_default("insertion_orientation", "").fillna("").astype(str)
+    # If insertion_orientation was previously overwritten by assembly, prefer
+    # disease/control insertion orientations via the consolidated chooser.
     asm_orient = _series_or_default("asm_insertion_orientation", "").fillna("").astype(str)
-    out["consensus_insertion_orientation"] = asm_orient.where(
-        asm_orient.isin(["+", "-"]),
-        _series_or_default("insertion_orientation", "").fillna("").astype(str),
+    read_orient_clean = read_orient.where(
+        ~(asm_has_mei & asm_orient.isin(["+", "-"]) & read_orient.eq(asm_orient)),
+        "",
+    )
+    out["consensus_insertion_orientation"] = consolidated_orient.where(
+        consolidated_orient.isin(["+", "-"]),
+        read_orient_clean.where(read_orient_clean.isin(["+", "-"]), ""),
     )
     raw_start_num = pd.to_numeric(raw_start, errors="coerce")
     raw_end_num = pd.to_numeric(raw_end, errors="coerce")
@@ -6828,7 +7403,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     out["consensus_insertion_mei_span"] = span_from_coords.where(
         out["consensus_insertion_mei_3p_coord"].astype(float).gt(0)
         & out["consensus_insertion_mei_5p_coord"].astype(float).gt(0),
-        asm_span.where(asm_has_mei & asm_span.notna(), base_span),
+        base_span.where(base_span.notna() & base_span.gt(0), float("nan")),
     )
     # Non-assembly fallback: impute MEI-axis coords only when discordant evidence
     # provides both-side MEI target mapping (no placeholder 1..span fallback).
@@ -8235,6 +8810,8 @@ def annotate_candidate_loci_with_mei(
     reference_fasta: Path | None = None,
     disease_bam_path: Path | None = None,
     control_bam_path: Path | None = None,
+    disease_mate_bam_path: Path | None = None,
+    control_mate_bam_path: Path | None = None,
     rmsk_table_path: Path | None = None,
     g1k_mei_vcf: Path | None = None,
     lr_mei_vcf: Path | None = None,
@@ -8310,6 +8887,45 @@ def annotate_candidate_loci_with_mei(
     control_disc_hits, control_disc_summary = _align_discordant_reads_with_minimap2(
         discordant_control, mei_fasta, sample="control"
     )
+    disease_disc_mate_hits, disease_disc_mate_summary = _align_discordant_mates_with_minimap2(
+        discordant_disease,
+        mei_fasta,
+        sample="disease_mate",
+        bam_path=disease_mate_bam_path or disease_bam_path,
+    )
+    control_disc_mate_hits, control_disc_mate_summary = _align_discordant_mates_with_minimap2(
+        discordant_control,
+        mei_fasta,
+        sample="control_mate",
+        bam_path=control_mate_bam_path or control_bam_path,
+    )
+    disease_disc_hits = _enrich_discordant_anchor_hits_with_mate_mei(disease_disc_hits, disease_disc_mate_hits)
+    control_disc_hits = _enrich_discordant_anchor_hits_with_mate_mei(control_disc_hits, control_disc_mate_hits)
+    disease_hits = _enrich_split_hits_with_mate_positions(disease_hits, disease_bam_path)
+    control_hits = _enrich_split_hits_with_mate_positions(control_hits, control_bam_path)
+    supporting_reads_detail = pd.concat(
+        [
+            _build_supporting_reads_detail_table(
+                split_hits=disease_hits,
+                discordant_hits=disease_disc_hits,
+                discordant_mate_hits=disease_disc_mate_hits,
+                sample="disease",
+            ),
+            _build_supporting_reads_detail_table(
+                split_hits=control_hits,
+                discordant_hits=control_disc_hits,
+                discordant_mate_hits=control_disc_mate_hits,
+                sample="control",
+            ),
+        ],
+        ignore_index=True,
+    )
+    if not supporting_reads_detail.empty:
+        detail_tsv = out_path.with_name("supporting_reads_detail.mei.tsv")
+        detail_parquet = out_path.with_name("supporting_reads_detail.mei.parquet")
+        supporting_reads_detail.to_csv(detail_tsv, sep="\t", index=False)
+        supporting_reads_detail.to_parquet(detail_parquet, index=False)
+        print(f"[mei-annotate] wrote supporting read detail table to {detail_tsv}")
     full_consensus_fasta = _resolve_full_consensus_fasta(
         mei_fasta=mei_fasta,
         out_dir=out_path.parent,
@@ -8367,6 +8983,8 @@ def annotate_candidate_loci_with_mei(
         f"control clips={control_summary.clip_count} hits={control_summary.paf_hits}; "
         f"disease discordant reads={disease_disc_summary.clip_count} hits={disease_disc_summary.paf_hits}; "
         f"control discordant reads={control_disc_summary.clip_count} hits={control_disc_summary.paf_hits}; "
+        f"disease discordant mates={disease_disc_mate_summary.clip_count} mei_hits={disease_disc_mate_summary.paf_hits}; "
+        f"control discordant mates={control_disc_mate_summary.clip_count} mei_hits={control_disc_mate_summary.paf_hits}; "
         f"disease full clips={disease_summary_full.clip_count} hits={disease_summary_full.paf_hits}; "
         f"control full clips={control_summary_full.clip_count} hits={control_summary_full.paf_hits}; "
         f"disease full discordant reads={disease_disc_summary_full.clip_count} hits={disease_disc_summary_full.paf_hits}; "

@@ -15,6 +15,8 @@ RTM_RESULTS_DIR="${RTM_RESULTS_DIR:-${RTM_WORKDIR}/results}"
 
 DISEASE_BAM=""
 CONTROL_BAM=""
+DISEASE_MATE_BAM=""
+CONTROL_MATE_BAM=""
 MEI_FASTA=""
 REFERENCE_FASTA=""
 RMSK_TABLE=""
@@ -40,7 +42,8 @@ EMPIRICAL_HIGHCONF_BED=""
 # Keep empirical gating enabled by default so noisy repeat-context loci are
 # filtered from gold-stage outputs unless explicitly disabled.
 EMPIRICAL_STAGE="1"
-LOCAL_ASSEMBLY="1"
+LOCAL_ASSEMBLY="0"
+ANNOTATE_ONLY="0"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
@@ -201,6 +204,14 @@ while [[ $# -gt 0 ]]; do
       CONTROL_BAM="$2"
       shift 2
       ;;
+    --disease-mate-bam)
+      DISEASE_MATE_BAM="$2"
+      shift 2
+      ;;
+    --control-mate-bam)
+      CONTROL_MATE_BAM="$2"
+      shift 2
+      ;;
     --mei-fasta)
       MEI_FASTA="$2"
       shift 2
@@ -283,6 +294,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-local-assembly)
       LOCAL_ASSEMBLY="0"
+      shift 1
+      ;;
+    --annotate-only)
+      ANNOTATE_ONLY="1"
       shift 1
       ;;
     --python-bin)
@@ -484,41 +499,10 @@ PY
   echo "[candidate-pipeline] consolidated ${basename} -> ${out_path}"
 }
 
-run_single_pipeline() {
+run_annotate_mei_support() {
   local run_region="$1"
   local run_outdir="$2"
   local stage_t0
-  mkdir -p "${run_outdir}"
-
-  stage_t0=$(now_epoch)
-  echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir}"
-  run_cli extract-split-evidence \
-    --disease-bam "${DISEASE_BAM}" \
-    --control-bam "${CONTROL_BAM}" \
-    --outdir "${run_outdir}" \
-    --region "${run_region}" \
-    --min-mapq 20 \
-    --min-mapq-discordant 20 \
-    --min-clip-len 20
-  echo "[candidate-pipeline] stage=extract-split-evidence done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
-
-  stage_t0=$(now_epoch)
-  echo "[candidate-pipeline] stage=build-candidate-loci region=${run_region} window_size=${WINDOW_SIZE}"
-  run_cli build-candidate-loci \
-    --evidence-dir "${run_outdir}" \
-    --window-size "${WINDOW_SIZE}" \
-    --pseudocount 1.0 \
-    --segdup-bed "${SEG_DUP_BED}" \
-    --segdup-min-fraction 0.1 \
-    --mappability-bedgraph "${MAPPABILITY_BEDGRAPH}" \
-    --mappability-low-threshold 0.5 \
-    --mappability-min-fraction 0.5 \
-    --gap-bed "${GAP_BED}" \
-    --gap-min-fraction 0.1 \
-    --encode-blacklist-bed "${BLACKLIST_BED}" \
-    --encode-blacklist-min-fraction 0.1
-  echo "[candidate-pipeline] stage=build-candidate-loci done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
-
   stage_t0=$(now_epoch)
   echo "[candidate-pipeline] stage=annotate-mei-support region=${run_region}"
   annotate_cmd=(
@@ -528,6 +512,14 @@ run_single_pipeline() {
     --mei-fasta "${MEI_FASTA}"
     --disease-bam-depth "${DISEASE_BAM}"
     --control-bam-depth "${CONTROL_BAM}"
+  )
+  if [[ -n "${DISEASE_MATE_BAM}" ]]; then
+    annotate_cmd+=(--disease-mate-bam "${DISEASE_MATE_BAM}")
+  fi
+  if [[ -n "${CONTROL_MATE_BAM}" ]]; then
+    annotate_cmd+=(--control-mate-bam "${CONTROL_MATE_BAM}")
+  fi
+  annotate_cmd+=(
     --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
     --empirical-exclude-segdup-bed "${SEG_DUP_BED}"
     --empirical-exclude-mappability-bedgraph "${MAPPABILITY_LOW_BED}"
@@ -570,6 +562,55 @@ run_single_pipeline() {
   annotate_cmd+=(--out-tsv "${run_outdir}/candidate_loci.mei.tsv")
   run_cli "${annotate_cmd[@]}"
   echo "[candidate-pipeline] stage=annotate-mei-support done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+}
+
+run_single_pipeline() {
+  local run_region="$1"
+  local run_outdir="$2"
+  local stage_t0
+  mkdir -p "${run_outdir}"
+
+  if [[ "${ANNOTATE_ONLY}" == "1" ]]; then
+    if [[ ! -f "${run_outdir}/candidate_loci.tsv" ]]; then
+      echo "ERROR: --annotate-only requires existing ${run_outdir}/candidate_loci.tsv" >&2
+      exit 1
+    fi
+    run_annotate_mei_support "${run_region}" "${run_outdir}"
+    return 0
+  fi
+
+  stage_t0=$(now_epoch)
+  echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir}"
+  run_cli extract-split-evidence \
+    --disease-bam "${DISEASE_BAM}" \
+    --control-bam "${CONTROL_BAM}" \
+    $( [[ -n "${DISEASE_MATE_BAM}" ]] && printf '%s ' --disease-mate-bam "${DISEASE_MATE_BAM}" ) \
+    $( [[ -n "${CONTROL_MATE_BAM}" ]] && printf '%s ' --control-mate-bam "${CONTROL_MATE_BAM}" ) \
+    --outdir "${run_outdir}" \
+    --region "${run_region}" \
+    --min-mapq 20 \
+    --min-mapq-discordant 20 \
+    --min-clip-len 20
+  echo "[candidate-pipeline] stage=extract-split-evidence done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+
+  stage_t0=$(now_epoch)
+  echo "[candidate-pipeline] stage=build-candidate-loci region=${run_region} window_size=${WINDOW_SIZE}"
+  run_cli build-candidate-loci \
+    --evidence-dir "${run_outdir}" \
+    --window-size "${WINDOW_SIZE}" \
+    --pseudocount 1.0 \
+    --segdup-bed "${SEG_DUP_BED}" \
+    --segdup-min-fraction 0.1 \
+    --mappability-bedgraph "${MAPPABILITY_BEDGRAPH}" \
+    --mappability-low-threshold 0.5 \
+    --mappability-min-fraction 0.5 \
+    --gap-bed "${GAP_BED}" \
+    --gap-min-fraction 0.1 \
+    --encode-blacklist-bed "${BLACKLIST_BED}" \
+    --encode-blacklist-min-fraction 0.1
+  echo "[candidate-pipeline] stage=build-candidate-loci done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
+
+  run_annotate_mei_support "${run_region}" "${run_outdir}"
 }
 
 if ! [[ "${CHR_CONCURRENCY}" =~ ^[0-9]+$ ]] || [[ "${CHR_CONCURRENCY}" -lt 1 ]]; then
