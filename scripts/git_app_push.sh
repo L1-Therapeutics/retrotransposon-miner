@@ -73,7 +73,13 @@ mint_token() {
 }
 
 slugify() {
-  printf '%s' "$1" \
+  local text
+  if [[ $# -gt 0 ]]; then
+    text="$1"
+  else
+    text="$(cat)"
+  fi
+  printf '%s' "${text}" \
     | tr '[:upper:]' '[:lower:]' \
     | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' \
     | cut -c1-40
@@ -81,7 +87,7 @@ slugify() {
 
 fresh_feat_branch() {
   local subject stamp
-  subject="$(git log -1 --pretty=%s | slugify)"
+  subject="$(slugify "$(git log -1 --pretty=%s)")"
   if [[ -z "${subject}" ]]; then
     subject="update"
   fi
