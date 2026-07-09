@@ -7689,8 +7689,10 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         asm_family.str.len() > 0,
         _series_or_default("mei_family", "").fillna("").astype(str),
     )
-    # Consolidate legacy consensus coordinates into *_full when full remap is
-    # unresolved. For ALU, also carry over one-sided coordinate fields.
+    # Consolidate SR/DPE consensus coordinates into *_full when full-consensus
+    # remap is unresolved. Base 5'/3' coords are the min/max footprint of
+    # split-read + discordant paired-end MEI mappings (same source used for
+    # read-architecture plots); apply identically for ALU/SVA/LINE1.
     base_span_num = pd.to_numeric(out["consensus_insertion_mei_span"], errors="coerce").fillna(0.0)
     base_5p_num = pd.to_numeric(out["consensus_insertion_mei_5p_coord"], errors="coerce").fillna(-1.0)
     base_3p_num = pd.to_numeric(out["consensus_insertion_mei_3p_coord"], errors="coerce").fillna(-1.0)
@@ -7702,10 +7704,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         out.loc[full_span_missing, "consensus_insertion_mei_span_full"] = (
             base_span_num.loc[full_span_missing].round().astype(int)
         )
-    fam_upper = out["consensus_mei_family"].fillna("").astype(str).str.upper()
-    alu_mask = fam_upper.eq("ALU")
-    fill_full_5p = alu_mask & full_5p_num.le(0) & base_5p_num.gt(0)
-    fill_full_3p = alu_mask & full_3p_num.le(0) & base_3p_num.gt(0)
+    fill_full_5p = full_5p_num.le(0) & base_5p_num.gt(0)
+    fill_full_3p = full_3p_num.le(0) & base_3p_num.gt(0)
     if fill_full_5p.any():
         out.loc[fill_full_5p, "consensus_insertion_mei_5p_coord_full"] = base_5p_num.loc[fill_full_5p]
     if fill_full_3p.any():

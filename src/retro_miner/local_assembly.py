@@ -499,15 +499,6 @@ def _sort_hit_key(hit: dict[str, object]) -> tuple[int, int, int]:
     return (int(hit.get("alnlen", 0)), int(hit.get("mapq", 0)), int(hit.get("nmatch", 0)))
 
 
-def _polyA_impute_threshold_for_family(mei_family: str) -> int:
-    fam = str(mei_family or "").upper()
-    if fam == "ALU":
-        return 15
-    if fam in {"LINE1", "SVA"}:
-        return 12
-    return int(_MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE)
-
-
 def _infer_breakpoint_from_alignments(
     mei_hit: dict[str, object],
     ref_hits: list[dict[str, object]],
@@ -915,8 +906,8 @@ def _extract_sample_assembly_features(
     mei_lengths = _load_fasta_lengths(mei_fasta)
     target_name = str(best.get("tname", ""))
     target_len = int(mei_lengths.get(target_name, 0))
-    target_family = _family_from_target(target_name)
-    polyA_impute_threshold = _polyA_impute_threshold_for_family(target_family)
+    # Same polyA gate for ALU/SVA/LINE1 (matches mei_support end-impute threshold).
+    polyA_impute_threshold = int(_MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE)
     allow_left_anchor_impute = mei_strand == "+"
     allow_right_anchor_impute = mei_strand == "-"
     coord_model = "single_best_contig"
