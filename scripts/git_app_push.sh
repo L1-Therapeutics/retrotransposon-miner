@@ -252,7 +252,9 @@ fi
 
 push_head_to_branch() {
   local target_branch="$1"
-  git push -u "${push_url}" "HEAD:refs/heads/${target_branch}"
+  # Do not use `git push -u` with a tokenized URL: that stores the token in
+  # branch.<name>.remote. Push, then set upstream to the normal origin remote.
+  git push "${push_url}" "HEAD:refs/heads/${target_branch}"
 }
 
 echo "Pushing HEAD -> origin/${BRANCH}"
@@ -270,13 +272,16 @@ if ! push_head_to_branch "${BRANCH}" 2>/tmp/rtm_git_app_push.err; then
 fi
 rm -f /tmp/rtm_git_app_push.err
 
-# Keep local tracking pointed at the writable remote branch we just pushed.
+# Ensure the remote-tracking ref exists, then track the normal origin remote.
+git fetch origin "refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" >/dev/null 2>&1 || true
 git branch --set-upstream-to="origin/${BRANCH}" >/dev/null 2>&1 || true
-# Ensure the remote-tracking ref exists locally for subsequent commands.
-git fetch origin "${BRANCH}" >/dev/null 2>&1 || true
 
 if [[ "${CREATE_PR}" -eq 1 ]]; then
   echo "Ensuring pull request ${BRANCH} -> ${BASE_BRANCH}"
-  pr_url="$(ensure_pr "${token}" "${BRANCH}" "${BASE_BRANCH}" "${TITLE}" "${BODY}")"
+  if ! pr_url="$(ensure_pr "${token}" "${BRANCH}" "${BASE_BRANCH}" "${TITLE}" "${BODY}")"; then
+    echo "ERROR: push succeeded but PR create/reuse failed for ${BRANCH} -> ${BASE_BRANCH}" >&2
+    echo "Open manually: https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/compare/${BASE_BRANCH}...${BRANCH}" >&2
+    exit 1
+  fi
   echo "PR: ${pr_url}"
 fi
