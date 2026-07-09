@@ -1871,8 +1871,14 @@ def _aggregate_side_metrics(
         )
         side_match = coord_df["coord_target"].eq(coord_df["coord_side_target"])
         keep_mask = pref_match | side_match
-        coord_df = coord_df.loc[keep_mask].copy()
-        if not coord_df.empty:
+        filtered = coord_df.loc[keep_mask].copy()
+        # If preferred/side-subfamily filtering removes every hit (common for
+        # multi-subfamily SVA/L1 loci), keep the unfiltered coordinate set so
+        # 5'/3' footprint estimation is not left empty.
+        if filtered.empty:
+            coord_df = coord_df.copy()
+        else:
+            coord_df = filtered
             coord_df["coord_target_rank"] = pd.Series([2] * len(coord_df), index=coord_df.index)
             coord_df.loc[side_match.loc[coord_df.index], "coord_target_rank"] = 1
             coord_df.loc[pref_match.loc[coord_df.index], "coord_target_rank"] = 0
@@ -2183,6 +2189,13 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         .median()
         .rename(columns={"target_mid": "target_mid_median"})
     )
+    side_target_extent = (
+        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)
+        .agg(
+            target_start_min=("target_start", "min"),
+            target_end_max=("target_end", "max"),
+        )
+    )
     side_mid_pivot = (
         side_target_mid.pivot_table(
             index=["chrom", "window_start", "window_end"],
@@ -2201,6 +2214,43 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         columns={
             "L": f"{sample_prefix}_discordant_mei_left_target_pos_median",
             "R": f"{sample_prefix}_discordant_mei_right_target_pos_median",
+        }
+    )
+    side_extent_start = (
+        side_target_extent.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values="target_start_min",
+            aggfunc="first",
+        )
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    side_extent_end = (
+        side_target_extent.pivot_table(
+            index=["chrom", "window_start", "window_end"],
+            columns="anchor_side",
+            values="target_end_max",
+            aggfunc="first",
+        )
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    for side_col in ("L", "R"):
+        if side_col not in side_extent_start.columns:
+            side_extent_start[side_col] = 0
+        if side_col not in side_extent_end.columns:
+            side_extent_end[side_col] = 0
+    side_extent_start = side_extent_start.rename(
+        columns={
+            "L": f"{sample_prefix}_discordant_mei_left_target_start_min",
+            "R": f"{sample_prefix}_discordant_mei_right_target_start_min",
+        }
+    )
+    side_extent_end = side_extent_end.rename(
+        columns={
+            "L": f"{sample_prefix}_discordant_mei_left_target_end_max",
+            "R": f"{sample_prefix}_discordant_mei_right_target_end_max",
         }
     )
 
@@ -2532,6 +2582,32 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
             how="left",
         )
         .merge(
+            side_extent_start[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_target_start_min",
+                    f"{sample_prefix}_discordant_mei_right_target_start_min",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        .merge(
+            side_extent_end[
+                [
+                    "chrom",
+                    "window_start",
+                    "window_end",
+                    f"{sample_prefix}_discordant_mei_left_target_end_max",
+                    f"{sample_prefix}_discordant_mei_right_target_end_max",
+                ]
+            ],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        .merge(
             side_subfamily_pivot[
                 [
                     "chrom",
@@ -2598,6 +2674,13 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     agg[f"{sample_prefix}_discordant_mei_right_target_pos_median"] = (
         agg[f"{sample_prefix}_discordant_mei_right_target_pos_median"].fillna(0).astype(float)
     )
+    for extent_col in (
+        f"{sample_prefix}_discordant_mei_left_target_start_min",
+        f"{sample_prefix}_discordant_mei_right_target_start_min",
+        f"{sample_prefix}_discordant_mei_left_target_end_max",
+        f"{sample_prefix}_discordant_mei_right_target_end_max",
+    ):
+        agg[extent_col] = pd.to_numeric(agg.get(extent_col, 0), errors="coerce").fillna(0).astype(int)
     agg[f"{sample_prefix}_discordant_mei_left_subfamily"] = (
         agg[f"{sample_prefix}_discordant_mei_left_subfamily"].fillna("").astype(str)
     )
@@ -4114,30 +4197,9 @@ def _apply_assembly_refinement_overrides(candidates: pd.DataFrame) -> pd.DataFra
         pd.concat([picked_poly, base_poly], axis=1).max(axis=1).fillna(0).astype(int)
     )
 
-    asm_orient = s("asm_insertion_orientation", "").fillna("").astype(str)
-    out["insertion_orientation"] = asm_orient.where(asm_has_mei & asm_orient.isin(["+", "-"]), s("insertion_orientation", "").fillna("").astype(str))
-
-    asm_span = pd.to_numeric(s("asm_insertion_length", float("nan")), errors="coerce")
-    out["insertion_mei_span"] = asm_span.where(asm_has_mei & asm_span.notna(), s("insertion_mei_span", 0)).fillna(0).astype(int)
-
-    asm_start = pd.to_numeric(s("asm_insertion_mei_start", float("nan")), errors="coerce")
-    asm_end = pd.to_numeric(s("asm_insertion_mei_end", float("nan")), errors="coerce")
-    out["disease_insertion_mei_start"] = asm_start.where(
-        asm_has_mei & (asm_source == "disease") & asm_start.gt(0),
-        s("disease_insertion_mei_start", 0),
-    ).fillna(0).astype(int)
-    out["disease_insertion_mei_end"] = asm_end.where(
-        asm_has_mei & (asm_source == "disease") & asm_end.gt(0),
-        s("disease_insertion_mei_end", 0),
-    ).fillna(0).astype(int)
-    out["control_insertion_mei_start"] = asm_start.where(
-        asm_has_mei & (asm_source == "control") & asm_start.gt(0),
-        s("control_insertion_mei_start", 0),
-    ).fillna(0).astype(int)
-    out["control_insertion_mei_end"] = asm_end.where(
-        asm_has_mei & (asm_source == "control") & asm_end.gt(0),
-        s("control_insertion_mei_end", 0),
-    ).fillna(0).astype(int)
+    # Do not override insertion orientation or MEI 5'/3' coords from local
+    # assembly: contigs often fail to span the element and can invert/truncate
+    # the footprint. Keep SR/DPE-derived orientation and coordinates.
 
     return out
 
@@ -6800,14 +6862,12 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     disease_mei_mapped = _extract_support_total(_df_col_series(out, "disease_supporting_reads", ""), "MEI_MAPPED")
     control_mei_mapped = _extract_support_total(_df_col_series(out, "control_supporting_reads", ""), "MEI_MAPPED")
     out["_prio_mei_mapped_max"] = pd.concat([disease_mei_mapped, control_mei_mapped], axis=1).max(axis=1).astype(int)
-    support_total = (out["_prio_split_reads_max"] + out["_prio_discordant_reads_max"]).astype(float)
-    mei_mapped_frac = (out["_prio_mei_mapped_max"].astype(float) / support_total.where(support_total > 0, 1.0)).clip(
-        lower=0.0, upper=1.0
-    )
+    # Prefer true MEI-mapped support over raw SR/DPE pileups (which can be complex SVs).
+    # MEI_MAPPED dominates; SR/DPE are secondary tie-breakers only.
     out["read_support_heuristic_score"] = (
-        0.50 * (out["_prio_split_reads_max"].astype(float).map(math.log1p))
-        + 0.35 * (out["_prio_discordant_reads_max"].astype(float).map(math.log1p))
-        + 0.15 * mei_mapped_frac
+        1.00 * (out["_prio_mei_mapped_max"].astype(float).map(math.log1p))
+        + 0.20 * (out["_prio_split_reads_max"].astype(float).map(math.log1p))
+        + 0.10 * (out["_prio_discordant_reads_max"].astype(float).map(math.log1p))
     )
     # Down-rank low-complexity pileup artifacts:
     # - strong A/T-rich/polyA signatures,
@@ -6870,8 +6930,8 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
     sort_cols.extend(
         [
             "low_complexity_noisy_artifact_flag",
-            "read_support_heuristic_score",
             "_prio_mei_mapped_max",
+            "read_support_heuristic_score",
             "_prio_split_reads_max",
             "_prio_discordant_reads_max",
             "_prio_tsd",
@@ -6881,7 +6941,7 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
             "_prio_insertion_model_score",
         ]
     )
-    # Artifact flag sorted ascending (False first), then strongest support.
+    # Artifact flag sorted ascending (False first), then MEI_MAPPED-first support.
     ascending.extend([True] + [False] * 9)
     sorted_out = out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
     return sorted_out.drop(
@@ -7080,8 +7140,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     bp_pos = _series_or_default("insertion_breakpoint_pos", 0).fillna(0).astype(int)
     out["insertion_breakpoint_pos"] = bp_pos.where(bp_pos > 0, -1)
 
-    # Assembly-preferred consensus fields (non-destructive): use assembly-derived
-    # values when present, else fall back to current evidence-derived fields.
+    # Assembly-preferred consensus fields for breakpoint/TSD/polyA only.
+    # MEI 5'/3' coords and orientation are set from SR/DPE below (not assembly).
     asm_bp = pd.to_numeric(_series_or_default("asm_consensus_breakpoint_pos", float("nan")), errors="coerce")
     out["consensus_insertion_breakpoint_pos"] = asm_bp.where(asm_has_mei & asm_bp.notna(), out["insertion_breakpoint_pos"]).astype(int)
     out["consensus_breakpoint_source"] = asm_source.copy()
@@ -7137,6 +7197,9 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     )
     out["consensus_poly_at_supported"] = out["consensus_poly_at_max_run"].fillna(0).astype(float) >= 8.0
 
+    # MEI 5'/3' coords and orientation come from split reads first, then DPE.
+    # Local assembly is intentionally excluded: contigs rarely span the full MEI
+    # and previously truncated/inverted consensus footprints (e.g. SVA stubs).
     asm_span = pd.to_numeric(_series_or_default("asm_insertion_length", float("nan")), errors="coerce")
     base_span = pd.to_numeric(_series_or_default("insertion_mei_span", float("nan")), errors="coerce")
     asm_mei_start = pd.to_numeric(_series_or_default("asm_insertion_mei_start", float("nan")), errors="coerce")
@@ -7145,24 +7208,181 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     control_start = pd.to_numeric(_series_or_default("control_insertion_mei_start", float("nan")), errors="coerce")
     disease_end = pd.to_numeric(_series_or_default("disease_insertion_mei_end", float("nan")), errors="coerce")
     control_end = pd.to_numeric(_series_or_default("control_insertion_mei_end", float("nan")), errors="coerce")
-    asm_pair_valid = asm_has_mei & asm_mei_start.gt(0) & asm_mei_end.gt(0)
-    disease_pair_valid = disease_start.gt(0) & disease_end.gt(0)
-    control_pair_valid = control_start.gt(0) & control_end.gt(0)
+
+    d_l_sr_start = pd.to_numeric(_series_or_default("disease_L_mei_start", float("nan")), errors="coerce")
+    d_l_sr_end = pd.to_numeric(_series_or_default("disease_L_mei_end", float("nan")), errors="coerce")
+    d_r_sr_start = pd.to_numeric(_series_or_default("disease_R_mei_start", float("nan")), errors="coerce")
+    d_r_sr_end = pd.to_numeric(_series_or_default("disease_R_mei_end", float("nan")), errors="coerce")
+    n_l_sr_start = pd.to_numeric(_series_or_default("control_L_mei_start", float("nan")), errors="coerce")
+    n_l_sr_end = pd.to_numeric(_series_or_default("control_L_mei_end", float("nan")), errors="coerce")
+    n_r_sr_start = pd.to_numeric(_series_or_default("control_R_mei_start", float("nan")), errors="coerce")
+    n_r_sr_end = pd.to_numeric(_series_or_default("control_R_mei_end", float("nan")), errors="coerce")
+    d_sr_bilateral = (
+        d_l_sr_start.gt(0) & d_l_sr_end.ge(d_l_sr_start) & d_r_sr_start.gt(0) & d_r_sr_end.ge(d_r_sr_start)
+    )
+    n_sr_bilateral = (
+        n_l_sr_start.gt(0) & n_l_sr_end.ge(n_l_sr_start) & n_r_sr_start.gt(0) & n_r_sr_end.ge(n_r_sr_start)
+    )
+    d_sr_lo = pd.concat([d_l_sr_start, d_l_sr_end, d_r_sr_start, d_r_sr_end], axis=1).min(axis=1, skipna=True)
+    d_sr_hi = pd.concat([d_l_sr_start, d_l_sr_end, d_r_sr_start, d_r_sr_end], axis=1).max(axis=1, skipna=True)
+    n_sr_lo = pd.concat([n_l_sr_start, n_l_sr_end, n_r_sr_start, n_r_sr_end], axis=1).min(axis=1, skipna=True)
+    n_sr_hi = pd.concat([n_l_sr_start, n_l_sr_end, n_r_sr_start, n_r_sr_end], axis=1).max(axis=1, skipna=True)
+
+    d_left_t_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_target_pos_median", float("nan")), errors="coerce"
+    )
+    d_right_t_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_target_pos_median", float("nan")), errors="coerce"
+    )
+    n_left_t_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_target_pos_median", float("nan")), errors="coerce"
+    )
+    n_right_t_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_target_pos_median", float("nan")), errors="coerce"
+    )
+    d_left_start_min = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_target_start_min", float("nan")), errors="coerce"
+    )
+    d_right_start_min = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_target_start_min", float("nan")), errors="coerce"
+    )
+    d_left_end_max = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_target_end_max", float("nan")), errors="coerce"
+    )
+    d_right_end_max = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_target_end_max", float("nan")), errors="coerce"
+    )
+    n_left_start_min = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_target_start_min", float("nan")), errors="coerce"
+    )
+    n_right_start_min = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_target_start_min", float("nan")), errors="coerce"
+    )
+    n_left_end_max = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_target_end_max", float("nan")), errors="coerce"
+    )
+    n_right_end_max = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_target_end_max", float("nan")), errors="coerce"
+    )
+    d_left_reads_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_left_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    d_right_reads_early = pd.to_numeric(
+        _series_or_default("disease_discordant_mei_right_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    n_left_reads_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_left_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    n_right_reads_early = pd.to_numeric(
+        _series_or_default("control_discordant_mei_right_supported_reads", 0), errors="coerce"
+    ).fillna(0.0)
+    d_dpe_extent_lo = pd.concat([d_left_start_min, d_right_start_min], axis=1).min(axis=1, skipna=True)
+    d_dpe_extent_hi = pd.concat([d_left_end_max, d_right_end_max], axis=1).max(axis=1, skipna=True)
+    n_dpe_extent_lo = pd.concat([n_left_start_min, n_right_start_min], axis=1).min(axis=1, skipna=True)
+    n_dpe_extent_hi = pd.concat([n_left_end_max, n_right_end_max], axis=1).max(axis=1, skipna=True)
+    d_dpe_bilateral = (
+        d_left_reads_early.ge(1.0)
+        & d_right_reads_early.ge(1.0)
+        & d_left_t_early.gt(0)
+        & d_right_t_early.gt(0)
+    )
+    n_dpe_bilateral = (
+        n_left_reads_early.ge(1.0)
+        & n_right_reads_early.ge(1.0)
+        & n_left_t_early.gt(0)
+        & n_right_t_early.gt(0)
+    )
+    d_dpe_extent_ok = d_dpe_bilateral & d_dpe_extent_lo.gt(0) & d_dpe_extent_hi.ge(d_dpe_extent_lo)
+    n_dpe_extent_ok = n_dpe_bilateral & n_dpe_extent_lo.gt(0) & n_dpe_extent_hi.ge(n_dpe_extent_lo)
+    # Median-based DPE footprint is only a last resort (orientation signal, not span).
+    d_dpe_lo = pd.concat([d_left_t_early, d_right_t_early], axis=1).min(axis=1, skipna=True)
+    d_dpe_hi = pd.concat([d_left_t_early, d_right_t_early], axis=1).max(axis=1, skipna=True)
+    n_dpe_lo = pd.concat([n_left_t_early, n_right_t_early], axis=1).min(axis=1, skipna=True)
+    n_dpe_hi = pd.concat([n_left_t_early, n_right_t_early], axis=1).max(axis=1, skipna=True)
+
+    # Drop per-sample insertion coords that were previously copied from assembly.
+    asm_polluted_disease = (
+        asm_has_mei
+        & (asm_source == "disease")
+        & disease_start.gt(0)
+        & asm_mei_start.gt(0)
+        & disease_start.eq(asm_mei_start)
+        & disease_end.eq(asm_mei_end)
+    )
+    asm_polluted_control = (
+        asm_has_mei
+        & (asm_source == "control")
+        & control_start.gt(0)
+        & asm_mei_start.gt(0)
+        & control_start.eq(asm_mei_start)
+        & control_end.eq(asm_mei_end)
+    )
+    disease_pair_valid = disease_start.gt(0) & disease_end.gt(0) & ~asm_polluted_disease
+    control_pair_valid = control_start.gt(0) & control_end.gt(0) & ~asm_polluted_control
+
     raw_start = pd.Series([float("nan")] * len(out), index=out.index)
     raw_end = pd.Series([float("nan")] * len(out), index=out.index)
-    raw_start = raw_start.where(~asm_pair_valid, asm_mei_start)
-    raw_end = raw_end.where(~asm_pair_valid, asm_mei_end)
-    disease_pick = (~asm_pair_valid) & disease_pair_valid
+
+    # 1) Bilateral split-read footprint = full mapped extent (min start, max end).
+    d_sr_support = (
+        pd.to_numeric(_series_or_default("disease_L_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(_series_or_default("disease_R_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+    )
+    n_sr_support = (
+        pd.to_numeric(_series_or_default("control_L_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(_series_or_default("control_R_mei_supported_reads", 0), errors="coerce").fillna(0.0)
+    )
+    choose_n_sr = n_sr_bilateral & (~d_sr_bilateral | n_sr_support.gt(d_sr_support))
+    choose_d_sr = d_sr_bilateral & ~choose_n_sr
+    raw_start = raw_start.where(~choose_d_sr, d_sr_lo)
+    raw_end = raw_end.where(~choose_d_sr, d_sr_hi)
+    raw_start = raw_start.where(~choose_n_sr, n_sr_lo)
+    raw_end = raw_end.where(~choose_n_sr, n_sr_hi)
+
+    # 2) Bilateral DPE full mapped extent (not medians) when SR footprint missing.
+    unresolved = raw_start.isna() | raw_end.isna()
+    d_dpe_support = d_left_reads_early + d_right_reads_early
+    n_dpe_support = n_left_reads_early + n_right_reads_early
+    choose_n_dpe_ext = unresolved & n_dpe_extent_ok & (~d_dpe_extent_ok | n_dpe_support.gt(d_dpe_support))
+    choose_d_dpe_ext = unresolved & d_dpe_extent_ok & ~choose_n_dpe_ext
+    raw_start = raw_start.where(~choose_d_dpe_ext, d_dpe_extent_lo)
+    raw_end = raw_end.where(~choose_d_dpe_ext, d_dpe_extent_hi)
+    raw_start = raw_start.where(~choose_n_dpe_ext, n_dpe_extent_lo)
+    raw_end = raw_end.where(~choose_n_dpe_ext, n_dpe_extent_hi)
+
+    # 3) Previously fused per-sample insertion coords (SR/DPE), excluding asm copies.
+    unresolved = raw_start.isna() | raw_end.isna()
+    disease_pick = unresolved & disease_pair_valid
     raw_start = raw_start.where(~disease_pick, disease_start)
     raw_end = raw_end.where(~disease_pick, disease_end)
-    control_pick = (~asm_pair_valid) & (~disease_pair_valid) & control_pair_valid
+    unresolved = raw_start.isna() | raw_end.isna()
+    control_pick = unresolved & control_pair_valid
     raw_start = raw_start.where(~control_pick, control_start)
     raw_end = raw_end.where(~control_pick, control_end)
 
+    # 4) Last resort: DPE side medians (orientation signal only; underestimates span).
+    unresolved = raw_start.isna() | raw_end.isna()
+    choose_n_dpe = unresolved & n_dpe_bilateral & (~d_dpe_bilateral | n_dpe_support.gt(d_dpe_support))
+    choose_d_dpe = unresolved & d_dpe_bilateral & ~choose_n_dpe
+    raw_start = raw_start.where(~choose_d_dpe, d_dpe_lo)
+    raw_end = raw_end.where(~choose_d_dpe, d_dpe_hi)
+    raw_start = raw_start.where(~choose_n_dpe, n_dpe_lo)
+    raw_end = raw_end.where(~choose_n_dpe, n_dpe_hi)
+
+    # Orientation: SR/DPE consolidated call only (never assembly).
+    # Footprint stays strictly min-max of mapped SR/DPE coords (no target_len expansion).
+    consolidated_orient = out.apply(_choose_consolidated_insertion_orientation, axis=1)
+    read_orient = _series_or_default("insertion_orientation", "").fillna("").astype(str)
+    # If insertion_orientation was previously overwritten by assembly, prefer
+    # disease/control insertion orientations via the consolidated chooser.
     asm_orient = _series_or_default("asm_insertion_orientation", "").fillna("").astype(str)
-    out["consensus_insertion_orientation"] = asm_orient.where(
-        asm_orient.isin(["+", "-"]),
-        _series_or_default("insertion_orientation", "").fillna("").astype(str),
+    read_orient_clean = read_orient.where(
+        ~(asm_has_mei & asm_orient.isin(["+", "-"]) & read_orient.eq(asm_orient)),
+        "",
+    )
+    out["consensus_insertion_orientation"] = consolidated_orient.where(
+        consolidated_orient.isin(["+", "-"]),
+        read_orient_clean.where(read_orient_clean.isin(["+", "-"]), ""),
     )
     raw_start_num = pd.to_numeric(raw_start, errors="coerce")
     raw_end_num = pd.to_numeric(raw_end, errors="coerce")
@@ -7183,7 +7403,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     out["consensus_insertion_mei_span"] = span_from_coords.where(
         out["consensus_insertion_mei_3p_coord"].astype(float).gt(0)
         & out["consensus_insertion_mei_5p_coord"].astype(float).gt(0),
-        asm_span.where(asm_has_mei & asm_span.notna(), base_span),
+        base_span.where(base_span.notna() & base_span.gt(0), float("nan")),
     )
     # Non-assembly fallback: impute MEI-axis coords only when discordant evidence
     # provides both-side MEI target mapping (no placeholder 1..span fallback).

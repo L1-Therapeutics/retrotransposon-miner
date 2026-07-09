@@ -55,8 +55,20 @@ Additional tumor-only novel LINE-1 insertion that is unnested.
 
 Novel tumor-only nested LINE-1 insertion on chromosome X.
 
+### GRCh38 chr22:22131552-22132407 - known LINE-1 with split-read and discordant-pair support
+
+![GRCh38 chr22:22131552-22132407 LINE-1 read architecture](examples/grch38_line1_read_arch_chr22_22131552_22132407.png)
+
+LINE-1 (`L1HS`) insertion at `chr22:22131981` (breakpoint interval `22131976-22131986`), annotated as a known 1000 Genomes polymorphism (`nssv14066334`, MELT).  
+The read-architecture plot shows split-read (SR) and discordant paired-end (DPE) support bridging the genomic flanks (black) into the reverse-oriented MEI consensus (orange), with TSD sequence `GCATATTTCTT` and a 17 bp polyA/polyT run.
+
 ### GRCh38 chr22:49029238-49029720 - known SVA from short-read data
 
 ![GRCh38 chr22:49029238-49029720 known SVA](examples/grch38_known_sva_chr22_49029238_49029720.png)
 
-SVA insertion present in 1000 Genomes short-read data but not reported in matched long-read data.
+SVA insertion present in 1000 Genomes short-read data but not reported in matched long-read data (`nssv14064350`, MELT).  
+Breakpoint at `chr22:49029650` (interval `49029645-49029656`), TSD `AAGAAAACTCCT`, and a 19 bp polyA/polyT run.
+
+![GRCh38 chr22:49029238-49029720 SVA read architecture](examples/grch38_sva_read_arch_chr22_49029238_49029720.png)
+
+Read-architecture view of the same SVA locus (`SVA_F` / `SVA_D`), showing dense SR and DPE support on both flanks into the forward-oriented MEI consensus.
