@@ -1699,8 +1699,48 @@ def plot_locus_architecture(
     support_str = str(row.get(f"{sample}_supporting_reads", "") or "")
     ori_label = "reverse (−)" if layout.reverse_oriented else "forward (+)"
 
-    # Half-size canvas; modest top band for wrapped title + flank labels above axes.
-    fig_h = max(3.0, len(pairs) * 0.09 + 2.0)
+    title_lines = [
+        (
+            f"SAMPLE: {sample_label}  |  "
+            f"{layout.chrom}:{layout.window_start}-{layout.window_end}  "
+            f"BP={layout.breakpoint_left}-{layout.breakpoint_right}  "
+            f"{row.get('consensus_mei_family', '')}/{row.get('consensus_mei_subfamily', '')}  "
+            f"tier={row.get('analysis_stage_tier', '')}"
+        ),
+        (
+            f"{sample_label} support: {support_str}  "
+            f"mei={layout.mei_5p}-{layout.mei_3p} ({layout.mei_span_bp} bp, {layout.span_source}, "
+            f"ori={layout.orientation} {ori_label})"
+            f"{insert_hint}"
+        ),
+        (
+            f"pairs_shown={pair_stats['pairs_shown']}/{pair_stats['pairs_before_cap']} "
+            f"(SR={pair_stats['sr_plotted']}, DPE={pair_stats['dpe_plotted']}; "
+            f"skipped SR={pair_stats['sr_skipped']}, DPE={pair_stats['dpe_skipped']}; "
+            f"detail_rows={pair_stats['detail_rows']})"
+        ),
+    ]
+    # Half-width figure (~700px @ 100dpi): wrap conservatively — bold 8.4pt is
+    # wider than monospace char estimates, so 95 chars still clips on the right.
+    title_fs = 8.4
+    wrap_width = 86
+    wrapped_parts: list[str] = []
+    for line in title_lines:
+        wrapped_parts.extend(
+            textwrap.wrap(line, width=wrap_width, break_long_words=True, break_on_hyphens=False) or [""]
+        )
+    wrapped_title = "\n".join(wrapped_parts)
+    n_title_rows = max(1, len(wrapped_parts))
+
+    # Reserve header/footer in inches so short (few-pair) figures still clear the
+    # wrapped title + flank labels. Fractional top margins shrink too much at fig_h~3.
+    title_line_in = (title_fs * 1.35) / 72.0
+    flank_label_in = 0.42
+    header_pad_in = 0.12
+    header_in = n_title_rows * title_line_in + flank_label_in + header_pad_in
+    bottom_in = 0.48
+    axes_in = max(1.35, len(pairs) * 0.09 + 0.55)
+    fig_h = header_in + axes_in + bottom_in
     fig, ax = plt.subplots(figsize=(7, fig_h))
     fig.patch.set_facecolor(COLOR_WHITE)
     ax.set_facecolor(COLOR_WHITE)
@@ -1730,46 +1770,22 @@ def plot_locus_architecture(
         color=COLOR_BLACK,
         fontsize=8,
     )
-    title_lines = [
-        (
-            f"SAMPLE: {sample_label}  |  "
-            f"{layout.chrom}:{layout.window_start}-{layout.window_end}  "
-            f"BP={layout.breakpoint_left}-{layout.breakpoint_right}  "
-            f"{row.get('consensus_mei_family', '')}/{row.get('consensus_mei_subfamily', '')}  "
-            f"tier={row.get('analysis_stage_tier', '')}"
-        ),
-        (
-            f"{sample_label} support: {support_str}  "
-            f"mei={layout.mei_5p}-{layout.mei_3p} ({layout.mei_span_bp} bp, {layout.span_source}, "
-            f"ori={layout.orientation} {ori_label})"
-            f"{insert_hint}"
-        ),
-        (
-            f"pairs_shown={pair_stats['pairs_shown']}/{pair_stats['pairs_before_cap']} "
-            f"(SR={pair_stats['sr_plotted']}, DPE={pair_stats['dpe_plotted']}; "
-            f"skipped SR={pair_stats['sr_skipped']}, DPE={pair_stats['dpe_skipped']}; "
-            f"detail_rows={pair_stats['detail_rows']})"
-        ),
-    ]
-    # Half-width figure (~700px @ 100dpi): wrap to ~95 chars so sides are not clipped.
-    title_fs = 8.4
-    wrap_width = 95
-    wrapped_parts: list[str] = []
-    for line in title_lines:
-        wrapped_parts.extend(textwrap.wrap(line, width=wrap_width, break_long_words=False, break_on_hyphens=False) or [""])
-    wrapped_title = "\n".join(wrapped_parts)
+
+    top = 1.0 - header_in / fig_h
+    bottom = bottom_in / fig_h
+    fig.subplots_adjust(left=0.04, right=0.99, bottom=bottom, top=top)
 
     # Title in figure coordinates (above axes), not ax.set_title (which collides when top is tight).
     fig.text(
         0.02,
-        0.99,
+        0.995,
         wrapped_title,
         ha="left",
         va="top",
         fontsize=title_fs,
         fontweight="bold",
         color=COLOR_BLACK,
-        linespacing=1.1,
+        linespacing=1.15,
     )
 
     # Region labels sit just above the axes frame (axes-fraction y > 1), not in the data area.
@@ -1788,7 +1804,7 @@ def plot_locus_architecture(
     ):
         ax.text(
             x_data,
-            1.03,
+            1.02,
             text,
             transform=label_trans,
             ha="center",
@@ -1816,10 +1832,6 @@ def plot_locus_architecture(
     for spine in ax.spines.values():
         spine.set_color(COLOR_BLACK)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    # Compact top margin: enough for title + flank labels, without a large empty band.
-    n_title_rows = max(3, len(wrapped_parts))
-    top = min(0.82, max(0.70, 0.86 - 0.025 * max(0, n_title_rows - 3)))
-    fig.subplots_adjust(left=0.04, right=0.99, bottom=0.11, top=top)
     fig.savefig(out_png, dpi=100)
     plt.close(fig)
     return out_png, detail
