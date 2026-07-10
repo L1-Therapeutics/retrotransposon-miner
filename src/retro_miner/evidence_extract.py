@@ -430,6 +430,22 @@ def extract_discordant_evidence(
 
             chrom = bam.get_reference_name(read.reference_id)
             pos_1based = read.reference_start + 1
+            ref_end_1based = int(read.reference_end) if read.reference_end is not None else pos_1based
+            # Soft-clips on discordant anchors often mark the insertion junction.
+            # Prefer the longest clip when both ends are clipped.
+            soft_clip_side = ""
+            soft_clip_len = 0
+            soft_clip_pos = 0
+            if read.cigartuples:
+                first_op, first_len = read.cigartuples[0]
+                last_op, last_len = read.cigartuples[-1]
+                candidates: list[tuple[str, int, int]] = []
+                if first_op == 4 and first_len > 0:
+                    candidates.append(("L", int(first_len), pos_1based))
+                if last_op == 4 and last_len > 0:
+                    candidates.append(("R", int(last_len), ref_end_1based))
+                if candidates:
+                    soft_clip_side, soft_clip_len, soft_clip_pos = max(candidates, key=lambda x: x[1])
             mate_seq, mate_ref_start, mate_ref_end = _fetch_mate_sequence_from_bam(
                 mate_bam,
                 read.query_name,
@@ -446,6 +462,10 @@ def extract_discordant_evidence(
                     "sample": sample_name,
                     "chrom": chrom,
                     "pos": pos_1based,
+                    "ref_end": int(ref_end_1based),
+                    "soft_clip_side": soft_clip_side,
+                    "soft_clip_len": int(soft_clip_len),
+                    "soft_clip_pos": int(soft_clip_pos),
                     "mate_chrom": mate_chrom,
                     "mate_pos": mate_pos_1based,
                     "mate_seq": mate_seq,
@@ -478,6 +498,10 @@ def extract_discordant_evidence(
                 "sample",
                 "chrom",
                 "pos",
+                "ref_end",
+                "soft_clip_side",
+                "soft_clip_len",
+                "soft_clip_pos",
                 "mate_chrom",
                 "mate_pos",
                 "mate_seq",
