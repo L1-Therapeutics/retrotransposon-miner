@@ -5777,25 +5777,31 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out.loc[complex_sidepair_event, "insertion_call_tier"] = "mei_with_complex"
     out.loc[high_conf_pass, "insertion_call_tier"] = "high_conf_two_sided"
 
-    # Sample presence: genotype on per-locus SR/DPE support strings so a disease-
-    # discovered locus with control-side SR/DPE evidence is marked shared.
-    def _support_total_from_string_col(col_name: str) -> pd.Series:
-        text = s(col_name, "").fillna("").astype(str)
-        total = pd.Series(0, index=out.index, dtype="int64")
-        for label in ("SR_L", "SR_R", "DPE_L", "DPE_R"):
-            vals = pd.to_numeric(text.str.extract(rf"{label}=([0-9]+)", expand=False), errors="coerce").fillna(0).astype(int)
-            total = total + vals
-        return total.astype(float)
-
-    disease_window_support_reads = _support_total_from_string_col("disease_supporting_reads")
-    control_window_support_reads = _support_total_from_string_col("control_supporting_reads")
-    disease_present = disease_window_support_reads.ge(1.0)
-    control_present = control_window_support_reads.ge(1.0)
+    # Sample presence: genotype on MEI_MAPPED (not SR/DPE). Soft-clip / discordant
+    # pileup without MEI mate mapping is not treated as sample presence.
+    #
+    # Extreme imbalance (≥90% of total MEI_MAPPED in one sample) is also labeled
+    # disease_only / control_only. Tumor/normal pairs often show a few bleed-
+    # through MEI-mapped reads from contamination, adjacent tissue, or noise;
+    # true shared germline events are usually much closer to balanced. Mosaic
+    # intermediate cases stay shared when neither side reaches 90%.
+    _mei_status_enrichment_frac = 0.90
+    disease_mei = _mei_mapped_from_support_string(s("disease_supporting_reads", ""))
+    control_mei = _mei_mapped_from_support_string(s("control_supporting_reads", ""))
+    mei_total = (disease_mei + control_mei).astype(float)
+    disease_present = disease_mei.ge(1)
+    control_present = control_mei.ge(1)
+    disease_frac = disease_mei.astype(float) / mei_total.clip(lower=1.0)
+    control_frac = control_mei.astype(float) / mei_total.clip(lower=1.0)
+    disease_enriched = disease_present & control_present & disease_frac.ge(_mei_status_enrichment_frac)
+    control_enriched = disease_present & control_present & control_frac.ge(_mei_status_enrichment_frac)
 
     out["sample_status_label"] = "low_support"
     out.loc[disease_present & control_present, "sample_status_label"] = "shared"
     out.loc[disease_present & (~control_present), "sample_status_label"] = "disease_only"
     out.loc[(~disease_present) & control_present, "sample_status_label"] = "control_only"
+    out.loc[disease_enriched, "sample_status_label"] = "disease_only"
+    out.loc[control_enriched, "sample_status_label"] = "control_only"
 
     # Explicit convenience flag for downstream filtering.
     out["likely_false_positive_control_only"] = out["sample_status_label"] == "control_only"
