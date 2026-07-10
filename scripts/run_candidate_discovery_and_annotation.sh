@@ -39,9 +39,9 @@ EMPIRICAL_RANDOM_WINDOWS="1000"
 EMPIRICAL_RANDOM_SCOPE="chromosome"
 EMPIRICAL_RANDOM_SEED="13"
 EMPIRICAL_HIGHCONF_BED=""
-# Keep empirical gating enabled by default so noisy repeat-context loci are
-# filtered from gold-stage outputs unless explicitly disabled.
-EMPIRICAL_STAGE="1"
+# Empirical BAM/context outlier gating is off by default (slow; little callset
+# impact). Pass --empirical-stage to enable.
+EMPIRICAL_STAGE="0"
 LOCAL_ASSEMBLY="0"
 ANNOTATE_ONLY="0"
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -669,6 +669,7 @@ if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   echo "  ${OUTDIR}/candidate_loci.mei.tsv"
   echo "  ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
   echo "  ${OUTDIR}/candidate_loci.mei.gold_review.igv/ (when reference + BAMs provided)"
+  echo "  ${OUTDIR}/candidate_loci.mei.read_architecture/ (gold-tier read-architecture PNGs)"
   exit 0
 fi
 

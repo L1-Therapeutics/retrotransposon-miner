@@ -18,6 +18,7 @@ import pysam
 from intervaltree import IntervalTree
 
 from retro_miner.igv_plots import generate_gold_review_igv_plots
+from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 
 
@@ -813,6 +814,17 @@ def _build_supporting_reads_detail_table(
             if key not in mid_cache:
                 mid_cache[key] = (int(rec.window_start) + int(rec.window_end)) // 2
             anchor_side = "L" if int(rec.pos) <= mid_cache[key] else "R"
+            soft_clip_pos = int(getattr(rec, "soft_clip_pos", 0) or 0)
+            ref_end = int(getattr(rec, "ref_end", 0) or 0)
+            if ref_end <= 0:
+                read_seq = str(getattr(rec, "read_seq", "") or "")
+                ref_end = int(rec.pos) + max(0, len(read_seq) - 1) if read_seq else int(rec.pos)
+            if soft_clip_pos > 0:
+                genomic_pos = soft_clip_pos
+            elif anchor_side == "L":
+                genomic_pos = ref_end
+            else:
+                genomic_pos = int(rec.pos)
             rows.append(
                 {
                     "sample": sample,
@@ -822,7 +834,7 @@ def _build_supporting_reads_detail_table(
                     "window_start": int(rec.window_start),
                     "window_end": int(rec.window_end),
                     "anchor_side": anchor_side,
-                    "genomic_pos": int(rec.pos),
+                    "genomic_pos": int(genomic_pos),
                     "mate_chrom": str(getattr(rec, "mate_chrom", "")),
                     "mate_genomic_pos": int(getattr(rec, "mate_pos", 0) or 0),
                     "mei_start": int(getattr(rec, "target_start", 0) or 0),
@@ -4261,18 +4273,35 @@ def _infer_disease_insertion_metrics(
         if l > 0 and r > 0:
             source = str(row.get("tsd_evidence_source", "") or "").strip() or "tsd_unknown"
             return int((l + r) // 2), source
-        l = int(row.get("disease_L_mei_breakpoint_mode", 0))
-        r = int(row.get("disease_R_mei_breakpoint_mode", 0))
-        if l > 0 and r > 0:
-            return int((l + r) // 2), "disease_split"
-        l = int(row.get("control_L_mei_breakpoint_mode", 0))
-        r = int(row.get("control_R_mei_breakpoint_mode", 0))
-        if l > 0 and r > 0:
-            return int((l + r) // 2), "control_split"
-        if l > 0:
-            return l, "control_single"
-        if r > 0:
-            return r, "control_single"
+        # Prefer MEI-mapped split modes, then raw split-clip modes. Soft-clipped
+        # anchors (including one-sided) are junction-resolving.
+        for prefix, label in (
+            ("disease", "disease"),
+            ("control", "control"),
+        ):
+            l = int(row.get(f"{prefix}_L_mei_breakpoint_mode", 0))
+            r = int(row.get(f"{prefix}_R_mei_breakpoint_mode", 0))
+            if l > 0 and r > 0:
+                return int((l + r) // 2), f"{label}_split"
+            if l > 0:
+                return l, f"{label}_single"
+            if r > 0:
+                return r, f"{label}_single"
+        for prefix, label in (
+            ("disease", "disease"),
+            ("control", "control"),
+        ):
+            l = int(row.get(f"{prefix}_L_split_breakpoint_mode", 0))
+            r = int(row.get(f"{prefix}_R_split_breakpoint_mode", 0))
+            l_sup = int(row.get(f"{prefix}_L_split_breakpoint_support", 0))
+            r_sup = int(row.get(f"{prefix}_R_split_breakpoint_support", 0))
+            if l > 0 and r > 0:
+                return int((l + r) // 2), f"{label}_split_clip"
+            # One-sided soft-clip / split-clip is enough for a point estimate.
+            if l > 0 and l_sup >= 1:
+                return l, f"{label}_single_clip"
+            if r > 0 and r_sup >= 1:
+                return r, f"{label}_single_clip"
         return 0, ""
 
     bp_fields = out.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
@@ -4548,8 +4577,10 @@ def _apply_assembly_refinement_overrides(candidates: pd.DataFrame) -> pd.DataFra
     asm_has_mei = asm_source.isin(["disease", "control"])
 
     asm_bp = pd.to_numeric(s("asm_consensus_breakpoint_pos", float("nan")), errors="coerce")
-    out["insertion_breakpoint_pos"] = asm_bp.where(asm_has_mei & asm_bp.notna(), s("insertion_breakpoint_pos", 0)).fillna(0).astype(int)
-    out.loc[asm_has_mei, "breakpoint_evidence_source"] = asm_source.loc[asm_has_mei]
+    # Only override when assembly actually resolved a positive breakpoint.
+    use_asm_bp = asm_has_mei & asm_bp.notna() & asm_bp.gt(0)
+    out["insertion_breakpoint_pos"] = asm_bp.where(use_asm_bp, s("insertion_breakpoint_pos", 0)).fillna(0).astype(int)
+    out.loc[use_asm_bp, "breakpoint_evidence_source"] = asm_source.loc[use_asm_bp]
 
     asm_tsd_seq = s("asm_tsd_seq", "").fillna("").astype(str)
     asm_tsd_len = pd.to_numeric(s("asm_tsd_len", float("nan")), errors="coerce")
@@ -7050,10 +7081,18 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _mei_mapped_from_support_string(series: pd.Series) -> pd.Series:
+    """Parse ``MEI_MAPPED=N`` from supporting-reads summary strings."""
+    text = series.fillna("").astype(str)
+    vals = pd.to_numeric(text.str.extract(r"MEI_MAPPED=([0-9]+)", expand=False), errors="coerce")
+    return vals.fillna(0).astype(int)
+
+
 def _assign_gold_stage(
     candidates: pd.DataFrame,
     empirical_p_threshold: float = 0.001,
     empirical_stage: bool = False,
+    min_mei_mapped: int = 3,
 ) -> pd.DataFrame:
     out = candidates.copy()
     out["gold_empirical_p_threshold"] = float(empirical_p_threshold)
@@ -7061,6 +7100,7 @@ def _assign_gold_stage(
     out["gold_empirical_outlier"] = False
     out["gold_stage_pass"] = False
     out["gold_stage_fail_reason"] = ""
+    out["gold_min_mei_mapped"] = int(min_mei_mapped)
 
     p_cols = [
         "disease_empirical_local_bam_mean_depth_p_high",
@@ -7086,6 +7126,33 @@ def _assign_gold_stage(
         out["gold_stage_pass"] = silver
         if empirical_stage:
             out.loc[silver, "gold_stage_fail_reason"] = "empirical_not_available"
+
+    # Require enough MEI-mapped support in at least one sample. Low MEI_MAPPED
+    # silver calls are dominated by disease/control-only noise and flood review plots.
+    disease_mei = pd.to_numeric(_df_col_series(out, "disease_mei_mapped", float("nan")), errors="coerce")
+    control_mei = pd.to_numeric(_df_col_series(out, "control_mei_mapped", float("nan")), errors="coerce")
+    if disease_mei.isna().all():
+        disease_mei = _mei_mapped_from_support_string(_df_col_series(out, "disease_supporting_reads", ""))
+    else:
+        disease_mei = disease_mei.fillna(0)
+    if control_mei.isna().all():
+        control_mei = _mei_mapped_from_support_string(_df_col_series(out, "control_supporting_reads", ""))
+    else:
+        control_mei = control_mei.fillna(0)
+    disease_mei = disease_mei.astype(int)
+    control_mei = control_mei.astype(int)
+    out["disease_mei_mapped"] = disease_mei
+    out["control_mei_mapped"] = control_mei
+    mei_mapped_ok = (disease_mei >= int(min_mei_mapped)) | (control_mei >= int(min_mei_mapped))
+    low_mei = silver & out["gold_stage_pass"] & (~mei_mapped_ok)
+    if low_mei.any():
+        out.loc[low_mei, "gold_stage_pass"] = False
+        prev = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
+        fail_tag = f"mei_mapped_lt_{int(min_mei_mapped)}"
+        need_append = low_mei & prev.ne("")
+        need_set = low_mei & prev.eq("")
+        out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
+        out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
 
     # Non-empirical depth-outlier guard for obvious pileup artifacts.
     # Use a run-adaptive 3-sigma threshold and keep known overlaps exempt.
@@ -7139,7 +7206,8 @@ def _assign_gold_stage(
     out.loc[out["gold_stage_pass"], "analysis_stage_tier"] = "gold"
     print(
         "[mei-annotate] stage counts "
-        f"silver={int(silver.sum())} gold={int(out['gold_stage_pass'].sum())}",
+        f"silver={int(silver.sum())} gold={int(out['gold_stage_pass'].sum())} "
+        f"(min_mei_mapped>={int(min_mei_mapped)})",
         flush=True,
     )
     return out
@@ -7421,6 +7489,397 @@ def _round_sig_series(series: pd.Series, sig: int) -> pd.Series:
     return rounded.where(numeric.notna(), series)
 
 
+def _estimate_discordant_ref_end(df: pd.DataFrame) -> pd.Series:
+    """1-based inclusive mapped end; prefer stored ref_end, else pos+read_len-1."""
+    pos = pd.to_numeric(df.get("pos", 0), errors="coerce").fillna(0).astype(int)
+    if "ref_end" in df.columns:
+        ref_end = pd.to_numeric(df["ref_end"], errors="coerce").fillna(0).astype(int)
+    else:
+        ref_end = pd.Series(0, index=df.index, dtype=int)
+    if "read_seq" in df.columns:
+        read_len = df["read_seq"].fillna("").astype(str).str.len().astype(int)
+    else:
+        read_len = pd.Series(0, index=df.index, dtype=int)
+    estimated = (pos + read_len - 1).where(read_len > 0, pos)
+    return ref_end.where(ref_end > 0, estimated).astype(int)
+
+
+def _discordant_junction_tips(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-read junction-proximal genomic tip for discordant anchors."""
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=["chrom", "window_start", "window_end", "read_name", "anchor_side", "junction_tip", "soft_clipped"]
+        )
+    required = {"chrom", "window_start", "window_end", "pos", "read_name"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame(
+            columns=["chrom", "window_start", "window_end", "read_name", "anchor_side", "junction_tip", "soft_clipped"]
+        )
+
+    work = df.loc[
+        :,
+        [
+            c
+            for c in list(required)
+            + ["ref_end", "soft_clip_pos", "soft_clip_side", "soft_clip_len", "read_seq", "mei_hit", "mate_mei_hit"]
+            if c in df.columns
+        ],
+    ].copy()
+    # Discordant MEI support is often on the mate (interchrom / large-insert), not the anchor.
+    # Soft-clipped anchors are junction-resolving even before MEI remapping succeeds.
+    mei_hit = work["mei_hit"].fillna(False).astype(bool) if "mei_hit" in work.columns else pd.Series(False, index=work.index)
+    mate_mei = (
+        work["mate_mei_hit"].fillna(False).astype(bool)
+        if "mate_mei_hit" in work.columns
+        else pd.Series(False, index=work.index)
+    )
+    soft_pos = (
+        pd.to_numeric(work["soft_clip_pos"], errors="coerce").fillna(0).astype(int)
+        if "soft_clip_pos" in work.columns
+        else pd.Series(0, index=work.index, dtype=int)
+    )
+    if "mei_hit" in work.columns or "mate_mei_hit" in work.columns or "soft_clip_pos" in work.columns:
+        work = work.loc[mei_hit | mate_mei | soft_pos.gt(0)].copy()
+    if work.empty:
+        return pd.DataFrame(
+            columns=["chrom", "window_start", "window_end", "read_name", "anchor_side", "junction_tip", "soft_clipped"]
+        )
+
+    work["pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
+    work = work.loc[work["pos"] > 0].copy()
+    if work.empty:
+        return pd.DataFrame(
+            columns=["chrom", "window_start", "window_end", "read_name", "anchor_side", "junction_tip", "soft_clipped"]
+        )
+
+    work["ref_end"] = _estimate_discordant_ref_end(work)
+    if "soft_clip_pos" in work.columns:
+        work["soft_clip_pos"] = pd.to_numeric(work["soft_clip_pos"], errors="coerce").fillna(0).astype(int)
+    else:
+        work["soft_clip_pos"] = 0
+    if "soft_clip_side" in work.columns:
+        work["soft_clip_side"] = work["soft_clip_side"].fillna("").astype(str).str.upper().str[:1]
+    else:
+        work["soft_clip_side"] = ""
+
+    work["anchor_side"] = ""
+    work["junction_tip"] = 0
+    work["soft_clipped"] = work["soft_clip_pos"].gt(0) & work["soft_clip_side"].isin(["L", "R"])
+
+    # Soft-clip geometry: right clip → left flank; left clip → right flank.
+    clipped = work["soft_clipped"]
+    if clipped.any():
+        work.loc[clipped, "anchor_side"] = work.loc[clipped, "soft_clip_side"].map({"R": "L", "L": "R"})
+        work.loc[clipped, "junction_tip"] = work.loc[clipped, "soft_clip_pos"]
+
+    # Assign unclipped sides per locus so multi-locus batches do not share one BP estimate.
+    unclipped = ~work["soft_clipped"]
+    key_cols = ["chrom", "window_start", "window_end"]
+    for (_, ws, we), grp in work.loc[unclipped].groupby(key_cols, sort=False):
+        if grp.empty:
+            continue
+        if clipped.any():
+            clip_tips = work.loc[
+                clipped
+                & work["chrom"].eq(grp["chrom"].iloc[0])
+                & work["window_start"].eq(ws)
+                & work["window_end"].eq(we),
+                "junction_tip",
+            ]
+            if not clip_tips.empty:
+                bp_est = float(clip_tips.median())
+            else:
+                bp_est = None
+        else:
+            bp_est = None
+        if bp_est is None:
+            positions = sorted({int(p) for p in grp["pos"].tolist()})
+            if len(positions) >= 2:
+                gaps = [(positions[i + 1] - positions[i], i) for i in range(len(positions) - 1)]
+                _gap, idx = max(gaps)
+                bp_est = (positions[idx] + positions[idx + 1]) / 2.0
+            else:
+                bp_est = float((int(ws) + int(we)) / 2.0)
+        left_idx = grp.index[grp["pos"].le(bp_est)]
+        right_idx = grp.index[~grp["pos"].le(bp_est)]
+        work.loc[left_idx, "anchor_side"] = "L"
+        work.loc[right_idx, "anchor_side"] = "R"
+        work.loc[left_idx, "junction_tip"] = work.loc[left_idx, "ref_end"]
+        work.loc[right_idx, "junction_tip"] = work.loc[right_idx, "pos"]
+
+    work["read_name"] = work["read_name"].fillna("").astype(str)
+    work = work.loc[work["read_name"].str.len() > 0].copy()
+    work = work.loc[work["anchor_side"].isin(["L", "R"]) & work["junction_tip"].gt(0)].copy()
+    return work.loc[:, ["chrom", "window_start", "window_end", "read_name", "anchor_side", "junction_tip", "soft_clipped"]]
+
+
+def _estimate_discordant_gap_intervals(
+    discordant_frames: list[pd.DataFrame],
+    *,
+    min_reads_per_side: int = 2,
+    max_gap_bp: int = 250,
+    min_soft_clip_support: int = 1,
+) -> pd.DataFrame:
+    """Estimate insertion intervals from discordant L/R tips and soft-clip modes.
+
+    Soft-clipped discordant anchors are junction-resolving even when support is
+    one-sided: the clip coordinate is the insertion breakpoint.
+    """
+    key_cols = ["chrom", "window_start", "window_end"]
+    empty = pd.DataFrame(
+        columns=key_cols
+        + [
+            "dpe_gap_left",
+            "dpe_gap_right",
+            "dpe_gap_pos",
+            "dpe_gap_n_left",
+            "dpe_gap_n_right",
+            "dpe_gap_n_soft_clip",
+            "dpe_soft_clip_mode",
+            "dpe_soft_clip_support",
+            "dpe_side_window_start",
+            "dpe_side_window_end",
+            "dpe_gap_two_sided",
+            "dpe_soft_clip_resolved",
+        ]
+    )
+    parts = [_discordant_junction_tips(frame) for frame in discordant_frames if frame is not None and not frame.empty]
+    if not parts:
+        return empty
+    tips = pd.concat(parts, ignore_index=True)
+    if tips.empty:
+        return empty
+
+    rows: list[dict[str, object]] = []
+    for (chrom, ws, we), grp in tips.groupby(key_cols, sort=False):
+        left = grp.loc[grp["anchor_side"].eq("L"), "junction_tip"].astype(int)
+        right = grp.loc[grp["anchor_side"].eq("R"), "junction_tip"].astype(int)
+        n_l = int(grp.loc[grp["anchor_side"].eq("L"), "read_name"].nunique())
+        n_r = int(grp.loc[grp["anchor_side"].eq("R"), "read_name"].nunique())
+        clipped = grp.loc[grp["soft_clipped"]].copy()
+        n_clip = int(clipped["read_name"].nunique()) if not clipped.empty else 0
+        soft_mode = 0
+        soft_support = 0
+        if not clipped.empty:
+            # Mode of soft-clip junction positions (unique reads per position).
+            clip_counts = (
+                clipped.groupby("junction_tip", as_index=False)["read_name"]
+                .nunique()
+                .sort_values(["read_name", "junction_tip"], ascending=[False, True])
+            )
+            if not clip_counts.empty:
+                soft_mode = int(clip_counts.iloc[0]["junction_tip"])
+                soft_support = int(clip_counts.iloc[0]["read_name"])
+        soft_resolved = soft_mode > 0 and soft_support >= int(min_soft_clip_support)
+
+        side_start = int(grp["junction_tip"].min())
+        side_end = int(grp["junction_tip"].max())
+        if soft_resolved:
+            # Soft-clip mode is a point estimate; shrink side window to that base.
+            side_start = soft_mode
+            side_end = soft_mode
+
+        two_sided = n_l >= int(min_reads_per_side) and n_r >= int(min_reads_per_side) and (not left.empty) and (not right.empty)
+        dpe_left = 0
+        dpe_right = 0
+        dpe_pos = 0
+        if soft_resolved:
+            dpe_left = soft_mode
+            dpe_right = soft_mode
+            dpe_pos = soft_mode
+        elif two_sided:
+            # Junction-facing edges: rightmost left-anchor tip, leftmost right-anchor tip.
+            left_edge = int(left.max())
+            right_edge = int(right.min())
+            lo = min(left_edge, right_edge)
+            hi = max(left_edge, right_edge)
+            if (hi - lo) <= int(max_gap_bp):
+                dpe_left = lo
+                dpe_right = hi
+                dpe_pos = int((lo + hi) // 2)
+                side_start = lo
+                side_end = hi
+            else:
+                two_sided = False
+        rows.append(
+            {
+                "chrom": str(chrom),
+                "window_start": int(ws),
+                "window_end": int(we),
+                "dpe_gap_left": int(dpe_left),
+                "dpe_gap_right": int(dpe_right),
+                "dpe_gap_pos": int(dpe_pos),
+                "dpe_gap_n_left": int(n_l),
+                "dpe_gap_n_right": int(n_r),
+                "dpe_gap_n_soft_clip": int(n_clip),
+                "dpe_soft_clip_mode": int(soft_mode),
+                "dpe_soft_clip_support": int(soft_support),
+                "dpe_side_window_start": int(side_start),
+                "dpe_side_window_end": int(side_end),
+                "dpe_gap_two_sided": bool(two_sided and dpe_pos > 0 and not soft_resolved),
+                "dpe_soft_clip_resolved": bool(soft_resolved),
+            }
+        )
+    if not rows:
+        return empty
+    return pd.DataFrame(rows)
+
+
+def _apply_discordant_gap_breakpoint_fallback(
+    candidates: pd.DataFrame,
+    *,
+    discordant_disease: pd.DataFrame | None = None,
+    discordant_control: pd.DataFrame | None = None,
+    min_reads_per_side: int = 2,
+    max_gap_bp: int = 250,
+    min_soft_clip_support: int = 1,
+) -> pd.DataFrame:
+    """Fill unresolved breakpoints from discordant soft-clips or L/R gaps.
+
+    Priority for unresolved loci:
+      1. soft-clipped DPE mode (one- or two-sided) → discordant_soft_clip
+      2. two-sided DPE gap midpoint → discordant_gap_midpoint
+    Never overwrites SR/TSD/assembly-resolved breakpoints.
+    """
+    out = candidates.copy()
+    key_cols = ["chrom", "window_start", "window_end"]
+    for col, default in [
+        ("dpe_gap_left", 0),
+        ("dpe_gap_right", 0),
+        ("dpe_gap_pos", 0),
+        ("dpe_gap_n_left", 0),
+        ("dpe_gap_n_right", 0),
+        ("dpe_gap_n_soft_clip", 0),
+        ("dpe_soft_clip_mode", 0),
+        ("dpe_soft_clip_support", 0),
+        ("dpe_side_window_start", 0),
+        ("dpe_side_window_end", 0),
+        ("dpe_gap_two_sided", False),
+        ("dpe_soft_clip_resolved", False),
+    ]:
+        if col not in out.columns:
+            out[col] = default
+
+    gap = _estimate_discordant_gap_intervals(
+        [
+            discordant_disease if discordant_disease is not None else pd.DataFrame(),
+            discordant_control if discordant_control is not None else pd.DataFrame(),
+        ],
+        min_reads_per_side=min_reads_per_side,
+        max_gap_bp=max_gap_bp,
+        min_soft_clip_support=min_soft_clip_support,
+    )
+    if gap.empty:
+        return out
+
+    drop_cols = [c for c in gap.columns if c not in key_cols and c in out.columns]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+    out = out.merge(gap, on=key_cols, how="left")
+    for col, default in [
+        ("dpe_gap_left", 0),
+        ("dpe_gap_right", 0),
+        ("dpe_gap_pos", 0),
+        ("dpe_gap_n_left", 0),
+        ("dpe_gap_n_right", 0),
+        ("dpe_gap_n_soft_clip", 0),
+        ("dpe_soft_clip_mode", 0),
+        ("dpe_soft_clip_support", 0),
+        ("dpe_side_window_start", 0),
+        ("dpe_side_window_end", 0),
+        ("dpe_gap_two_sided", False),
+        ("dpe_soft_clip_resolved", False),
+    ]:
+        if col not in out.columns:
+            out[col] = default
+        if col in {"dpe_gap_two_sided", "dpe_soft_clip_resolved"}:
+            out[col] = out[col].fillna(False).astype(bool)
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(default).astype(type(default))
+
+    bp = pd.to_numeric(out.get("insertion_breakpoint_pos", 0), errors="coerce").fillna(0).astype(int)
+    unresolved = bp.le(0)
+    if "breakpoint_evidence_source" not in out.columns:
+        out["breakpoint_evidence_source"] = ""
+
+    use_clip = unresolved & out["dpe_soft_clip_resolved"] & out["dpe_soft_clip_mode"].gt(0)
+    out.loc[use_clip, "insertion_breakpoint_pos"] = out.loc[use_clip, "dpe_soft_clip_mode"].astype(int)
+    out.loc[use_clip, "breakpoint_evidence_source"] = "discordant_soft_clip"
+
+    still_unresolved = pd.to_numeric(out["insertion_breakpoint_pos"], errors="coerce").fillna(0).le(0)
+    use_gap = still_unresolved & out["dpe_gap_two_sided"] & out["dpe_gap_pos"].gt(0)
+    out.loc[use_gap, "insertion_breakpoint_pos"] = out.loc[use_gap, "dpe_gap_pos"].astype(int)
+    out.loc[use_gap, "breakpoint_evidence_source"] = "discordant_gap_midpoint"
+    return out
+
+
+def _tighten_windows_to_breakpoint_interval(
+    df: pd.DataFrame,
+    *,
+    breakpoint_pos_col: str,
+    interval_start_col: str,
+    interval_end_col: str,
+) -> pd.DataFrame:
+    """Set window_start/end to the resolved breakpoint interval (no pad).
+
+    - TSD / two-sided split / DPE gap: window = interval
+    - Point-resolved BP: window = [pos, pos]
+    - Unresolved one-sided DPE: keep pos unresolved, shrink window to that side's tips
+
+    Preserves the original discovery span in discovery_window_{start,end} so
+    supporting-read detail tables (keyed on discovery windows) still join.
+    """
+    out = df.copy()
+    if out.empty or "window_start" not in out.columns or "window_end" not in out.columns:
+        return out
+
+    if "discovery_window_start" not in out.columns:
+        out["discovery_window_start"] = pd.to_numeric(out["window_start"], errors="coerce").fillna(0).astype(int)
+    if "discovery_window_end" not in out.columns:
+        out["discovery_window_end"] = pd.to_numeric(out["window_end"], errors="coerce").fillna(0).astype(int)
+
+    ws = pd.to_numeric(out["discovery_window_start"], errors="coerce")
+    we = pd.to_numeric(out["discovery_window_end"], errors="coerce")
+    bp = pd.to_numeric(out.get(breakpoint_pos_col, 0), errors="coerce")
+    lo = pd.to_numeric(out.get(interval_start_col, float("nan")), errors="coerce")
+    hi = pd.to_numeric(out.get(interval_end_col, float("nan")), errors="coerce")
+
+    # Prefer explicit interval when valid.
+    valid_interval = lo.notna() & hi.notna() & lo.gt(0) & hi.gt(0) & hi.ge(lo)
+    new_ws = ws.copy()
+    new_we = we.copy()
+    new_ws = new_ws.where(~valid_interval, lo)
+    new_we = new_we.where(~valid_interval, hi)
+
+    # Point estimate with no interval → 1 bp window.
+    point = (~valid_interval) & bp.notna() & bp.gt(0)
+    new_ws = new_ws.where(~point, bp)
+    new_we = new_we.where(~point, bp)
+
+    # One-sided / unresolved DPE: shrink to observed junction-tip span on that side.
+    side_lo = pd.to_numeric(out.get("dpe_side_window_start", float("nan")), errors="coerce")
+    side_hi = pd.to_numeric(out.get("dpe_side_window_end", float("nan")), errors="coerce")
+    unresolved = (~valid_interval) & (bp.isna() | bp.le(0))
+    use_side = unresolved & side_lo.notna() & side_hi.notna() & side_lo.gt(0) & side_hi.ge(side_lo)
+    new_ws = new_ws.where(~use_side, side_lo)
+    new_we = new_we.where(~use_side, side_hi)
+
+    # Keep windows ordered and within original discovery span when possible.
+    ordered_ws = pd.concat([new_ws, new_we], axis=1).min(axis=1)
+    ordered_we = pd.concat([new_ws, new_we], axis=1).max(axis=1)
+    # Do not expand beyond the discovery window.
+    ordered_ws = pd.concat([ordered_ws, ws], axis=1).max(axis=1)
+    ordered_we = pd.concat([ordered_we, we], axis=1).min(axis=1)
+    # If clipping inverted the interval, fall back to discovery window.
+    bad = ordered_ws.isna() | ordered_we.isna() | ordered_we.lt(ordered_ws)
+    ordered_ws = ordered_ws.where(~bad, ws)
+    ordered_we = ordered_we.where(~bad, we)
+
+    out["window_start"] = ordered_ws.fillna(ws).astype(int)
+    out["window_end"] = ordered_we.fillna(we).astype(int)
+    return out
+
+
 def _derive_breakpoint_interval_fields(
     df: pd.DataFrame,
     *,
@@ -7436,20 +7895,41 @@ def _derive_breakpoint_interval_fields(
 
     tsd_left = pd.to_numeric(s("tsd_left_breakpoint", float("nan")), errors="coerce")
     tsd_right = pd.to_numeric(s("tsd_right_breakpoint", float("nan")), errors="coerce")
-    bp_candidates = pd.concat(
+    dpe_left = pd.to_numeric(s("dpe_gap_left", float("nan")), errors="coerce")
+    dpe_right = pd.to_numeric(s("dpe_gap_right", float("nan")), errors="coerce")
+    split_candidates = pd.concat(
         [
-            tsd_left,
-            tsd_right,
             pd.to_numeric(s("disease_L_mei_breakpoint_mode", float("nan")), errors="coerce"),
             pd.to_numeric(s("disease_R_mei_breakpoint_mode", float("nan")), errors="coerce"),
             pd.to_numeric(s("control_L_mei_breakpoint_mode", float("nan")), errors="coerce"),
             pd.to_numeric(s("control_R_mei_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("disease_L_split_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("disease_R_split_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("control_L_split_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("control_R_split_breakpoint_mode", float("nan")), errors="coerce"),
+            pd.to_numeric(s("dpe_soft_clip_mode", float("nan")), errors="coerce"),
         ],
         axis=1,
     )
-    bp_candidates = bp_candidates.where(bp_candidates.gt(0))
-    bp_lo = bp_candidates.min(axis=1, skipna=True)
-    bp_hi = bp_candidates.max(axis=1, skipna=True)
+    split_candidates = split_candidates.where(split_candidates.gt(0))
+    tsd_ok = tsd_left.gt(0) & tsd_right.gt(0)
+    dpe_ok = dpe_left.gt(0) & dpe_right.gt(0)
+    split_lo = split_candidates.min(axis=1, skipna=True)
+    split_hi = split_candidates.max(axis=1, skipna=True)
+    split_ok = split_lo.notna() & split_hi.notna()
+
+    # Prefer TSD span, then split-read modes, then discordant gap. Do not mix
+    # weaker evidence into a tighter higher-confidence interval.
+    bp_lo = pd.Series(float("nan"), index=out.index, dtype=float)
+    bp_hi = pd.Series(float("nan"), index=out.index, dtype=float)
+    bp_lo = bp_lo.where(~tsd_ok, tsd_left)
+    bp_hi = bp_hi.where(~tsd_ok, tsd_right)
+    use_split = (~tsd_ok) & split_ok
+    bp_lo = bp_lo.where(~use_split, split_lo)
+    bp_hi = bp_hi.where(~use_split, split_hi)
+    use_dpe = (~tsd_ok) & (~split_ok) & dpe_ok
+    bp_lo = bp_lo.where(~use_dpe, dpe_left)
+    bp_hi = bp_hi.where(~use_dpe, dpe_right)
 
     bp_pos = pd.to_numeric(s(breakpoint_pos_col, float("nan")), errors="coerce")
     use_pos_single = bp_lo.isna() & bp_hi.isna() & bp_pos.gt(0)
@@ -7511,8 +7991,10 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     # Assembly-preferred consensus fields for breakpoint/TSD/polyA only.
     # MEI 5'/3' coords and orientation are set from SR/DPE below (not assembly).
     asm_bp = pd.to_numeric(_series_or_default("asm_consensus_breakpoint_pos", float("nan")), errors="coerce")
-    out["consensus_insertion_breakpoint_pos"] = asm_bp.where(asm_has_mei & asm_bp.notna(), out["insertion_breakpoint_pos"]).astype(int)
-    out["consensus_breakpoint_source"] = asm_source.copy()
+    use_asm_bp = asm_has_mei & asm_bp.notna() & asm_bp.gt(0)
+    out["consensus_insertion_breakpoint_pos"] = asm_bp.where(use_asm_bp, out["insertion_breakpoint_pos"]).astype(int)
+    out["consensus_breakpoint_source"] = ""
+    out.loc[use_asm_bp, "consensus_breakpoint_source"] = asm_source.loc[use_asm_bp]
     out.loc[out["consensus_breakpoint_source"] == "", "consensus_breakpoint_source"] = _series_or_default(
         "breakpoint_evidence_source", ""
     ).fillna("").astype(str)
@@ -7521,10 +8003,17 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         breakpoint_pos_col="consensus_insertion_breakpoint_pos",
         output_prefix="consensus_",
     )
+    empty_source = out["consensus_breakpoint_source"].fillna("").astype(str).str.len().eq(0)
     out.loc[
-        (out["consensus_breakpoint_interval_width_bp"].astype(int) > 0) & (~asm_has_mei),
+        (out["consensus_breakpoint_interval_width_bp"].astype(int) > 0) & (~asm_has_mei) & empty_source,
         "consensus_breakpoint_source",
     ] = "interval_midpoint"
+    out = _tighten_windows_to_breakpoint_interval(
+        out,
+        breakpoint_pos_col="consensus_insertion_breakpoint_pos",
+        interval_start_col="consensus_breakpoint_interval_start",
+        interval_end_col="consensus_breakpoint_interval_end",
+    )
 
     asm_tsd_seq = _series_or_default("asm_tsd_seq", "").fillna("").astype(str)
     asm_tsd_len = pd.to_numeric(_series_or_default("asm_tsd_len", float("nan")), errors="coerce")
@@ -8298,6 +8787,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "consensus_insertion_breakpoint_pos",
         "window_start",
         "window_end",
+        "discovery_window_start",
+        "discovery_window_end",
         "control_supporting_reads",
         "disease_supporting_reads",
         "sample_status_label",
@@ -8325,7 +8816,10 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "chrom",
         "window_start",
         "window_end",
+        "discovery_window_start",
+        "discovery_window_end",
         "consensus_insertion_breakpoint_pos",
+        "consensus_breakpoint_source",
         "consensus_breakpoint_interval_start",
         "consensus_breakpoint_interval_end",
         "consensus_breakpoint_interval_width_bp",
@@ -9306,6 +9800,9 @@ def annotate_candidate_loci_with_mei(
     igv_panel_height_min: int = 250,
     igv_panel_height_max: int = 8000,
     igv_timeout_sec: int | None = None,
+    read_architecture_plots: bool = True,
+    read_architecture_top_n: int = 0,
+    read_architecture_dir: Path | None = None,
     local_assembly: bool = False,
     assembly_cache_dir: Path | None = None,
     assembly_interval_pad_bp: int = 250,
@@ -9627,6 +10124,11 @@ def annotate_candidate_loci_with_mei(
         split_disease=split_disease,
         split_control=split_control,
     )
+    candidate = _apply_discordant_gap_breakpoint_fallback(
+        candidate,
+        discordant_disease=discordant_disease_mei,
+        discordant_control=discordant_control_mei,
+    )
     candidate = _derive_breakpoint_interval_fields(
         candidate,
         breakpoint_pos_col="insertion_breakpoint_pos",
@@ -9679,6 +10181,11 @@ def annotate_candidate_loci_with_mei(
             candidate = candidate.merge(asm_df, on=["chrom", "window_start", "window_end"], how="left")
             candidate = _apply_assembly_refinement_overrides(candidate)
             candidate = _recompute_breakpoint_sequence_metrics(candidate, reference_fasta=reference_fasta)
+            candidate = _derive_breakpoint_interval_fields(
+                candidate,
+                breakpoint_pos_col="insertion_breakpoint_pos",
+                output_prefix="insertion_",
+            )
         print(
             f"[mei-annotate] local assembly complete loci={len(asm_df)} "
             f"cache={asm_dir} elapsed={time.monotonic() - asm_t0:.1f}s"
@@ -9758,6 +10265,21 @@ def annotate_candidate_loci_with_mei(
     candidate = _apply_breakpoint_motif_report_gating(candidate)
     candidate = _prioritize_mei_candidates(candidate, stage_first=True)
 
+    # Final window shrink to resolved breakpoint interval (no pad). Keep discovery
+    # windows as merge keys until here so all upstream joins stay stable.
+    if "insertion_breakpoint_interval_start" not in candidate.columns:
+        candidate = _derive_breakpoint_interval_fields(
+            candidate,
+            breakpoint_pos_col="insertion_breakpoint_pos",
+            output_prefix="insertion_",
+        )
+    candidate = _tighten_windows_to_breakpoint_interval(
+        candidate,
+        breakpoint_pos_col="insertion_breakpoint_pos",
+        interval_start_col="insertion_breakpoint_interval_start",
+        interval_end_col="insertion_breakpoint_interval_end",
+    )
+
     candidate_tsv = _stable_tsv_export_frame(candidate)
     candidate_tsv.to_csv(out_path, sep="\t", index=False)
     candidate.to_parquet(out_path.with_suffix(".parquet"), index=False)
@@ -9802,6 +10324,39 @@ def annotate_candidate_loci_with_mei(
             "--disease-bam-depth, and --control-bam-depth",
             flush=True,
         )
+    if read_architecture_plots:
+        detail_path = out_path.with_name("supporting_reads_detail.mei.tsv")
+        detail_parquet = out_path.with_name("supporting_reads_detail.mei.parquet")
+        detail_source: pd.DataFrame | Path | None = None
+        if not supporting_reads_detail.empty:
+            detail_source = supporting_reads_detail
+        elif detail_parquet.exists():
+            detail_source = detail_parquet
+        elif detail_path.exists():
+            detail_source = detail_path
+        if detail_source is None:
+            print(
+                "[mei-annotate] read-architecture plots skipped: missing supporting_reads_detail.mei.tsv",
+                flush=True,
+            )
+        else:
+            arch_dir = (
+                read_architecture_dir
+                if read_architecture_dir is not None
+                else out_path.with_name(out_path.stem + ".read_architecture")
+            )
+            try:
+                generate_gold_read_architecture_plots(
+                    gold_review,
+                    supporting_reads_detail=detail_source,
+                    out_dir=arch_dir,
+                    mei_table=candidate,
+                    gold_tsv=gold_review_path,
+                    gold_only=True,
+                    top_n=read_architecture_top_n,
+                )
+            except Exception as exc:  # noqa: BLE001 - do not fail annotate on plot errors
+                print(f"[mei-annotate] read-architecture plot generation failed: {exc}", flush=True)
     print(f"[mei-annotate] wrote {len(candidate)} rows to {out_path}")
     print(f"[mei-annotate] total annotate walltime={time.monotonic() - total_t0:.1f}s")
     return out_path

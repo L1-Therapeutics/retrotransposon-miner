@@ -264,6 +264,18 @@ def _window_locus_id(chrom: str, window_start: int, window_end: int) -> str:
     return _safe_locus_id(chrom, max(1, s), max(1, e))
 
 
+def _row_discovery_window(row: object) -> tuple[str, int, int]:
+    """Prefer discovery span for IGV/assembly-cache keys; fall back to reported window."""
+    chrom = str(getattr(row, "chrom", "") or "")
+    disc_start = int(getattr(row, "discovery_window_start", 0) or 0)
+    disc_end = int(getattr(row, "discovery_window_end", 0) or 0)
+    if disc_start > 0 and disc_end >= disc_start:
+        return chrom, disc_start, disc_end
+    start = int(getattr(row, "window_start", 0) or 0)
+    end = int(getattr(row, "window_end", 0) or 0)
+    return chrom, start, end
+
+
 def _read_json_dict(path: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
@@ -310,9 +322,7 @@ def _build_assembly_contig_track(
 
     contig_entries: list[tuple[str, str]] = []
     for rank, row in enumerate(variants.itertuples(index=False), start=1):
-        chrom = str(getattr(row, "chrom", "") or "")
-        window_start = int(getattr(row, "window_start", 0) or 0)
-        window_end = int(getattr(row, "window_end", 0) or 0)
+        chrom, window_start, window_end = _row_discovery_window(row)
         contig_id = str(getattr(row, "assembly_best_contig_id", "") or "")
         if not chrom or window_start <= 0 or window_end <= 0 or not contig_id:
             continue
@@ -440,17 +450,21 @@ def build_igv_batch_script(
         lines.append(f"load {contig_annotation_bed.resolve()}")
 
     for rank, row in enumerate(variants.itertuples(index=False), start=1):
-        chrom = str(getattr(row, "chrom", "") or "")
-        start = int(getattr(row, "window_start", 0) or 0)
-        end = int(getattr(row, "window_end", 0) or 0)
-        if not chrom or start <= 0 or end <= start:
+        chrom, start, end = _row_discovery_window(row)
+        # Tight 1bp reported windows are hard to review; pad tiny spans for IGV view.
+        view_start, view_end = start, end
+        if view_end - view_start < 50:
+            mid = (view_start + view_end) // 2
+            view_start = max(1, mid - 100)
+            view_end = mid + 100
+        if not chrom or start <= 0 or end < start:
             continue
         panel_height = _estimate_panel_height(
             disease_bam,
             control_bam,
             chrom,
-            start,
-            end,
+            view_start,
+            view_end,
             min_height=panel_height_min,
             max_height=panel_height_max,
         )
@@ -458,7 +472,7 @@ def build_igv_batch_script(
         snapshot_name = _safe_snapshot_stem(rank, chrom, start, end, contig_id=best_contig)
         lines.extend(
             [
-                f"goto {chrom}:{start}-{end}",
+                f"goto {chrom}:{view_start}-{view_end}",
                 "expand",
                 "sort position",
                 f"maxPanelHeight {panel_height}",
@@ -582,10 +596,8 @@ def generate_gold_review_igv_plots(
 
     index_rows: list[dict[str, object]] = []
     for rank, row in enumerate(variants.itertuples(index=False), start=1):
-        chrom = str(getattr(row, "chrom", "") or "")
-        start = int(getattr(row, "window_start", 0) or 0)
-        end = int(getattr(row, "window_end", 0) or 0)
-        if not chrom or start <= 0 or end <= start:
+        chrom, start, end = _row_discovery_window(row)
+        if not chrom or start <= 0 or end < start:
             continue
         best_contig = str(getattr(row, "assembly_best_contig_id", "") or "")
         snapshot_name = _safe_snapshot_stem(rank, chrom, start, end, contig_id=best_contig)
@@ -594,8 +606,10 @@ def generate_gold_review_igv_plots(
                 "plot_rank": rank,
                 "analysis_stage_tier": getattr(row, "analysis_stage_tier", ""),
                 "chrom": chrom,
-                "window_start": start,
-                "window_end": end,
+                "window_start": int(getattr(row, "window_start", start) or start),
+                "window_end": int(getattr(row, "window_end", end) or end),
+                "discovery_window_start": start,
+                "discovery_window_end": end,
                 "insertion_breakpoint_pos": getattr(row, "insertion_breakpoint_pos", -1),
                 "mei_family": getattr(row, "mei_family", ""),
                 "mei_subfamily": getattr(row, "mei_subfamily", ""),

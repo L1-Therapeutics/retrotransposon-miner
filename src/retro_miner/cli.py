@@ -637,6 +637,25 @@ def build_candidate_loci_cmd(
     help="Optional timeout for the IGV batch run.",
 )
 @click.option(
+    "--read-architecture-plots/--no-read-architecture-plots",
+    default=True,
+    show_default=True,
+    help="Generate schematic read-architecture PNGs for gold-tier loci.",
+)
+@click.option(
+    "--read-architecture-top-n",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Maximum gold loci for read-architecture plots (<=0 means all gold).",
+)
+@click.option(
+    "--read-architecture-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory for read-architecture PNGs (default: <out-tsv-stem>.read_architecture).",
+)
+@click.option(
     "--local-assembly/--no-local-assembly",
     default=False,
     show_default=True,
@@ -741,6 +760,9 @@ def annotate_mei_support_cmd(
     igv_panel_height_min: int,
     igv_panel_height_max: int,
     igv_timeout_sec: int | None,
+    read_architecture_plots: bool,
+    read_architecture_top_n: int,
+    read_architecture_dir: Path | None,
     local_assembly: bool,
     assembly_cache_dir: Path | None,
     assembly_interval_pad_bp: int,
@@ -794,6 +816,9 @@ def annotate_mei_support_cmd(
         igv_panel_height_min=igv_panel_height_min,
         igv_panel_height_max=igv_panel_height_max,
         igv_timeout_sec=igv_timeout_sec,
+        read_architecture_plots=read_architecture_plots,
+        read_architecture_top_n=read_architecture_top_n,
+        read_architecture_dir=read_architecture_dir,
         local_assembly=local_assembly,
         assembly_cache_dir=assembly_cache_dir,
         assembly_interval_pad_bp=assembly_interval_pad_bp,
