@@ -1323,6 +1323,186 @@ def _build_mei_full_consensus_panel(outdir: Path, ds_map: dict[str, Dataset], ti
     }
 
 
+def _build_mei_fragment_to_full_coord_map(
+    outdir: Path,
+    ds_map: dict[str, Dataset],
+    timeout_sec: int,
+    force: bool,
+) -> dict[str, Any]:
+    """One-time map of each Dfam MEI fragment onto a full-length consensus.
+
+    Aligns ``dfam_human_mei_l1_alu_sva.fasta`` records to the full-consensus
+    panel (prefer matching ``{subfamily}_full``, else family canonical
+    L1HS/AluY/SVA_F). Writes a TSV used at annotate time to project panel
+    hit coordinates onto the full-length axis — no per-read full remap.
+    """
+    del ds_map, timeout_sec  # signature matches other prepare steps
+    dfam_subset = outdir / "retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta"
+    out_dir = outdir / "retrotransposon_db/full_consensus"
+    panel_fa = out_dir / "mei_full_canonical.panel.fa"
+    canonical_fa = out_dir / "mei_full_canonical.ucsc_repeatbrowser.fa"
+    map_tsv = out_dir / "mei_fragment_to_full_coords.tsv"
+
+    if map_tsv.exists() and not force:
+        return {"status": "skipped_exists", "path": str(map_tsv), "bytes": map_tsv.stat().st_size}
+    if not dfam_subset.exists():
+        return {"status": "skipped_missing_dfam_subset", "path": str(dfam_subset)}
+    if not panel_fa.exists() and not canonical_fa.exists():
+        return {
+            "status": "skipped_missing_full_consensus",
+            "panel_fasta": str(panel_fa),
+            "canonical_fasta": str(canonical_fa),
+        }
+    if shutil.which("minimap2") is None:
+        return {"status": "failed", "error": "minimap2_not_found"}
+
+    panel_seqs: dict[str, str] = {}
+    for path in (panel_fa, canonical_fa):
+        if not path.exists():
+            continue
+        for hdr, seq in _iter_fasta(path):
+            key = hdr.split("|", 1)[0]
+            if key and seq and key not in panel_seqs:
+                panel_seqs[key] = seq
+    if not panel_seqs:
+        return {"status": "failed", "error": "empty_full_consensus_sequences"}
+
+    family_canonical = {
+        "ALU": next((k for k in ("AluY_full#SINE/Alu", "AluY_full") if k in panel_seqs), ""),
+        "LINE1": next((k for k in ("L1HS_full#LINE/L1", "L1HS_full") if k in panel_seqs), ""),
+        "SVA": next((k for k in ("SVA_F_full#Retroposon/SVA", "SVA_F_full") if k in panel_seqs), ""),
+    }
+
+    fragments: list[tuple[str, str, str]] = []
+    for hdr, seq in _iter_fasta(dfam_subset):
+        fam = _mei_family_from_header(hdr)
+        if fam not in {"ALU", "SVA", "LINE1"} or not seq:
+            continue
+        fragments.append((hdr, fam, seq))
+    if not fragments:
+        return {"status": "failed", "error": "no_dfam_mei_fragments"}
+
+    with tempfile.TemporaryDirectory(prefix="mei_frag2full_") as tmp:
+        tmp_path = Path(tmp)
+        query_fa = tmp_path / "fragments.fa"
+        target_fa = tmp_path / "full_targets.fa"
+        with query_fa.open("w", encoding="utf-8") as handle:
+            for hdr, _fam, seq in fragments:
+                handle.write(f">{hdr}\n")
+                for i in range(0, len(seq), 60):
+                    handle.write(seq[i : i + 60] + "\n")
+        with target_fa.open("w", encoding="utf-8") as handle:
+            for name, seq in panel_seqs.items():
+                handle.write(f">{name}\n")
+                for i in range(0, len(seq), 60):
+                    handle.write(seq[i : i + 60] + "\n")
+        _run_cmd(["samtools", "faidx", str(target_fa)], required=True)
+        ok, paf_text = _run_cmd(
+            ["minimap2", "-c", "--cs", "-N", "5", str(target_fa), str(query_fa)],
+            required=True,
+        )
+        if not ok:
+            return {"status": "failed", "error": "minimap2_failed", "detail": paf_text}
+
+    # Prefer primary hits onto the matching subfamily full, else family canonical.
+    best_by_query: dict[str, tuple[float, list[str]]] = {}
+    for line in paf_text.splitlines():
+        if not line.strip():
+            continue
+        cols = line.split("\t")
+        if len(cols) < 12:
+            continue
+        qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alnlen, mapq = cols[:12]
+        try:
+            qlen_i = int(qlen)
+            qstart_i = int(qstart)
+            qend_i = int(qend)
+            tlen_i = int(tlen)
+            tstart_i = int(tstart)
+            tend_i = int(tend)
+            nmatch_i = int(nmatch)
+            alnlen_i = max(1, int(alnlen))
+            mapq_i = int(mapq)
+        except ValueError:
+            continue
+        fam = _mei_family_from_header(qname)
+        norm = _normalize_dfam_subfamily_for_full(qname)
+        preferred = f"{norm}_full"
+        t_base = tname.split("#", 1)[0]
+        rank = 0
+        if t_base == preferred or tname.startswith(preferred):
+            rank = 3
+        elif tname == family_canonical.get(fam, "") or t_base == family_canonical.get(fam, "").split("#", 1)[0]:
+            rank = 2
+        elif _mei_family_from_header(tname) == fam:
+            rank = 1
+        else:
+            continue
+        identity = nmatch_i / float(alnlen_i)
+        cov = (qend_i - qstart_i) / float(max(1, qlen_i))
+        score = (rank, identity, cov, mapq_i, alnlen_i)
+        # 1-based inclusive coords for annotate-time projection.
+        row = [
+            qname,
+            str(qlen_i),
+            tname,
+            str(tlen_i),
+            str(qstart_i + 1),
+            str(qend_i),
+            str(tstart_i + 1),
+            str(tend_i),
+            strand,
+            str(alnlen_i),
+            str(nmatch_i),
+            f"{identity:.6f}",
+            f"{cov:.6f}",
+            str(mapq_i),
+            fam,
+        ]
+        prev = best_by_query.get(qname)
+        if prev is None or score > prev[0]:
+            best_by_query[qname] = (score, row)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with map_tsv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(
+            [
+                "fragment_name",
+                "fragment_length",
+                "full_name",
+                "full_length",
+                "fragment_aln_start",
+                "fragment_aln_end",
+                "full_aln_start",
+                "full_aln_end",
+                "strand",
+                "aln_length",
+                "n_matches",
+                "identity",
+                "query_coverage",
+                "mapq",
+                "family",
+            ]
+        )
+        for hdr, _fam, _seq in fragments:
+            hit = best_by_query.get(hdr)
+            if hit is None:
+                writer.writerow([hdr, len(_seq), "", 0, 0, 0, 0, 0, "", 0, 0, 0, 0, 0, _fam])
+            else:
+                writer.writerow(hit[1])
+
+    mapped = len(best_by_query)
+    return {
+        "status": "prepared",
+        "path": str(map_tsv),
+        "fragments_total": len(fragments),
+        "fragments_mapped": mapped,
+        "fragments_unmapped": len(fragments) - mapped,
+        "bytes": map_tsv.stat().st_size,
+    }
+
+
 def _postprocess(
     outdir: Path,
     datasets: list[Dataset],
@@ -1847,6 +2027,12 @@ def _postprocess(
     run_step(
         "prepare_full_consensus_mei_panel",
         lambda: _build_mei_full_consensus_panel(outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force),
+    )
+    run_step(
+        "prepare_mei_fragment_to_full_coord_map",
+        lambda: _build_mei_fragment_to_full_coord_map(
+            outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force
+        ),
     )
 
     return steps

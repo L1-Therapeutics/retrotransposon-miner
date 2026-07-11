@@ -222,8 +222,66 @@ def _build_loci_from_evidence(
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
     out = pd.DataFrame(rows).drop_duplicates()
+    out = _merge_overlapping_loci(out, max_locus_span_bp=int(max_locus_span_bp))
     out = out.sort_values(["chrom", "window_start", "window_end"], kind="mergesort").reset_index(drop=True)
     _progress(f"built {len(out)} candidate loci from {len(split_all)} split and {len(discordant_all)} discordant rows")
+    return out
+
+
+def _merge_overlapping_loci(
+    loci: pd.DataFrame,
+    *,
+    max_locus_span_bp: int,
+) -> pd.DataFrame:
+    """Collapse overlapping discovery windows on the same chromosome.
+
+    Split seeds a few dozen bp apart (e.g. SVA TSD / dual-breakpoint scatter)
+    otherwise become two gold calls for one insertion. Exact-coordinate
+    ``drop_duplicates`` does not catch that. Intervals that only touch at an
+    endpoint are merged; non-overlapping neighbors stay separate. Merges that
+    would exceed ``max_locus_span_bp`` are skipped so long discordant chains
+    are not glued into mega-loci.
+    """
+    if loci is None or loci.empty:
+        return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
+    required = {"chrom", "window_start", "window_end"}
+    if not required.issubset(loci.columns):
+        return loci.copy()
+
+    max_span = max(1, int(max_locus_span_bp))
+    merged_rows: list[dict[str, object]] = []
+    n_in = len(loci)
+    for chrom, grp in loci.groupby("chrom", sort=False):
+        intervals = sorted(
+            (
+                (int(r.window_start), int(r.window_end))
+                for r in grp.itertuples(index=False)
+            ),
+            key=lambda x: (x[0], x[1]),
+        )
+        if not intervals:
+            continue
+        cur_start, cur_end = intervals[0]
+        for start, end in intervals[1:]:
+            # Closed intervals: merge only on true overlap (not mere abutment),
+            # so adjacent-but-distinct insertions stay separate.
+            if start <= cur_end:
+                new_end = max(cur_end, end)
+                if (new_end - cur_start + 1) <= max_span:
+                    cur_end = new_end
+                    continue
+                # Would exceed span cap: keep current, start a new interval.
+            merged_rows.append(
+                {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
+            )
+            cur_start, cur_end = start, end
+        merged_rows.append(
+            {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
+        )
+
+    out = pd.DataFrame(merged_rows).drop_duplicates()
+    if len(out) < n_in:
+        _progress(f"merged overlapping loci: {n_in} -> {len(out)}")
     return out
 
 
@@ -681,7 +739,7 @@ def build_candidate_loci(
     evidence_dir: Path,
     outdir: Path,
     window_size: int = 200,
-    split_cluster_bp: int = 30,
+    split_cluster_bp: int = 100,
     discordant_cluster_bp: int = 400,
     max_locus_span_bp: int = 2000,
     pseudocount: float = 1.0,

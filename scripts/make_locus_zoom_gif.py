@@ -96,7 +96,7 @@ def _load_locus_from_tsv(tsv_path: Path, chrom: str, pos: int) -> LocusSpec:
         family=str(row.get("consensus_mei_family", "") or "MEI"),
         subfamily=str(row.get("consensus_mei_subfamily", "") or ""),
         tsd=str(row.get("consensus_tsd_seq", "") or "").strip(),
-        poly_a_run=int(row.get("consensus_poly_at_max_run", 0) or 0),
+        poly_a_run=int(row.get("consensus_poly_at_min_bp", 0) or 0),
         orientation=str(row.get("consensus_insertion_orientation", "") or ""),
         control_support=str(row.get("control_supporting_reads", "") or ""),
         known_source=str(row.get("known_mei_polymorphism_source", "") or ""),
