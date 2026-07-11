@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Schematic read-pair architecture plot for a gold-review MEI locus.
 
-Composite axis:
+Composite axis (forward / ``+`` orientation):
 
-    chr22 left flank  |  mapped MEI insertion  |  chr22 right flank
-    <anchor>---------------------------<mate or MEI projection>
+    left flank  |  MEI 5′→3′  |  polyA zone  |  right flank
 
-The MEI segment width is the mapped insertion span for the locus (Alu/SVA/LINE-1),
-not the full consensus element length.
+Reverse (``-``) swaps MEI direction and puts the polyA zone on the 3′ side
+(left of the MEI body). The MEI segment is consensus 5′–3′ only; polyA/T
+rescues and polyA split clips are drawn in the dedicated polyA zone whose
+width is the longest observed polyA/T support at the locus.
 """
 
 from __future__ import annotations
@@ -35,6 +36,12 @@ COLOR_DARK_ORANGE = "#fd8d3c"
 COLOR_BLACK = "black"
 COLOR_WHITE = "white"
 
+# Illumina PE ~150 bp: a single polyA mate/clip is at most one read.
+# Anchor-clip + polyA-mate on the same DPE can cover non-overlapping stretches,
+# so allow up to ~2 reads when summing those lengths for the plot zone/bar.
+_MAX_POLYA_SINGLE_BP = 151
+_MAX_POLYA_COMBINED_BP = 280
+
 # Slim columns pulled from candidate_loci.mei.tsv when gold_review lacks them.
 _MEI_ENRICH_COLS = (
     "chrom",
@@ -50,6 +57,12 @@ _MEI_ENRICH_COLS = (
     "control_discordant_mei_right_target_pos_median",
     "control_discordant_mei_insertion_span_estimate",
     "g1k_melt_insertion_length",
+    "consensus_insertion_mei_5p_coord",
+    "consensus_insertion_mei_3p_coord",
+    "consensus_insertion_mei_span",
+    "consensus_insertion_mei_5p_coord_full",
+    "consensus_insertion_mei_3p_coord_full",
+    "consensus_insertion_mei_span_full",
 )
 
 _DETAIL_COLS = (
@@ -69,6 +82,18 @@ _DETAIL_COLS = (
     "mate_mei_end",
     "mei_hit",
     "mate_mei_hit",
+    "vntr_rescue",
+    "polya_rescue",
+    "mei_hit_source",
+    "mate_seq_len",
+    "polya_base",
+    "soft_clip_side",
+    "soft_clip_len",
+    "soft_clip_pos",
+    "anchor_poly_at_run",
+    "anchor_poly_base",
+    "anchor_poly_side",
+    "poly_tail_anchor_rescued",
 )
 
 
@@ -88,6 +113,8 @@ class LocusLayout:
     insert_size_estimates: tuple[int, ...] = ()
     # "-" means the insertion is reverse-oriented: left flank abuts MEI 3', right abuts 5'.
     orientation: str = "+"
+    # Dedicated polyA/T tail zone beyond MEI 3' (max observed polyA length).
+    polya_zone_bp: int = 0
 
     @property
     def left_flank_bp(self) -> int:
@@ -98,36 +125,74 @@ class LocusLayout:
         return self.flank_bp
 
     @property
+    def reverse_oriented(self) -> bool:
+        return str(self.orientation).strip() in {"-", "−", "rev", "reverse", "-1"}
+
+    @property
     def total_width(self) -> int:
-        return self.flank_bp + self.mei_span_bp + self.flank_bp
+        return int(self.flank_bp + self.polya_zone_bp + self.mei_span_bp + self.flank_bp)
+
+    @property
+    def polya_region_start_x(self) -> float:
+        """Start of the polyA zone (abuts MEI 3')."""
+        if self.polya_zone_bp <= 0:
+            # Degenerate: collapse onto the 3' MEI edge.
+            return self.mei_3p_junction_x
+        if self.reverse_oriented:
+            return float(self.flank_bp)
+        return float(self.flank_bp + self.mei_span_bp)
+
+    @property
+    def polya_region_end_x(self) -> float:
+        return self.polya_region_start_x + float(max(0, self.polya_zone_bp))
 
     @property
     def mei_region_start_x(self) -> float:
+        if self.reverse_oriented and self.polya_zone_bp > 0:
+            return float(self.flank_bp + self.polya_zone_bp)
         return float(self.flank_bp)
 
     @property
     def mei_region_end_x(self) -> float:
-        return float(self.flank_bp + self.mei_span_bp)
+        return self.mei_region_start_x + float(self.mei_span_bp)
 
     @property
-    def reverse_oriented(self) -> bool:
-        return str(self.orientation).strip() in {"-", "−", "rev", "reverse", "-1"}
+    def mei_3p_junction_x(self) -> float:
+        """X coordinate of the MEI 3′ edge (where the polyA zone abuts)."""
+        if self.reverse_oriented:
+            return self.mei_region_start_x
+        return self.mei_region_end_x
+
+    @property
+    def insertion_left_x(self) -> float:
+        """Left edge of the insertion block (polyA or MEI) abutting left flank."""
+        if self.reverse_oriented and self.polya_zone_bp > 0:
+            return self.polya_region_start_x
+        return self.mei_region_start_x
+
+    @property
+    def insertion_right_x(self) -> float:
+        """Right edge of the insertion block abutting right flank."""
+        if (not self.reverse_oriented) and self.polya_zone_bp > 0:
+            return self.polya_region_end_x
+        return self.mei_region_end_x
 
     def genomic_to_x(self, pos: int) -> float:
         """Map genomic coordinate onto the composite axis (clamped to visible flanks)."""
         pos = int(pos)
+        left_end = self.insertion_left_x
+        right_start = self.insertion_right_x
         if pos <= self.breakpoint:
-            x = self.flank_bp - max(0, self.breakpoint - pos)
-            return max(0.0, min(x, float(self.flank_bp)))
-        x = self.mei_region_end_x + max(0, pos - self.breakpoint)
-        return max(self.mei_region_end_x, min(x, float(self.total_width)))
+            x = left_end - max(0, self.breakpoint - pos)
+            return max(0.0, min(x, left_end))
+        x = right_start + max(0, pos - self.breakpoint)
+        return max(right_start, min(x, float(self.total_width)))
 
     def mei_coord_to_x(self, coord: int) -> float:
-        """Map MEI consensus coordinate onto the insertion segment.
+        """Map MEI consensus coordinate onto the MEI body segment (not polyA zone).
 
         Forward (+): 5' at left junction, 3' at right junction.
-        Reverse (-): 3' at left junction, 5' at right junction (so split reads
-        abut the correct genomic flank).
+        Reverse (-): 3' at left junction, 5' at right junction.
         """
         coord = int(coord)
         lo = int(self.mei_5p)
@@ -136,12 +201,36 @@ class LocusLayout:
             return self.mei_region_start_x
         coord = max(lo, min(coord, hi))
         if self.reverse_oriented:
-            # Left junction = 3', right junction = 5'.
             rel = hi - coord
         else:
             rel = coord - lo
         rel = max(0, min(rel, self.mei_span_bp))
         return self.mei_region_start_x + rel
+
+    def polya_span_x(self, width_bp: int) -> tuple[float, float]:
+        """Place a polyA/T bar of ``width_bp`` at the distal (flank) end of the polyA zone.
+
+        The zone width is the locus max polyA. A shorter bar of length L in a zone
+        of width W sits at offset ``W - L`` from MEI 3′ (abutting the flank), not at
+        ``0..L``. Example: max=180, read=60 → span 120–180 from MEI 3′.
+        """
+        width = float(max(1, min(int(width_bp), max(1, self.polya_zone_bp or int(width_bp)))))
+        if self.polya_zone_bp <= 0:
+            # Fallback: tiny stub just past 3'.
+            if self.reverse_oriented:
+                return max(0.0, self.mei_3p_junction_x - width), self.mei_3p_junction_x
+            return self.mei_3p_junction_x, self.mei_3p_junction_x + width
+        if self.reverse_oriented:
+            # left flank | polyA | MEI — abut left flank, grow toward MEI.
+            x0 = self.polya_region_start_x
+            x1 = min(self.polya_region_end_x, x0 + width)
+        else:
+            # MEI | polyA | right flank — abut right flank, grow toward MEI.
+            x1 = self.polya_region_end_x
+            x0 = max(self.polya_region_start_x, x1 - width)
+        if x1 <= x0:
+            x1 = x0 + 1.0
+        return x0, x1
 
 
 def _row_int(row: pd.Series, col: str, default: int = 0) -> int:
@@ -156,17 +245,79 @@ def _row_int(row: pd.Series, col: str, default: int = 0) -> int:
         return default
 
 
-def _mei_coords_from_detail(detail: pd.DataFrame) -> tuple[int, int] | None:
+def _target_family(target: str) -> str:
+    t = (target or "").upper()
+    if "SVA" in t:
+        return "SVA"
+    if "ALU" in t:
+        return "ALU"
+    if "LINE1" in t or "LINE/L1" in t or re.search(r"(?:^|[^A-Z0-9])L1(?:[^A-Z0-9]|$)", t):
+        return "LINE1"
+    if "HERV" in t or "ERV" in t:
+        return "ERV"
+    return "OTHER"
+
+
+def _row_mei_family(row: pd.Series | None) -> str:
+    if row is None:
+        return ""
+    for col in (
+        "consensus_mei_family",
+        "mei_family",
+        "disease_discordant_mei_family",
+        "control_discordant_mei_family",
+    ):
+        fam = _target_family(str(row.get(col, "") or ""))
+        if fam in {"ALU", "LINE1", "SVA"}:
+            return fam
+    return ""
+
+
+def _mei_coords_from_detail(
+    detail: pd.DataFrame,
+    *,
+    family: str = "",
+) -> tuple[int, int] | None:
+    """MEI body extent from consensus-mapped hits only (exclude polyA rescues).
+
+    When ``family`` is ALU/LINE1/SVA, ignore off-family hits (e.g. stray L1
+    mates at an Alu locus) so the plot axis is not inflated to ~6 kb.
+    """
     coords: list[int] = []
+    work = detail
+    # PolyA-rescue mates use synthetic coords past MEI 3′; exclude from body span.
+    if "polya_rescue" in detail.columns:
+        work = detail.loc[~detail["polya_rescue"].fillna(False).astype(bool)]
+    if "mei_hit_source" in work.columns:
+        src = work["mei_hit_source"].fillna("").astype(str)
+        work = work.loc[~src.eq("polya_rescue")]
+    fam = (family or "").upper()
+    if fam in {"ALU", "LINE1", "SVA"}:
+        keep = pd.Series(True, index=work.index)
+        for tcol in ("mei_target", "mate_mei_target", "target"):
+            if tcol not in work.columns:
+                continue
+            tfam = work[tcol].fillna("").astype(str).map(_target_family)
+            # Keep rows whose target is empty/OTHER (unknown) or matches locus family.
+            keep = keep & (tfam.eq("") | tfam.eq("OTHER") | tfam.eq(fam))
+        # If filtering would drop everything, fall back to unfiltered (better than empty).
+        filtered = work.loc[keep]
+        if not filtered.empty:
+            work = filtered
     for start_col, end_col, hit_col in (
         ("mei_start", "mei_end", "mei_hit"),
         ("mate_mei_start", "mate_mei_end", "mate_mei_hit"),
     ):
-        if start_col not in detail.columns or end_col not in detail.columns:
+        if start_col not in work.columns or end_col not in work.columns:
             continue
-        hits = detail
-        if hit_col in detail.columns:
-            hits = detail.loc[detail[hit_col].astype(bool)]
+        hits = work
+        if hit_col in work.columns:
+            hits = work.loc[work[hit_col].astype(bool)]
+        # Per-hit family gate using the column that owns these coords.
+        tcol = "mei_target" if start_col.startswith("mei_") and not start_col.startswith("mate_") else "mate_mei_target"
+        if fam in {"ALU", "LINE1", "SVA"} and tcol in hits.columns:
+            tfam = hits[tcol].fillna("").astype(str).map(_target_family)
+            hits = hits.loc[tfam.eq(fam)]
         starts = pd.to_numeric(hits[start_col], errors="coerce").fillna(0).astype(int)
         ends = pd.to_numeric(hits[end_col], errors="coerce").fillna(0).astype(int)
         for start, end in zip(starts.tolist(), ends.tolist()):
@@ -177,6 +328,88 @@ def _mei_coords_from_detail(detail: pd.DataFrame) -> tuple[int, int] | None:
     if len(coords) < 2:
         return None
     return min(coords), max(coords)
+
+
+def _max_polya_zone_bp(detail: pd.DataFrame | None) -> int:
+    """Width of the dedicated polyA zone = longest observed polyA/T support."""
+    if detail is None or detail.empty:
+        return 0
+    widths: list[int] = []
+
+    def _add_span_widths(frame: pd.DataFrame) -> None:
+        for start_col, end_col in (("mate_mei_start", "mate_mei_end"), ("mei_start", "mei_end")):
+            if start_col not in frame.columns or end_col not in frame.columns:
+                continue
+            s = pd.to_numeric(frame[start_col], errors="coerce").fillna(0).astype(int)
+            e = pd.to_numeric(frame[end_col], errors="coerce").fillna(0).astype(int)
+            widths.extend(
+                int(ee - ss + 1) for ss, ee in zip(s.tolist(), e.tolist()) if ss > 0 and ee >= ss
+            )
+
+    if "polya_rescue" in detail.columns:
+        resc = detail.loc[detail["polya_rescue"].fillna(False).astype(bool)]
+        if not resc.empty:
+            if "mate_seq_len" in resc.columns:
+                lens = pd.to_numeric(resc["mate_seq_len"], errors="coerce").fillna(0).astype(int)
+                widths.extend(int(v) for v in lens.tolist() if int(v) >= 12)
+            _add_span_widths(resc)
+    if "mei_hit_source" in detail.columns:
+        src = detail["mei_hit_source"].fillna("").astype(str)
+        poly_src = detail.loc[src.eq("polya_rescue")]
+        if not poly_src.empty:
+            if "mate_seq_len" in poly_src.columns:
+                lens = pd.to_numeric(poly_src["mate_seq_len"], errors="coerce").fillna(0).astype(int)
+                widths.extend(int(v) for v in lens.tolist() if int(v) >= 12)
+            _add_span_widths(poly_src)
+    if "polya_base" in detail.columns:
+        poly_base = detail.loc[detail["polya_base"].fillna("").astype(str).isin({"A", "T", "a", "t"})]
+        if not poly_base.empty:
+            if "clip_len" in poly_base.columns:
+                cl = pd.to_numeric(poly_base["clip_len"], errors="coerce").fillna(0).astype(int)
+                widths.extend(int(v) for v in cl.tolist() if int(v) >= 12)
+            if "mate_seq_len" in poly_base.columns:
+                lens = pd.to_numeric(poly_base["mate_seq_len"], errors="coerce").fillna(0).astype(int)
+                widths.extend(int(v) for v in lens.tolist() if int(v) >= 12)
+    if "poly_tail_rescued" in detail.columns:
+        rescued = detail.loc[detail["poly_tail_rescued"].fillna(False).astype(bool)]
+        if not rescued.empty and "clip_len" in rescued.columns:
+            cl = pd.to_numeric(rescued["clip_len"], errors="coerce").fillna(0).astype(int)
+            widths.extend(int(v) for v in cl.tolist() if int(v) >= 12)
+    # DPE anchors clipped into polyA at the flank junction.
+    if "poly_tail_anchor_rescued" in detail.columns:
+        anc = detail.loc[detail["poly_tail_anchor_rescued"].fillna(False).astype(bool)]
+    else:
+        anc = detail.iloc[0:0].copy()
+    if anc.empty and "anchor_poly_at_run" in detail.columns:
+        runs = pd.to_numeric(detail["anchor_poly_at_run"], errors="coerce").fillna(0).astype(int)
+        anc = detail.loc[runs.ge(8)]
+    if not anc.empty:
+        if "anchor_poly_at_run" in anc.columns:
+            runs = pd.to_numeric(anc["anchor_poly_at_run"], errors="coerce").fillna(0).astype(int)
+            widths.extend(int(v) for v in runs.tolist() if int(v) >= 8)
+        if "soft_clip_len" in anc.columns:
+            cl = pd.to_numeric(anc["soft_clip_len"], errors="coerce").fillna(0).astype(int)
+            widths.extend(int(v) for v in cl.tolist() if int(v) >= 8)
+        # Same DPE: junction polyA clip + polyA mate → minimum tail ≈ sum.
+        if "mate_seq_len" in anc.columns:
+            mate_lens = pd.to_numeric(anc["mate_seq_len"], errors="coerce").fillna(0).astype(int)
+            clip_lens = (
+                pd.to_numeric(anc["soft_clip_len"], errors="coerce").fillna(0).astype(int)
+                if "soft_clip_len" in anc.columns
+                else pd.Series(0, index=anc.index)
+            )
+            run_lens = (
+                pd.to_numeric(anc["anchor_poly_at_run"], errors="coerce").fillna(0).astype(int)
+                if "anchor_poly_at_run" in anc.columns
+                else pd.Series(0, index=anc.index)
+            )
+            anchor_w = clip_lens.combine(run_lens, max)
+            for aw, mw in zip(anchor_w.tolist(), mate_lens.tolist()):
+                if int(aw) >= 8 and int(mw) >= 12:
+                    widths.append(int(aw) + int(mw))
+    if not widths:
+        return 0
+    return int(max(12, min(_MAX_POLYA_COMBINED_BP, max(widths))))
 
 
 def _discordant_mei_axis(row: pd.Series, sample: str) -> tuple[int, int, int] | None:
@@ -263,36 +496,59 @@ def _insertion_span_from_evidence(
 ) -> tuple[int, int, int, str]:
     """Return (mei_5p, mei_3p, span, source_label) for the plotted MEI axis.
 
-    Axis width is the extent of actual MEI consensus mappings only. Genomic
-    insert-size / TLEN estimates are never used to set or expand the axis —
-    mates are drawn at their minimap coordinates on that axis.
+    Axis width is the extent of same-family MEI consensus mappings only.
+    Off-family minimap hits (e.g. L1 mates at an Alu locus) are ignored.
+    Genomic insert-size / TLEN estimates are never used to set the axis.
     """
     del bp_l, bp_r, breakpoint  # retained for call-site compatibility
+    family = _row_mei_family(row)
 
-    detail_extent = _mei_coords_from_detail(detail) if detail is not None and not detail.empty else None
+    def _consensus_span() -> tuple[int, int, int, str] | None:
+        full_5p = _row_int(row, "consensus_insertion_mei_5p_coord_full")
+        full_3p = _row_int(row, "consensus_insertion_mei_3p_coord_full")
+        full_span = _row_int(row, "consensus_insertion_mei_span_full")
+        if full_5p > 0 and full_3p > full_5p:
+            return full_5p, full_3p, full_3p - full_5p + 1, "consensus_coords_full"
+        if full_span > 0 and full_5p > 0:
+            return full_5p, full_5p + full_span - 1, full_span, "consensus_span_full"
+        if full_span > 0 and full_3p > 0:
+            return max(1, full_3p - full_span + 1), full_3p, full_span, "consensus_span_full"
+        mei_5p = _row_int(row, "consensus_insertion_mei_5p_coord")
+        mei_3p = _row_int(row, "consensus_insertion_mei_3p_coord")
+        span = _row_int(row, "consensus_insertion_mei_span")
+        if mei_5p > 0 and mei_3p > mei_5p:
+            return mei_5p, mei_3p, mei_3p - mei_5p + 1, "consensus_coords"
+        if span > 0:
+            if mei_5p > 0 and mei_3p <= 0:
+                mei_3p = mei_5p + span - 1
+            elif mei_3p > 0 and mei_5p <= 0:
+                mei_5p = max(1, mei_3p - span + 1)
+            else:
+                mei_5p, mei_3p = 1, span
+            return mei_5p, mei_3p, span, "consensus_span"
+        return None
+
+    # Family-plausible upper bounds for read-derived axes (guards residual noise).
+    max_plausible = {"ALU": 400, "SVA": 2000, "LINE1": 7000}.get(family, 7000)
+
+    detail_extent = (
+        _mei_coords_from_detail(detail, family=family)
+        if detail is not None and not detail.empty
+        else None
+    )
     if detail_extent is not None:
         detail_5p, detail_3p = detail_extent
         detail_span = detail_3p - detail_5p + 1
-        if detail_span >= 1:
+        if detail_span >= 1 and detail_span <= max_plausible:
             return detail_5p, detail_3p, detail_span, "read_mei_coords"
 
-    disc = _discordant_mei_axis(row, sample)
-    if disc is not None:
-        return disc[0], disc[1], disc[2], "discordant_mei_targets"
+    consensus = _consensus_span()
+    if consensus is not None:
+        return consensus
 
-    mei_5p = _row_int(row, "consensus_insertion_mei_5p_coord")
-    mei_3p = _row_int(row, "consensus_insertion_mei_3p_coord")
-    span = _row_int(row, "consensus_insertion_mei_span")
-    if mei_5p > 0 and mei_3p > mei_5p:
-        return mei_5p, mei_3p, mei_3p - mei_5p + 1, "consensus_coords"
-    if span > 0:
-        if mei_5p > 0 and mei_3p <= 0:
-            mei_3p = mei_5p + span - 1
-        elif mei_3p > 0 and mei_5p <= 0:
-            mei_5p = max(1, mei_3p - span + 1)
-        else:
-            mei_5p, mei_3p = 1, span
-        return mei_5p, mei_3p, span, "consensus_span"
+    disc = _discordant_mei_axis(row, sample)
+    if disc is not None and disc[2] <= max_plausible:
+        return disc[0], disc[1], disc[2], "discordant_mei_targets"
 
     melt_len = _row_int(row, "g1k_melt_insertion_length")
     if melt_len > 0:
@@ -447,6 +703,7 @@ def _layout_from_row(
         window_start=ws,
         window_end=we,
     )
+    polya_zone_bp = _max_polya_zone_bp(detail)
     return LocusLayout(
         chrom=chrom,
         window_start=ws,
@@ -461,6 +718,7 @@ def _layout_from_row(
         span_source=span_source,
         insert_size_estimates=insert_sizes,
         orientation=orientation,
+        polya_zone_bp=polya_zone_bp,
     )
 
 
@@ -537,6 +795,10 @@ def _infer_orientation(
         left_mids: list[float] = []
         right_mids: list[float] = []
         for rec in work.itertuples(index=False):
+            if bool(getattr(rec, "polya_rescue", False)):
+                continue
+            if str(getattr(rec, "mei_hit_source", "") or "") == "polya_rescue":
+                continue
             et = str(rec.evidence_type)
             if evidence == "DPE":
                 if et != "DPE" or not bool(getattr(rec, "mate_mei_hit", False)):
@@ -581,21 +843,29 @@ def _infer_orientation(
 
 
 def _parse_support_counts(support_str: object) -> dict[str, int]:
-    """Parse ``SR_L=..,SR_R=..,DPE_L=..,DPE_R=..,MEI_MAPPED=..`` strings."""
+    """Parse ``SR_L=..,SR_R=..,DPE_L=..,DPE_R=..,MEI_MAPPED=..,polyA_MAPPED=..,VNTR_MAPPED=..``."""
     text = "" if support_str is None or (isinstance(support_str, float) and pd.isna(support_str)) else str(support_str)
-    out = {"SR_L": 0, "SR_R": 0, "DPE_L": 0, "DPE_R": 0, "MEI_MAPPED": 0}
+    out = {
+        "SR_L": 0,
+        "SR_R": 0,
+        "DPE_L": 0,
+        "DPE_R": 0,
+        "MEI_MAPPED": 0,
+        "polyA_MAPPED": 0,
+        "VNTR_MAPPED": 0,
+    }
     for key in out:
-        m = re.search(rf"{key}=([0-9]+)", text)
+        m = re.search(rf"{re.escape(key)}=([0-9]+)", text)
         if m:
             out[key] = int(m.group(1))
     return out
 
 
-def _support_score(support_str: object) -> tuple[int, int]:
-    """Rank sample support: prefer MEI_MAPPED, then total SR+DPE counts."""
+def _support_score(support_str: object) -> tuple[int, int, int, int]:
+    """Rank sample support: MEI_MAPPED, polyA_MAPPED, VNTR_MAPPED, then SR+DPE."""
     counts = _parse_support_counts(support_str)
     flank = counts["SR_L"] + counts["SR_R"] + counts["DPE_L"] + counts["DPE_R"]
-    return counts["MEI_MAPPED"], flank
+    return counts["MEI_MAPPED"], counts["polyA_MAPPED"], counts["VNTR_MAPPED"], flank
 
 
 def _choose_sample(row: pd.Series, sample: str) -> str:
@@ -610,11 +880,20 @@ def _choose_sample(row: pd.Series, sample: str) -> str:
     if disease_score > control_score:
         return "disease"
     # Tie: prefer disease when both present, else whichever has any flank support.
-    if disease_score[1] or disease_score[0]:
+    if any(disease_score):
         return "disease"
-    if control_score[1] or control_score[0]:
+    if any(control_score):
         return "control"
     return "disease"
+
+
+def _sample_status_label(row: pd.Series) -> str:
+    """Locus call status for plot labels: shared / disease_only / control_only / …"""
+    raw = row.get("sample_status_label", "")
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    text = str(raw).strip()
+    return text if text else ""
 
 
 def _normalize_mei_coords(
@@ -662,6 +941,215 @@ def _mei_span_x(
     return min(x0, x1), max(x0, x1)
 
 
+def _rescue_kind(rec) -> str:
+    """Return 'polya', 'vntr', or '' for second-pass MEI rescues."""
+    source = str(getattr(rec, "mei_hit_source", "") or "").strip().lower()
+    if bool(getattr(rec, "polya_rescue", False)) or source == "polya_rescue":
+        return "polya"
+    if bool(getattr(rec, "vntr_rescue", False)) or source == "vntr_rescue":
+        return "vntr"
+    return ""
+
+
+def _polya_base_from_rec(rec) -> str:
+    """Dominant A/T base for a polyA-rescue mate (default A)."""
+    base = str(getattr(rec, "polya_base", "") or "").upper()
+    if base in {"A", "T"}:
+        return base
+    mate_seq = str(getattr(rec, "mate_seq", "") or "").upper()
+    if mate_seq:
+        n_a = mate_seq.count("A")
+        n_t = mate_seq.count("T")
+        if n_t > n_a:
+            return "T"
+        if n_a > 0:
+            return "A"
+    return "A"
+
+
+def _polya_tail_label(width_bp: int, base: str = "A") -> str:
+    """Plot label as polyA length (e.g. ``66A``), never strand-dependent ``T``."""
+    del base  # sequenced mate may be polyT; display as polyA length
+    return f"{int(max(1, width_bp))}A"
+
+
+def _draw_polya_label(
+    ax,
+    *,
+    x0: float,
+    x1: float,
+    yi: float,
+    label: str,
+) -> None:
+    """Compact length+base label centered on the polyA bar (small-plot friendly)."""
+    span = float(x1) - float(x0)
+    if span <= 0 or not label:
+        return
+    # ~7" figure / ~700 bp axis ⇒ short tails are tiny; keep type readable but small.
+    if span >= 50:
+        fs = 5.0
+    elif span >= 25:
+        fs = 4.5
+    else:
+        fs = 4.0
+    ax.text(
+        (float(x0) + float(x1)) / 2.0,
+        float(yi),
+        label,
+        ha="center",
+        va="center",
+        fontsize=fs,
+        color=COLOR_BLACK,
+        zorder=5,
+        clip_on=True,
+        fontweight="bold",
+    )
+
+
+def _polya_tail_width_from_rec(rec, *, default: int = 0) -> int:
+    """Width of a polyA-rescue bar from mate length or sequence (0 if unknown)."""
+    for col in ("mate_seq_len", "polya_width"):
+        val = getattr(rec, col, None)
+        try:
+            n = int(float(val)) if val is not None and not (isinstance(val, float) and pd.isna(val)) else 0
+        except (TypeError, ValueError):
+            n = 0
+        if n >= 12:
+            return int(min(_MAX_POLYA_SINGLE_BP, n))
+    mate_seq = str(getattr(rec, "mate_seq", "") or "")
+    if len(mate_seq) >= 12:
+        # Prefer full mate length for near-pure tails.
+        s = mate_seq.upper()
+        n_a = s.count("A")
+        n_t = s.count("T")
+        dom = max(n_a, n_t)
+        # Dominant base / length (mostly A *or* mostly T), not A+T.
+        dom_frac = dom / float(len(s)) if s else 0.0
+        if dom_frac >= 0.90:
+            return int(min(_MAX_POLYA_SINGLE_BP, len(s)))
+    for start_col, end_col in (
+        ("mate_mei_start", "mate_mei_end"),
+        ("mei_start", "mei_end"),
+    ):
+        start = int(getattr(rec, start_col, 0) or 0)
+        end = int(getattr(rec, end_col, 0) or 0)
+        if start > 0 and end >= start:
+            return int(max(12, min(_MAX_POLYA_SINGLE_BP, end - start + 1)))
+    return int(default)
+
+
+def _combined_dpe_polya_width(anchor_width: int, mate_width: int) -> int:
+    """Minimum polyA length when junction clip and mate are both polyA.
+
+    Treat as non-overlapping stretches of the same tail (clip at the flank
+    junction + mate further into the A-tail), so length ≥ clip + mate.
+    """
+    a = max(0, int(anchor_width))
+    m = max(0, int(mate_width))
+    if a >= 8 and m >= 12:
+        return int(min(_MAX_POLYA_COMBINED_BP, a + m))
+    return int(min(_MAX_POLYA_COMBINED_BP, max(a, m)))
+
+
+def _polya_tail_span_x(layout: LocusLayout, width_bp: int) -> tuple[float, float]:
+    """Place a polyA/T bar inside the dedicated polyA zone (distal / flank-aligned)."""
+    return layout.polya_span_x(width_bp)
+
+
+def _dpe_has_anchor_polya_clip(rec) -> bool:
+    """True when the genomic DPE anchor itself is clipped / polyA-tailed at the junction."""
+    if bool(getattr(rec, "poly_tail_anchor_rescued", False)):
+        return True
+    try:
+        run = int(float(getattr(rec, "anchor_poly_at_run", 0) or 0))
+    except (TypeError, ValueError):
+        run = 0
+    if run >= 8:
+        return True
+    try:
+        soft = int(float(getattr(rec, "soft_clip_len", 0) or 0))
+    except (TypeError, ValueError):
+        soft = 0
+    base = str(getattr(rec, "anchor_poly_base", "") or "").upper()
+    return soft >= 8 and base in {"A", "T"}
+
+
+def _dpe_anchor_polya_width(rec, layout: LocusLayout) -> int:
+    """Width of the orange polyA overhang drawn from the flank junction into the polyA zone."""
+    try:
+        soft = int(float(getattr(rec, "soft_clip_len", 0) or 0))
+    except (TypeError, ValueError):
+        soft = 0
+    try:
+        run = int(float(getattr(rec, "anchor_poly_at_run", 0) or 0))
+    except (TypeError, ValueError):
+        run = 0
+    width = max(soft, run, 0)
+    if width < 8:
+        return 0
+    if layout.polya_zone_bp > 0:
+        width = min(width, int(layout.polya_zone_bp))
+    return int(min(_MAX_POLYA_SINGLE_BP, max(8, width)))
+
+
+def _dpe_anchor_polya_base(rec) -> str:
+    base = str(getattr(rec, "anchor_poly_base", "") or "").upper()
+    if base in {"A", "T"}:
+        return "A"  # display as polyA length
+    return _polya_base_from_rec(rec) or "A"
+
+
+def _dpe_anchor_abuts_polya_zone(side: str, layout: LocusLayout) -> bool:
+    """True when the genomic flank abuts the dedicated polyA zone (3′ side)."""
+    side_u = str(side or "").upper()
+    if layout.reverse_oriented:
+        return side_u == "L"
+    return side_u == "R"
+
+
+def _polya_span_from_flank_x(layout: LocusLayout, width_bp: int) -> tuple[float, float]:
+    """Place a polyA bar at the flank|polyA boundary (same as ``polya_span_x``)."""
+    return layout.polya_span_x(int(width_bp))
+
+
+def _sr_is_polya_clip(rec, layout: LocusLayout) -> bool:
+    """True when a split clip should be drawn in the polyA zone, not the MEI body."""
+    if _rescue_kind(rec) == "polya":
+        return True
+    base = str(
+        getattr(rec, "polya_base", "") or getattr(rec, "clip_poly_base", "") or ""
+    ).upper()
+    if base in {"A", "T"}:
+        return True
+    if bool(getattr(rec, "poly_tail_rescued", False)):
+        return True
+    mei_start = int(getattr(rec, "mei_start", 0) or 0)
+    # Synthetic polyA coords are tacked past consensus 3′.
+    if layout.polya_zone_bp > 0 and mei_start > int(layout.mei_3p):
+        return True
+    return False
+
+
+def _imputed_rescue_mei_span(rec, layout: LocusLayout) -> tuple[float, float] | None:
+    """Place polyA/VNTR-rescued mates that lack real consensus coords."""
+    kind = _rescue_kind(rec)
+    if not kind:
+        return None
+    if kind == "polya":
+        return _polya_tail_span_x(layout, _polya_tail_width_from_rec(rec))
+    lo = int(layout.mei_5p)
+    hi = int(layout.mei_3p)
+    if hi < lo:
+        return None
+    span = max(1, hi - lo + 1)
+    width = min(40, span)
+    start = lo + span // 3
+    end = lo + (2 * span) // 3
+    if end < start:
+        end = min(hi, start + max(1, width - 1))
+    return _mei_span_x(start, end, layout)
+
+
 def _resolve_anchor_side(rec, layout: LocusLayout) -> str | None:
     """Flank side from genomic position; fall back to detail anchor_side at the BP."""
     anchor_pos = int(rec.genomic_pos)
@@ -699,13 +1187,14 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
 
     BAM geometry:
       L softclip at junction J, clip_len C, schematic read width R:
-        orange (MEI) = C bp into insertion from the left junction
+        orange (MEI/polyA) = C bp into insertion from the left junction
         black (ref)  = (R-C) bp on the RIGHT flank starting at J
       R softclip at junction J:
-        orange (MEI) = C bp into insertion from the right junction
+        orange (MEI/polyA) = C bp into insertion from the right junction
         black (ref)  = (R-C) bp on the LEFT flank ending at J
 
     ``side`` is the genomic flank holding the mapped (black) portion.
+    PolyA/T clips are placed in the dedicated polyA zone beyond MEI 3′.
     """
     if not bool(getattr(rec, "mei_hit", False)):
         return None
@@ -731,9 +1220,25 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
         ref_end = junction
         ref_start = junction - mapped_len + 1
 
-    mei = _mei_span_x(int(rec.mei_start), int(rec.mei_end), layout)
-    if mei is None:
-        return None
+    polya_clip = _sr_is_polya_clip(rec, layout)
+    polya_width = 0
+    polya_base = ""
+    polya_label = ""
+    if polya_clip:
+        polya_width = int(max(clip_len, _polya_tail_width_from_rec(rec, default=clip_len)))
+        if layout.polya_zone_bp > 0:
+            polya_width = min(polya_width, int(layout.polya_zone_bp))
+        polya_base = _polya_base_from_rec(rec)
+        if not polya_base:
+            polya_base = str(getattr(rec, "clip_poly_base", "") or "A").upper() or "A"
+            if polya_base not in {"A", "T"}:
+                polya_base = "A"
+        polya_label = _polya_tail_label(polya_width, polya_base)
+        mei = layout.polya_span_x(polya_width)
+    else:
+        mei = _mei_span_x(int(rec.mei_start), int(rec.mei_end), layout)
+        if mei is None:
+            return None
 
     pair: dict[str, object] = {
         "anchor_pos": junction,
@@ -756,6 +1261,10 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
         "remote_kind": "sr_mei",
         "anchor_on_reference": True,
         "is_split": True,
+        "rescue_kind": "polya" if polya_clip else "",
+        "polya_width": polya_width,
+        "polya_base": polya_base,
+        "polya_label": polya_label,
     }
     if bool(getattr(rec, "mate_mei_hit", False)):
         mate_mei = _mei_span_x(
@@ -799,25 +1308,90 @@ def _pair_from_dpe_row(rec, layout: LocusLayout) -> dict[str, object] | None:
     remote_mei_x1 = 0.0
     mei_start = 0
     mei_end = 0
+    rescue_kind = _rescue_kind(rec)
+    polya_width = 0
+    polya_base = ""
+    polya_label = ""
 
-    if bool(getattr(rec, "mate_mei_hit", False)):
-        mei_start = int(getattr(rec, "mate_mei_start", 0) or 0)
-        mei_end = int(getattr(rec, "mate_mei_end", 0) or 0)
-        mate_mei = _mei_span_x(mei_start, mei_end, layout)
-        if mate_mei is not None:
-            remote_kind = "mate_mei"
-            remote_mei_x0, remote_mei_x1 = mate_mei
+    # PolyA rescues are not real consensus hits — always tack a polyA/T bar onto
+    # the MEI 3′ end instead of trusting clamped/zero remap coords.
+    if rescue_kind == "polya":
+        polya_width = _polya_tail_width_from_rec(rec)
+        polya_base = _polya_base_from_rec(rec)
+        polya_label = _polya_tail_label(polya_width, polya_base)
+        remote_mei_x0, remote_mei_x1 = _polya_tail_span_x(layout, polya_width)
+        remote_kind = "mate_mei"
+        # Keep synthetic coords as a tail past consensus 3′ for detail tables.
+        mei_start = int(layout.mei_3p) + 1
+        mei_end = int(layout.mei_3p) + int(polya_width)
+    else:
+        if bool(getattr(rec, "mate_mei_hit", False)):
+            mei_start = int(getattr(rec, "mate_mei_start", 0) or 0)
+            mei_end = int(getattr(rec, "mate_mei_end", 0) or 0)
+            mate_mei = _mei_span_x(mei_start, mei_end, layout)
+            if mate_mei is not None:
+                remote_kind = "mate_mei"
+                remote_mei_x0, remote_mei_x1 = mate_mei
 
-    if remote_kind == "" and bool(getattr(rec, "mei_hit", False)):
-        mei_start = int(getattr(rec, "mei_start", 0) or 0)
-        mei_end = int(getattr(rec, "mei_end", 0) or 0)
-        anchor_mei = _mei_span_x(mei_start, mei_end, layout)
-        if anchor_mei is not None:
-            remote_kind = "anchor_mei"
-            remote_mei_x0, remote_mei_x1 = anchor_mei
+        if remote_kind == "" and bool(getattr(rec, "mei_hit", False)):
+            mei_start = int(getattr(rec, "mei_start", 0) or 0)
+            mei_end = int(getattr(rec, "mei_end", 0) or 0)
+            anchor_mei = _mei_span_x(mei_start, mei_end, layout)
+            if anchor_mei is not None:
+                remote_kind = "anchor_mei"
+                remote_mei_x0, remote_mei_x1 = anchor_mei
+
+        if remote_kind == "" and rescue_kind:
+            imputed = _imputed_rescue_mei_span(rec, layout)
+            if imputed is not None:
+                remote_kind = "mate_mei"
+                remote_mei_x0, remote_mei_x1 = imputed
+                lo, hi = int(layout.mei_5p), int(layout.mei_3p)
+                span = max(1, hi - lo + 1)
+                width = min(40, span)
+                mei_start = lo + span // 3
+                mei_end = lo + (2 * span) // 3
+                if mei_end < mei_start:
+                    mei_end = mei_start + max(1, width - 1)
 
     if remote_kind == "":
         return None
+
+    anchor_polya_clip = False
+    anchor_polya_width = 0
+    anchor_polya_base = ""
+    anchor_polya_label = ""
+    anchor_polya_x0 = 0.0
+    anchor_polya_x1 = 0.0
+    if _dpe_has_anchor_polya_clip(rec):
+        # Ensure a polyA zone exists so the overhang has somewhere to land.
+        # (Zone width is usually set from locus-wide max; fall back to this clip.)
+        aw = _dpe_anchor_polya_width(rec, layout)
+        if aw <= 0 and layout.polya_zone_bp <= 0:
+            aw = max(12, int(getattr(rec, "anchor_poly_at_run", 0) or 12))
+        if aw > 0:
+            # Junction clip + polyA mate: minimum tail length is the sum
+            # (non-overlapping stretches of the same A-tail).
+            if rescue_kind == "polya" and polya_width >= 12:
+                combined = _combined_dpe_polya_width(aw, polya_width)
+                if layout.polya_zone_bp > 0:
+                    combined = min(combined, int(layout.polya_zone_bp))
+                polya_width = combined
+                polya_label = _polya_tail_label(combined, polya_base or _dpe_anchor_polya_base(rec))
+                remote_mei_x0, remote_mei_x1 = _polya_tail_span_x(layout, combined)
+                mei_start = int(layout.mei_3p) + 1
+                mei_end = int(layout.mei_3p) + int(combined)
+                aw = combined
+            elif layout.polya_zone_bp > 0:
+                aw = min(aw, int(layout.polya_zone_bp))
+            if _dpe_anchor_abuts_polya_zone(anchor_side, layout):
+                anchor_polya_x0, anchor_polya_x1 = _polya_span_from_flank_x(layout, aw)
+            else:
+                anchor_polya_x0, anchor_polya_x1 = _polya_tail_span_x(layout, aw)
+            anchor_polya_clip = True
+            anchor_polya_width = aw
+            anchor_polya_base = _dpe_anchor_polya_base(rec)
+            anchor_polya_label = _polya_tail_label(aw, anchor_polya_base)
 
     return {
         "anchor_pos": anchor_pos,
@@ -834,6 +1408,16 @@ def _pair_from_dpe_row(rec, layout: LocusLayout) -> dict[str, object] | None:
         "evidence_type": "DPE",
         "remote_kind": remote_kind,
         "anchor_on_reference": True,
+        "rescue_kind": rescue_kind,
+        "polya_width": polya_width,
+        "polya_base": polya_base,
+        "polya_label": polya_label,
+        "anchor_polya_clip": anchor_polya_clip,
+        "anchor_polya_width": anchor_polya_width,
+        "anchor_polya_base": anchor_polya_base,
+        "anchor_polya_label": anchor_polya_label,
+        "anchor_polya_x0": anchor_polya_x0,
+        "anchor_polya_x1": anchor_polya_x1,
     }
 
 
@@ -1189,6 +1773,8 @@ def _pair_segments(
         "dpe_skipped": 0,
         "sr_plotted": 0,
         "dpe_plotted": 0,
+        "polya_rescue_plotted": 0,
+        "vntr_rescue_plotted": 0,
     }
     for rec in detail.itertuples(index=False):
         if str(rec.evidence_type) == "SR":
@@ -1198,12 +1784,22 @@ def _pair_segments(
             else:
                 stats["sr_plotted"] += 1
                 pairs.append(pair)
+                rk = str(pair.get("rescue_kind", "") or "")
+                if rk == "polya":
+                    stats["polya_rescue_plotted"] += 1
+                elif rk == "vntr":
+                    stats["vntr_rescue_plotted"] += 1
         else:
             pair = _pair_from_dpe_row(rec, layout)
             if pair is None:
                 stats["dpe_skipped"] += 1
             else:
                 stats["dpe_plotted"] += 1
+                rk = str(pair.get("rescue_kind", "") or "")
+                if rk == "polya":
+                    stats["polya_rescue_plotted"] += 1
+                elif rk == "vntr":
+                    stats["vntr_rescue_plotted"] += 1
                 pairs.append(pair)
 
     stats["pairs_before_cap"] = len(pairs)
@@ -1257,8 +1853,8 @@ def _anchor_fully_on_reference(genomic_pos: int, layout: LocusLayout) -> bool:
 
 def _split_junction_x(layout: LocusLayout, side: str) -> float:
     if side == "L":
-        return layout.mei_region_start_x
-    return layout.mei_region_end_x
+        return layout.insertion_left_x
+    return layout.insertion_right_x
 
 
 def _clip_span(x0: float, x1: float, x_min: float, x_max: float) -> tuple[float, float]:
@@ -1287,6 +1883,8 @@ def _genomic_read_bar(
     start = int(genomic_pos)
     width = int(width_bp)
     end_excl = start + width
+    left_edge = layout.insertion_left_x
+    right_edge = layout.insertion_right_x
     if side == "L":
         end_excl = min(end_excl, layout.breakpoint)
         if end_excl <= start:
@@ -1294,13 +1892,13 @@ def _genomic_read_bar(
         x0 = layout.genomic_to_x(start)
         # Map exclusive end: last included base is end_excl-1, but keep width in x.
         x1 = x0 + (end_excl - start)
-        x1 = min(x1, layout.mei_region_start_x)
-        return _clip_span(x0, x1, 0.0, layout.mei_region_start_x)
+        x1 = min(x1, left_edge)
+        return _clip_span(x0, x1, 0.0, left_edge)
     start = max(start, layout.breakpoint)
     end_excl = start + width
     x0 = layout.genomic_to_x(start)
     x1 = x0 + width
-    return _clip_span(x0, x1, layout.mei_region_end_x, float(layout.total_width))
+    return _clip_span(x0, x1, right_edge, float(layout.total_width))
 
 
 def _split_segments(
@@ -1311,23 +1909,30 @@ def _split_segments(
     mei_x0: float,
     mei_x1: float,
     layout: LocusLayout,
+    polya_clip: bool = False,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """Black|orange split-read segments from real clip/mapped lengths + MEI coords.
 
     BAM: L softclip → mapped extends right of junction; R softclip → mapped ends at junction.
-    Orange width is the real clip_len, centered on the minimap MEI hit (so a 52 bp clip
-    at consensus 1327-1378 is drawn there, not as a generic stub).
+    Orange width is the real clip_len, centered on the mapped MEI hit (so a 52 bp clip
+    at consensus 1327-1378 is drawn there, not as a generic stub). PolyA clips are
+    placed in the dedicated polyA zone abutting MEI 3′.
     """
     clip_len = max(1, int(clip_len))
     mapped_len = max(1, int(mapped_len))
+    left_edge = layout.insertion_left_x
+    right_edge = layout.insertion_right_x
     if clip_side == "L":
         # Mapped genomic portion starts at BP and extends into the right flank.
-        j_ref = layout.mei_region_end_x
-        ref_span = _clip_span(j_ref, j_ref + mapped_len, layout.mei_region_end_x, float(layout.total_width))
+        j_ref = right_edge
+        ref_span = _clip_span(j_ref, j_ref + mapped_len, right_edge, float(layout.total_width))
     else:
         # Mapped genomic portion ends at BP on the left flank.
-        j_ref = layout.mei_region_start_x
-        ref_span = _clip_span(j_ref - mapped_len, j_ref, 0.0, layout.mei_region_start_x)
+        j_ref = left_edge
+        ref_span = _clip_span(j_ref - mapped_len, j_ref, 0.0, left_edge)
+
+    if polya_clip and layout.polya_zone_bp > 0:
+        return ref_span, layout.polya_span_x(clip_len)
 
     # Orange: clip_len bp centered on the mapped MEI interval.
     mx0 = min(float(mei_x0), float(mei_x1))
@@ -1344,7 +1949,6 @@ def _split_segments(
     if mei_span[1] - mei_span[0] < clip_len * 0.9 and mx1 > mx0:
         mei_span = _clip_span(mx0, mx1, layout.mei_region_start_x, layout.mei_region_end_x)
     return ref_span, mei_span
-
 
 def _mei_read_bar(
     *,
@@ -1410,15 +2014,17 @@ def _dpe_anchor_and_overhang(
     del mate_mei_x0, mate_mei_x1
     width = int(width_bp)
     start = int(anchor_pos)
+    left_edge = layout.insertion_left_x
+    right_edge = layout.insertion_right_x
     if side == "L":
         end_excl = min(start + width, layout.breakpoint)
         if end_excl <= start:
-            return (layout.mei_region_start_x, layout.mei_region_start_x), None
+            return (left_edge, left_edge), None
         x0 = layout.genomic_to_x(start)
-        return _clip_span(x0, x0 + (end_excl - start), 0.0, layout.mei_region_start_x), None
+        return _clip_span(x0, x0 + (end_excl - start), 0.0, left_edge), None
     start = max(start, layout.breakpoint)
     x0 = layout.genomic_to_x(start)
-    return _clip_span(x0, x0 + width, layout.mei_region_end_x, float(layout.total_width)), None
+    return _clip_span(x0, x0 + width, right_edge, float(layout.total_width)), None
 
 
 def _connector_endpoints(span_a: tuple[float, float], span_b: tuple[float, float]) -> tuple[float, float]:
@@ -1481,6 +2087,7 @@ def _draw_read_pair(
         mapped_len = int(pair.get("mapped_len", 0) or 0)
         if mapped_len <= 0:
             mapped_len = max(1, int(read_width_bp) - max(1, clip_len))
+        polya_clip = str(pair.get("rescue_kind", "")) == "polya"
         ref_span, mei_span = _split_segments(
             clip_side=clip_side,
             clip_len=clip_len,
@@ -1488,11 +2095,21 @@ def _draw_read_pair(
             mei_x0=float(pair.get("remote_mei_x0", 0)),
             mei_x1=float(pair.get("remote_mei_x1", 0)),
             layout=layout,
+            polya_clip=polya_clip,
         )
+        mei_color = COLOR_LIGHT_ORANGE if polya_clip else COLOR_DARK_ORANGE
         _draw_bar_span(ax, x0=ref_span[0], x1=ref_span[1], yi=yi, color=COLOR_BLACK)
-        _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=COLOR_DARK_ORANGE)
+        _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=mei_color)
+        if polya_clip:
+            label = str(pair.get("polya_label", "") or "")
+            if not label:
+                label = _polya_tail_label(
+                    int(pair.get("polya_width", 0) or max(1, int(mei_span[1] - mei_span[0]))),
+                    str(pair.get("polya_base", "A") or "A"),
+                )
+            _draw_polya_label(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, label=label)
         # Tick at the genomic junction the mapped portion abuts.
-        j = layout.mei_region_end_x if clip_side == "L" else layout.mei_region_start_x
+        j = layout.insertion_right_x if clip_side == "L" else layout.insertion_left_x
         ax.plot([j, j], [yi - 0.32, yi + 0.32], color=COLOR_BLACK, lw=2.2, zorder=4)
         c0, c1 = _connector_endpoints(mei_span, ref_span)
         _draw_connector(ax, x0=c0, x1=c1, yi=yi)
@@ -1515,16 +2132,79 @@ def _draw_read_pair(
     )
     _draw_bar_span(ax, x0=ref_span[0], x1=ref_span[1], yi=yi, color=COLOR_BLACK)
 
+    # Anchor softclip into polyA: orange from flank|polyA boundary into the polyA zone
+    # (SR-style), even when the mate is also a polyA rescue.
+    anchor_polya = bool(pair.get("anchor_polya_clip"))
+    anchor_polya_span: tuple[float, float] | None = None
+    mate_is_polya = str(pair.get("rescue_kind", "")) == "polya"
+    if anchor_polya and layout.polya_zone_bp > 0:
+        aw = int(pair.get("anchor_polya_width", 0) or 0)
+        if aw <= 0:
+            aw = max(1, int(round(float(pair.get("anchor_polya_x1", 0)) - float(pair.get("anchor_polya_x0", 0)))))
+        # Junction polyA clip + polyA mate → sum (minimum non-overlapping tail).
+        if mate_is_polya:
+            mate_w = int(pair.get("polya_width", 0) or 0)
+            # polya_width may already be the combined sum from pair-building;
+            # if anchor_polya_width was also set to that sum, don't double-add.
+            if mate_w > aw:
+                aw = mate_w
+            elif aw == mate_w:
+                pass
+            else:
+                # Prefer explicit sum when both raw pieces are present.
+                raw_anchor = int(pair.get("anchor_polya_width", 0) or 0)
+                # If pair already combined, polya_width == anchor_polya_width == sum.
+                aw = max(aw, mate_w)
+        aw = min(max(1, aw), int(layout.polya_zone_bp))
+        if _dpe_anchor_abuts_polya_zone(side, layout):
+            anchor_polya_span = _polya_span_from_flank_x(layout, aw)
+            j = layout.insertion_left_x if layout.reverse_oriented else layout.insertion_right_x
+        else:
+            anchor_polya_span = layout.polya_span_x(aw)
+            j = layout.insertion_left_x if side == "L" else layout.insertion_right_x
+        _draw_bar_span(
+            ax,
+            x0=anchor_polya_span[0],
+            x1=anchor_polya_span[1],
+            yi=yi,
+            color=COLOR_LIGHT_ORANGE,
+        )
+        label = str(pair.get("polya_label", "") or "") or str(pair.get("anchor_polya_label", "") or "")
+        if not label:
+            label = _polya_tail_label(aw, str(pair.get("anchor_polya_base", "A") or "A"))
+        _draw_polya_label(ax, x0=anchor_polya_span[0], x1=anchor_polya_span[1], yi=yi, label=label)
+        ax.plot([j, j], [yi - 0.32, yi + 0.32], color=COLOR_BLACK, lw=2.2, zorder=4)
+
+    mei_color = COLOR_LIGHT_ORANGE if str(pair.get("rescue_kind", "")) else COLOR_DARK_ORANGE
     mei_span = None
     if mate_mei is not None:
-        mei_span = _mei_read_bar(
-            mei_x0=mate_mei[0],
-            mei_x1=mate_mei[1],
-            width_bp=read_width_bp,
-            layout=layout,
-            anchor_side=side,
-        )
-        _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=COLOR_DARK_ORANGE)
+        if mate_is_polya:
+            if anchor_polya_span is not None:
+                # Already drew the polyA zone bar from the anchor clip (merged width).
+                mei_span = anchor_polya_span
+            else:
+                # Mate-only polyA rescue (no anchor polyA clip).
+                mei_span = (
+                    min(float(mate_mei[0]), float(mate_mei[1])),
+                    max(float(mate_mei[0]), float(mate_mei[1])),
+                )
+                _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=mei_color)
+                label = str(pair.get("polya_label", "") or "")
+                if not label:
+                    label = _polya_tail_label(
+                        int(pair.get("polya_width", 0) or max(1, int(mei_span[1] - mei_span[0]))),
+                        str(pair.get("polya_base", "A") or "A"),
+                    )
+                _draw_polya_label(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, label=label)
+        else:
+            mei_span = _mei_read_bar(
+                mei_x0=mate_mei[0],
+                mei_x1=mate_mei[1],
+                width_bp=read_width_bp,
+                layout=layout,
+                anchor_side=side,
+            )
+            _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=mei_color)
 
     if overhang is not None:
         _draw_bar_span(ax, x0=overhang[0], x1=overhang[1], yi=yi, color=COLOR_DARK_ORANGE)
@@ -1533,6 +2213,13 @@ def _draw_read_pair(
         _draw_connector(ax, x0=c0, x1=c1, yi=yi)
         if mei_span is not None:
             c0, c1 = _connector_endpoints(overhang, mei_span)
+            _draw_connector(ax, x0=c0, x1=c1, yi=yi)
+    elif anchor_polya_span is not None:
+        c0, c1 = _connector_endpoints(ref_span, anchor_polya_span)
+        _draw_connector(ax, x0=c0, x1=c1, yi=yi)
+        # If mate is a real MEI body hit (not polyA), also connect polyA -> mate.
+        if mei_span is not None and str(pair.get("rescue_kind", "")) != "polya":
+            c0, c1 = _connector_endpoints(anchor_polya_span, mei_span)
             _draw_connector(ax, x0=c0, x1=c1, yi=yi)
     elif mei_span is not None:
         c0, c1 = _connector_endpoints(ref_span, mei_span)
@@ -1695,12 +2382,55 @@ def plot_locus_architecture(
     if layout.insert_size_estimates:
         insert_hint = f"  genomic_insert_sizes={list(layout.insert_size_estimates)}"
 
-    sample_label = sample.upper()
+    # Plot reads from one BAM (disease or control); label by call status.
+    status_label = _sample_status_label(row) or sample
     support_str = str(row.get(f"{sample}_supporting_reads", "") or "")
     ori_label = "reverse (−)" if layout.reverse_oriented else "forward (+)"
 
-    # Half-size canvas; modest top band for wrapped title + flank labels above axes.
-    fig_h = max(3.0, len(pairs) * 0.09 + 2.0)
+    title_lines = [
+        (
+            f"SAMPLE: {status_label}  |  "
+            f"{layout.chrom}:{layout.window_start}-{layout.window_end}  "
+            f"BP={layout.breakpoint_left}-{layout.breakpoint_right}  "
+            f"{row.get('consensus_mei_family', '')}/{row.get('consensus_mei_subfamily', '')}  "
+            f"tier={row.get('analysis_stage_tier', '')}"
+        ),
+        (
+            f"{status_label} support: {support_str}  "
+            f"mei={layout.mei_5p}-{layout.mei_3p} ({layout.mei_span_bp} bp, {layout.span_source}, "
+            f"ori={layout.orientation} {ori_label})"
+            f"{insert_hint}"
+        ),
+        (
+            f"pairs_shown={pair_stats['pairs_shown']}/{pair_stats['pairs_before_cap']} "
+            f"(SR={pair_stats['sr_plotted']}, DPE={pair_stats['dpe_plotted']}; "
+            f"polyA_rescue={pair_stats.get('polya_rescue_plotted', 0)}, "
+            f"VNTR_rescue={pair_stats.get('vntr_rescue_plotted', 0)}; "
+            f"skipped SR={pair_stats['sr_skipped']}, DPE={pair_stats['dpe_skipped']}; "
+            f"detail_rows={pair_stats['detail_rows']})"
+        ),
+    ]
+    # Half-width figure (~700px @ 100dpi): wrap conservatively — bold 8.4pt is
+    # wider than monospace char estimates, so 95 chars still clips on the right.
+    title_fs = 8.4
+    wrap_width = 86
+    wrapped_parts: list[str] = []
+    for line in title_lines:
+        wrapped_parts.extend(
+            textwrap.wrap(line, width=wrap_width, break_long_words=True, break_on_hyphens=False) or [""]
+        )
+    wrapped_title = "\n".join(wrapped_parts)
+    n_title_rows = max(1, len(wrapped_parts))
+
+    # Reserve header/footer in inches so short (few-pair) figures still clear the
+    # wrapped title + flank labels. Fractional top margins shrink too much at fig_h~3.
+    title_line_in = (title_fs * 1.35) / 72.0
+    flank_label_in = 0.50 if layout.polya_zone_bp > 0 else 0.42
+    header_pad_in = 0.12
+    header_in = n_title_rows * title_line_in + flank_label_in + header_pad_in
+    bottom_in = 0.48
+    axes_in = max(1.35, len(pairs) * 0.09 + 0.55)
+    fig_h = header_in + axes_in + bottom_in
     fig, ax = plt.subplots(figsize=(7, fig_h))
     fig.patch.set_facecolor(COLOR_WHITE)
     ax.set_facecolor(COLOR_WHITE)
@@ -1708,11 +2438,29 @@ def plot_locus_architecture(
     # Tight axes: only reads (+ small pad). Labels live above the axes box.
     ax.set_ylim(-1, max(1, len(pairs)) + 0.8)
 
-    ax.axvspan(0, layout.flank_bp, color=COLOR_WHITE, alpha=1.0, zorder=0)
-    ax.axvspan(layout.mei_region_start_x, layout.mei_region_end_x, color=COLOR_LIGHT_ORANGE, alpha=0.55, zorder=0)
-    ax.axvspan(layout.mei_region_end_x, layout.total_width, color=COLOR_WHITE, alpha=1.0, zorder=0)
+    # Left flank | (polyA?) MEI (polyA?) | right flank
+    ax.axvspan(0, layout.insertion_left_x, color=COLOR_WHITE, alpha=1.0, zorder=0)
+    if layout.polya_zone_bp > 0:
+        ax.axvspan(
+            layout.polya_region_start_x,
+            layout.polya_region_end_x,
+            color=COLOR_LIGHT_ORANGE,
+            alpha=0.28,
+            zorder=0,
+        )
+    ax.axvspan(
+        layout.mei_region_start_x,
+        layout.mei_region_end_x,
+        color=COLOR_LIGHT_ORANGE,
+        alpha=0.55,
+        zorder=0,
+    )
+    ax.axvspan(layout.insertion_right_x, layout.total_width, color=COLOR_WHITE, alpha=1.0, zorder=0)
     ax.axvline(layout.mei_region_start_x, color=COLOR_DARK_ORANGE, ls="--", lw=1.2, alpha=0.9)
     ax.axvline(layout.mei_region_end_x, color=COLOR_DARK_ORANGE, ls="--", lw=1.2, alpha=0.9)
+    if layout.polya_zone_bp > 0:
+        outer = layout.polya_region_start_x if layout.reverse_oriented else layout.polya_region_end_x
+        ax.axvline(outer, color=COLOR_DARK_ORANGE, ls=":", lw=1.0, alpha=0.7)
     ax.axvline(layout.genomic_to_x(layout.breakpoint), color=COLOR_BLACK, ls="-", lw=2, alpha=1.0)
 
     for yi, pair in enumerate(reversed(pairs)):
@@ -1723,53 +2471,32 @@ def plot_locus_architecture(
     ax.set_xticklabels(mei_labels, color=COLOR_BLACK)
     ax.tick_params(axis="x", colors=COLOR_BLACK)
     ax.set_yticks([])
+    polya_note = (
+        f"; polyA zone {layout.polya_zone_bp} bp beyond 3′" if layout.polya_zone_bp > 0 else ""
+    )
     ax.set_xlabel(
-        f"MEI consensus coordinates ({layout.mei_5p}-{layout.mei_3p}, {layout.mei_span_bp} bp"
-        f", {ori_label}); "
+        f"MEI insertion 5′–3′ ({layout.mei_5p}–{layout.mei_3p}, {layout.mei_span_bp} bp, {ori_label})"
+        f"{polya_note}; "
         f"flanks are {layout.flank_bp} bp each side of breakpoint",
         color=COLOR_BLACK,
         fontsize=8,
     )
-    title_lines = [
-        (
-            f"SAMPLE: {sample_label}  |  "
-            f"{layout.chrom}:{layout.window_start}-{layout.window_end}  "
-            f"BP={layout.breakpoint_left}-{layout.breakpoint_right}  "
-            f"{row.get('consensus_mei_family', '')}/{row.get('consensus_mei_subfamily', '')}  "
-            f"tier={row.get('analysis_stage_tier', '')}"
-        ),
-        (
-            f"{sample_label} support: {support_str}  "
-            f"mei={layout.mei_5p}-{layout.mei_3p} ({layout.mei_span_bp} bp, {layout.span_source}, "
-            f"ori={layout.orientation} {ori_label})"
-            f"{insert_hint}"
-        ),
-        (
-            f"pairs_shown={pair_stats['pairs_shown']}/{pair_stats['pairs_before_cap']} "
-            f"(SR={pair_stats['sr_plotted']}, DPE={pair_stats['dpe_plotted']}; "
-            f"skipped SR={pair_stats['sr_skipped']}, DPE={pair_stats['dpe_skipped']}; "
-            f"detail_rows={pair_stats['detail_rows']})"
-        ),
-    ]
-    # Half-width figure (~700px @ 100dpi): wrap to ~95 chars so sides are not clipped.
-    title_fs = 8.4
-    wrap_width = 95
-    wrapped_parts: list[str] = []
-    for line in title_lines:
-        wrapped_parts.extend(textwrap.wrap(line, width=wrap_width, break_long_words=False, break_on_hyphens=False) or [""])
-    wrapped_title = "\n".join(wrapped_parts)
+
+    top = 1.0 - header_in / fig_h
+    bottom = bottom_in / fig_h
+    fig.subplots_adjust(left=0.04, right=0.99, bottom=bottom, top=top)
 
     # Title in figure coordinates (above axes), not ax.set_title (which collides when top is tight).
     fig.text(
         0.02,
-        0.99,
+        0.995,
         wrapped_title,
         ha="left",
         va="top",
         fontsize=title_fs,
         fontweight="bold",
         color=COLOR_BLACK,
-        linespacing=1.1,
+        linespacing=1.15,
     )
 
     # Region labels sit just above the axes frame (axes-fraction y > 1), not in the data area.
@@ -1778,18 +2505,31 @@ def plot_locus_architecture(
     right_lab = layout.mei_5p if layout.reverse_oriented else layout.mei_3p
     left_end = "3′" if layout.reverse_oriented else "5′"
     right_end = "5′" if layout.reverse_oriented else "3′"
-    for x_data, text in (
-        (layout.flank_bp / 2, f"{layout.chrom}\nleft flank"),
+    region_labels: list[tuple[float, str]] = [
+        (layout.insertion_left_x / 2.0, f"{layout.chrom}\nleft flank"),
         (
-            layout.mei_region_start_x + layout.mei_span_bp / 2,
+            layout.mei_region_start_x + layout.mei_span_bp / 2.0,
             f"MEI ({ori_label})\n{left_end} {left_lab}…{right_lab} {right_end}",
         ),
-        (layout.mei_region_end_x + layout.flank_bp / 2, f"{layout.chrom}\nright flank"),
-    ):
+    ]
+    if layout.polya_zone_bp > 0:
+        region_labels.append(
+            (
+                (layout.polya_region_start_x + layout.polya_region_end_x) / 2.0,
+                f"polyA\n{layout.polya_zone_bp} bp",
+            )
+        )
+    region_labels.append(
+        (
+            layout.insertion_right_x + layout.flank_bp / 2.0,
+            f"{layout.chrom}\nright flank",
+        )
+    )
+    for x_data, label_text in region_labels:
         ax.text(
             x_data,
-            1.03,
-            text,
+            1.02,
+            label_text,
             transform=label_trans,
             ha="center",
             va="bottom",
@@ -1798,11 +2538,11 @@ def plot_locus_architecture(
             clip_on=False,
         )
 
-    # Sample badge inside the plot (corner).
+    # Call-status badge inside the plot (corner): shared / disease_only / control_only.
     ax.text(
         0.01,
         0.98,
-        sample_label,
+        status_label,
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -1816,10 +2556,6 @@ def plot_locus_architecture(
     for spine in ax.spines.values():
         spine.set_color(COLOR_BLACK)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    # Compact top margin: enough for title + flank labels, without a large empty band.
-    n_title_rows = max(3, len(wrapped_parts))
-    top = min(0.82, max(0.70, 0.86 - 0.025 * max(0, n_title_rows - 3)))
-    fig.subplots_adjust(left=0.04, right=0.99, bottom=0.11, top=top)
     fig.savefig(out_png, dpi=100)
     plt.close(fig)
     return out_png, detail
@@ -1929,6 +2665,7 @@ def generate_gold_read_architecture_plots(
                 "discovery_window_end": _row_int(row, "discovery_window_end"),
                 "consensus_insertion_breakpoint_pos": bp,
                 "sample": chosen,
+                "sample_status_label": _sample_status_label(row),
                 "consensus_mei_family": row.get("consensus_mei_family", ""),
                 "consensus_mei_subfamily": row.get("consensus_mei_subfamily", ""),
                 "png": str(out_png) if status == "ok" else "",

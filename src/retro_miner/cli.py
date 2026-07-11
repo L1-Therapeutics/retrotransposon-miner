@@ -270,9 +270,10 @@ def extract_split_evidence_cmd(
 @click.option(
     "--split-cluster-bp",
     type=int,
-    default=30,
+    default=100,
     show_default=True,
-    help="Breakpoint clustering distance for split-read evidence (bp).",
+    help="Breakpoint clustering distance for split-read evidence (bp). "
+    "Larger than a typical TSD so dual-breakpoint / SVA scatter stays one seed.",
 )
 @click.option(
     "--discordant-cluster-bp",

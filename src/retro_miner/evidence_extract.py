@@ -54,29 +54,86 @@ def _collect_soft_clips(read: pysam.AlignedSegment, min_clip_len: int) -> list[t
 
 
 def _poly_at_stats(seq: str) -> tuple[int, float, str]:
+    """PolyA/T stats: longest dominant-base run, dominant-base fraction, base.
+
+    Purity is ``max(n_A, n_T) / length`` — mostly A **or** mostly T — not
+    combined A+T. Mixed AT sequence scores ~0.5 and fails typical thresholds.
+    """
     s = (seq or "").upper()
     if not s:
         return (0, 0.0, "")
+    n_a = s.count("A")
+    n_t = s.count("T")
+    if n_a <= 0 and n_t <= 0:
+        return (0, 0.0, "")
+    if n_a >= n_t:
+        base = "A"
+        n_dom = n_a
+    else:
+        base = "T"
+        n_dom = n_t
+    frac = float(n_dom) / float(len(s))
     best = 0
-    best_base = ""
     cur = 0
-    prev = ""
-    at_bases = 0
     for ch in s:
-        if ch in {"A", "T"}:
-            at_bases += 1
-            if ch == prev:
-                cur += 1
-            else:
-                cur = 1
-                prev = ch
+        if ch == base:
+            cur += 1
             if cur > best:
                 best = cur
-                best_base = ch
         else:
             cur = 0
-            prev = ""
-    return (best, float(at_bases) / float(len(s)), best_base)
+    return (int(best), float(frac), base)
+
+
+def _longest_poly_at_span(
+    seq: str,
+    *,
+    min_frac: float = 0.90,
+    min_len: int = 25,
+) -> tuple[int, float, str, str]:
+    """Longest substring that is mostly polyA or mostly polyT (see mei_support)."""
+    s = "".join(ch for ch in (seq or "").upper() if ch in {"A", "C", "G", "T"})
+    n = len(s)
+    if n < int(min_len):
+        return (0, 0.0, "", "")
+    best_len = 0
+    best_frac = 0.0
+    best_base = ""
+    best_ij = (0, 0)
+    thr = float(min_frac)
+    for base in ("A", "T"):
+        left = 0
+        n_base = 0
+        for right in range(n):
+            if s[right] == base:
+                n_base += 1
+            while left <= right and (n_base / float(right - left + 1)) < thr:
+                if s[left] == base:
+                    n_base -= 1
+                left += 1
+            cur_len = right - left + 1
+            if cur_len >= int(min_len) and n_base > 0:
+                frac = float(n_base) / float(cur_len)
+                if cur_len > best_len or (cur_len == best_len and frac > best_frac):
+                    best_len = cur_len
+                    best_frac = frac
+                    best_base = base
+                    best_ij = (left, right + 1)
+    if best_len <= 0:
+        return (0, 0.0, "", "")
+    span = s[best_ij[0] : best_ij[1]]
+    if best_len >= 140 or best_len >= n - 2:
+        best_len = n
+        best_frac = float(span.count(best_base)) / float(len(span)) if span else best_frac
+        span = s
+    return (int(best_len), float(best_frac), best_base, span)
+
+
+def _clip_to_poly_at_region(seq: str, *, min_dom_frac: float = 0.90) -> str:
+    """Return the longest mostly-A or mostly-T substring (empty if none)."""
+    _length, _frac, _base, span = _longest_poly_at_span(seq, min_frac=float(min_dom_frac))
+    return span
+
 
 
 def _poly_at_breakpoint_proximal_stats(
@@ -156,7 +213,12 @@ def extract_split_evidence(
                         clip_seq = query_seq[:clip_len]
                     else:
                         clip_seq = query_seq[-clip_len:]
-                poly_run, poly_frac, poly_base = _poly_at_stats(clip_seq)
+                span_len, poly_frac, poly_base, poly_region = _longest_poly_at_span(clip_seq, min_frac=0.90, min_len=8)
+                if span_len <= 0:
+                    poly_run, poly_frac, poly_base = _poly_at_stats(clip_seq)
+                else:
+                    poly_run = span_len
+                    # keep poly_frac/base from span
                 poly_tail_rescued = (
                     clip_len < min_clip_len
                     and clip_len >= max(1, int(poly_tail_rescue_min_clip_len))

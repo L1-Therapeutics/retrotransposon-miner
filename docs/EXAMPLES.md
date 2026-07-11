@@ -55,22 +55,24 @@ Additional tumor-only novel LINE-1 insertion that is unnested.
 
 Novel tumor-only nested LINE-1 insertion on chromosome X.
 
-### GRCh38 chr22:22131552-22132407 - known LINE-1 with split-read and discordant-pair support
-
-![GRCh38 chr22:22131552-22132407 LINE-1 read architecture](examples/grch38_line1_read_arch_chr22_22131552_22132407.png)
-
-LINE-1 (`L1HS`) insertion at `chr22:22131981` (breakpoint interval `22131976-22131986`), annotated as a known 1000 Genomes polymorphism (`nssv14066334`, MELT).  
-The read-architecture plot shows split-read (SR) and discordant paired-end (DPE) support bridging the genomic flanks (black) into the reverse-oriented MEI consensus (orange), with TSD sequence `GCATATTTCTT` and a 17 bp polyA/polyT run.
-
-### GRCh38 chr22:49029238-49029720 - known SVA from short-read data
-
-![GRCh38 chr22:49029238-49029720 known SVA](examples/grch38_known_sva_chr22_49029238_49029720.png)
-
-SVA insertion present in 1000 Genomes short-read data but not reported in matched long-read data (`nssv14064350`, MELT).  
-Breakpoint at `chr22:49029650` (interval `49029645-49029656`), TSD `AAGAAAACTCCT`, and a 19 bp polyA/polyT run.
-
-### SVA insertion (GRCh38 chr22:49029650)
+### GRCh38 chr22:49029650 - top-ranked SVA (read architecture)
 
 <img src="examples/grch38_sva_read_arch_chr22_49029238_49029720.png" alt="GRCh38 chr22 SVA read architecture" width="1470" />
 
-Known SVA insertion (`nssv14064350`) with two-sided SR/DPE support into a forward-oriented SVA consensus. Black segments map to chr22 flanks; orange segments map to the SVA consensus (`SVA_F` / `SVA_D`).
+Known SVA insertion (`nssv14064350`, MELT) with two-sided SR/DPE support into a forward-oriented `SVA_D` consensus.  
+Breakpoint interval `49029645-49029656`, TSD `AAGAAAACTCCT`, polyA/VNTR rescue in the support string, and full-consensus span ~1–1386. Overlapping split seeds for this event are merged into one candidate window.
+
+An IGV-style snapshot of the same locus is at `examples/grch38_known_sva_chr22_49029238_49029720.png`.
+
+### GRCh38 chr22:31355872 - top-ranked Alu (read architecture)
+
+<img src="examples/grch38_alu_read_arch_chr22_31355856_31355889.png" alt="GRCh38 chr22 Alu read architecture" width="1470" />
+
+Shared Alu (`AluYh7`) at `chr22:31355872` (interval `31355856-31355889`) with TSD `GCCCGCCTCGGCTTCCCAAAGTGCTGGGATTACA` and near-full consensus coverage (~1–299).
+
+### GRCh38 chr22:22131981 - known LINE-1 with split-read and discordant-pair support
+
+<img src="examples/grch38_line1_read_arch_chr22_22131552_22132407.png" alt="GRCh38 chr22 LINE-1 read architecture" width="1470" />
+
+LINE-1 (`L1HS`) insertion at `chr22:22131981` (breakpoint interval `22131976-22131986`), annotated as a known 1000 Genomes polymorphism (`nssv14066334`, MELT).  
+Control-only with TSD `GCATATTTCTT`. Panel `L1HS_5end` / `L1HS_3end` alignments are projected onto the shared full-length L1 axis (near-full ~3–6018) rather than min/max’d on short fragment references.

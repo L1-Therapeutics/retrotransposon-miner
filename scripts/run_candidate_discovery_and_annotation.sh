@@ -18,6 +18,9 @@ CONTROL_BAM=""
 DISEASE_MATE_BAM=""
 CONTROL_MATE_BAM=""
 MEI_FASTA=""
+# Optional full-length consensus panel (L1HS ~6 kb, AluY, SVA_F). When unset,
+# annotate-mei-support auto-resolves packaged full_consensus next to --mei-fasta.
+MEI_FULL_FASTA="${MEI_FULL_FASTA:-}"
 REFERENCE_FASTA=""
 RMSK_TABLE=""
 G1K_MEI_VCF=""
@@ -214,6 +217,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mei-fasta)
       MEI_FASTA="$2"
+      shift 2
+      ;;
+    --mei-full-fasta)
+      MEI_FULL_FASTA="$2"
       shift 2
       ;;
     --reference-fasta)
@@ -513,6 +520,21 @@ run_annotate_mei_support() {
     --disease-bam-depth "${DISEASE_BAM}"
     --control-bam-depth "${CONTROL_BAM}"
   )
+  if [[ -z "${MEI_FULL_FASTA}" ]]; then
+    # Prefer curated full-length panel beside the Dfam/panel fasta.
+    for _cand in \
+      "$(dirname "${MEI_FASTA}")/../full_consensus/mei_full_canonical.ucsc_repeatbrowser.fa" \
+      "$(dirname "${MEI_FASTA}")/full_consensus/mei_full_canonical.ucsc_repeatbrowser.fa"
+    do
+      if [[ -f "${_cand}" ]]; then
+        MEI_FULL_FASTA="$(cd "$(dirname "${_cand}")" && pwd)/$(basename "${_cand}")"
+        break
+      fi
+    done
+  fi
+  if [[ -n "${MEI_FULL_FASTA}" ]]; then
+    annotate_cmd+=(--mei-full-fasta "${MEI_FULL_FASTA}")
+  fi
   if [[ -n "${DISEASE_MATE_BAM}" ]]; then
     annotate_cmd+=(--disease-mate-bam "${DISEASE_MATE_BAM}")
   fi
