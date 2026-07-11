@@ -330,11 +330,61 @@ def _mei_coords_from_detail(
     return min(coords), max(coords)
 
 
-def _max_polya_zone_bp(detail: pd.DataFrame | None) -> int:
+def _mate_polya_width_bp(row: pd.Series) -> int:
+    """Observed polyA/T width for a mate — never raw mate_seq_len alone.
+
+    Prefer purity-checked ``mate_seq``, then imputed polyA rescue spans.
+    ``mate_seq_len`` is only a fallback when the row is explicitly a polyA
+    rescue (annotate already required a mostly-A/T mate).
+    """
+    mate_seq = str(row.get("mate_seq", "") or "")
+    if len(mate_seq) >= 12:
+        s = mate_seq.upper()
+        n_a = s.count("A")
+        n_t = s.count("T")
+        dom = max(n_a, n_t)
+        if dom / float(len(s)) >= 0.90:
+            return int(min(_MAX_POLYA_SINGLE_BP, len(s)))
+    for start_col, end_col in (("mate_mei_start", "mate_mei_end"), ("mei_start", "mei_end")):
+        if start_col not in row.index or end_col not in row.index:
+            continue
+        try:
+            start = int(float(row.get(start_col) or 0))
+            end = int(float(row.get(end_col) or 0))
+        except (TypeError, ValueError):
+            continue
+        if start > 0 and end >= start:
+            # Only trust synthetic/imputed spans on polyA-rescue rows.
+            is_rescue = bool(row.get("polya_rescue", False)) or str(
+                row.get("mei_hit_source", "") or ""
+            ).strip().lower() in {"polya_rescue", "poly_tail_rescue"}
+            if is_rescue:
+                return int(max(0, min(_MAX_POLYA_SINGLE_BP, end - start + 1)))
+    is_rescue = bool(row.get("polya_rescue", False)) or str(
+        row.get("mei_hit_source", "") or ""
+    ).strip().lower() in {"polya_rescue", "poly_tail_rescue"}
+    if is_rescue and "mate_seq_len" in row.index:
+        try:
+            n = int(float(row.get("mate_seq_len") or 0))
+        except (TypeError, ValueError):
+            n = 0
+        if n >= 12:
+            return int(min(_MAX_POLYA_SINGLE_BP, n))
+    return 0
+
+
+def _max_polya_zone_bp(
+    detail: pd.DataFrame | None,
+    *,
+    consensus_poly_at_min_bp: int = 0,
+) -> int:
     """Width of the dedicated polyA zone = longest observed polyA/T support."""
-    if detail is None or detail.empty:
-        return 0
     widths: list[int] = []
+    gold = int(consensus_poly_at_min_bp or 0)
+    if gold >= 8:
+        widths.append(gold)
+    if detail is None or detail.empty:
+        return int(max(0, min(_MAX_POLYA_COMBINED_BP, max(widths)))) if widths else 0
 
     def _add_span_widths(frame: pd.DataFrame) -> None:
         for start_col, end_col in (("mate_mei_start", "mate_mei_end"), ("mei_start", "mei_end")):
@@ -349,17 +399,17 @@ def _max_polya_zone_bp(detail: pd.DataFrame | None) -> int:
     if "polya_rescue" in detail.columns:
         resc = detail.loc[detail["polya_rescue"].fillna(False).astype(bool)]
         if not resc.empty:
-            if "mate_seq_len" in resc.columns:
-                lens = pd.to_numeric(resc["mate_seq_len"], errors="coerce").fillna(0).astype(int)
-                widths.extend(int(v) for v in lens.tolist() if int(v) >= 12)
+            # Use imputed polyA spans / purity-checked mate width — not raw mate_seq_len
+            # on non-rescue MEI mates (that inflated zones to ~clip+151).
+            widths.extend(int(v) for v in resc.apply(_mate_polya_width_bp, axis=1).tolist() if int(v) >= 12)
             _add_span_widths(resc)
     if "mei_hit_source" in detail.columns:
         src = detail["mei_hit_source"].fillna("").astype(str)
         poly_src = detail.loc[src.eq("polya_rescue")]
         if not poly_src.empty:
-            if "mate_seq_len" in poly_src.columns:
-                lens = pd.to_numeric(poly_src["mate_seq_len"], errors="coerce").fillna(0).astype(int)
-                widths.extend(int(v) for v in lens.tolist() if int(v) >= 12)
+            widths.extend(
+                int(v) for v in poly_src.apply(_mate_polya_width_bp, axis=1).tolist() if int(v) >= 12
+            )
             _add_span_widths(poly_src)
     if "polya_base" in detail.columns:
         poly_base = detail.loc[detail["polya_base"].fillna("").astype(str).isin({"A", "T", "a", "t"})]
@@ -367,9 +417,9 @@ def _max_polya_zone_bp(detail: pd.DataFrame | None) -> int:
             if "clip_len" in poly_base.columns:
                 cl = pd.to_numeric(poly_base["clip_len"], errors="coerce").fillna(0).astype(int)
                 widths.extend(int(v) for v in cl.tolist() if int(v) >= 12)
-            if "mate_seq_len" in poly_base.columns:
-                lens = pd.to_numeric(poly_base["mate_seq_len"], errors="coerce").fillna(0).astype(int)
-                widths.extend(int(v) for v in lens.tolist() if int(v) >= 12)
+            widths.extend(
+                int(v) for v in poly_base.apply(_mate_polya_width_bp, axis=1).tolist() if int(v) >= 12
+            )
     if "poly_tail_rescued" in detail.columns:
         rescued = detail.loc[detail["poly_tail_rescued"].fillna(False).astype(bool)]
         if not rescued.empty and "clip_len" in rescued.columns:
@@ -390,23 +440,23 @@ def _max_polya_zone_bp(detail: pd.DataFrame | None) -> int:
         if "soft_clip_len" in anc.columns:
             cl = pd.to_numeric(anc["soft_clip_len"], errors="coerce").fillna(0).astype(int)
             widths.extend(int(v) for v in cl.tolist() if int(v) >= 8)
-        # Same DPE: junction polyA clip + polyA mate → minimum tail ≈ sum.
-        if "mate_seq_len" in anc.columns:
-            mate_lens = pd.to_numeric(anc["mate_seq_len"], errors="coerce").fillna(0).astype(int)
-            clip_lens = (
-                pd.to_numeric(anc["soft_clip_len"], errors="coerce").fillna(0).astype(int)
-                if "soft_clip_len" in anc.columns
-                else pd.Series(0, index=anc.index)
-            )
-            run_lens = (
-                pd.to_numeric(anc["anchor_poly_at_run"], errors="coerce").fillna(0).astype(int)
-                if "anchor_poly_at_run" in anc.columns
-                else pd.Series(0, index=anc.index)
-            )
-            anchor_w = clip_lens.combine(run_lens, max)
-            for aw, mw in zip(anchor_w.tolist(), mate_lens.tolist()):
-                if int(aw) >= 8 and int(mw) >= 12:
-                    widths.append(int(aw) + int(mw))
+        # Same DPE: junction polyA clip + polyA mate → sum only when mate is
+        # actually polyA (rescue / purity), never raw mate_seq_len of MEI mates.
+        clip_lens = (
+            pd.to_numeric(anc["soft_clip_len"], errors="coerce").fillna(0).astype(int)
+            if "soft_clip_len" in anc.columns
+            else pd.Series(0, index=anc.index)
+        )
+        run_lens = (
+            pd.to_numeric(anc["anchor_poly_at_run"], errors="coerce").fillna(0).astype(int)
+            if "anchor_poly_at_run" in anc.columns
+            else pd.Series(0, index=anc.index)
+        )
+        anchor_w = clip_lens.combine(run_lens, max)
+        mate_w = anc.apply(_mate_polya_width_bp, axis=1)
+        for aw, mw in zip(anchor_w.tolist(), mate_w.tolist()):
+            if int(aw) >= 8 and int(mw) >= 12:
+                widths.append(int(aw) + int(mw))
     if not widths:
         return 0
     return int(max(12, min(_MAX_POLYA_COMBINED_BP, max(widths))))
@@ -703,7 +753,12 @@ def _layout_from_row(
         window_start=ws,
         window_end=we,
     )
-    polya_zone_bp = _max_polya_zone_bp(detail)
+    gold_poly = 0
+    try:
+        gold_poly = int(float(row.get("consensus_poly_at_min_bp", 0) or 0))
+    except (TypeError, ValueError):
+        gold_poly = 0
+    polya_zone_bp = _max_polya_zone_bp(detail, consensus_poly_at_min_bp=gold_poly)
     return LocusLayout(
         chrom=chrom,
         window_start=ws,
@@ -1007,34 +1062,32 @@ def _draw_polya_label(
 
 
 def _polya_tail_width_from_rec(rec, *, default: int = 0) -> int:
-    """Width of a polyA-rescue bar from mate length or sequence (0 if unknown)."""
-    for col in ("mate_seq_len", "polya_width"):
-        val = getattr(rec, col, None)
+    """Width of a polyA-rescue bar from purity-checked mate / imputed span."""
+    if isinstance(rec, pd.Series):
+        w = _mate_polya_width_bp(rec)
+        if w >= 12:
+            return int(w)
+    else:
+        # namedtuple / row-like from itertuples
+        row = {
+            "mate_seq": getattr(rec, "mate_seq", ""),
+            "mate_seq_len": getattr(rec, "mate_seq_len", 0),
+            "mate_mei_start": getattr(rec, "mate_mei_start", 0),
+            "mate_mei_end": getattr(rec, "mate_mei_end", 0),
+            "mei_start": getattr(rec, "mei_start", 0),
+            "mei_end": getattr(rec, "mei_end", 0),
+            "polya_rescue": getattr(rec, "polya_rescue", False),
+            "mei_hit_source": getattr(rec, "mei_hit_source", ""),
+        }
+        w = _mate_polya_width_bp(pd.Series(row))
+        if w >= 12:
+            return int(w)
         try:
-            n = int(float(val)) if val is not None and not (isinstance(val, float) and pd.isna(val)) else 0
+            pw = int(float(getattr(rec, "polya_width", 0) or 0))
         except (TypeError, ValueError):
-            n = 0
-        if n >= 12:
-            return int(min(_MAX_POLYA_SINGLE_BP, n))
-    mate_seq = str(getattr(rec, "mate_seq", "") or "")
-    if len(mate_seq) >= 12:
-        # Prefer full mate length for near-pure tails.
-        s = mate_seq.upper()
-        n_a = s.count("A")
-        n_t = s.count("T")
-        dom = max(n_a, n_t)
-        # Dominant base / length (mostly A *or* mostly T), not A+T.
-        dom_frac = dom / float(len(s)) if s else 0.0
-        if dom_frac >= 0.90:
-            return int(min(_MAX_POLYA_SINGLE_BP, len(s)))
-    for start_col, end_col in (
-        ("mate_mei_start", "mate_mei_end"),
-        ("mei_start", "mei_end"),
-    ):
-        start = int(getattr(rec, start_col, 0) or 0)
-        end = int(getattr(rec, end_col, 0) or 0)
-        if start > 0 and end >= start:
-            return int(max(12, min(_MAX_POLYA_SINGLE_BP, end - start + 1)))
+            pw = 0
+        if pw >= 12:
+            return int(min(_MAX_POLYA_SINGLE_BP, pw))
     return int(default)
 
 
