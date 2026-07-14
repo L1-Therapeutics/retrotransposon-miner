@@ -6688,10 +6688,18 @@ def _add_consolidated_event_fields(candidates: pd.DataFrame) -> pd.DataFrame:
         )
     out["mei_subfamily"] = out.apply(_choose_event_subfamily, axis=1)
     out["mei_family"] = out.apply(_choose_event_family, axis=1)
-    empty_family = out["mei_family"].fillna("").astype(str) == ""
-    out.loc[empty_family, "mei_family"] = (
-        out.loc[empty_family, "mei_subfamily"].fillna("").astype(str).map(_normalize_mei_family_token)
+
+    # mei_subfamily is chosen by weighted read support, while _choose_event_family scans
+    # candidate columns in a fixed precedence order. The two procedures are independent,
+    # so they can disagree (e.g. subfamily=SVA_E#Retroposon/SVA paired with family=ALU).
+    # Derive the family from the chosen subfamily when possible so the columns are
+    # consistent by construction; fall back to the column scan only when the subfamily
+    # normalizes to nothing.
+    subfamily_family = (
+        out["mei_subfamily"].fillna("").astype(str).map(_normalize_mei_family_token)
     )
+    out["mei_family"] = subfamily_family.where(subfamily_family != "", out["mei_family"])
+
     return out
 
 
