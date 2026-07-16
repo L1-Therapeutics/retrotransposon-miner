@@ -1,5 +1,5 @@
 ---
-description: Activate and validate rtm-miner before any test or pipeline run
+description: Activate rtm-miner before runs; never use <<'PY' heredocs (causes PY: command not found)
 alwaysApply: true
 ---
 
@@ -28,6 +28,25 @@ Non-interactive shells: prefer `micromamba run -n rtm-miner ...` or set `PATH` t
 - Package lives under `src/`: use `PYTHONPATH=src` or `pip install -e .` inside `rtm-miner`.
 - Unit tests: `pytest` from repo root **inside** the activated env.
 - Smoke / chr quickstarts: see `CONTRIBUTING.md` and `scripts/smoke_test_chr.sh`; public data is **not** auto-downloaded — use `scripts/download_public_data.py` first when BAMs/refs are needed.
+
+## Inline Python: never use `<<'PY'` heredocs
+
+`PY: command not found` means a heredoc terminator ran as a bare shell command (agent shells often split `python <<'PY' ... PY`). **Do not use that pattern** — also avoid `<<'PYTHON'` / `python - <<EOF`.
+
+Prefer, in order:
+
+```bash
+# 1) Short checks: python -c (single-quoted)
+python -c 'import pysam; print(pysam.__version__)'
+
+# 2) Longer snippets: Write a .py file with the editor/Write tool, then:
+python /tmp/rtm_check.py
+# or keep it in-repo under /tmp is fine for throwaways
+
+# 3) Prefer pytest / existing scripts over ad-hoc inline Python
+```
+
+Never paste a closing `PY` / `EOF` line as its own shell command.
 
 ## If a command fails with missing module/binary
 
