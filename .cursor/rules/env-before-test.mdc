@@ -1,0 +1,36 @@
+---
+description: Activate and validate rtm-miner before any test or pipeline run
+alwaysApply: true
+---
+
+# Environment Before Testing
+
+Do **not** run tests, smoke scripts, CLI (`rtm`), or pipeline wrappers until the conda env is active and validated. Bare system `python`/`python3` will fail (missing pysam, samtools, etc.).
+
+## Before every test / run session
+
+```bash
+# If env missing or stale:
+bash scripts/bootstrap_env.sh
+bash scripts/install_ucsc_tools.sh
+
+# Activate (pick what exists):
+conda activate rtm-miner || micromamba activate rtm-miner
+
+# Confirm tools + Python modules:
+bash scripts/validate_environment.sh
+```
+
+Non-interactive shells: prefer `micromamba run -n rtm-miner ...` or set `PATH` to the env’s `bin` instead of hoping `activate` sticks.
+
+## Running code
+
+- Package lives under `src/`: use `PYTHONPATH=src` or `pip install -e .` inside `rtm-miner`.
+- Unit tests: `pytest` from repo root **inside** the activated env.
+- Smoke / chr quickstarts: see `CONTRIBUTING.md` and `scripts/smoke_test_chr.sh`; public data is **not** auto-downloaded — use `scripts/download_public_data.py` first when BAMs/refs are needed.
+
+## If a command fails with missing module/binary
+
+1. Assume wrong/missing env (do not invent ad-hoc `pip install` fixes first).
+2. Re-activate `rtm-miner` and re-run `bash scripts/validate_environment.sh`.
+3. Only then bootstrap or install the specific missing piece (e.g. `scripts/install_headless_igv_deps.sh` for IGV on headless Linux).
