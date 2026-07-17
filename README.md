@@ -91,6 +91,7 @@ Gold-tier calls from the SEQC2 tumor/normal chr22 annotate run after `COMPLEX_IN
 | chr22 | 40898245 | 40898226 | 40898264 | SR_L=4,SR_R=12,DPE_L=8,DPE_R=16,BRK_CLP_L=3,BRK_CLP_R=11,MEI_MAPPED=9,polyA_MAPPED=22,polyA_side=R | SR_L=6,SR_R=22,DPE_L=31,DPE_R=30,BRK_CLP_L=2,BRK_CLP_R=21,MEI_MAPPED=20,polyA_MAPPED=47,polyA_side=R | shared |  | 62 | ALU | AluYb8#SINE/Alu |  |  | - | nested | 318 | 1 | 318 |
 | chr22 | 24791085 | 24791085 | 24791085 | SR_L=4,SR_R=0,DPE_L=15,DPE_R=3,BRK_CLP_L=4,BRK_CLP_R=0,MEI_MAPPED=12,polyA_MAPPED=0 | SR_L=5,SR_R=0,DPE_L=29,DPE_R=7,BRK_CLP_L=4,BRK_CLP_R=0,MEI_MAPPED=20,polyA_MAPPED=2,polyA_side=L | shared |  | 15 | ALU | AluY#SINE/Alu |  |  | + | nested | 289 | 23 | 311 |
 | chr22 | 28337288 | 28337208 | 28337369 | SR_L=0,SR_R=2,DPE_L=0,DPE_R=21,BRK_CLP_L=0,BRK_CLP_R=1,MEI_MAPPED=20,polyA_MAPPED=0 | SR_L=2,SR_R=0,DPE_L=0,DPE_R=15,BRK_CLP_L=1,BRK_CLP_R=0,MEI_MAPPED=15,polyA_MAPPED=0 | shared |  | 7 | LINE1 | L1HS#LINE/L1 |  |  | + | unnested | 2017 | 2075 | 4091 |
+
 ## Examples
 
 See [`docs/EXAMPLES.md`](docs/EXAMPLES.md) for additional annotated IGV review snapshots and read-architecture plots.

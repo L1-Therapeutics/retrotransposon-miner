@@ -1,0 +1,26 @@
+---
+description: Never put raw | in README markdown table cells; use the update script
+globs: README.md
+alwaysApply: false
+---
+
+# README markdown tables
+
+`known_mei_polymorphism_id` (and similar fields) can contain literal `|`
+(e.g. `g1k:…|lr:…`). That **splits markdown columns** and shifts the row.
+
+## Required
+
+- When refreshing the gold example table in `README.md`, run
+  `scripts/update_readme_example_table.py` (do not hand-edit table rows from
+  raw TSV).
+- Every cell must go through `retro_miner.readme_example_table.markdown_table_cell`
+  (pipes → `;`, newlines → space).
+- After writing, `assert_markdown_table_shape()` must pass (header cell count
+  equals every data row).
+
+## Do not
+
+- Paste TSV / support / polymorphism IDs into README table cells without
+  escaping `|`.
+- "Fix" one shifted row by hand without regenerating via the script.
