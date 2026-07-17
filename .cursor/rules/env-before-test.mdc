@@ -36,13 +36,14 @@ Non-interactive shells: prefer `micromamba run -n rtm-miner ...` or set `PATH` t
 Prefer, in order:
 
 ```bash
-# Short checks: python -c (single-quoted)
+# 1) Short checks: python -c (single-quoted)
 python -c 'import pysam; print(pysam.__version__)'
 
-# Longer snippets: write a .py file with the editor/Write tool, then run it
+# 2) Longer snippets: Write a .py file with the editor/Write tool, then:
 python /tmp/rtm_check.py
+# or keep it in-repo under /tmp is fine for throwaways
 
-# Prefer pytest / existing scripts over ad-hoc inline Python
+# 3) Prefer pytest / existing scripts over ad-hoc inline Python
 ```
 
 Never paste a closing `PY` / `EOF` line as its own shell command.
