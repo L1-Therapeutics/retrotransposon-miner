@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,46 @@ def _collect_soft_clips(read: pysam.AlignedSegment, min_clip_len: int) -> list[t
         clips.append(("R", last_len))
 
     return clips
+
+
+def _soft_clip_query_seq(query_seq: str, side: str, clip_len: int) -> str:
+    """Extract leftmost (L) or rightmost (R) soft-clip bases from a query sequence."""
+    seq = query_seq or ""
+    side_u = (side or "").upper()[:1]
+    n = int(clip_len or 0)
+    if n <= 0 or len(seq) < n:
+        return ""
+    if side_u == "L":
+        return seq[:n]
+    if side_u == "R":
+        return seq[-n:]
+    return ""
+
+
+def _longest_soft_clip_from_read(
+    read: pysam.AlignedSegment,
+) -> tuple[str, int, int, str]:
+    """Return ``(side, clip_len, clip_pos_1based, clip_seq)`` for the longest soft clip.
+
+    ``clip_pos_1based`` is the genomic junction tip (left clip → alignment start;
+    right clip → alignment end). Empty when the read has no soft clip.
+    """
+    if read.cigartuples is None:
+        return ("", 0, 0, "")
+    query_seq = read.query_sequence or ""
+    pos_1based = int(read.reference_start) + 1 if read.reference_start is not None else 0
+    ref_end_1based = int(read.reference_end) if read.reference_end is not None else pos_1based
+    first_op, first_len = read.cigartuples[0]
+    last_op, last_len = read.cigartuples[-1]
+    candidates: list[tuple[str, int, int]] = []
+    if first_op == 4 and first_len > 0:
+        candidates.append(("L", int(first_len), pos_1based))
+    if last_op == 4 and last_len > 0:
+        candidates.append(("R", int(last_len), ref_end_1based))
+    if not candidates:
+        return ("", 0, 0, "")
+    side, clip_len, clip_pos = max(candidates, key=lambda x: x[1])
+    return (side, clip_len, clip_pos, _soft_clip_query_seq(query_seq, side, clip_len))
 
 
 def _poly_at_stats(seq: str) -> tuple[int, float, str]:
@@ -297,12 +338,18 @@ def _fetch_mate_sequence_from_bam(
     mate_pos_1based: int,
     *,
     fetch_window_bp: int = 500,
-) -> tuple[str, int, int]:
-    """Best-effort mate sequence fetch for discordant-pair MEI remapping."""
+) -> tuple[str, int, int, str, int, str]:
+    """Best-effort mate sequence fetch for discordant-pair MEI remapping.
+
+    Returns
+    ``(mate_seq, mate_ref_start, mate_ref_end, mate_soft_clip_side,
+    mate_soft_clip_len, mate_soft_clip_seq)``.
+    """
+    empty = ("", 0, 0, "", 0, "")
     if mate_chrom in {"", "*"} or mate_pos_1based <= 0:
-        return ("", 0, 0)
+        return empty
     if mate_chrom not in bam.references:
-        return ("", 0, 0)
+        return empty
 
     start0 = max(0, int(mate_pos_1based) - 1)
     end0 = start0 + max(1, int(fetch_window_bp))
@@ -316,12 +363,16 @@ def _fetch_mate_sequence_from_bam(
         seq = mate_read.query_sequence or ""
         if not seq:
             continue
+        clip_side, clip_len, _clip_pos, clip_seq = _longest_soft_clip_from_read(mate_read)
         return (
             seq,
             int(mate_read.reference_start) + 1 if mate_read.reference_start is not None else 0,
             int(mate_read.reference_end) if mate_read.reference_end is not None else 0,
+            clip_side,
+            int(clip_len),
+            clip_seq,
         )
-    return ("", 0, 0)
+    return empty
 
 
 def _validate_mate_fetch_bam(
@@ -406,6 +457,7 @@ def extract_discordant_evidence(
     require_strong_discordant_reason: bool = True,
     mate_bam_path: Path | None = None,
     mate_fetch_window_bp: int = 500,
+    fetch_mate_seq: bool = True,
 ) -> ExtractionSummary:
     outdir.mkdir(parents=True, exist_ok=True)
     insert_threshold = _estimate_insert_size_threshold(
@@ -424,9 +476,15 @@ def extract_discordant_evidence(
     mate_seq_missing_interchrom_rows = 0
     region_list = _normalize_regions(regions)
     mate_bam_resolved = mate_bam_path if mate_bam_path is not None else bam_path
-    _validate_mate_fetch_bam(bam_path, mate_bam_path, region_list)
+    if fetch_mate_seq:
+        _validate_mate_fetch_bam(bam_path, mate_bam_path, region_list)
 
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.AlignmentFile(str(mate_bam_resolved), "rb") as mate_bam:
+    # Mate BAM is only opened when fetch_mate_seq is enabled. Annotate can re-fetch
+    # mates for candidate loci later; skipping here is the main extract speedup.
+    mate_bam_ctx = (
+        pysam.AlignmentFile(str(mate_bam_resolved), "rb") if fetch_mate_seq else nullcontext(None)
+    )
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam, mate_bam_ctx as mate_bam:
         for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
 
@@ -491,48 +549,53 @@ def extract_discordant_evidence(
                 continue
 
             chrom = bam.get_reference_name(read.reference_id)
-            pos_1based = read.reference_start + 1
-            ref_end_1based = int(read.reference_end) if read.reference_end is not None else pos_1based
-            # Soft-clips on discordant anchors often mark the insertion junction.
-            # Prefer the longest clip when both ends are clipped.
-            soft_clip_side = ""
-            soft_clip_len = 0
-            soft_clip_pos = 0
-            if read.cigartuples:
-                first_op, first_len = read.cigartuples[0]
-                last_op, last_len = read.cigartuples[-1]
-                candidates: list[tuple[str, int, int]] = []
-                if first_op == 4 and first_len > 0:
-                    candidates.append(("L", int(first_len), pos_1based))
-                if last_op == 4 and last_len > 0:
-                    candidates.append(("R", int(last_len), ref_end_1based))
-                if candidates:
-                    soft_clip_side, soft_clip_len, soft_clip_pos = max(candidates, key=lambda x: x[1])
-            mate_seq, mate_ref_start, mate_ref_end = _fetch_mate_sequence_from_bam(
-                mate_bam,
-                read.query_name,
-                mate_chrom,
-                mate_pos_1based,
-                fetch_window_bp=mate_fetch_window_bp,
-            )
-            if mate_seq:
-                mate_seq_fetched_rows += 1
-            elif "interchrom" in reasons:
-                mate_seq_missing_interchrom_rows += 1
+            soft_clip_side, soft_clip_len, soft_clip_pos, soft_clip_seq = _longest_soft_clip_from_read(read)
+            if fetch_mate_seq and mate_bam is not None:
+                (
+                    mate_seq,
+                    mate_ref_start,
+                    mate_ref_end,
+                    mate_soft_clip_side,
+                    mate_soft_clip_len,
+                    mate_soft_clip_seq,
+                ) = _fetch_mate_sequence_from_bam(
+                    mate_bam,
+                    read.query_name,
+                    mate_chrom,
+                    mate_pos_1based,
+                    fetch_window_bp=mate_fetch_window_bp,
+                )
+                if mate_seq:
+                    mate_seq_fetched_rows += 1
+                elif "interchrom" in reasons:
+                    mate_seq_missing_interchrom_rows += 1
+            else:
+                mate_seq = ""
+                mate_ref_start = 0
+                mate_ref_end = 0
+                mate_soft_clip_side = ""
+                mate_soft_clip_len = 0
+                mate_soft_clip_seq = ""
             rows.append(
                 {
                     "sample": sample_name,
                     "chrom": chrom,
-                    "pos": pos_1based,
-                    "ref_end": int(ref_end_1based),
+                    "pos": int(read.reference_start) + 1 if read.reference_start is not None else 0,
+                    "ref_end": int(read.reference_end) if read.reference_end is not None else (
+                        int(read.reference_start) + 1 if read.reference_start is not None else 0
+                    ),
                     "soft_clip_side": soft_clip_side,
                     "soft_clip_len": int(soft_clip_len),
                     "soft_clip_pos": int(soft_clip_pos),
+                    "soft_clip_seq": soft_clip_seq,
                     "mate_chrom": mate_chrom,
                     "mate_pos": mate_pos_1based,
                     "mate_seq": mate_seq,
                     "mate_ref_start": int(mate_ref_start),
                     "mate_ref_end": int(mate_ref_end),
+                    "mate_soft_clip_side": mate_soft_clip_side,
+                    "mate_soft_clip_len": int(mate_soft_clip_len),
+                    "mate_soft_clip_seq": mate_soft_clip_seq,
                     "mapq": int(read.mapping_quality),
                     "template_len": int(read.template_length),
                     "is_reverse": bool(read.is_reverse),
@@ -564,11 +627,15 @@ def extract_discordant_evidence(
                 "soft_clip_side",
                 "soft_clip_len",
                 "soft_clip_pos",
+                "soft_clip_seq",
                 "mate_chrom",
                 "mate_pos",
                 "mate_seq",
                 "mate_ref_start",
                 "mate_ref_end",
+                "mate_soft_clip_side",
+                "mate_soft_clip_len",
+                "mate_soft_clip_seq",
                 "mapq",
                 "template_len",
                 "is_reverse",

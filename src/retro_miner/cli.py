@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 import time
 
@@ -24,6 +26,111 @@ def check_env() -> None:
     """Print basic environment status."""
     click.echo("retrotransposon-miner CLI is installed.")
     click.echo("Run scripts/validate_environment.sh for full validation.")
+
+
+@dataclass(frozen=True)
+class _SampleExtractResult:
+    sample: str
+    split: ExtractionSummary
+    discordant: ExtractionSummary | None
+    split_elapsed_s: float
+    discordant_elapsed_s: float
+    total_elapsed_s: float
+
+
+def _extract_one_sample(
+    *,
+    sample: str,
+    bam: Path,
+    mate_bam: Path | None,
+    outdir: Path,
+    region_list: list[str],
+    min_mapq: int,
+    min_mapq_discordant: int,
+    min_clip_len: int,
+    poly_tail_rescue_min_clip_len: int,
+    poly_tail_rescue_min_run: int,
+    poly_tail_rescue_min_frac: float,
+    with_discordant: bool,
+    discordant_quantile: float,
+    discordant_min_abs_tlen: int,
+    discordant_poly_tail_rescue_window_bases: int,
+    discordant_poly_tail_rescue_min_run: int,
+    discordant_poly_tail_rescue_min_frac: float,
+    discordant_poly_tail_rescue_min_abs_tlen: int,
+    discordant_mate_fetch_window_bp: int,
+    fetch_mate_seq: bool,
+    require_strong_discordant_reason: bool,
+) -> _SampleExtractResult:
+    """Extract split (+ optional discordant) evidence for one sample.
+
+    Disease and control may be launched in parallel from the CLI; each process writes
+    only its own sample-named output files under ``outdir``.
+    """
+    sample_t0 = time.monotonic()
+    print(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}", flush=True)
+    split_t0 = time.monotonic()
+    split_summary = extract_split_evidence(
+        bam_path=bam,
+        sample_name=sample,
+        outdir=outdir,
+        regions=region_list,
+        min_mapq=min_mapq,
+        min_clip_len=min_clip_len,
+        poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+        poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+        poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+    )
+    split_elapsed = time.monotonic() - split_t0
+    print(
+        f"[done] sample={sample} scanned={split_summary.total_reads_scanned} "
+        f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows} "
+        f"elapsed={split_elapsed:.1f}s",
+        flush=True,
+    )
+
+    discordant_summary: ExtractionSummary | None = None
+    discordant_elapsed = 0.0
+    if with_discordant:
+        disc_t0 = time.monotonic()
+        print(f"[extract-discordant] sample={sample} regions={','.join(region_list)}", flush=True)
+        discordant_summary = extract_discordant_evidence(
+            bam_path=bam,
+            sample_name=sample,
+            outdir=outdir,
+            regions=region_list,
+            min_mapq=min_mapq_discordant,
+            insert_quantile=discordant_quantile,
+            min_abs_tlen=discordant_min_abs_tlen,
+            poly_tail_rescue_window_bases=discordant_poly_tail_rescue_window_bases,
+            poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
+            poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
+            poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
+            require_strong_discordant_reason=require_strong_discordant_reason,
+            mate_bam_path=mate_bam,
+            mate_fetch_window_bp=discordant_mate_fetch_window_bp,
+            fetch_mate_seq=fetch_mate_seq,
+        )
+        discordant_elapsed = time.monotonic() - disc_t0
+        print(
+            f"[done-discordant] sample={sample} scanned={discordant_summary.total_reads_scanned} "
+            f"passing={discordant_summary.passing_reads} discordant_rows={discordant_summary.discordant_evidence_rows} "
+            f"insert_threshold={discordant_summary.insert_size_threshold} "
+            f"mate_seq_fetched={discordant_summary.mate_seq_fetched_rows} "
+            f"mate_seq_missing_interchrom={discordant_summary.mate_seq_missing_interchrom_rows} "
+            f"weak_only_filtered={discordant_summary.weak_only_discordant_filtered_rows} "
+            f"elapsed={discordant_elapsed:.1f}s",
+            flush=True,
+        )
+
+    return _SampleExtractResult(
+        sample=sample,
+        split=split_summary,
+        discordant=discordant_summary,
+        split_elapsed_s=split_elapsed,
+        discordant_elapsed_s=discordant_elapsed,
+        total_elapsed_s=time.monotonic() - sample_t0,
+    )
 
 
 @cli.command("extract-split-evidence")
@@ -134,6 +241,25 @@ def check_env() -> None:
     help="Fetch window around mate_pos when resolving discordant mate sequences.",
 )
 @click.option(
+    "--sample-workers",
+    default=2,
+    show_default=True,
+    type=click.IntRange(1, 2),
+    help=(
+        "How many sample extract processes to run at once (disease/control). "
+        "Use 1 under multi-chromosome concurrency so chrom workers leave enough CPU."
+    ),
+)
+@click.option(
+    "--fetch-mate-seq/--no-fetch-mate-seq",
+    default=True,
+    show_default=True,
+    help=(
+        "Fetch discordant mate sequences during extract. "
+        "Disable when annotate will re-fetch mates from BAMs (much faster extract; same quality)."
+    ),
+)
+@click.option(
     "--require-strong-discordant-reason/--allow-weak-discordant-only",
     default=True,
     show_default=True,
@@ -165,9 +291,14 @@ def extract_split_evidence_cmd(
     discordant_poly_tail_rescue_min_frac: float,
     discordant_poly_tail_rescue_min_abs_tlen: int,
     discordant_mate_fetch_window_bp: int,
+    sample_workers: int,
+    fetch_mate_seq: bool,
     require_strong_discordant_reason: bool,
 ) -> None:
-    """Extract split-read MEI evidence and optional discordant evidence."""
+    """Extract split-read MEI evidence and optional discordant evidence.
+
+    Disease and control can run simultaneously (``--sample-workers 2``).
+    """
     cmd_t0 = time.monotonic()
     outdir.mkdir(parents=True, exist_ok=True)
     region_list = [r.strip() for r in regions.split(",")] if regions else [region]
@@ -175,65 +306,97 @@ def extract_split_evidence_cmd(
     if not region_list:
         raise click.ClickException("No valid regions provided via --region/--regions.")
 
+    sample_jobs = [
+        {
+            "sample": "disease",
+            "bam": disease_bam,
+            "mate_bam": disease_mate_bam,
+        },
+        {
+            "sample": "control",
+            "bam": control_bam,
+            "mate_bam": control_mate_bam,
+        },
+    ]
+    workers = int(sample_workers)
+    mode = "in parallel" if workers > 1 else "sequentially"
+    click.echo(
+        f"[extract] running disease and control {mode} "
+        f"(sample_workers={workers}; regions={','.join(region_list)}; "
+        f"with_discordant={with_discordant}; fetch_mate_seq={fetch_mate_seq})"
+    )
+
+    results_by_sample: dict[str, _SampleExtractResult] = {}
+    errors: list[str] = []
+
+    def _submit_kwargs(job: dict) -> dict:
+        return {
+            "sample": str(job["sample"]),
+            "bam": Path(job["bam"]),
+            "mate_bam": Path(job["mate_bam"]) if job["mate_bam"] is not None else None,
+            "outdir": outdir,
+            "region_list": region_list,
+            "min_mapq": min_mapq,
+            "min_mapq_discordant": min_mapq_discordant,
+            "min_clip_len": min_clip_len,
+            "poly_tail_rescue_min_clip_len": poly_tail_rescue_min_clip_len,
+            "poly_tail_rescue_min_run": poly_tail_rescue_min_run,
+            "poly_tail_rescue_min_frac": poly_tail_rescue_min_frac,
+            "with_discordant": with_discordant,
+            "discordant_quantile": discordant_quantile,
+            "discordant_min_abs_tlen": discordant_min_abs_tlen,
+            "discordant_poly_tail_rescue_window_bases": discordant_poly_tail_rescue_window_bases,
+            "discordant_poly_tail_rescue_min_run": discordant_poly_tail_rescue_min_run,
+            "discordant_poly_tail_rescue_min_frac": discordant_poly_tail_rescue_min_frac,
+            "discordant_poly_tail_rescue_min_abs_tlen": discordant_poly_tail_rescue_min_abs_tlen,
+            "discordant_mate_fetch_window_bp": discordant_mate_fetch_window_bp,
+            "fetch_mate_seq": fetch_mate_seq,
+            "require_strong_discordant_reason": require_strong_discordant_reason,
+        }
+
+    if workers <= 1:
+        for job in sample_jobs:
+            sample = str(job["sample"])
+            try:
+                results_by_sample[sample] = _extract_one_sample(**_submit_kwargs(job))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{sample}: {exc}")
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_extract_one_sample, **_submit_kwargs(job)): str(job["sample"])
+                for job in sample_jobs
+            }
+            for fut in as_completed(futures):
+                sample = futures[fut]
+                try:
+                    results_by_sample[sample] = fut.result()
+                except Exception as exc:  # noqa: BLE001 - surface worker failures to CLI
+                    errors.append(f"{sample}: {exc}")
+
+    if errors:
+        raise click.ClickException(
+            "Extract failed for one or more samples:\n  - " + "\n  - ".join(errors)
+        )
+
+    # Stable disease→control order for the summary table.
     split_summaries: list[ExtractionSummary] = []
     discordant_summaries: dict[str, ExtractionSummary] = {}
-    sample_bams = {
-        "disease": disease_bam,
-        "control": control_bam,
-    }
-    sample_mate_bams = {
-        "disease": disease_mate_bam,
-        "control": control_mate_bam,
-    }
-    for sample, bam in sample_bams.items():
-        sample_t0 = time.monotonic()
-        click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
-        split_summary = extract_split_evidence(
-            bam_path=bam,
-            sample_name=sample,
-            outdir=outdir,
-            regions=region_list,
-            min_mapq=min_mapq,
-            min_clip_len=min_clip_len,
-            poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
-            poly_tail_rescue_min_run=poly_tail_rescue_min_run,
-            poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
-        )
-        split_summaries.append(split_summary)
+    for sample in ("disease", "control"):
+        result = results_by_sample[sample]
+        split_summaries.append(result.split)
+        if result.discordant is not None:
+            discordant_summaries[sample] = result.discordant
         click.echo(
-            f"[done] sample={sample} scanned={split_summary.total_reads_scanned} "
-            f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows} "
-            f"elapsed={time.monotonic() - sample_t0:.1f}s"
+            f"[extract] sample={sample} wall={result.total_elapsed_s:.1f}s "
+            f"(split={result.split_elapsed_s:.1f}s"
+            + (
+                f", discordant={result.discordant_elapsed_s:.1f}s"
+                if result.discordant is not None
+                else ""
+            )
+            + ")"
         )
-        if with_discordant:
-            disc_t0 = time.monotonic()
-            click.echo(f"[extract-discordant] sample={sample} regions={','.join(region_list)}")
-            discordant_summary = extract_discordant_evidence(
-                bam_path=bam,
-                sample_name=sample,
-                outdir=outdir,
-                regions=region_list,
-                min_mapq=min_mapq_discordant,
-                insert_quantile=discordant_quantile,
-                min_abs_tlen=discordant_min_abs_tlen,
-                poly_tail_rescue_window_bases=discordant_poly_tail_rescue_window_bases,
-                poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
-                poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
-                poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
-                require_strong_discordant_reason=require_strong_discordant_reason,
-                mate_bam_path=sample_mate_bams.get(sample),
-                mate_fetch_window_bp=discordant_mate_fetch_window_bp,
-            )
-            discordant_summaries[sample] = discordant_summary
-            click.echo(
-                f"[done-discordant] sample={sample} scanned={discordant_summary.total_reads_scanned} "
-                f"passing={discordant_summary.passing_reads} discordant_rows={discordant_summary.discordant_evidence_rows} "
-                f"insert_threshold={discordant_summary.insert_size_threshold} "
-                f"mate_seq_fetched={discordant_summary.mate_seq_fetched_rows} "
-                f"mate_seq_missing_interchrom={discordant_summary.mate_seq_missing_interchrom_rows} "
-                f"weak_only_filtered={discordant_summary.weak_only_discordant_filtered_rows} "
-                f"elapsed={time.monotonic() - disc_t0:.1f}s"
-            )
 
     summary_path = outdir / "split_evidence.summary.tsv"
     with summary_path.open("w", encoding="utf-8") as handle:
@@ -250,7 +413,8 @@ def extract_split_evidence_cmd(
                 f"{discordant_rows}\t{insert_threshold}\t{weak_only_filtered}\n"
             )
     click.echo(f"[summary] {summary_path}")
-    click.echo(f"[extract] total_elapsed={time.monotonic() - cmd_t0:.1f}s")
+    parallel_note = "disease∥control" if workers > 1 else "sequential samples"
+    click.echo(f"[extract] total_elapsed={time.monotonic() - cmd_t0:.1f}s ({parallel_note})")
 
 
 @cli.command("build-candidate-loci")
@@ -723,6 +887,16 @@ def build_candidate_loci_cmd(
     show_default=True,
     help="Only reuse existing assembled cache entries; do not run SPAdes on cache miss.",
 )
+@click.option(
+    "--reuse-mei-annotate-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Prior annotate output directory containing supporting_reads_detail.mei.{parquet,tsv}. "
+        "Hydrate MEI hits from that detail table and re-label only — skips indel BAM scan, "
+        "mate-seq fetch, and minimap2 remaps."
+    ),
+)
 def annotate_mei_support_cmd(
     evidence_dir: Path,
     candidate_loci: Path,
@@ -774,10 +948,17 @@ def annotate_mei_support_cmd(
     assembly_minimap2_threads: int,
     assembly_locus_workers: int,
     assembly_reuse_cache_only: bool,
+    reuse_mei_annotate_dir: Path | None,
 ) -> None:
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
     t0 = time.monotonic()
-    click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
+    if reuse_mei_annotate_dir is not None:
+        click.echo(
+            f"[mei-annotate] re-label mode: reuse MEI hits from {reuse_mei_annotate_dir} "
+            "(skip indel+mate-fetch+minimap2)"
+        )
+    else:
+        click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
     if (disease_bam_depth is None) ^ (control_bam_depth is None):
         raise click.ClickException("Provide both --disease-bam-depth and --control-bam-depth, or neither.")
     out_path = annotate_candidate_loci_with_mei(
@@ -831,6 +1012,7 @@ def annotate_mei_support_cmd(
         assembly_locus_workers=assembly_locus_workers,
         assembly_reuse_cache_only=assembly_reuse_cache_only,
         mei_full_fasta=mei_full_fasta,
+        reuse_mei_annotate_dir=reuse_mei_annotate_dir,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 

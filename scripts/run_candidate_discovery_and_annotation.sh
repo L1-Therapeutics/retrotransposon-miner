@@ -30,6 +30,9 @@ OUTDIR=""
 REGION="chr22"
 CHR_ARG=""
 CHR_CONCURRENCY="6"
+# Disease∥control extract workers. Empty = adaptive: 1 under multi-chrom concurrency,
+# 2 for single-chromosome (or CHR_CONCURRENCY=1) so chrom slots leave enough CPU.
+SAMPLE_WORKERS=""
 CHR_ALL_MODE="0"
 # Default resume-safe behavior: skip chromosomes already complete in this outdir.
 SKIP_COMPLETE_EXISTING="1"
@@ -188,6 +191,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --chr_concurrency|--chr-concurrency)
       CHR_CONCURRENCY="$2"
+      shift 2
+      ;;
+    --sample-workers|--sample_workers)
+      SAMPLE_WORKERS="$2"
       shift 2
       ;;
     --skip-complete|--skip-complete-in-outdir|--skip-complete-today)
@@ -602,7 +609,17 @@ run_single_pipeline() {
   fi
 
   stage_t0=$(now_epoch)
-  echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir}"
+  # Under multi-chrom concurrency, keep sample extract serial so each chrom
+  # worker leaves enough cores for other chroms / annotate / minimap2.
+  local sample_workers="${SAMPLE_WORKERS}"
+  if [[ -z "${sample_workers}" ]]; then
+    if [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${CHR_CONCURRENCY}" -gt 1 ]]; then
+      sample_workers=1
+    else
+      sample_workers=2
+    fi
+  fi
+  echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir} (sample_workers=${sample_workers}; no-fetch-mate-seq)"
   run_cli extract-split-evidence \
     --disease-bam "${DISEASE_BAM}" \
     --control-bam "${CONTROL_BAM}" \
@@ -612,7 +629,9 @@ run_single_pipeline() {
     --region "${run_region}" \
     --min-mapq 20 \
     --min-mapq-discordant 20 \
-    --min-clip-len 20
+    --min-clip-len 20 \
+    --sample-workers "${sample_workers}" \
+    --no-fetch-mate-seq
   echo "[candidate-pipeline] stage=extract-split-evidence done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
 
   stage_t0=$(now_epoch)

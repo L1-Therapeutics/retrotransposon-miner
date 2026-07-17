@@ -82,14 +82,19 @@ _DETAIL_COLS = (
     "mate_mei_end",
     "mei_hit",
     "mate_mei_hit",
+    "brk_clp_support",
     "vntr_rescue",
     "polya_rescue",
     "mei_hit_source",
     "mate_seq_len",
     "polya_base",
+    "clip_poly_base",
+    "clip_len",
     "soft_clip_side",
     "soft_clip_len",
     "soft_clip_pos",
+    "poly_tail_rescued",
+    "clip_poly_at_run",
     "anchor_poly_at_run",
     "anchor_poly_base",
     "anchor_poly_side",
@@ -996,12 +1001,28 @@ def _mei_span_x(
     return min(x0, x1), max(x0, x1)
 
 
+def _flag_true(rec, *names: str) -> bool:
+    """True if any named attribute is a non-null truthy value (NaN → False)."""
+    for name in names:
+        val = getattr(rec, name, False)
+        if val is None:
+            continue
+        try:
+            if pd.isna(val):
+                continue
+        except (TypeError, ValueError):
+            pass
+        if bool(val):
+            return True
+    return False
+
+
 def _rescue_kind(rec) -> str:
     """Return 'polya', 'vntr', or '' for second-pass MEI rescues."""
     source = str(getattr(rec, "mei_hit_source", "") or "").strip().lower()
-    if bool(getattr(rec, "polya_rescue", False)) or source == "polya_rescue":
+    if _flag_true(rec, "polya_rescue") or source == "polya_rescue":
         return "polya"
-    if bool(getattr(rec, "vntr_rescue", False)) or source == "vntr_rescue":
+    if _flag_true(rec, "vntr_rescue") or source == "vntr_rescue":
         return "vntr"
     return ""
 
@@ -1166,21 +1187,50 @@ def _polya_span_from_flank_x(layout: LocusLayout, width_bp: int) -> tuple[float,
 
 
 def _sr_is_polya_clip(rec, layout: LocusLayout) -> bool:
-    """True when a split clip should be drawn in the polyA zone, not the MEI body."""
+    """True when a split clip should be drawn in the polyA zone, not the MEI body.
+
+    Requires an explicit polyA signal (rescue flag or long A/T run). A lone
+    ``clip_poly_base`` of A/T is not enough — most softclips report a dominant
+    base even when they are ordinary BRK_CLP / MEI remaps.
+    """
     if _rescue_kind(rec) == "polya":
         return True
-    base = str(
-        getattr(rec, "polya_base", "") or getattr(rec, "clip_poly_base", "") or ""
-    ).upper()
-    if base in {"A", "T"}:
+    if _flag_true(rec, "polya_rescue", "poly_tail_rescued"):
         return True
-    if bool(getattr(rec, "poly_tail_rescued", False)):
-        return True
-    mei_start = int(getattr(rec, "mei_start", 0) or 0)
+    try:
+        run = getattr(rec, "clip_poly_at_run", 0)
+        if run is not None and not (isinstance(run, float) and pd.isna(run)):
+            if int(run) >= 8:
+                return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        mei_start = int(getattr(rec, "mei_start", 0) or 0)
+    except (TypeError, ValueError):
+        mei_start = 0
     # Synthetic polyA coords are tacked past consensus 3′.
     if layout.polya_zone_bp > 0 and mei_start > int(layout.mei_3p):
         return True
     return False
+
+
+def _brk_clp_stub_span_x(layout: LocusLayout, clip_side: str, clip_len: int) -> tuple[float, float]:
+    """Junction-anchored orange stub for BRK_CLP clips without MEI remap coords.
+
+    Clip into the full insertion block (MEI + polyA zone). Clipping to the MEI
+    body alone collapses right-junction stubs into a ~1 bp sliver whenever the
+    polyA zone occupies the 3' edge.
+    """
+    width = max(1, int(clip_len))
+    left = float(layout.insertion_left_x)
+    right = float(layout.insertion_right_x)
+    if str(clip_side).upper() == "L":
+        x0 = left
+        x1 = x0 + width
+    else:
+        x1 = right
+        x0 = x1 - width
+    return _clip_span(x0, x1, left, right)
 
 
 def _imputed_rescue_mei_span(rec, layout: LocusLayout) -> tuple[float, float] | None:
@@ -1248,8 +1298,12 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
 
     ``side`` is the genomic flank holding the mapped (black) portion.
     PolyA/T clips are placed in the dedicated polyA zone beyond MEI 3′.
+    BRK_CLP clips without MEI remap use a junction-anchored insertion stub.
     """
-    if not bool(getattr(rec, "mei_hit", False)):
+    mei_hit = _flag_true(rec, "mei_hit")
+    brk_clp = _flag_true(rec, "brk_clp_support")
+    polya_clip = _sr_is_polya_clip(rec, layout)
+    if not (mei_hit or brk_clp or polya_clip):
         return None
     junction = int(rec.genomic_pos)
     clip_side = str(getattr(rec, "anchor_side", "") or getattr(rec, "clip_side", "") or "").upper()
@@ -1273,7 +1327,6 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
         ref_end = junction
         ref_start = junction - mapped_len + 1
 
-    polya_clip = _sr_is_polya_clip(rec, layout)
     polya_width = 0
     polya_base = ""
     polya_label = ""
@@ -1288,10 +1341,19 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
                 polya_base = "A"
         polya_label = _polya_tail_label(polya_width, polya_base)
         mei = layout.polya_span_x(polya_width)
-    else:
-        mei = _mei_span_x(int(rec.mei_start), int(rec.mei_end), layout)
+        remote_kind = "sr_polya"
+    elif mei_hit:
+        mei = _mei_span_x(int(getattr(rec, "mei_start", 0) or 0), int(getattr(rec, "mei_end", 0) or 0), layout)
         if mei is None:
-            return None
+            if not brk_clp:
+                return None
+            mei = _brk_clp_stub_span_x(layout, clip_side, clip_len)
+            remote_kind = "sr_brk_clp"
+        else:
+            remote_kind = "sr_mei"
+    else:
+        mei = _brk_clp_stub_span_x(layout, clip_side, clip_len)
+        remote_kind = "sr_brk_clp"
 
     pair: dict[str, object] = {
         "anchor_pos": junction,
@@ -1304,20 +1366,21 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
         "remote_x": (mei[0] + mei[1]) / 2.0,
         "remote_mei_x0": mei[0],
         "remote_mei_x1": mei[1],
-        "mei_start": int(rec.mei_start),
-        "mei_end": int(rec.mei_end),
+        "mei_start": int(getattr(rec, "mei_start", 0) or 0),
+        "mei_end": int(getattr(rec, "mei_end", 0) or 0),
         "side": plot_side,
         "interchrom": False,
-        "mei_mapped": True,
+        "mei_mapped": bool(mei_hit),
         "read_name": str(rec.read_name),
         "evidence_type": "SR",
-        "remote_kind": "sr_mei",
+        "remote_kind": remote_kind,
         "anchor_on_reference": True,
         "is_split": True,
         "rescue_kind": "polya" if polya_clip else "",
         "polya_width": polya_width,
         "polya_base": polya_base,
         "polya_label": polya_label,
+        "brk_clp_support": bool(brk_clp),
     }
     if bool(getattr(rec, "mate_mei_hit", False)):
         mate_mei = _mei_span_x(
@@ -1338,7 +1401,11 @@ def _pair_from_dpe_row(rec, layout: LocusLayout) -> dict[str, object] | None:
     If the schematic 150 bp anchor would cross the breakpoint, the overhang is
     drawn inside the MEI (clipped sequence placed in the insertion).
     """
-    if not (bool(getattr(rec, "mate_mei_hit", False)) or bool(getattr(rec, "mei_hit", False))):
+    rescue_kind = _rescue_kind(rec)
+    if not (
+        _flag_true(rec, "mate_mei_hit", "mei_hit", "polya_rescue", "vntr_rescue")
+        or bool(rescue_kind)
+    ):
         return None
 
     anchor_pos = int(rec.genomic_pos)
@@ -1361,7 +1428,6 @@ def _pair_from_dpe_row(rec, layout: LocusLayout) -> dict[str, object] | None:
     remote_mei_x1 = 0.0
     mei_start = 0
     mei_end = 0
-    rescue_kind = _rescue_kind(rec)
     polya_width = 0
     polya_base = ""
     polya_label = ""
@@ -1555,13 +1621,47 @@ def _dedupe_detail_rows(detail: pd.DataFrame) -> pd.DataFrame:
     if detail.empty:
         return detail
     out = detail.copy()
+
+    def _flag(col: str) -> pd.Series:
+        s = out.get(col, False)
+        if not isinstance(s, pd.Series):
+            return pd.Series(False, index=out.index)
+        return s.fillna(False).astype(bool)
+
     out["_mei_rank"] = (
-        out.get("mate_mei_hit", False).fillna(False).astype(int) * 2
-        + out.get("mei_hit", False).fillna(False).astype(int)
+        _flag("mate_mei_hit").astype(int) * 4
+        + _flag("mei_hit").astype(int) * 3
+        + (_flag("polya_rescue") | _flag("poly_tail_rescued")).astype(int) * 2
+        + _flag("brk_clp_support").astype(int)
     )
     out = out.sort_values(["_mei_rank"], ascending=False)
     out = out.drop_duplicates(subset=["read_name", "evidence_type"], keep="first")
     return out.drop(columns=["_mei_rank"]).reset_index(drop=True)
+
+
+def _detail_support_mask(detail: pd.DataFrame) -> pd.Series:
+    """Rows eligible for read-architecture plots (MEI, BRK_CLP, or polyA)."""
+    if detail.empty:
+        return pd.Series(dtype=bool)
+
+    def _flag(col: str) -> pd.Series:
+        s = detail.get(col, False)
+        if not isinstance(s, pd.Series):
+            return pd.Series(False, index=detail.index)
+        return s.fillna(False).astype(bool)
+
+    poly_run = pd.Series(False, index=detail.index)
+    if "clip_poly_at_run" in detail.columns:
+        poly_run = pd.to_numeric(detail["clip_poly_at_run"], errors="coerce").fillna(0).astype(int) >= 8
+    return (
+        _flag("mei_hit")
+        | _flag("mate_mei_hit")
+        | _flag("brk_clp_support")
+        | _flag("polya_rescue")
+        | _flag("poly_tail_rescued")
+        | _flag("vntr_rescue")
+        | poly_run
+    )
 
 
 def _filter_detail_for_locus(
@@ -1574,7 +1674,7 @@ def _filter_detail_for_locus(
     breakpoint: int | None = None,
     neighbor_bp: int = 600,
 ) -> pd.DataFrame:
-    """Select MEI-supporting reads for one locus from an in-memory detail table."""
+    """Select MEI / BRK_CLP / polyA supporting reads for one locus."""
     if detail.empty:
         return detail.iloc[0:0].copy()
 
@@ -1589,17 +1689,12 @@ def _filter_detail_for_locus(
 
     bp = int(breakpoint) if breakpoint is not None else (window_start + window_end) // 2
     gpos = pd.to_numeric(detail["genomic_pos"], errors="coerce")
-    mei_hit = detail.get("mei_hit", False)
-    mate_hit = detail.get("mate_mei_hit", False)
-    if not isinstance(mei_hit, pd.Series):
-        mei_hit = pd.Series(False, index=detail.index)
-    if not isinstance(mate_hit, pd.Series):
-        mate_hit = pd.Series(False, index=detail.index)
+    support = _detail_support_mask(detail)
     nearby = detail.loc[
         same_sample
         & (gpos >= bp - int(neighbor_bp))
         & (gpos <= bp + int(neighbor_bp))
-        & (mate_hit.fillna(False).astype(bool) | mei_hit.fillna(False).astype(bool))
+        & support
     ].copy()
     return _dedupe_detail_rows(pd.concat([exact, nearby], ignore_index=True))
 
@@ -1671,13 +1766,7 @@ class ReadArchitectureCache:
             for k, idxs in detail.groupby(keys, sort=False).indices.items()
         }
 
-        mei_hit = detail.get("mei_hit", False)
-        mate_hit = detail.get("mate_mei_hit", False)
-        if not isinstance(mei_hit, pd.Series):
-            mei_hit = pd.Series(False, index=detail.index)
-        if not isinstance(mate_hit, pd.Series):
-            mate_hit = pd.Series(False, index=detail.index)
-        hit_mask = (mate_hit.fillna(False).astype(bool) | mei_hit.fillna(False).astype(bool)).to_numpy()
+        hit_mask = _detail_support_mask(detail).to_numpy()
         gpos = pd.to_numeric(detail["genomic_pos"], errors="coerce").fillna(-1).astype(int).to_numpy()
         hit_gpos: dict[tuple[str, str], object] = {}
         hit_rows: dict[tuple[str, str], object] = {}
@@ -1861,8 +1950,61 @@ def _pair_segments(
     if len(pairs) > cap:
         sr_pairs = [p for p in pairs if p.get("evidence_type") == "SR"]
         dpe_pairs = [p for p in pairs if p.get("evidence_type") != "SR"]
-        # Always keep split reads when they fit; randomly fill the rest by flank.
-        keep_sr = sr_pairs if len(sr_pairs) <= cap else sampler.sample(sr_pairs, cap)
+
+        def _sample_stratified(items: list[dict[str, object]], n: int) -> list[dict[str, object]]:
+            """Keep a mix of MEI / BRK_CLP / polyA SR (and both clip sides) under the cap."""
+            if n <= 0 or not items:
+                return []
+            if len(items) <= n:
+                return list(items)
+            buckets: dict[str, list[dict[str, object]]] = {
+                "sr_mei": [],
+                "sr_brk_clp": [],
+                "sr_polya": [],
+                "other": [],
+            }
+            for p in items:
+                kind = str(p.get("remote_kind", "") or "other")
+                buckets[kind if kind in buckets else "other"].append(p)
+            # Prefer covering each evidence class and both L/R clip sides.
+            chosen: list[dict[str, object]] = []
+            chosen_ids: set[int] = set()
+
+            def _take(pool: list[dict[str, object]], k: int) -> None:
+                if k <= 0 or not pool:
+                    return
+                avail = [p for p in pool if id(p) not in chosen_ids]
+                if not avail:
+                    return
+                pick = avail if len(avail) <= k else sampler.sample(avail, k)
+                for p in pick:
+                    chosen.append(p)
+                    chosen_ids.add(id(p))
+
+            # Guarantee at least one L and one R BRK_CLP when present.
+            for side in ("L", "R"):
+                side_brk = [
+                    p
+                    for p in buckets["sr_brk_clp"]
+                    if str(p.get("clip_side", "") or "").upper() == side
+                ]
+                _take(side_brk, 1)
+            # Round-robin a few from each SR class, then fill randomly.
+            per_class = max(1, (n - len(chosen)) // 3)
+            for key in ("sr_mei", "sr_brk_clp", "sr_polya"):
+                _take(buckets[key], per_class)
+            leftover = [p for p in items if id(p) not in chosen_ids]
+            _take(leftover, n - len(chosen))
+            return chosen[:n]
+
+        # Prefer keeping all split reads; reserve a small DPE slice only when SR
+        # alone would consume the whole cap (common after BRK_CLP/polyA expansion).
+        dpe_reserve = min(len(dpe_pairs), max(0, min(30, cap // 5))) if dpe_pairs else 0
+        sr_budget = min(len(sr_pairs), max(0, cap - dpe_reserve))
+        if len(sr_pairs) > sr_budget:
+            keep_sr = _sample_stratified(sr_pairs, sr_budget)
+        else:
+            keep_sr = list(sr_pairs)
         remaining = max(0, cap - len(keep_sr))
         dpe_left = [p for p in dpe_pairs if p["side"] == "L"]
         dpe_right = [p for p in dpe_pairs if p["side"] == "R"]
@@ -1881,6 +2023,14 @@ def _pair_segments(
             chosen.extend(sampler.sample(dpe_left, n_left))
         if n_right:
             chosen.extend(sampler.sample(dpe_right, n_right))
+        # Unused DPE slots go back to SR.
+        if len(chosen) < cap and len(sr_pairs) > len(keep_sr):
+            keep_ids = {id(p) for p in keep_sr}
+            extra_sr = _sample_stratified(
+                [p for p in sr_pairs if id(p) not in keep_ids],
+                cap - len(chosen),
+            )
+            chosen.extend(extra_sr)
         pairs = chosen
     # Stable visual order: left then right, SR before DPE, then genomic position.
     pairs.sort(
@@ -1987,20 +2137,17 @@ def _split_segments(
     if polya_clip and layout.polya_zone_bp > 0:
         return ref_span, layout.polya_span_x(clip_len)
 
-    # Orange: clip_len bp centered on the mapped MEI interval.
+    # Orange: clip_len bp centered on the mapped MEI / BRK stub interval.
+    # Bound to the full insertion (MEI + polyA): BRK stubs often sit on the
+    # polyA-side junction and collapse if clipped to the MEI body alone.
     mx0 = min(float(mei_x0), float(mei_x1))
     mx1 = max(float(mei_x0), float(mei_x1))
     center = (mx0 + mx1) / 2.0 if mx1 > mx0 else mx0
     half = clip_len / 2.0
-    mei_span = _clip_span(
-        center - half,
-        center + half,
-        layout.mei_region_start_x,
-        layout.mei_region_end_x,
-    )
-    # If centering clipped the width, fall back to the true mapped MEI interval.
+    mei_span = _clip_span(center - half, center + half, left_edge, right_edge)
+    # If centering clipped the width, fall back to the true mapped interval.
     if mei_span[1] - mei_span[0] < clip_len * 0.9 and mx1 > mx0:
-        mei_span = _clip_span(mx0, mx1, layout.mei_region_start_x, layout.mei_region_end_x)
+        mei_span = _clip_span(mx0, mx1, left_edge, right_edge)
     return ref_span, mei_span
 
 def _mei_read_bar(
@@ -2132,15 +2279,15 @@ def _draw_read_pair(
     read_width_bp: float,
 ) -> None:
     remote_kind = str(pair.get("remote_kind", ""))
-    is_split = bool(pair.get("is_split", False)) or remote_kind == "sr_mei"
+    is_split = bool(pair.get("is_split", False)) or remote_kind.startswith("sr_")
 
-    if is_split and remote_kind == "sr_mei":
+    if is_split and remote_kind in {"sr_mei", "sr_brk_clp", "sr_polya"}:
         clip_side = str(pair.get("clip_side", "L"))
         clip_len = int(pair.get("clip_len", 0) or 0)
         mapped_len = int(pair.get("mapped_len", 0) or 0)
         if mapped_len <= 0:
             mapped_len = max(1, int(read_width_bp) - max(1, clip_len))
-        polya_clip = str(pair.get("rescue_kind", "")) == "polya"
+        polya_clip = remote_kind == "sr_polya" or str(pair.get("rescue_kind", "")) == "polya"
         ref_span, mei_span = _split_segments(
             clip_side=clip_side,
             clip_len=clip_len,
@@ -2796,7 +2943,7 @@ def main() -> None:
         "--max-pairs",
         type=int,
         default=50,
-        help="Maximum supporting read pairs to plot (random sample if more).",
+        help="Maximum supporting read pairs to plot (stratified sample if more).",
     )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for random pair sampling.")
     parser.add_argument("--flank-bp", type=int, default=200, help="Symmetric flank width on each side of breakpoint.")
