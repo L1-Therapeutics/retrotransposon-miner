@@ -1,4 +1,4 @@
-"""Read-architecture plots include BRK_CLP and polyA supporting splits."""
+"""Read-architecture plots include MEI and polyA supporting splits (no BRK_CLP)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import pandas as pd
 
 from retro_miner.mei_support import (
     _build_supporting_reads_detail_table,
-    _split_brk_clp_member_mask,
     _split_polya_member_mask,
 )
 from retro_miner.read_architecture import (
@@ -34,45 +33,29 @@ def _layout() -> LocusLayout:
     )
 
 
-def test_split_masks_mark_brk_clp_and_polya():
+def test_split_polya_mask():
     split = pd.DataFrame(
         [
-            {"chrom": "chr22", "window_start": 100, "window_end": 200, "read_name": "b1", "clip_side": "L", "pos": 148, "clip_len": 30},
-            {"chrom": "chr22", "window_start": 100, "window_end": 200, "read_name": "b2", "clip_side": "L", "pos": 149, "clip_len": 28},
-            {"chrom": "chr22", "window_start": 100, "window_end": 200, "read_name": "b3", "clip_side": "L", "pos": 148, "clip_len": 25},
-            {"chrom": "chr22", "window_start": 100, "window_end": 200, "read_name": "far", "clip_side": "L", "pos": 180, "clip_len": 20},
             {"chrom": "chr22", "window_start": 100, "window_end": 200, "read_name": "p1", "clip_side": "R", "pos": 152, "clip_len": 40, "poly_tail_rescued": True, "clip_poly_at_run": 20},
+            {"chrom": "chr22", "window_start": 100, "window_end": 200, "read_name": "n1", "clip_side": "L", "pos": 148, "clip_len": 30},
         ]
     )
-    brk = _split_brk_clp_member_mask(split)
     polya = _split_polya_member_mask(split)
-    assert bool(brk.loc[split.read_name.eq("b1").idxmax()])
-    assert bool(brk.loc[split.read_name.eq("b2").idxmax()])
-    assert not bool(brk.loc[split.read_name.eq("far").idxmax()])
     assert bool(polya.loc[split.read_name.eq("p1").idxmax()])
+    assert not bool(polya.loc[split.read_name.eq("n1").idxmax()])
 
 
-def test_detail_emits_brk_clp_and_polya_without_mei_hit():
+def test_detail_emits_polya_without_mei_hit_but_not_bare_pileup():
     split = pd.DataFrame(
         [
             {
                 "chrom": "chr22",
                 "window_start": 100,
                 "window_end": 200,
-                "read_name": "brk1",
+                "read_name": "noise",
                 "clip_side": "L",
                 "pos": 148,
                 "clip_len": 30,
-                "mei_hit": False,
-            },
-            {
-                "chrom": "chr22",
-                "window_start": 100,
-                "window_end": 200,
-                "read_name": "brk2",
-                "clip_side": "L",
-                "pos": 148,
-                "clip_len": 28,
                 "mei_hit": False,
             },
             {
@@ -85,7 +68,7 @@ def test_detail_emits_brk_clp_and_polya_without_mei_hit():
                 "clip_len": 40,
                 "mei_hit": False,
                 "poly_tail_rescued": True,
-                "clip_poly_at_run": 18,
+                "clip_poly_at_run": 20,
                 "clip_poly_base": "A",
             },
             {
@@ -93,8 +76,8 @@ def test_detail_emits_brk_clp_and_polya_without_mei_hit():
                 "window_start": 100,
                 "window_end": 200,
                 "read_name": "mei1",
-                "clip_side": "R",
-                "pos": 151,
+                "clip_side": "L",
+                "pos": 149,
                 "clip_len": 50,
                 "mei_hit": True,
                 "target": "AluY#SINE/Alu",
@@ -111,22 +94,7 @@ def test_detail_emits_brk_clp_and_polya_without_mei_hit():
         sample="disease",
     )
     names = set(detail.read_name.astype(str))
-    assert {"brk1", "brk2", "poly1", "mei1"} <= names
-    brk_row = detail.loc[detail.read_name.eq("brk1")].iloc[0]
-    assert bool(brk_row.brk_clp_support) is True
-    assert bool(brk_row.mei_hit) is False
-    poly_row = detail.loc[detail.read_name.eq("poly1")].iloc[0]
-    assert bool(poly_row.polya_rescue) is True
-
-
-def test_brk_clp_stub_keeps_width_into_polya_zone():
-    """Right-junction BRK stubs must not collapse when polyA occupies the 3' edge."""
-    from retro_miner.read_architecture import _brk_clp_stub_span_x
-
-    layout = _layout()  # + ori, polyA after MEI
-    x0, x1 = _brk_clp_stub_span_x(layout, "R", 30)
-    assert (x1 - x0) >= 29.0
-    assert x1 == layout.insertion_right_x
+    assert names == {"poly1", "mei1"}
 
 
 def test_sr_polya_requires_run_or_rescue_not_bare_base():
@@ -139,7 +107,6 @@ def test_sr_polya_requires_run_or_rescue_not_bare_base():
             "anchor_side": "L",
             "clip_len": 30,
             "mei_hit": False,
-            "brk_clp_support": True,
             "polya_rescue": False,
             "poly_tail_rescued": False,
             "clip_poly_at_run": 2,
@@ -152,26 +119,11 @@ def test_sr_polya_requires_run_or_rescue_not_bare_base():
     from retro_miner.read_architecture import _sr_is_polya_clip
 
     assert _sr_is_polya_clip(bare, layout) is False
-    pair = _pair_from_sr_row(bare, layout)
-    assert pair is not None
-    assert pair["remote_kind"] == "sr_brk_clp"
+    assert _pair_from_sr_row(bare, layout) is None
 
 
-def test_pair_from_sr_builds_brk_clp_and_polya_without_mei():
+def test_pair_from_sr_builds_polya_without_mei():
     layout = _layout()
-    brk = pd.Series(
-        {
-            "evidence_type": "SR",
-            "read_name": "brk1",
-            "genomic_pos": 148,
-            "anchor_side": "L",
-            "clip_len": 30,
-            "mei_hit": False,
-            "brk_clp_support": True,
-            "mei_start": 0,
-            "mei_end": 0,
-        }
-    )
     poly = pd.Series(
         {
             "evidence_type": "SR",
@@ -180,7 +132,6 @@ def test_pair_from_sr_builds_brk_clp_and_polya_without_mei():
             "anchor_side": "R",
             "clip_len": 40,
             "mei_hit": False,
-            "brk_clp_support": False,
             "polya_rescue": True,
             "poly_tail_rescued": True,
             "clip_poly_at_run": 20,
@@ -189,36 +140,31 @@ def test_pair_from_sr_builds_brk_clp_and_polya_without_mei():
             "mei_end": 0,
         }
     )
-    brk_pair = _pair_from_sr_row(brk, layout)
     poly_pair = _pair_from_sr_row(poly, layout)
-    assert brk_pair is not None
-    assert brk_pair["remote_kind"] == "sr_brk_clp"
-    assert brk_pair["mei_mapped"] is False
     assert poly_pair is not None
     assert poly_pair["remote_kind"] == "sr_polya"
     assert poly_pair["rescue_kind"] == "polya"
 
 
-def test_filter_and_pair_segments_keep_brk_clp_polya():
+def test_filter_and_pair_segments_keep_mei_polya():
     layout = _layout()
     detail = pd.DataFrame(
         [
             {
                 "sample": "disease",
                 "evidence_type": "SR",
-                "read_name": "brk1",
+                "read_name": "mei1",
                 "chrom": "chr22",
                 "window_start": 100,
                 "window_end": 200,
                 "anchor_side": "L",
                 "genomic_pos": 148,
-                "mei_hit": False,
+                "mei_hit": True,
                 "mate_mei_hit": False,
-                "brk_clp_support": True,
                 "polya_rescue": False,
                 "clip_len": 30,
-                "mei_start": 0,
-                "mei_end": 0,
+                "mei_start": 10,
+                "mei_end": 40,
             },
             {
                 "sample": "disease",
@@ -231,7 +177,6 @@ def test_filter_and_pair_segments_keep_brk_clp_polya():
                 "genomic_pos": 152,
                 "mei_hit": False,
                 "mate_mei_hit": False,
-                "brk_clp_support": False,
                 "polya_rescue": True,
                 "poly_tail_rescued": True,
                 "clip_len": 40,
@@ -253,6 +198,6 @@ def test_filter_and_pair_segments_keep_brk_clp_polya():
     assert len(filtered) == 2
     pairs, stats = _pair_segments(filtered, layout, max_pairs=50)
     kinds = {p["remote_kind"] for p in pairs}
-    assert "sr_brk_clp" in kinds
+    assert "sr_mei" in kinds
     assert "sr_polya" in kinds
     assert stats["sr_plotted"] == 2

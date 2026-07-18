@@ -223,20 +223,84 @@ def _collect_panel_fragment_intervals(row: pd.Series) -> list[tuple[int, int, st
     return intervals
 
 
+def _row_consensus_mei_family(row: pd.Series) -> str:
+    """Preferred MEI family for full-axis projection (never cross-family)."""
+    for col in (
+        "consensus_mei_family",
+        "mei_family",
+        "asm_mei_family",
+        "consensus_mei_subfamily",
+        "mei_subfamily",
+    ):
+        if col not in row.index:
+            continue
+        fam = _normalize_mei_family_token(str(row.get(col, "") or ""))
+        if fam:
+            return fam
+    return ""
+
+
 def _full_axis_union_from_panel_fragments(
     row: pd.Series,
     frag_map: dict[str, FragmentToFullMap],
 ) -> tuple[int, int] | None:
-    """Project each panel-fragment interval onto the full axis, then union."""
+    """Project panel-fragment intervals onto one full-consensus axis, then union.
+
+    Never mix families (Alu tip + L1 body) or different ``full_name`` axes.
+    When the call has a consensus family, only same-family projections count;
+    among those, keep the ``full_name`` with the most intervals (then longest span).
+    """
     if not frag_map:
         return None
-    coords: list[int] = []
+    preferred_fam = _row_consensus_mei_family(row)
+    by_full: dict[str, list[int]] = {}
     for start, end, frag in _collect_panel_fragment_intervals(row):
+        frag_fam = _normalize_mei_family_token(frag)
+        if preferred_fam and frag_fam and frag_fam != preferred_fam:
+            continue
         projected = _project_panel_coords_to_full(start, end, frag, frag_map)
         if projected is None:
             continue
-        coords.append(int(projected[0]))
-        coords.append(int(projected[1]))
+        full_start, full_end, full_name = projected
+        full_fam = _normalize_mei_family_token(full_name)
+        if preferred_fam and full_fam and full_fam != preferred_fam:
+            continue
+        if not preferred_fam and frag_fam and full_fam and frag_fam != full_fam:
+            continue
+        key = str(full_name or "").strip()
+        if not key:
+            continue
+        by_full.setdefault(key, []).extend([int(full_start), int(full_end)])
+    if not by_full:
+        return None
+
+    preferred_full = ""
+    for col in ("consensus_mei_subfamily", "mei_subfamily"):
+        if col not in row.index:
+            continue
+        sub = str(row.get(col, "") or "").strip()
+        if not sub:
+            continue
+        base = sub.split("#", 1)[0]
+        base = re.sub(r"_(3end|5end|orf2)$", "", base, flags=re.IGNORECASE)
+        base = re.sub(r"_short_?$", "", base, flags=re.IGNORECASE)
+        if base:
+            preferred_full = f"{base}_full"
+            break
+
+    # Prefer consensus-subfamily full axis, then most intervals, then longest span.
+    def _axis_score(name: str) -> tuple[int, int, int]:
+        coords = by_full[name]
+        n_intervals = len(coords) // 2
+        span = int(max(coords)) - int(min(coords))
+        t_base = name.split("#", 1)[0]
+        prefer = 1 if preferred_full and (
+            t_base == preferred_full or name.startswith(preferred_full + "#") or name.startswith(preferred_full)
+        ) else 0
+        return prefer, n_intervals, span
+
+    best_full = max(by_full, key=_axis_score)
+    coords = by_full[best_full]
     if len(coords) < 2:
         return None
     return int(min(coords)), int(max(coords))
@@ -326,9 +390,15 @@ def _family_from_target(target: str) -> str:
 # MEI placements; deletion-vs-insertion is handled by other call logic.
 _DPE_MEI_IDENTITY_MIN_SAME_CHR_BP = 1000
 
-# Soft-clip pileups within this distance of the modal clip position count toward
-# BRK_CLP_L/R (breakpoint-aligned clips), independent of MEI remap / strict SR gate.
-_BRK_CLP_POS_TOLERANCE_BP = 2
+# Short soft-clips may count as SR only when consistent with a strict MEI SR seed
+# (preferred) or a same-side DPE MEI seed (fallback).
+_STRICT_MEI_CLIP_MIN_BP = 20
+_SHORT_MEI_RESCUE_MIN_CLIP_BP = 12
+_SHORT_MEI_RESCUE_MIN_ALN_BP = 10
+_SHORT_MEI_RESCUE_MAX_COORD_GAP_BP = 5
+_SHORT_MEI_DPE_MIN_SUPPORT = 2
+_SHORT_MEI_DPE_MAX_AXIS_GAP_BP = 500
+_SHORT_MEI_DPE_PROXIMAL_SLACK_BP = 80
 
 # Minimum soft-clip length for DPE→MEI consensus remap. Shorter clips are too
 # ambiguous among Alu/SVA/L1; full reference-matching read bodies must never be
@@ -678,6 +748,197 @@ def _resolve_full_consensus_fasta(
 
 
 
+_MEI_HIT_COLUMNS = [
+    "qname",
+    "target",
+    "target_start",
+    "target_end",
+    "target_len",
+    "target_strand",
+    "alnlen",
+    "mapq",
+    "pid",
+    "qcov",
+    "mei_score",
+    "family",
+]
+
+# Short MEI tips (~20–30 bp) need smaller seeds than bwa mem defaults (k=19, T=30).
+# Empirically (scripts/benchmark_mei_aligners.py on Alu/LINE1/SVA consensus samples):
+# bwa mem -k10 -T10 recovers ~100% of 20 bp+ tips; default minimap2 -x sr recovers 0% ≤30 bp.
+# Primary alignments only (no -a): we keep the best hit per query anyway, and -a
+# inflates SAM ~8× with secondaries that are discarded after scoring.
+# Thread count is per invocation via --bwa-threads (default 1). The pipeline wrapper
+# raises it for single-chrom runs and keeps 1 under multi-chrom concurrency.
+def _bwa_mem_mei_args(*, bwa_threads: int = 1) -> tuple[str, ...]:
+    threads = max(1, int(bwa_threads))
+    return ("mem", "-t", str(threads), "-k", "10", "-T", "10")
+# After polyA/T trim, length-aware hit gate (qcov vs trimmed query length):
+# short tips must cover most of the query; longer clips often tip-align only.
+_MEI_ALIGN_MIN_QCOV_SHORT = 0.80
+_MEI_ALIGN_MIN_PID = 0.90
+_MEI_ALIGN_MIN_TRIMMED_BP = 12
+# Short path: qcov≥0.80 on trimmed len≥12 already implies ≳10 bp aligned.
+_MEI_ALIGN_MIN_ALN_BP_LONG = 20
+_MEI_ALIGN_SHORT_QLEN_MAX = 30
+
+
+def _trim_poly_at_from_clip(seq: str, side: str = "") -> str:
+    """Remove the longest A- or T-homopolymer run (≥8 bp) from a soft-clip.
+
+    Used before MEI consensus remap so polyA+tip clips are scored on the tip.
+    Prefers the non-poly segment consistent with clip side (L→3' of clip /
+    right residual; R→5' of clip / left residual).
+    """
+    s = (seq or "").upper().replace("U", "T")
+    if not s:
+        return ""
+    best_start = -1
+    best_end = -1
+    best_len = 0
+    cur_start = -1
+    cur_base = ""
+    for i, ch in enumerate(s):
+        if ch not in {"A", "T"}:
+            if cur_start >= 0:
+                run_len = i - cur_start
+                if run_len > best_len:
+                    best_start, best_end, best_len = cur_start, i, run_len
+                cur_start = -1
+                cur_base = ""
+            continue
+        if cur_start < 0:
+            cur_start = i
+            cur_base = ch
+        elif ch != cur_base:
+            run_len = i - cur_start
+            if run_len > best_len:
+                best_start, best_end, best_len = cur_start, i, run_len
+            cur_start = i
+            cur_base = ch
+    if cur_start >= 0:
+        run_len = len(s) - cur_start
+        if run_len > best_len:
+            best_start, best_end, best_len = cur_start, len(s), run_len
+    if best_len < 8:
+        return s
+    left = s[:best_start]
+    right = s[best_end:]
+    side_u = (side or "").upper()
+    preferred = right if side_u == "L" else left if side_u == "R" else (
+        right if len(right) >= len(left) else left
+    )
+    backup = left if preferred is right else right
+    if len(preferred) >= _MEI_ALIGN_MIN_TRIMMED_BP:
+        return preferred
+    if len(backup) >= _MEI_ALIGN_MIN_TRIMMED_BP:
+        return backup
+    joined = (left + right).strip()
+    return joined if len(joined) >= _MEI_ALIGN_MIN_TRIMMED_BP else s
+
+
+def _mei_align_quality_ok(
+    df: pd.DataFrame,
+    *,
+    query_len: pd.Series | None = None,
+) -> pd.Series:
+    """Length-aware MEI-hit gate on trimmed-query alignment metrics.
+
+    Short trimmed queries (≤30 bp): require high qcov + pid.
+    Longer queries: tip alignments are allowed — require pid + min alnlen,
+    not full-query coverage (long clips often have only an MEI tip).
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    has = (
+        df["target"].notna() & df["target"].fillna("").astype(str).ne("")
+        if "target" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    qcov = (
+        pd.to_numeric(df["qcov"], errors="coerce").fillna(0.0)
+        if "qcov" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    pid = (
+        pd.to_numeric(df["pid"], errors="coerce").fillna(0.0)
+        if "pid" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    aln = (
+        pd.to_numeric(df["alnlen"], errors="coerce").fillna(0.0)
+        if "alnlen" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    if query_len is None:
+        # Recover approximate query length from q_aln / qcov when available.
+        qlen = pd.Series(0.0, index=df.index)
+        recoverable = qcov.gt(0)
+        qlen.loc[recoverable] = (aln.loc[recoverable] / qcov.loc[recoverable]).astype(float)
+    else:
+        qlen = pd.to_numeric(query_len, errors="coerce").reindex(df.index).fillna(0.0)
+    short = qlen.le(float(_MEI_ALIGN_SHORT_QLEN_MAX))
+    short_ok = (
+        short
+        & qcov.ge(float(_MEI_ALIGN_MIN_QCOV_SHORT))
+        & pid.ge(float(_MEI_ALIGN_MIN_PID))
+    )
+    long_ok = (
+        (~short)
+        & pid.ge(float(_MEI_ALIGN_MIN_PID))
+        & aln.ge(float(_MEI_ALIGN_MIN_ALN_BP_LONG))
+    )
+    return has & (short_ok | long_ok)
+
+
+def _apply_mei_align_quality_gate(
+    df: pd.DataFrame,
+    *,
+    query_len: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Clear MEI hit fields that fail the length-aware qcov/pid gate."""
+    if df is None or df.empty or "target" not in df.columns:
+        return df
+    out = df.copy()
+    ok = _mei_align_quality_ok(out, query_len=query_len)
+    bad = out["target"].fillna("").astype(str).ne("") & ~ok
+    if not bool(bad.any()):
+        return out
+    clear_empty = ("target", "family", "target_strand")
+    clear_zero_int = ("target_start", "target_end", "target_len", "alnlen", "mapq")
+    clear_zero_float = ("pid", "qcov", "mei_score")
+    for col in clear_empty:
+        if col in out.columns:
+            out.loc[bad, col] = ""
+    for col in clear_zero_int:
+        if col in out.columns:
+            out.loc[bad, col] = 0
+    for col in clear_zero_float:
+        if col in out.columns:
+            out.loc[bad, col] = 0.0
+    return out
+
+
+def _empty_mei_hits() -> pd.DataFrame:
+    return pd.DataFrame(columns=_MEI_HIT_COLUMNS)
+
+
+def _mei_score_from_metrics(*, pid: float, qcov: float, mapq: int) -> float:
+    raw_score = (0.45 * float(pid)) + (0.35 * float(qcov)) + (0.2 * (float(mapq) / 60.0))
+    return float(max(0.0, min(1.0, raw_score)))
+
+
+def _pick_best_mei_hits(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return _empty_mei_hits()
+    hits = pd.DataFrame(rows)
+    hits = hits.sort_values(
+        ["qname", "mei_score", "alnlen", "mapq", "pid", "qcov"],
+        ascending=[True, False, False, False, False, False],
+    )
+    return hits.drop_duplicates(subset=["qname"], keep="first")
+
+
 def _best_hits_from_paf(paf_path: Path) -> pd.DataFrame:
     rows = []
     with paf_path.open("r", encoding="utf-8") as handle:
@@ -699,8 +960,6 @@ def _best_hits_from_paf(paf_path: Path) -> pd.DataFrame:
             mapq = int(parts[11])
             qcov = (qend - qstart) / qlen if qlen > 0 else 0.0
             pid = (nmatch / alnlen) if alnlen > 0 else 0.0
-            raw_score = (0.45 * pid) + (0.35 * qcov) + (0.2 * (mapq / 60.0))
-            score = max(0.0, min(1.0, raw_score))
             rows.append(
                 {
                     "qname": qname,
@@ -713,38 +972,149 @@ def _best_hits_from_paf(paf_path: Path) -> pd.DataFrame:
                     "mapq": mapq,
                     "pid": pid,
                     "qcov": qcov,
-                    "mei_score": score,
+                    "mei_score": _mei_score_from_metrics(pid=pid, qcov=qcov, mapq=mapq),
                     "family": _family_from_target(tname),
                 }
             )
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "qname",
-                "target",
-                "target_start",
-                "target_end",
-                "target_len",
-                "target_strand",
-                "alnlen",
-                "mapq",
-                "pid",
-                "qcov",
-                "mei_score",
-                "family",
-            ]
-        )
+    return _pick_best_mei_hits(rows)
 
-    paf = pd.DataFrame(rows)
-    paf = paf.sort_values(
-        ["qname", "mei_score", "alnlen", "mapq", "pid", "qcov"],
-        ascending=[True, False, False, False, False, False],
+
+_CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+
+
+def _cigar_alignment_spans(cigar: str) -> tuple[int, int, int]:
+    """Return (query_aligned_bp, ref_span_bp, alnlen) from a CIGAR string."""
+    q_aln = 0
+    r_span = 0
+    alnlen = 0
+    for n_s, op in _CIGAR_RE.findall(cigar or ""):
+        n = int(n_s)
+        if op in {"M", "=", "X"}:
+            q_aln += n
+            r_span += n
+            alnlen += n
+        elif op == "I":
+            q_aln += n
+            alnlen += n
+        elif op in {"D", "N"}:
+            r_span += n
+            alnlen += n
+    return q_aln, r_span, alnlen
+
+
+def _cigar_query_len(cigar: str) -> int:
+    """Full query length implied by CIGAR (M/I/=/X/S/H)."""
+    qlen = 0
+    for n_s, op in _CIGAR_RE.findall(cigar or ""):
+        if op in {"M", "I", "=", "X", "S", "H"}:
+            qlen += int(n_s)
+    return qlen
+
+
+def _best_hits_from_sam(sam_text: str, *, target_lengths: dict[str, int] | None = None) -> pd.DataFrame:
+    """Best *primary* SAM hit per query (same columns as PAF path).
+
+    Skips secondary (0x100) and supplementary (0x800). Those often hard-clip SEQ
+    to the aligned tip only, which falsely makes qcov look like 1.0 and beats the
+    real soft-clipped primary when ranking by mei_score.
+    """
+    tlen_map = dict(target_lengths or {})
+    rows: list[dict] = []
+    for line in (sam_text or "").splitlines():
+        if not line or line.startswith("@"):
+            if line.startswith("@SQ"):
+                # @SQ SN:name LN:len
+                sn = ln = None
+                for field in line.split("\t")[1:]:
+                    if field.startswith("SN:"):
+                        sn = field[3:]
+                    elif field.startswith("LN:"):
+                        ln = int(field[3:])
+                if sn and ln:
+                    tlen_map[sn] = ln
+            continue
+        parts = line.split("\t")
+        if len(parts) < 11:
+            continue
+        qname = parts[0]
+        flag = int(parts[1])
+        if flag & 0x4:  # unmapped
+            continue
+        if flag & 0x100 or flag & 0x800:  # secondary / supplementary
+            continue
+        tname = parts[2]
+        if not tname or tname == "*":
+            continue
+        tstart = int(parts[3])  # 1-based
+        mapq = int(parts[4])
+        cigar = parts[5]
+        seq = parts[9]
+        tags: dict[str, str] = {}
+        for field in parts[11:]:
+            try:
+                tag, _typ, val = field.split(":", 2)
+            except ValueError:
+                continue
+            tags[tag] = val
+        q_aln, r_span, alnlen = _cigar_alignment_spans(cigar)
+        if alnlen <= 0:
+            continue
+        nm = int(tags["NM"]) if "NM" in tags and str(tags["NM"]).lstrip("-").isdigit() else 0
+        nmatch = max(0, alnlen - nm)
+        pid = (nmatch / alnlen) if alnlen > 0 else 0.0
+        # Prefer CIGAR-implied full query length so soft/hard clips count in qcov.
+        qlen = _cigar_query_len(cigar)
+        if qlen <= 0:
+            qlen = len(seq) if seq and seq != "*" else q_aln
+        qcov = (q_aln / qlen) if qlen > 0 else 0.0
+        strand = "-" if (flag & 0x10) else "+"
+        tend = tstart + max(r_span - 1, 0)
+        rows.append(
+            {
+                "qname": qname,
+                "target": tname,
+                "target_start": tstart,
+                "target_end": tend,
+                "target_len": int(tlen_map.get(tname, 0)),
+                "target_strand": strand,
+                "alnlen": int(alnlen),
+                "mapq": mapq,
+                "pid": float(pid),
+                "qcov": float(qcov),
+                "mei_score": _mei_score_from_metrics(pid=pid, qcov=qcov, mapq=mapq),
+                "family": _family_from_target(tname),
+            }
+        )
+    return _pick_best_mei_hits(rows)
+
+
+def _ensure_bwa_index(mei_fasta: Path) -> None:
+    """Build classic bwa index next to ``mei_fasta`` when missing."""
+    if Path(f"{mei_fasta}.bwt").exists() and Path(f"{mei_fasta}.sa").exists():
+        return
+    subprocess.run(
+        ["bwa", "index", str(mei_fasta)],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    return paf.drop_duplicates(subset=["qname"], keep="first")
+
+
+def _align_queries_to_mei_bwa(
+    query_fa: Path,
+    mei_fasta: Path,
+    *,
+    bwa_threads: int = 1,
+) -> pd.DataFrame:
+    """Remap query FASTA to MEI consensus with ``bwa mem -k10 -T10``."""
+    _ensure_bwa_index(mei_fasta)
+    cmd = ["bwa", *_bwa_mem_mei_args(bwa_threads=bwa_threads), str(mei_fasta), str(query_fa)]
+    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return _best_hits_from_sam(proc.stdout or "")
 
 
 def _canonicalize_alignment_hit_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize minimap2 hit columns after merges with possible name collisions."""
+    """Normalize MEI-alignment hit columns after merges with possible name collisions."""
     out = df.copy()
     expected_cols = [
         "target",
@@ -774,6 +1144,8 @@ def _align_clips_with_minimap2(
     split_df: pd.DataFrame,
     mei_fasta: Path,
     sample: str,
+    *,
+    bwa_threads: int = 1,
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
     if "clip_seq" not in split_df.columns:
         raise ValueError(
@@ -783,54 +1155,14 @@ def _align_clips_with_minimap2(
     clips = split_df.copy()
     clips = clips.loc[clips["clip_seq"].fillna("").astype(str).str.len() > 0].copy()
     clips["clip_id"] = [f"{sample}_{i}" for i in range(len(clips))]
-    def _trim_clip_for_coord_alignment(seq: str, side: str) -> str:
-        s = (seq or "").upper()
-        if not s:
-            return ""
-        best_start = -1
-        best_end = -1
-        best_len = 0
-        cur_start = -1
-        cur_base = ""
-        for i, ch in enumerate(s):
-            if ch not in {"A", "T"}:
-                if cur_start >= 0:
-                    run_len = i - cur_start
-                    if run_len > best_len:
-                        best_start, best_end, best_len = cur_start, i, run_len
-                    cur_start = -1
-                    cur_base = ""
-                continue
-            if cur_start < 0:
-                cur_start = i
-                cur_base = ch
-            elif ch != cur_base:
-                run_len = i - cur_start
-                if run_len > best_len:
-                    best_start, best_end, best_len = cur_start, i, run_len
-                cur_start = i
-                cur_base = ch
-        if cur_start >= 0:
-            run_len = len(s) - cur_start
-            if run_len > best_len:
-                best_start, best_end, best_len = cur_start, len(s), run_len
-        if best_len < 8:
-            return s
-        left = s[:best_start]
-        right = s[best_end:]
-        side_u = (side or "").upper()
-        preferred = right if side_u == "L" else left if side_u == "R" else (right if len(right) >= len(left) else left)
-        backup = left if preferred is right else right
-        if len(preferred) >= 12:
-            return preferred
-        if len(backup) >= 12:
-            return backup
-        joined = (left + right).strip()
-        return joined if len(joined) >= 12 else s
+    # Primary MEI remap uses polyA/T-trimmed clip sequence; coord fields mirror
+    # the same gated hit (no second bwa pass).
     clips["clip_seq_coord"] = [
-        _trim_clip_for_coord_alignment(str(seq), str(side))
+        _trim_poly_at_from_clip(str(seq), str(side))
         for seq, side in zip(clips["clip_seq"].fillna(""), clips["clip_side"].fillna(""))
     ]
+    clips["mei_query_seq"] = clips["clip_seq_coord"].fillna("").astype(str)
+    clips = clips.loc[clips["mei_query_seq"].str.len() >= _MEI_ALIGN_MIN_TRIMMED_BP].copy()
     if clips.empty:
         summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
         return clips, summary
@@ -838,30 +1170,20 @@ def _align_clips_with_minimap2(
     with tempfile.TemporaryDirectory(prefix=f"rtm_mei_{sample}_") as tmpdir:
         tmp = Path(tmpdir)
         query_fa = tmp / "clips.fa"
-        paf_path = tmp / "clips_vs_mei.paf"
-        query_coord_fa = tmp / "clips_coord.fa"
-        paf_coord_path = tmp / "clips_coord_vs_mei.paf"
 
         with query_fa.open("w", encoding="utf-8") as handle:
             for row in clips.itertuples(index=False):
-                handle.write(f">{row.clip_id}\n{row.clip_seq}\n")
+                handle.write(f">{row.clip_id}\n{row.mei_query_seq}\n")
 
-        cmd = [
-            "minimap2",
-            "-x",
-            "sr",
-            "--secondary=yes",
-            "-c",
-            str(mei_fasta),
-            str(query_fa),
-        ]
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        paf_path.write_text(proc.stdout, encoding="utf-8")
-
-        best_hits = _best_hits_from_paf(paf_path)
+        # bwa mem -k10 -T10: recovers ~20 bp Alu/L1/SVA tips that minimap2 -x sr misses.
+        best_hits = _align_queries_to_mei_bwa(query_fa, mei_fasta, bwa_threads=bwa_threads)
         out = clips.merge(best_hits, left_on="clip_id", right_on="qname", how="left")
         out = _canonicalize_alignment_hit_columns(out)
-        out["mei_hit"] = out["target"].notna()
+        out = _apply_mei_align_quality_gate(
+            out,
+            query_len=out["mei_query_seq"].fillna("").astype(str).str.len(),
+        )
+        out["mei_hit"] = out["target"].notna() & out["target"].fillna("").astype(str).ne("")
         out["family"] = out["family"].fillna("")
         out["target"] = out["target"].fillna("")
         out["target_strand"] = out["target_strand"].fillna("")
@@ -869,49 +1191,27 @@ def _align_clips_with_minimap2(
         out["target_end"] = out["target_end"].fillna(0).astype(int)
         out["target_len"] = out["target_len"].fillna(0).astype(int)
         out["alnlen"] = out["alnlen"].fillna(0).astype(int)
+        for _col, _default in (("mapq", 0), ("pid", 0.0), ("qcov", 0.0), ("mei_score", 0.0)):
+            if _col not in out.columns:
+                out[_col] = _default
+        out["mapq"] = out["mapq"].fillna(0).astype(int)
+        out["pid"] = out["pid"].fillna(0.0).astype(float)
+        out["qcov"] = out["qcov"].fillna(0.0).astype(float)
         out["mei_score"] = out["mei_score"].fillna(0.0).astype(float)
 
-        # Coordinate-only alignment path from poly-trimmed clips. This keeps raw
-        # clip alignment for support scoring but improves MEI-axis coordinate recovery.
-        with query_coord_fa.open("w", encoding="utf-8") as handle:
-            for row in clips.itertuples(index=False):
-                coord_seq = str(getattr(row, "clip_seq_coord", "") or "")
-                if len(coord_seq) < 8:
-                    continue
-                handle.write(f">{row.clip_id}\n{coord_seq}\n")
-        coord_hits = pd.DataFrame(columns=["qname", "target", "family", "target_strand", "target_start", "target_end", "target_len", "alnlen", "mapq", "pid", "qcov", "mei_score"])
-        if query_coord_fa.exists() and query_coord_fa.stat().st_size > 0:
-            proc_coord = subprocess.run(cmd[:-1] + [str(query_coord_fa)], check=True, capture_output=True, text=True)
-            paf_coord_path.write_text(proc_coord.stdout, encoding="utf-8")
-            coord_hits = _best_hits_from_paf(paf_coord_path)
-        coord_hits = coord_hits.rename(
-            columns={
-                "target": "target_coord",
-                "family": "family_coord",
-                "target_strand": "target_strand_coord",
-                "target_start": "target_start_coord",
-                "target_end": "target_end_coord",
-                "target_len": "target_len_coord",
-                "alnlen": "alnlen_coord",
-                "mapq": "mapq_coord",
-                "pid": "pid_coord",
-                "qcov": "qcov_coord",
-                "mei_score": "mei_score_coord",
-            }
-        )
-        out = out.merge(coord_hits, left_on="clip_id", right_on="qname", how="left", suffixes=("", "_coord_merge"))
-        out["mei_hit_coord"] = out["target_coord"].notna()
-        out["target_coord"] = out["target_coord"].fillna("")
-        out["target_strand_coord"] = out["target_strand_coord"].fillna("")
-        out["target_start_coord"] = out["target_start_coord"].fillna(0).astype(int)
-        out["target_end_coord"] = out["target_end_coord"].fillna(0).astype(int)
-        out["target_len_coord"] = out["target_len_coord"].fillna(0).astype(int)
-        out["alnlen_coord"] = out["alnlen_coord"].fillna(0).astype(int)
-        out["mapq_coord"] = out["mapq_coord"].fillna(0).astype(int)
-        out["pid_coord"] = out["pid_coord"].fillna(0.0).astype(float)
-        out["qcov_coord"] = out["qcov_coord"].fillna(0.0).astype(float)
-        out["family_coord"] = out["family_coord"].fillna("")
-        out["mei_score_coord"] = out["mei_score_coord"].fillna(0.0).astype(float)
+        # Coord columns: same trimmed+gated alignment (legacy consumers).
+        out["target_coord"] = out["target"]
+        out["family_coord"] = out["family"]
+        out["target_strand_coord"] = out["target_strand"]
+        out["target_start_coord"] = out["target_start"]
+        out["target_end_coord"] = out["target_end"]
+        out["target_len_coord"] = out["target_len"]
+        out["alnlen_coord"] = out["alnlen"]
+        out["mapq_coord"] = out["mapq"]
+        out["pid_coord"] = out["pid"]
+        out["qcov_coord"] = out["qcov"]
+        out["mei_score_coord"] = out["mei_score"]
+        out["mei_hit_coord"] = out["mei_hit"]
 
     summary = ClipAlignmentSummary(
         sample=sample,
@@ -925,6 +1225,8 @@ def _align_discordant_reads_with_minimap2(
     discordant_df: pd.DataFrame,
     mei_fasta: Path,
     sample: str,
+    *,
+    bwa_threads: int = 1,
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
     """Remap DPE *soft-clipped* bases (not ref-matched bodies) to MEI consensus."""
     if discordant_df is None or discordant_df.empty:
@@ -961,8 +1263,18 @@ def _align_discordant_reads_with_minimap2(
         ]
         reads.loc[missing_clip, "soft_clip_seq"] = derived
 
-    reads["mei_query_seq"] = reads["soft_clip_seq"].fillna("").astype(str)
-    reads = reads.loc[reads["mei_query_seq"].str.len() >= _DPE_MEI_REMAP_MIN_CLIP_BP].copy()
+    raw_query = reads["soft_clip_seq"].fillna("").astype(str)
+    clip_side = (
+        reads["soft_clip_side"].fillna("").astype(str)
+        if "soft_clip_side" in reads.columns
+        else pd.Series("", index=reads.index)
+    )
+    reads["mei_query_seq"] = [
+        _trim_poly_at_from_clip(seq, side) for seq, side in zip(raw_query, clip_side)
+    ]
+    reads = reads.loc[
+        reads["mei_query_seq"].str.len() >= max(_DPE_MEI_REMAP_MIN_CLIP_BP, _MEI_ALIGN_MIN_TRIMMED_BP)
+    ].copy()
     reads["discordant_id"] = [f"{sample}_disc_{i}" for i in range(len(reads))]
     if reads.empty:
         summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
@@ -982,26 +1294,18 @@ def _align_discordant_reads_with_minimap2(
     with tempfile.TemporaryDirectory(prefix=f"rtm_mei_disc_{sample}_") as tmpdir:
         tmp = Path(tmpdir)
         query_fa = tmp / "discordant_clips.fa"
-        paf_path = tmp / "discordant_vs_mei.paf"
 
         with query_fa.open("w", encoding="utf-8") as handle:
             for row in reads.itertuples(index=False):
                 handle.write(f">{row.discordant_id}\n{row.mei_query_seq}\n")
 
-        cmd = [
-            "minimap2",
-            "-x",
-            "sr",
-            "--secondary=yes",
-            "-c",
-            str(mei_fasta),
-            str(query_fa),
-        ]
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        paf_path.write_text(proc.stdout, encoding="utf-8")
-        best_hits = _best_hits_from_paf(paf_path)
+        best_hits = _align_queries_to_mei_bwa(query_fa, mei_fasta, bwa_threads=bwa_threads)
         hit_rows = reads.merge(best_hits, left_on="discordant_id", right_on="qname", how="left")
         hit_rows = _canonicalize_alignment_hit_columns(hit_rows)
+        hit_rows = _apply_mei_align_quality_gate(
+            hit_rows,
+            query_len=hit_rows["mei_query_seq"].fillna("").astype(str).str.len(),
+        )
 
     # Left-join hits back onto the full discordant table so unclipped anchors stay.
     out = discordant_df.copy()
@@ -1015,6 +1319,9 @@ def _align_discordant_reads_with_minimap2(
         "target_end",
         "target_len",
         "alnlen",
+        "mapq",
+        "pid",
+        "qcov",
         "mei_score",
     ]
     if not merge_keys:
@@ -1026,7 +1333,7 @@ def _align_discordant_reads_with_minimap2(
                 hit_rows[col] = False
             elif col in {"target", "family", "target_strand"}:
                 hit_rows[col] = ""
-            elif col == "mei_score":
+            elif col in {"mei_score", "pid", "qcov"}:
                 hit_rows[col] = 0.0
             else:
                 hit_rows[col] = 0
@@ -1172,6 +1479,8 @@ def _align_discordant_mates_with_minimap2(
     mei_fasta: Path,
     sample: str,
     bam_path: Path | None = None,
+    *,
+    bwa_threads: int = 1,
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
     """Map discordant mates to MEI consensus (clip-only when mate is soft-clipped)."""
     fetch_t0 = time.monotonic()
@@ -1199,18 +1508,35 @@ def _align_discordant_mates_with_minimap2(
     mates["mate_query_id"] = [f"{sample}_mate_{i}" for i in range(len(mates))]
     mate_query = mates.copy()
     # Shared discordant aligner historically expected read_seq; pass clip/full query.
+    # PolyA trim uses mate soft-clip side when the query is a clip; full-mate queries
+    # leave side empty so trim keeps the longer non-poly residual.
     mate_query["read_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
     mate_query["soft_clip_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
-    mate_query["soft_clip_side"] = "R"
+    mate_has_clip = (
+        pd.to_numeric(mate_query.get("mate_soft_clip_len", 0), errors="coerce").fillna(0).astype(int).gt(0)
+        | mate_query.get("mate_soft_clip_seq", pd.Series("", index=mate_query.index))
+        .fillna("")
+        .astype(str)
+        .str.len()
+        .gt(0)
+    )
+    mate_side = (
+        mate_query["mate_soft_clip_side"].fillna("").astype(str)
+        if "mate_soft_clip_side" in mate_query.columns
+        else pd.Series("", index=mate_query.index)
+    )
+    mate_query["soft_clip_side"] = mate_side.where(mate_has_clip, "")
     mate_query["soft_clip_len"] = mate_query["mei_query_seq"].str.len().astype(int)
     # Force a strong reason so the shared discordant aligner does not drop mates
     # whose only original reason was poly_tail_anchor_rescue (or empty).
     mate_query["discordant_reasons"] = "interchrom"
     aln_t0 = time.monotonic()
-    hits, summary = _align_discordant_reads_with_minimap2(mate_query, mei_fasta, sample=sample)
+    hits, summary = _align_discordant_reads_with_minimap2(
+        mate_query, mei_fasta, sample=sample, bwa_threads=bwa_threads
+    )
     print(
-        f"[mei-annotate] sample={sample} mate_minimap2 queries={len(mate_query)} "
-        f"paf_hits={summary.paf_hits} elapsed={time.monotonic() - aln_t0:.1f}s",
+        f"[mei-annotate] sample={sample} mate_bwa_mem queries={len(mate_query)} "
+        f"mei_hits={summary.paf_hits} elapsed={time.monotonic() - aln_t0:.1f}s",
         flush=True,
     )
     keep_cols = [
@@ -1299,7 +1625,7 @@ def _hydrate_sample_mei_hits_from_detail(
 ) -> dict[str, object]:
     """Rebuild per-read MEI hit frames from a prior supporting_reads_detail table.
 
-    Skips minimap2 and mate-BAM fetch. Non-hit evidence rows are retained so
+    Skips MEI consensus remap and mate-BAM fetch. Non-hit evidence rows are retained so
     residual complex fractions stay correct.
     """
     t0 = time.monotonic()
@@ -1503,7 +1829,7 @@ def _hydrate_sample_mei_hits_from_detail(
     )
     print(
         f"[mei-annotate] sample={sample} reused detail hits "
-        f"split_paf={split_paf} disc_anchor_paf={disc_paf} disc_mate_paf={mate_paf} "
+        f"split_mei={split_paf} disc_anchor_mei={disc_paf} disc_mate_mei={mate_paf} "
         f"elapsed={time.monotonic() - t0:.1f}s",
         flush=True,
     )
@@ -1525,24 +1851,28 @@ def _remap_one_sample_mei_evidence(
     mei_fasta: Path,
     bam_path: Path | None,
     mate_bam_path: Path | None,
+    bwa_threads: int = 1,
 ) -> dict[str, object]:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
     t0 = time.monotonic()
-    print(f"[mei-annotate] sample={sample} remap start", flush=True)
+    print(f"[mei-annotate] sample={sample} remap start bwa_threads={max(1, int(bwa_threads))}", flush=True)
     split_t0 = time.monotonic()
-    split_hits, split_summary = _align_clips_with_minimap2(split_df, mei_fasta, sample=sample)
+    split_hits, split_summary = _align_clips_with_minimap2(
+        split_df, mei_fasta, sample=sample, bwa_threads=bwa_threads
+    )
     print(
-        f"[mei-annotate] sample={sample} split_minimap2 rows={len(split_df)} "
-        f"paf_hits={split_summary.paf_hits} elapsed={time.monotonic() - split_t0:.1f}s",
+        f"[mei-annotate] sample={sample} split_bwa_mem rows={len(split_df)} "
+        f"mei_hits={split_summary.paf_hits} "
+        f"elapsed={time.monotonic() - split_t0:.1f}s",
         flush=True,
     )
     disc_t0 = time.monotonic()
     disc_anchor_hits, disc_summary = _align_discordant_reads_with_minimap2(
-        discordant_df, mei_fasta, sample=sample
+        discordant_df, mei_fasta, sample=sample, bwa_threads=bwa_threads
     )
     print(
-        f"[mei-annotate] sample={sample} disc_anchor_minimap2 rows={len(discordant_df)} "
-        f"paf_hits={disc_summary.paf_hits} elapsed={time.monotonic() - disc_t0:.1f}s",
+        f"[mei-annotate] sample={sample} disc_anchor_bwa_mem rows={len(discordant_df)} "
+        f"mei_hits={disc_summary.paf_hits} elapsed={time.monotonic() - disc_t0:.1f}s",
         flush=True,
     )
     disc_mate_hits, disc_mate_summary = _align_discordant_mates_with_minimap2(
@@ -1550,22 +1880,38 @@ def _remap_one_sample_mei_evidence(
         mei_fasta,
         sample=f"{sample}_mate",
         bam_path=mate_bam_path or bam_path,
+        bwa_threads=bwa_threads,
     )
     post_t0 = time.monotonic()
     disc_hits = _attach_mei_hits_to_discordant_rows(discordant_df, disc_anchor_hits, disc_mate_hits)
     disc_hits = _rescue_vntr_like_discordant_mei_hits(disc_hits)
     disc_hits = _rescue_polya_like_discordant_mei_hits(disc_hits)
     split_hits = _enrich_split_hits_with_mate_positions(split_hits, bam_path)
+    # CCCTCT / SVA-VNTR soft-clips → VNTR_MAPPED (never MEI-SR), before short rescue.
+    split_hits = _annotate_vntr_like_split_clips(split_hits, discordant_df=disc_hits)
+    # Short-clip rescue after DPE remap so DPE can seed when SR≥20 is absent.
+    split_hits = _annotate_short_mei_seed_rescue(split_hits, discordant_df=disc_hits)
+    n_short_rescue = (
+        int(split_hits["short_mei_seed_rescued"].fillna(False).astype(bool).sum())
+        if "short_mei_seed_rescued" in split_hits.columns
+        else 0
+    )
+    n_vntr_split = (
+        int(split_hits["vntr_rescue"].fillna(False).astype(bool).sum())
+        if "vntr_rescue" in split_hits.columns
+        else 0
+    )
     print(
         f"[mei-annotate] sample={sample} attach/rescue/enrich "
+        f"short_mei_rescued={n_short_rescue} vntr_split={n_vntr_split} "
         f"elapsed={time.monotonic() - post_t0:.1f}s",
         flush=True,
     )
     print(
         f"[mei-annotate] sample={sample} remap done elapsed={time.monotonic() - t0:.1f}s "
-        f"split_paf={getattr(split_summary, 'paf_hits', 0)} "
-        f"disc_anchor_paf={getattr(disc_summary, 'paf_hits', 0)} "
-        f"disc_mate_paf={getattr(disc_mate_summary, 'paf_hits', 0)}",
+        f"split_mei={getattr(split_summary, 'paf_hits', 0)} "
+        f"disc_anchor_mei={getattr(disc_summary, 'paf_hits', 0)} "
+        f"disc_mate_mei={getattr(disc_mate_summary, 'paf_hits', 0)}",
         flush=True,
     )
     return {
@@ -1794,6 +2140,8 @@ def _attach_mei_hits_to_discordant_rows(
 
 _VNTR_HEXAMERS = ("CCCTCT", "CTCTCC", "CTCCCT", "TCCCTC", "CCCTCTC", "GGGAGA")
 _VNTR_MIN_SEQ_LEN = 40
+# Soft-clips can be shorter than discordant mates; still require clear hexamer content.
+_VNTR_MIN_CLIP_SEQ_LEN = 20
 _VNTR_MIN_HEXAMER_HITS = 3
 _VNTR_MIN_HEXAMER_COV = 0.30
 _VNTR_RESCUE_MIN_SUPPORT_READS = 3
@@ -1801,7 +2149,7 @@ _VNTR_RESCUE_MIN_FAMILY_PURITY = 0.60
 _VNTR_RESCUE_FAMILIES = frozenset({"SVA"})
 
 
-def _sva_vntr_like_score(seq: str) -> float:
+def _sva_vntr_like_score(seq: str, *, min_seq_len: int | None = None) -> float:
     """
     Score SVA VNTR / hexamer-repeat content in [0, 1].
 
@@ -1809,7 +2157,8 @@ def _sva_vntr_like_score(seq: str) -> float:
     fails on allele-specific VNTR even when BAM placed the mate on a genomic SVA.
     """
     s = (seq or "").upper().replace("U", "T")
-    if len(s) < _VNTR_MIN_SEQ_LEN:
+    min_len = int(_VNTR_MIN_SEQ_LEN if min_seq_len is None else min_seq_len)
+    if len(s) < min_len:
         return 0.0
     hits = 0
     covered = [False] * len(s)
@@ -1832,8 +2181,10 @@ def _sva_vntr_like_score(seq: str) -> float:
     return float(max(0.0, min(1.0, 0.55 * cov + 0.45 * hit_term)))
 
 
-def _is_sva_vntr_like(seq: str, *, min_score: float = 0.35) -> bool:
-    return _sva_vntr_like_score(seq) >= float(min_score)
+def _is_sva_vntr_like(
+    seq: str, *, min_score: float = 0.35, min_seq_len: int | None = None
+) -> bool:
+    return _sva_vntr_like_score(seq, min_seq_len=min_seq_len) >= float(min_score)
 
 
 def _rescue_vntr_like_discordant_mei_hits(df: pd.DataFrame) -> pd.DataFrame:
@@ -1967,6 +2318,118 @@ def _rescue_vntr_like_discordant_mei_hits(df: pd.DataFrame) -> pd.DataFrame:
             f"across {int(eligible.drop_duplicates(['chrom','window_start','window_end']).shape[0])} SVA-supported loci"
         )
     out = out.drop(columns=["_fam_norm", "top_family", "support_reads"], errors="ignore")
+    return out
+
+
+def _annotate_vntr_like_split_clips(
+    split_df: pd.DataFrame,
+    discordant_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Move CCCTCT/VNTR-like soft-clips out of MEI-SR into VNTR_MAPPED.
+
+    - VNTR-like clips that minimap assigned to SVA are demoted (not MEI_MAPPED/SR).
+    - VNTR-like non-hits at SVA-supported loci are rescued as ``vntr_rescue``.
+    """
+    if split_df is None or split_df.empty:
+        return split_df
+    out = split_df.copy()
+    if "vntr_rescue" not in out.columns:
+        out["vntr_rescue"] = False
+    else:
+        out["vntr_rescue"] = out["vntr_rescue"].fillna(False).astype(bool)
+    if "vntr_like_score" not in out.columns:
+        out["vntr_like_score"] = 0.0
+    if "mei_hit" not in out.columns:
+        out["mei_hit"] = False
+    if "mei_hit_source" not in out.columns:
+        out["mei_hit_source"] = ""
+
+    seq = (
+        out["clip_seq"].fillna("").astype(str)
+        if "clip_seq" in out.columns
+        else pd.Series("", index=out.index, dtype=str)
+    )
+    out["vntr_like_score"] = seq.map(
+        lambda s: _sva_vntr_like_score(s, min_seq_len=_VNTR_MIN_CLIP_SEQ_LEN)
+    ).astype(float)
+    vntr_like = out["vntr_like_score"].fillna(0.0) >= 0.35
+    if not bool(vntr_like.any()):
+        return out
+
+    fam = (
+        out["family"].fillna("").astype(str).map(_family_from_target)
+        if "family" in out.columns
+        else pd.Series("", index=out.index, dtype=str)
+    )
+    if "target" in out.columns:
+        empty_fam = fam.eq("") | fam.eq("OTHER")
+        fam = fam.where(~empty_fam, out["target"].fillna("").astype(str).map(_family_from_target))
+    mei_hit = out["mei_hit"].fillna(False).astype(bool)
+    if "mei_hit_coord" in out.columns:
+        mei_hit = mei_hit | out["mei_hit_coord"].fillna(False).astype(bool)
+
+    # Always demote VNTR-like clips that aligned to SVA (hexamer smash-hits).
+    demote = vntr_like & mei_hit & fam.isin(_VNTR_RESCUE_FAMILIES)
+    # Rescue non-MEI VNTR-like clips at loci with SVA consensus support.
+    sva_loci: set[tuple[str, int, int]] = set()
+    key_cols = ["chrom", "window_start", "window_end"]
+    if all(c in out.columns for c in key_cols):
+        split_sva = out.loc[mei_hit & ~demote & fam.isin(_VNTR_RESCUE_FAMILIES), key_cols]
+        for row in split_sva.itertuples(index=False):
+            sva_loci.add((str(row.chrom), int(row.window_start), int(row.window_end)))
+        if discordant_df is not None and not discordant_df.empty:
+            d = discordant_df
+            d_mapped = _discordant_row_mei_mapped(d) if not d.empty else pd.Series(dtype=bool)
+            if d_mapped.any() and all(c in d.columns for c in key_cols):
+                d_fam = (
+                    d["family"].fillna("").astype(str).map(_family_from_target)
+                    if "family" in d.columns
+                    else pd.Series("", index=d.index, dtype=str)
+                )
+                if "mate_mei_family" in d.columns:
+                    mf = d["mate_mei_family"].fillna("").astype(str).map(_family_from_target)
+                    d_fam = d_fam.where(d_fam.isin(_VNTR_RESCUE_FAMILIES), mf)
+                if "target" in d.columns:
+                    empty = d_fam.eq("") | d_fam.eq("OTHER")
+                    d_fam = d_fam.where(
+                        ~empty, d["target"].fillna("").astype(str).map(_family_from_target)
+                    )
+                for row in d.loc[d_mapped & d_fam.isin(_VNTR_RESCUE_FAMILIES), key_cols].itertuples(
+                    index=False
+                ):
+                    sva_loci.add((str(row.chrom), int(row.window_start), int(row.window_end)))
+    at_sva_locus = pd.Series(False, index=out.index)
+    if sva_loci and all(c in out.columns for c in key_cols):
+        at_sva_locus = pd.Series(
+            [
+                (str(c), int(ws), int(we)) in sva_loci
+                for c, ws, we in zip(out["chrom"], out["window_start"], out["window_end"])
+            ],
+            index=out.index,
+        )
+    rescue = vntr_like & (~mei_hit | demote) & (demote | at_sva_locus)
+    rescue = rescue & ~out["vntr_rescue"]
+    n = int(rescue.sum())
+    if not n:
+        return out
+
+    out.loc[rescue, "vntr_rescue"] = True
+    out.loc[rescue, "mei_hit_source"] = "vntr_rescue"
+    # Remove from MEI-SR / MEI_MAPPED; keep as VNTR_MAPPED only.
+    out.loc[rescue, "mei_hit"] = False
+    if "mei_hit_coord" in out.columns:
+        out.loc[rescue, "mei_hit_coord"] = False
+    if "short_mei_seed_rescued" in out.columns:
+        out.loc[rescue, "short_mei_seed_rescued"] = False
+    out.loc[rescue, "family"] = "SVA"
+    if "target" in out.columns:
+        out.loc[rescue, "target"] = "SVA_VNTR_rescue#Retroposon/SVA"
+    out.loc[rescue, "mei_score"] = out.loc[rescue, "vntr_like_score"].clip(lower=0.35, upper=0.85)
+    print(
+        f"[mei-annotate] VNTR-like split rescue: flagged {n} soft-clips as VNTR_MAPPED "
+        f"(demoted_mei_hits={int(demote.sum())})",
+        flush=True,
+    )
     return out
 
 
@@ -2582,57 +3045,342 @@ def _enrich_split_hits_with_mate_positions(
     return out
 
 
-def _split_brk_clp_member_mask(split_df: pd.DataFrame) -> pd.Series:
-    """True for split clips within ±``_BRK_CLP_POS_TOLERANCE_BP`` of modal pos/side.
+def _split_clip_mei_fields(split_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize per-split MEI alignment fields used by short-clip rescue."""
+    mei_hit = (
+        split_df["mei_hit"].fillna(False).astype(bool)
+        if "mei_hit" in split_df.columns
+        else pd.Series(False, index=split_df.index)
+    )
+    mei_hit_coord = (
+        split_df["mei_hit_coord"].fillna(False).astype(bool)
+        if "mei_hit_coord" in split_df.columns
+        else pd.Series(False, index=split_df.index)
+    )
+    has_mei = mei_hit | mei_hit_coord
+    clip_len = pd.to_numeric(split_df.get("clip_len", 0), errors="coerce").fillna(0).astype(int)
+    if "target_start_coord" in split_df.columns:
+        t_start = pd.to_numeric(split_df["target_start_coord"], errors="coerce").fillna(0).astype(int)
+        t_end = pd.to_numeric(split_df["target_end_coord"], errors="coerce").fillna(0).astype(int)
+        t_strand = split_df.get("target_strand_coord", pd.Series("", index=split_df.index)).fillna("").astype(str)
+        t_family = split_df.get("family_coord", pd.Series("", index=split_df.index)).fillna("").astype(str)
+        t_aln = pd.to_numeric(split_df.get("alnlen_coord", 0), errors="coerce").fillna(0).astype(int)
+        use_coord = (t_start > 0) | (t_end > 0)
+        if "target_start" in split_df.columns:
+            t_start = t_start.where(
+                use_coord, pd.to_numeric(split_df["target_start"], errors="coerce").fillna(0).astype(int)
+            )
+            t_end = t_end.where(
+                use_coord, pd.to_numeric(split_df["target_end"], errors="coerce").fillna(0).astype(int)
+            )
+            raw_strand = split_df.get("target_strand", pd.Series("", index=split_df.index)).fillna("").astype(str)
+            raw_family = split_df.get("family", pd.Series("", index=split_df.index)).fillna("").astype(str)
+            raw_aln = pd.to_numeric(split_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+            t_strand = t_strand.where(use_coord & t_strand.ne(""), raw_strand)
+            t_family = t_family.where(use_coord & t_family.ne(""), raw_family)
+            t_aln = t_aln.where(use_coord & t_aln.gt(0), raw_aln)
+    else:
+        t_start = pd.to_numeric(split_df.get("target_start", 0), errors="coerce").fillna(0).astype(int)
+        t_end = pd.to_numeric(split_df.get("target_end", 0), errors="coerce").fillna(0).astype(int)
+        t_strand = split_df.get("target_strand", pd.Series("", index=split_df.index)).fillna("").astype(str)
+        t_family = split_df.get("family", pd.Series("", index=split_df.index)).fillna("").astype(str)
+        t_aln = pd.to_numeric(split_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+    side = (
+        split_df["clip_side"].fillna("").astype(str).str.upper().str[:1]
+        if "clip_side" in split_df.columns
+        else pd.Series("", index=split_df.index)
+    )
+    work = pd.DataFrame(
+        {
+            "clip_len": clip_len,
+            "has_mei": has_mei,
+            "t_strand": t_strand,
+            "t_family": t_family,
+            "t_aln": t_aln,
+            "side": side,
+            "t_lo": pd.concat([t_start, t_end], axis=1).min(axis=1),
+            "t_hi": pd.concat([t_start, t_end], axis=1).max(axis=1),
+        },
+        index=split_df.index,
+    )
+    return work
 
-    Mirrors ``BRK_CLP_L/R`` support-string counting so architecture plots can
-    show the same breakpoint pileup reads.
+
+def _dpe_mei_seed_table(discordant_df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
+    """Build per-locus/side DPE MEI seeds for short-clip rescue."""
+    empty_cols = key_cols + [
+        "side",
+        "seed_lo",
+        "seed_hi",
+        "seed_mid",
+        "seed_strand",
+        "seed_family",
+        "seed_n",
+        "seed_source",
+    ]
+    if discordant_df is None or discordant_df.empty:
+        return pd.DataFrame(columns=empty_cols)
+    if not all(c in discordant_df.columns for c in key_cols + ["pos"]):
+        return pd.DataFrame(columns=empty_cols)
+
+    mapped = _discordant_row_mei_mapped(discordant_df)
+    if not mapped.any():
+        return pd.DataFrame(columns=empty_cols)
+    d = discordant_df.loc[mapped].copy()
+    mate_hit = (
+        d["mate_mei_hit"].fillna(False).astype(bool)
+        if "mate_mei_hit" in d.columns
+        else pd.Series(False, index=d.index)
+    )
+    # Prefer mate MEI coords (classic DPE→MEI); fall back to anchor remap.
+    t_start = (
+        pd.to_numeric(d["target_start"], errors="coerce").fillna(0).astype(int)
+        if "target_start" in d.columns
+        else pd.Series(0, index=d.index, dtype=int)
+    )
+    t_end = (
+        pd.to_numeric(d["target_end"], errors="coerce").fillna(0).astype(int)
+        if "target_end" in d.columns
+        else pd.Series(0, index=d.index, dtype=int)
+    )
+    t_strand = (
+        d["target_strand"].fillna("").astype(str)
+        if "target_strand" in d.columns
+        else pd.Series("", index=d.index, dtype=str)
+    )
+    t_family = (
+        d["family"].fillna("").astype(str)
+        if "family" in d.columns
+        else pd.Series("", index=d.index, dtype=str)
+    )
+    if "mate_mei_start" in d.columns:
+        m_start = pd.to_numeric(d["mate_mei_start"], errors="coerce").fillna(0).astype(int)
+        m_end = (
+            pd.to_numeric(d["mate_mei_end"], errors="coerce").fillna(0).astype(int)
+            if "mate_mei_end" in d.columns
+            else pd.Series(0, index=d.index, dtype=int)
+        )
+        m_strand = (
+            d["mate_mei_strand"].fillna("").astype(str)
+            if "mate_mei_strand" in d.columns
+            else pd.Series("", index=d.index, dtype=str)
+        )
+        m_family = (
+            d["mate_mei_family"].fillna("").astype(str)
+            if "mate_mei_family" in d.columns
+            else pd.Series("", index=d.index, dtype=str)
+        )
+        t_start = m_start.where(mate_hit & ((m_start > 0) | (m_end > 0)), t_start)
+        t_end = m_end.where(mate_hit & ((m_start > 0) | (m_end > 0)), t_end)
+        t_strand = m_strand.where(mate_hit & m_strand.ne(""), t_strand)
+        t_family = m_family.where(mate_hit & m_family.ne(""), t_family)
+    d["_lo"] = pd.concat([t_start, t_end], axis=1).min(axis=1)
+    d["_hi"] = pd.concat([t_start, t_end], axis=1).max(axis=1)
+    d = d.loc[d["_hi"].gt(0)].copy()
+    if d.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    mid = (
+        pd.to_numeric(d["window_start"], errors="coerce").fillna(0).astype(int)
+        + pd.to_numeric(d["window_end"], errors="coerce").fillna(0).astype(int)
+    ) // 2
+    pos = pd.to_numeric(d["pos"], errors="coerce").fillna(mid).astype(int)
+    d["_side"] = pd.Series(["L"] * len(d), index=d.index).where(pos <= mid, "R")
+    d["_strand"] = t_strand.loc[d.index]
+    d["_family"] = t_family.loc[d.index]
+
+    seeds = (
+        d.groupby(key_cols + ["_side"], as_index=False)
+        .agg(
+            seed_lo=("_lo", "min"),
+            seed_hi=("_hi", "max"),
+            seed_strand=("_strand", lambda s: s.mode().iloc[0] if len(s.mode()) else ""),
+            seed_family=("_family", lambda s: s.mode().iloc[0] if len(s.mode()) else ""),
+            seed_n=("pos", "count"),
+        )
+        .rename(columns={"_side": "side"})
+    )
+    seeds = seeds.loc[seeds["seed_n"] >= int(_SHORT_MEI_DPE_MIN_SUPPORT)].copy()
+    if seeds.empty:
+        return pd.DataFrame(columns=empty_cols)
+    seeds["seed_mid"] = (seeds["seed_lo"] + seeds["seed_hi"]) / 2.0
+    seeds["seed_source"] = "dpe"
+    return seeds.loc[:, empty_cols]
+
+
+def _annotate_short_mei_seed_rescue(
+    split_df: pd.DataFrame,
+    discordant_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Mark short MEI-mapped clips consistent with SR≥20 or DPE MEI seeds.
+
+    Priority per locus/side:
+      1. Strict SR MEI clips (≥20bp): short clip must overlap seed MEI coords.
+      2. Else DPE MEI (≥``_SHORT_MEI_DPE_MIN_SUPPORT`` mates): same family/strand,
+         near DPE span along the MEI axis, and junction-proximal to the DPE
+         cluster (clips need not overlap DPE mate coords).
     """
     if split_df is None or split_df.empty:
-        return pd.Series(dtype=bool)
+        return split_df
+    out = split_df.copy()
+    out["short_mei_seed_rescued"] = False
+    if "clip_len" not in out.columns:
+        return out
     key_cols = ["chrom", "window_start", "window_end"]
-    if not all(c in split_df.columns for c in key_cols + ["read_name", "pos"]):
-        return pd.Series(False, index=split_df.index)
-    work = split_df.copy()
-    work["_pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
-    if "clip_side" in work.columns:
-        side = work["clip_side"].fillna("").astype(str).str.upper().str[:1]
-        mid = (
-            pd.to_numeric(work["window_start"], errors="coerce").fillna(0).astype(int)
-            + pd.to_numeric(work["window_end"], errors="coerce").fillna(0).astype(int)
-        ) // 2
-        fallback = pd.Series(["L"] * len(work), index=work.index).where(work["_pos"] <= mid, "R")
-        work["_side"] = side.where(side.isin(["L", "R"]), fallback)
-    else:
-        mid = (
-            pd.to_numeric(work["window_start"], errors="coerce").fillna(0).astype(int)
-            + pd.to_numeric(work["window_end"], errors="coerce").fillna(0).astype(int)
-        ) // 2
-        work["_side"] = pd.Series(["L"] * len(work), index=work.index).where(work["_pos"] <= mid, "R")
-    work = work.loc[work["_side"].isin(["L", "R"]) & work["_pos"].gt(0)]
-    if work.empty:
-        return pd.Series(False, index=split_df.index)
-    pos_support = (
-        work.groupby(key_cols + ["_side", "_pos"], as_index=False)["read_name"]
-        .nunique()
-        .rename(columns={"read_name": "_support"})
-        .sort_values(
-            key_cols + ["_side", "_support", "_pos"],
-            ascending=[True, True, True, True, False, True],
-        )
+    if not all(c in out.columns for c in key_cols):
+        return out
+
+    work = _split_clip_mei_fields(out)
+    for c in key_cols:
+        work[c] = out[c]
+    work["t_mid"] = (work["t_lo"] + work["t_hi"]) / 2.0
+
+    vntr_blocked = (
+        out["vntr_rescue"].fillna(False).astype(bool)
+        if "vntr_rescue" in out.columns
+        else pd.Series(False, index=out.index)
     )
-    modes = pos_support.drop_duplicates(key_cols + ["_side"], keep="first").loc[
-        :, key_cols + ["_side", "_pos"]
-    ].rename(columns={"_pos": "_mode_pos"})
-    tagged = work.merge(modes, on=key_cols + ["_side"], how="inner")
-    if tagged.empty:
-        return pd.Series(False, index=split_df.index)
-    keep_idx = tagged.loc[
-        (tagged["_pos"] - tagged["_mode_pos"]).abs() <= int(_BRK_CLP_POS_TOLERANCE_BP)
-    ].index
-    out = pd.Series(False, index=split_df.index)
-    out.loc[keep_idx] = True
+    short_mask = (
+        work["has_mei"]
+        & ~vntr_blocked
+        & work["clip_len"].ge(int(_SHORT_MEI_RESCUE_MIN_CLIP_BP))
+        & work["clip_len"].lt(int(_STRICT_MEI_CLIP_MIN_BP))
+        & work["t_aln"].ge(int(_SHORT_MEI_RESCUE_MIN_ALN_BP))
+        & work["side"].isin(["L", "R"])
+        & work["t_hi"].gt(0)
+    )
+    if not short_mask.any():
+        return out
+
+    rescued = pd.Series(False, index=out.index)
+
+    # --- 1) Strict SR seeds (overlap) ---
+    sr_seed_mask = (
+        work["has_mei"]
+        & ~vntr_blocked
+        & work["clip_len"].ge(int(_STRICT_MEI_CLIP_MIN_BP))
+        & work["t_aln"].ge(int(_SHORT_MEI_RESCUE_MIN_ALN_BP))
+        & work["side"].isin(["L", "R"])
+        & work["t_hi"].gt(0)
+    )
+    sr_sides: set[tuple[str, int, int, str]] = set()
+    if sr_seed_mask.any():
+        sr_seeds = (
+            work.loc[sr_seed_mask]
+            .groupby(key_cols + ["side"], as_index=False)
+            .agg(
+                seed_lo=("t_lo", "min"),
+                seed_hi=("t_hi", "max"),
+                seed_strand=("t_strand", lambda s: s.mode().iloc[0] if len(s.mode()) else ""),
+                seed_family=("t_family", lambda s: s.mode().iloc[0] if len(s.mode()) else ""),
+            )
+        )
+        for row in sr_seeds.itertuples(index=False):
+            sr_sides.add((str(row.chrom), int(row.window_start), int(row.window_end), str(row.side)))
+        cand = work.loc[short_mask].reset_index().merge(sr_seeds, on=key_cols + ["side"], how="inner")
+        if not cand.empty:
+            gap = int(_SHORT_MEI_RESCUE_MAX_COORD_GAP_BP)
+            strand_ok = cand["t_strand"].eq(cand["seed_strand"]) | cand["seed_strand"].eq("") | cand["t_strand"].eq("")
+            fam_ok = (
+                cand["t_family"].eq(cand["seed_family"])
+                | cand["seed_family"].eq("")
+                | cand["t_family"].eq("")
+            )
+            overlap = (cand["t_lo"] <= cand["seed_hi"] + gap) & (cand["t_hi"] >= cand["seed_lo"] - gap)
+            hit_idx = cand.loc[strand_ok & fam_ok & overlap, "index"].astype(int)
+            rescued.loc[hit_idx] = True
+
+    # --- 2) DPE seeds on sides without SR≥20 ---
+    still_short = short_mask & ~rescued
+    if still_short.any() and discordant_df is not None and not discordant_df.empty:
+        dpe_seeds = _dpe_mei_seed_table(discordant_df, key_cols)
+        if not dpe_seeds.empty:
+            if sr_sides:
+                keep_rows = []
+                for row in dpe_seeds.itertuples(index=False):
+                    key = (str(row.chrom), int(row.window_start), int(row.window_end), str(row.side))
+                    if key not in sr_sides:
+                        keep_rows.append(True)
+                    else:
+                        keep_rows.append(False)
+                dpe_seeds = dpe_seeds.loc[keep_rows].copy()
+            if not dpe_seeds.empty:
+                cand = work.loc[still_short].reset_index().merge(
+                    dpe_seeds, on=key_cols + ["side"], how="inner"
+                )
+                if not cand.empty:
+                    axis_gap = int(_SHORT_MEI_DPE_MAX_AXIS_GAP_BP)
+                    slack = int(_SHORT_MEI_DPE_PROXIMAL_SLACK_BP)
+                    strand_ok = (
+                        cand["t_strand"].eq(cand["seed_strand"])
+                        | cand["seed_strand"].eq("")
+                        | cand["t_strand"].eq("")
+                    )
+                    fam_ok = (
+                        cand["t_family"].eq(cand["seed_family"])
+                        | cand["seed_family"].eq("")
+                        | cand["t_family"].eq("")
+                    )
+                    # Distance between intervals along MEI (0 if overlap).
+                    sep = pd.concat(
+                        [
+                            cand["t_lo"] - cand["seed_hi"],
+                            cand["seed_lo"] - cand["t_hi"],
+                        ],
+                        axis=1,
+                    ).max(axis=1).clip(lower=0)
+                    near = sep <= axis_gap
+                    # Junction-proximal: clip toward the flank entry end vs DPE cluster.
+                    # +/L or -/R → enter at MEI 5' (lower coords); else enter at 3'.
+                    entry_5p = (
+                        (cand["side"].eq("L") & cand["seed_strand"].isin(["+", ""]))
+                        | (cand["side"].eq("R") & cand["seed_strand"].eq("-"))
+                    )
+                    proximal = pd.Series(False, index=cand.index)
+                    if entry_5p.any():
+                        proximal.loc[entry_5p] = cand.loc[entry_5p, "t_mid"] <= (
+                            cand.loc[entry_5p, "seed_mid"] + slack
+                        )
+                    if (~entry_5p).any():
+                        proximal.loc[~entry_5p] = cand.loc[~entry_5p, "t_mid"] >= (
+                            cand.loc[~entry_5p, "seed_mid"] - slack
+                        )
+                    hit_idx = cand.loc[strand_ok & fam_ok & near & proximal, "index"].astype(int)
+                    rescued.loc[hit_idx] = True
+
+    out.loc[rescued, "short_mei_seed_rescued"] = True
     return out
+
+
+def _split_mei_support_eligible_mask(split_df: pd.DataFrame) -> pd.Series:
+    """True for MEI-mapped splits eligible for SR / MEI_MAPPED counting."""
+    if split_df is None or split_df.empty:
+        return pd.Series(dtype=bool)
+    mei_hit = (
+        split_df["mei_hit"].fillna(False).astype(bool)
+        if "mei_hit" in split_df.columns
+        else pd.Series(False, index=split_df.index)
+    )
+    mei_hit_coord = (
+        split_df["mei_hit_coord"].fillna(False).astype(bool)
+        if "mei_hit_coord" in split_df.columns
+        else pd.Series(False, index=split_df.index)
+    )
+    has_mei = mei_hit | mei_hit_coord
+    if "vntr_rescue" in split_df.columns:
+        has_mei = has_mei & ~split_df["vntr_rescue"].fillna(False).astype(bool)
+    if "mei_hit_source" in split_df.columns:
+        src = split_df["mei_hit_source"].fillna("").astype(str)
+        has_mei = has_mei & ~src.eq("vntr_rescue")
+    if "clip_len" not in split_df.columns:
+        return has_mei
+    clip_len = pd.to_numeric(split_df["clip_len"], errors="coerce").fillna(int(_STRICT_MEI_CLIP_MIN_BP)).astype(int)
+    rescued = (
+        split_df["short_mei_seed_rescued"].fillna(False).astype(bool)
+        if "short_mei_seed_rescued" in split_df.columns
+        else pd.Series(False, index=split_df.index)
+    )
+    return has_mei & (clip_len.ge(int(_STRICT_MEI_CLIP_MIN_BP)) | rescued)
 
 
 def _split_polya_member_mask(split_df: pd.DataFrame) -> pd.Series:
@@ -2658,9 +3406,8 @@ def _build_supporting_reads_detail_table(
 ) -> pd.DataFrame:
     """Flatten per-read coordinates for architecture plots and review.
 
-    Includes MEI-mapped splits, plus BRK_CLP pileup clips and polyA-supporting
-    splits (even when they do not remap to consensus) so read-architecture plots
-    match the support-string evidence.
+    Includes MEI-eligible splits (strict or short-seed-rescued) and polyA-
+    supporting splits so read-architecture plots match the support-string evidence.
     """
     rows: list[dict[str, object]] = []
 
@@ -2683,16 +3430,13 @@ def _build_supporting_reads_detail_table(
         return bool(val)
 
     if not split_hits.empty:
-        brk_mask = _split_brk_clp_member_mask(split_hits)
+        mei_eligible = _split_mei_support_eligible_mask(split_hits)
         polya_mask = _split_polya_member_mask(split_hits)
         for i, rec in enumerate(split_hits.itertuples(index=False)):
             idx = split_hits.index[i]
-            mei_hit = _as_bool(getattr(rec, "mei_hit", False)) or _as_bool(
-                getattr(rec, "mei_hit_coord", False)
-            )
-            brk_clp = bool(brk_mask.loc[idx]) if idx in brk_mask.index else False
+            mei_hit = bool(mei_eligible.loc[idx]) if idx in mei_eligible.index else False
             polya_split = bool(polya_mask.loc[idx]) if idx in polya_mask.index else False
-            if not (mei_hit or brk_clp or polya_split):
+            if not (mei_hit or polya_split):
                 continue
             start_col = (
                 "target_start_coord"
@@ -2721,11 +3465,13 @@ def _build_supporting_reads_detail_table(
                     poly_base = ""
             hit_source = ""
             if mei_hit:
-                hit_source = "mei"
+                hit_source = (
+                    "short_mei_rescue"
+                    if _as_bool(getattr(rec, "short_mei_seed_rescued", False))
+                    else "mei"
+                )
             elif polya_split:
                 hit_source = "polya_clip"
-            elif brk_clp:
-                hit_source = "brk_clp"
             rows.append(
                 {
                     "sample": sample,
@@ -2748,7 +3494,7 @@ def _build_supporting_reads_detail_table(
                     "mate_mei_strand": "",
                     "mei_hit": bool(mei_hit),
                     "mate_mei_hit": False,
-                    "brk_clp_support": bool(brk_clp),
+                    "short_mei_seed_rescued": _as_bool(getattr(rec, "short_mei_seed_rescued", False)),
                     "polya_rescue": bool(poly_rescued),
                     "mei_hit_source": hit_source,
                     "clip_len": int(clip_len),
@@ -2866,7 +3612,7 @@ def _build_supporting_reads_detail_table(
         "mate_mei_strand",
         "mei_hit",
         "mate_mei_hit",
-        "brk_clp_support",
+        "short_mei_seed_rescued",
         "vntr_rescue",
         "polya_rescue",
         "mei_hit_source",
@@ -2890,7 +3636,7 @@ def _build_supporting_reads_detail_table(
     for col, default in (
         ("mei_strand", ""),
         ("mate_mei_strand", ""),
-        ("brk_clp_support", False),
+        ("short_mei_seed_rescued", False),
         ("vntr_rescue", False),
         ("polya_rescue", False),
         ("poly_tail_rescued", False),
@@ -2902,7 +3648,7 @@ def _build_supporting_reads_detail_table(
             out[col] = default
     out["mei_strand"] = out["mei_strand"].fillna("").astype(str)
     out["mate_mei_strand"] = out["mate_mei_strand"].fillna("").astype(str)
-    out["brk_clp_support"] = out["brk_clp_support"].fillna(False).astype(bool)
+    out["short_mei_seed_rescued"] = out["short_mei_seed_rescued"].fillna(False).astype(bool)
     out["polya_rescue"] = out["polya_rescue"].fillna(False).astype(bool)
     out["poly_tail_rescued"] = out["poly_tail_rescued"].fillna(False).astype(bool)
     return out
@@ -3821,14 +4567,14 @@ def _add_candidate_support_info_fields(
     - if either sample has >=1 MEI-supporting read (split or discordant),
       count assigned SR/DPE reads on each side for both disease and control.
     - otherwise set support counts to zero.
-    - BRK_CLP_L/R count split clips that pile up within
-      ``_BRK_CLP_POS_TOLERANCE_BP`` of the modal clip position per side.
-      These are not subject to the MEI/polyA strict SR gate (so junction
-      pileups remain visible when MEI_MAPPED is weak).
+    - SR counts only MEI-mapped split clips: strict (≥20bp) or short clips
+      rescued when consistent with a MEI seed. PolyA and CIGAR indels do
+      not count toward SR (polyA is reported separately as polyA_MAPPED).
     - support strings also include MEI_MAPPED (consensus remap), then
       polyA_MAPPED (mate polyA rescue ∪ junction-clip / anchor polyA) and
-      VNTR_MAPPED second-pass rescue counts, plus polyA_side=L|R when
-      polyA evidence has a clear majority flank.
+      VNTR_MAPPED (discordant VNTR rescue ∪ VNTR-like soft-clips demoted
+      out of MEI-SR), plus polyA_side=L|R when polyA evidence has a clear
+      majority flank.
     """
 
     out = candidates.copy()
@@ -3864,7 +4610,10 @@ def _add_candidate_support_info_fields(
         work = work.loc[work["read_name"].str.len() > 0].copy()
         if work.empty:
             return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_raw", f"{prefix}_sr_r_raw"])
-        if informative_reads is not None and not informative_reads.empty:
+        if informative_reads is not None:
+            # Empty informative set means zero SR (do not fall back to all clips).
+            if informative_reads.empty:
+                return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_raw", f"{prefix}_sr_r_raw"])
             work = work.merge(informative_reads, on=key_cols + ["read_name"], how="inner")
             if work.empty:
                 return pd.DataFrame(columns=key_cols + [f"{prefix}_sr_l_raw", f"{prefix}_sr_r_raw"])
@@ -3914,7 +4663,9 @@ def _add_candidate_support_info_fields(
         work = work.loc[work["read_name"].str.len() > 0].copy()
         if work.empty:
             return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"])
-        if informative_reads is not None and not informative_reads.empty:
+        if informative_reads is not None:
+            if informative_reads.empty:
+                return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"])
             work = work.merge(informative_reads, on=key_cols + ["read_name"], how="inner")
             if work.empty:
                 return pd.DataFrame(columns=key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"])
@@ -3937,88 +4688,6 @@ def _add_candidate_support_info_fields(
         agg[f"{prefix}_dpe_l_raw"] = pd.to_numeric(agg["L"], errors="coerce").fillna(0).astype(int)
         agg[f"{prefix}_dpe_r_raw"] = pd.to_numeric(agg["R"], errors="coerce").fillna(0).astype(int)
         return agg[key_cols + [f"{prefix}_dpe_l_raw", f"{prefix}_dpe_r_raw"]]
-
-    def _counts_brk_clp_from_split(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
-        """Count unique split clips piled near the modal clip position per side.
-
-        Unlike SR_L/SR_R, these counts are not filtered by the MEI/polyA strict
-        gate — they report breakpoint-aligned soft-clip support even when few
-        clips remap to consensus.
-        """
-        out_cols = key_cols + [f"{prefix}_brk_clp_l", f"{prefix}_brk_clp_r"]
-        if df.empty or "read_name" not in df.columns:
-            return pd.DataFrame(columns=out_cols)
-        cols = key_cols + ["read_name"]
-        if "clip_side" in df.columns:
-            cols.append("clip_side")
-        if "pos" in df.columns:
-            cols.append("pos")
-        work = df.loc[:, [c for c in cols if c in df.columns]].copy()
-        work["read_name"] = work["read_name"].fillna("").astype(str)
-        work = work.loc[work["read_name"].str.len() > 0].copy()
-        if work.empty:
-            return pd.DataFrame(columns=out_cols)
-        work = work.merge(bp_tbl, on=key_cols, how="inner")
-        if work.empty:
-            return pd.DataFrame(columns=out_cols)
-
-        if "clip_side" in work.columns:
-            side = work["clip_side"].fillna("").astype(str).str.upper().str[:1]
-            if "pos" in work.columns:
-                pos = pd.to_numeric(work["pos"], errors="coerce").fillna(work["insertion_breakpoint_pos"]).astype(int)
-                fallback = pd.Series(["L"] * len(work), index=work.index).where(pos <= work["insertion_breakpoint_pos"], "R")
-                side = side.where(side.isin(["L", "R"]), fallback)
-            else:
-                side = side.where(side.isin(["L", "R"]), "L")
-        elif "pos" in work.columns:
-            pos = pd.to_numeric(work["pos"], errors="coerce").fillna(work["insertion_breakpoint_pos"]).astype(int)
-            side = pd.Series(["L"] * len(work), index=work.index).where(pos <= work["insertion_breakpoint_pos"], "R")
-        else:
-            return pd.DataFrame(columns=out_cols)
-
-        work["raw_side"] = side
-        work = work.loc[work["raw_side"].isin(["L", "R"])].copy()
-        if work.empty or "pos" not in work.columns:
-            return pd.DataFrame(columns=out_cols)
-        work["pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
-        work = work.loc[work["pos"] > 0].copy()
-        if work.empty:
-            return pd.DataFrame(columns=out_cols)
-
-        pos_support = (
-            work.groupby(key_cols + ["raw_side", "pos"], as_index=False)["read_name"]
-            .nunique()
-            .rename(columns={"read_name": "support_reads"})
-            .sort_values(
-                key_cols + ["raw_side", "support_reads", "pos"],
-                ascending=[True, True, True, True, False, True],
-            )
-        )
-        modes = pos_support.drop_duplicates(key_cols + ["raw_side"], keep="first").loc[
-            :, key_cols + ["raw_side", "pos"]
-        ].rename(columns={"pos": "mode_pos"})
-        work = work.merge(modes, on=key_cols + ["raw_side"], how="inner")
-        if work.empty:
-            return pd.DataFrame(columns=out_cols)
-        work = work.loc[
-            (work["pos"] - work["mode_pos"]).abs() <= int(_BRK_CLP_POS_TOLERANCE_BP)
-        ].copy()
-        if work.empty:
-            return pd.DataFrame(columns=out_cols)
-        agg = (
-            work.groupby(key_cols + ["raw_side"], as_index=False)["read_name"]
-            .nunique()
-            .pivot_table(index=key_cols, columns="raw_side", values="read_name", fill_value=0)
-            .reset_index()
-        )
-        agg.columns = [str(c) for c in agg.columns]
-        if "L" not in agg.columns:
-            agg["L"] = 0
-        if "R" not in agg.columns:
-            agg["R"] = 0
-        agg[f"{prefix}_brk_clp_l"] = pd.to_numeric(agg["L"], errors="coerce").fillna(0).astype(int)
-        agg[f"{prefix}_brk_clp_r"] = pd.to_numeric(agg["R"], errors="coerce").fillna(0).astype(int)
-        return agg[out_cols]
 
     def _polya_side_table(
         disc_df: pd.DataFrame,
@@ -4481,15 +5150,40 @@ def _add_candidate_support_info_fields(
             ignore_index=True,
         ).drop_duplicates()
 
-        sr_raw = _counts_from_split(split_support_df, prefix)
+        # SR = MEI-mapped split clips only (strict ≥20bp or short-seed-rescued).
+        # PolyA stays in polyA_MAPPED; CIGAR indels are not SR.
+        sr_raw = _counts_from_split(split_df, prefix, informative_reads=mei_split_reads)
         dpe_raw = _counts_from_discordant(disc_df, prefix)
-        brk_clp = _counts_brk_clp_from_split(split_support_df, prefix)
-        sr_strict = _counts_from_split(split_support_df, prefix, informative_reads=strict_reads)
+        sr_strict = _counts_from_split(split_df, prefix, informative_reads=mei_split_reads)
         dpe_strict = _counts_from_discordant(disc_df, prefix, informative_reads=strict_reads)
         mei_mapped = _mei_mapped_counts(split_mei_df, disc_mei_df, prefix)
         polya_mapped = _polya_mapped_counts(disc_df, split_support_df, prefix)
         polya_side = _polya_side_table(disc_df, split_support_df, prefix)
-        vntr_mapped = _rescue_mapped_counts(disc_df, prefix, "vntr_rescue", f"{prefix}_vntr_mapped")
+        # VNTR_MAPPED = discordant VNTR rescue ∪ demoted/rescued VNTR-like soft-clips.
+        vntr_parts = []
+        for src in (disc_df, split_df):
+            if src is None or src.empty or "vntr_rescue" not in src.columns or "read_name" not in src.columns:
+                continue
+            if not all(c in src.columns for c in key_cols):
+                continue
+            part = src.loc[src["vntr_rescue"].fillna(False).astype(bool), key_cols + ["read_name"]].copy()
+            if not part.empty:
+                vntr_parts.append(part)
+        if not vntr_parts:
+            vntr_mapped = pd.DataFrame(columns=key_cols + [f"{prefix}_vntr_mapped"])
+        else:
+            vntr_mapped = (
+                pd.concat(vntr_parts, ignore_index=True)
+                .drop_duplicates()
+                .groupby(key_cols, as_index=False)["read_name"]
+                .nunique()
+                .rename(columns={"read_name": f"{prefix}_vntr_mapped"})
+            )
+            vntr_mapped[f"{prefix}_vntr_mapped"] = (
+                pd.to_numeric(vntr_mapped[f"{prefix}_vntr_mapped"], errors="coerce")
+                .fillna(0)
+                .astype(int)
+            )
         polya_max_len = _rescue_polya_max_len(disc_df, split_support_df, prefix)
 
         merged = (
@@ -4497,7 +5191,6 @@ def _add_candidate_support_info_fields(
             .drop_duplicates()
             .merge(sr_raw, on=key_cols, how="left")
             .merge(dpe_raw, on=key_cols, how="left")
-            .merge(brk_clp, on=key_cols, how="left")
             .merge(
                 sr_strict.rename(
                     columns={
@@ -4575,22 +5268,11 @@ def _add_candidate_support_info_fields(
         polya_mapped_total = pd.to_numeric(merged.get(f"{prefix}_polya_mapped", 0), errors="coerce").fillna(0).astype(int)
         vntr_mapped_total = pd.to_numeric(merged.get(f"{prefix}_vntr_mapped", 0), errors="coerce").fillna(0).astype(int)
 
-        sr_l = sr_l_raw.where(~strict_mode, sr_l_strict).where(has_locus_mei_support, 0)
-        sr_r = sr_r_raw.where(~strict_mode, sr_r_strict).where(has_locus_mei_support, 0)
+        # SR is always informative-only; strict_mode still gates DPE raw vs strict.
+        sr_l = sr_l_raw.where(has_locus_mei_support, 0)
+        sr_r = sr_r_raw.where(has_locus_mei_support, 0)
         dpe_l = dpe_l_raw.where(~strict_mode, dpe_l_strict).where(has_locus_mei_support, 0)
         dpe_r = dpe_r_raw.where(~strict_mode, dpe_r_strict).where(has_locus_mei_support, 0)
-        brk_clp_l = (
-            pd.to_numeric(merged.get(f"{prefix}_brk_clp_l", 0), errors="coerce")
-            .fillna(0)
-            .astype(int)
-            .where(has_locus_mei_support, 0)
-        )
-        brk_clp_r = (
-            pd.to_numeric(merged.get(f"{prefix}_brk_clp_r", 0), errors="coerce")
-            .fillna(0)
-            .astype(int)
-            .where(has_locus_mei_support, 0)
-        )
 
         # VNTR_MAPPED is SVA-only; omit the token for ALU/LINE1.
         fam_series = pd.Series("", index=merged.index, dtype="object")
@@ -4614,18 +5296,15 @@ def _add_candidate_support_info_fields(
         merged[f"{prefix}_supporting_reads"] = [
             (
                 f"SR_L={sl},SR_R={srx},DPE_L={dl},DPE_R={dr},"
-                f"BRK_CLP_L={bl},BRK_CLP_R={br},"
                 f"MEI_MAPPED={mm},polyA_MAPPED={pa}"
                 + (f",VNTR_MAPPED={vn}" if sva else "")
                 + (f",polyA_side={ps}" if ps else "")
             )
-            for sl, srx, dl, dr, bl, br, mm, pa, vn, sva, ps in zip(
+            for sl, srx, dl, dr, mm, pa, vn, sva, ps in zip(
                 sr_l.tolist(),
                 sr_r.tolist(),
                 dpe_l.tolist(),
                 dpe_r.tolist(),
-                brk_clp_l.tolist(),
-                brk_clp_r.tolist(),
                 mei_mapped_total.tolist(),
                 polya_mapped_total.tolist(),
                 vntr_mapped_total.tolist(),
@@ -4643,7 +5322,7 @@ def _add_candidate_support_info_fields(
         out[f"{prefix}_supporting_reads"] = (
             out[f"{prefix}_supporting_reads"]
             .fillna(
-                "SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,BRK_CLP_L=0,BRK_CLP_R=0,MEI_MAPPED=0,polyA_MAPPED=0"
+                "SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=0,polyA_MAPPED=0"
             )
             .astype(str)
         )
@@ -7851,7 +8530,6 @@ _COMPLEX_RESIDUAL_MIN_UNIQUE_READS = 2
 # COMPLEX_INS: MEI_MAPPED must be weak relative to residual discordants.
 _COMPLEX_INS_MAX_MEI_MAPPED = 2
 _COMPLEX_INS_MEI_FRAC_OF_RESIDUAL = 0.25
-_COMPLEX_INS_MIN_BRK_CLP_TOTAL = 3
 _COMPLEX_INS_MIN_SPLIT_MODE_SUPPORT = 2
 
 
@@ -8676,15 +9354,6 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     ) | (
         ((c_sr_l + c_dpe_l) >= 1) & ((c_sr_r + c_dpe_r) >= 1)
     )
-    d_brk = _support_string_token(disease_support, "BRK_CLP_L") + _support_string_token(
-        disease_support, "BRK_CLP_R"
-    )
-    c_brk = _support_string_token(control_support, "BRK_CLP_L") + _support_string_token(
-        control_support, "BRK_CLP_R"
-    )
-    brk_clp_pileup = (d_brk >= int(_COMPLEX_INS_MIN_BRK_CLP_TOTAL)) | (
-        c_brk >= int(_COMPLEX_INS_MIN_BRK_CLP_TOTAL)
-    )
     split_mode_support = pd.concat(
         [
             _df_col_float(out, "disease_L_split_breakpoint_support"),
@@ -8695,7 +9364,7 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     ).max(axis=1)
     split_mode_pileup = split_mode_support >= float(_COMPLEX_INS_MIN_SPLIT_MODE_SUPPORT)
-    breakpoint_pileup = bilateral_pileup | brk_clp_pileup | split_mode_pileup
+    breakpoint_pileup = bilateral_pileup | split_mode_pileup
 
     mei_mapped_max = pd.concat(
         [
@@ -11657,9 +12326,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         out.loc[complex_ins, "consensus_mei_family"] = ""
         out.loc[complex_ins, "consensus_mei_subfamily"] = ""
     # Project each panel-fragment interval (e.g. L1HS_5end and L1HS_3end) onto
-    # the shared full-length axis, then take the union. Never min/max raw panel
-    # coords across different fragment references — that yielded bogus spans
-    # like 3–901 for a near-full L1.
+    # one full-length axis, then take the union. Never min/max raw panel coords
+    # across fragment refs, and never mix Alu/L1 (or different full_name axes).
     frag_map = fragment_to_full_map or {}
     if frag_map:
         proj_5 = pd.Series(-1, index=out.index, dtype=int)
@@ -11758,7 +12426,6 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
             [
                 (
                     f"SR_L={sl},SR_R={sr},DPE_L={dl},DPE_R={dr},"
-                    f"BRK_CLP_L=0,BRK_CLP_R=0,"
                     f"MEI_MAPPED={mm},polyA_MAPPED=0"
                     + (",VNTR_MAPPED=0" if sva else "")
                 )
@@ -11810,7 +12477,9 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         # polyA_side is rebuilt from the existing token when present.
         polya_side = text.str.extract(r"polyA_side=([LR])", expand=False).fillna("")
         base = base.str.replace(r",?polyA_side=[LR]", "", regex=True).str.strip(",")
-        base = base.where(base.str.len() > 0, "SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,BRK_CLP_L=0,BRK_CLP_R=0")
+        base = base.where(base.str.len() > 0, "SR_L=0,SR_R=0,DPE_L=0,DPE_R=0")
+        # Drop legacy BRK_CLP tokens if present in older support strings.
+        base = base.str.replace(r",?BRK_CLP_[LR]=[0-9]+", "", regex=True).str.strip(",")
         out_s = base + ",MEI_MAPPED=" + mapped.astype(str) + ",polyA_MAPPED=" + polya.astype(str)
         out_s = out_s.where(~is_sva, out_s + ",VNTR_MAPPED=" + vntr.astype(str))
         out_s = out_s.where(polya_side.eq(""), out_s + ",polyA_side=" + polya_side)
@@ -13061,9 +13730,11 @@ def annotate_candidate_loci_with_mei(
     assembly_reuse_cache_only: bool = False,
     mei_full_fasta: Path | None = None,
     reuse_mei_annotate_dir: Path | None = None,
+    bwa_threads: int = 1,
 ) -> Path:
     total_t0 = time.monotonic()
     reuse_dir = Path(reuse_mei_annotate_dir) if reuse_mei_annotate_dir is not None else None
+    bwa_threads = max(1, int(bwa_threads))
     load_t0 = time.monotonic()
     candidate = pd.read_csv(candidate_loci_path, sep="\t")
     split_disease_raw = _load_table(evidence_dir, "split_evidence", "disease")
@@ -13094,7 +13765,7 @@ def annotate_candidate_loci_with_mei(
 
     if reuse_dir is not None:
         # Re-label path: hydrate MEI hits from a prior annotate detail table.
-        # Skips indel BAM scan, mate fetch, and minimap2 remaps.
+        # Skips indel BAM scan, mate fetch, and MEI consensus remaps.
         detail_path = _resolve_supporting_reads_detail_path(reuse_dir)
         print(
             f"[mei-annotate] reuse-mei-annotate-dir={reuse_dir} "
@@ -13132,7 +13803,7 @@ def annotate_candidate_loci_with_mei(
                 disc = _rescue_polya_like_discordant_mei_hits(disc)
                 remap_by_sample[sample]["disc_hits"] = disc  # type: ignore[index]
     else:
-        # Indel collection + MEI remaps: disease∥control (I/O and minimap2 release the GIL).
+        # Indel collection + MEI remaps: disease∥control (I/O and bwa mem release the GIL).
         print("[mei-annotate] running disease∥control indel + MEI remaps", flush=True)
         indel_t0 = time.monotonic()
         indel_jobs: dict[str, object] = {}
@@ -13167,6 +13838,14 @@ def annotate_candidate_loci_with_mei(
         )
 
         remap_t0 = time.monotonic()
+        # disease∥control remaps can run together; split bwa threads across them
+        # when the caller asked for more than one thread.
+        per_sample_bwa_threads = max(1, bwa_threads // 2) if bwa_threads > 1 else 1
+        print(
+            f"[mei-annotate] bwa_threads total={bwa_threads} "
+            f"per_sample={per_sample_bwa_threads} (disease∥control)",
+            flush=True,
+        )
         remap_by_sample = {}
         with ThreadPoolExecutor(max_workers=2) as pool:
             remap_futs = {
@@ -13178,6 +13857,7 @@ def annotate_candidate_loci_with_mei(
                     mei_fasta=mei_fasta,
                     bam_path=disease_bam_path,
                     mate_bam_path=disease_mate_bam_path,
+                    bwa_threads=per_sample_bwa_threads,
                 ): "disease",
                 pool.submit(
                     _remap_one_sample_mei_evidence,
@@ -13187,6 +13867,7 @@ def annotate_candidate_loci_with_mei(
                     mei_fasta=mei_fasta,
                     bam_path=control_bam_path,
                     mate_bam_path=control_mate_bam_path,
+                    bwa_threads=per_sample_bwa_threads,
                 ): "control",
             }
             for fut in as_completed(remap_futs):
@@ -13208,7 +13889,7 @@ def annotate_candidate_loci_with_mei(
     disease_disc_mate_summary = remap_by_sample["disease"]["disc_mate_summary"]  # type: ignore[assignment]
     control_disc_mate_summary = remap_by_sample["control"]["disc_mate_summary"]  # type: ignore[assignment]
     detail_t0 = time.monotonic()
-    # Always rebuild from hit frames so BRK_CLP / polyA split evidence is included
+    # Always rebuild from hit frames so short-MEI rescue / polyA split evidence is included
     # even when MEI hits were hydrated from a prior detail table (reuse mode).
     supporting_reads_detail = pd.concat(
         [
@@ -13295,33 +13976,39 @@ def annotate_candidate_loci_with_mei(
                 split_disease,
                 full_consensus_fasta,
                 sample="disease_full",
+                bwa_threads=bwa_threads,
             )
             control_hits_full, control_summary_full = _align_clips_with_minimap2(
                 split_control,
                 full_consensus_fasta,
                 sample="control_full",
+                bwa_threads=bwa_threads,
             )
             disease_disc_anchor_hits_full, disease_disc_summary_full = _align_discordant_reads_with_minimap2(
                 discordant_disease,
                 full_consensus_fasta,
                 sample="disease_full",
+                bwa_threads=bwa_threads,
             )
             control_disc_anchor_hits_full, control_disc_summary_full = _align_discordant_reads_with_minimap2(
                 discordant_control,
                 full_consensus_fasta,
                 sample="control_full",
+                bwa_threads=bwa_threads,
             )
             disease_disc_mate_hits_full, _disease_disc_mate_summary_full = _align_discordant_mates_with_minimap2(
                 discordant_disease,
                 full_consensus_fasta,
                 sample="disease_full_mate",
                 bam_path=disease_mate_bam_path or disease_bam_path,
+                bwa_threads=bwa_threads,
             )
             control_disc_mate_hits_full, _control_disc_mate_summary_full = _align_discordant_mates_with_minimap2(
                 discordant_control,
                 full_consensus_fasta,
                 sample="control_full_mate",
                 bam_path=control_mate_bam_path or control_bam_path,
+                bwa_threads=bwa_threads,
             )
             disease_disc_hits_full = _attach_mei_hits_to_discordant_rows(
                 discordant_disease, disease_disc_anchor_hits_full, disease_disc_mate_hits_full
@@ -13374,31 +14061,39 @@ def annotate_candidate_loci_with_mei(
         f"disease indel reads={len(indel_disease)} control indel reads={len(indel_control)}"
     )
 
-    def _mei_rows_only(df: pd.DataFrame) -> pd.DataFrame:
-        if ("mei_hit" not in df.columns) and ("mei_hit_coord" not in df.columns):
+    def _mei_rows_only(df: pd.DataFrame, *, is_split: bool = False) -> pd.DataFrame:
+        if ("mei_hit" not in df.columns) and ("mei_hit_coord" not in df.columns) and (
+            "mate_mei_hit" not in df.columns
+        ):
             return df.iloc[0:0].copy()
-        raw_hit = df["mei_hit"].fillna(False).astype(bool) if "mei_hit" in df.columns else pd.Series(False, index=df.index)
-        coord_hit = (
-            df["mei_hit_coord"].fillna(False).astype(bool)
-            if "mei_hit_coord" in df.columns
-            else pd.Series(False, index=df.index)
-        )
-        keep = raw_hit | coord_hit
+        work = df
+        if is_split:
+            # Short-clip rescue should already be annotated during remap; re-run
+            # without DPE only if the flag is missing (e.g. unit tests).
+            if "short_mei_seed_rescued" not in work.columns:
+                work = _annotate_short_mei_seed_rescue(work)
+            keep = _split_mei_support_eligible_mask(work)
+        else:
+            keep = _discordant_row_mei_mapped(work)
         # Exclude second-pass rescues from MEI_MAPPED row sets.
-        if "polya_rescue" in df.columns:
-            keep = keep & ~df["polya_rescue"].fillna(False).astype(bool)
-        if "vntr_rescue" in df.columns:
-            keep = keep & ~df["vntr_rescue"].fillna(False).astype(bool)
-        if "mei_hit_source" in df.columns:
-            src = df["mei_hit_source"].fillna("").astype(str)
+        if "polya_rescue" in work.columns:
+            keep = keep & ~work["polya_rescue"].fillna(False).astype(bool)
+        if "vntr_rescue" in work.columns:
+            keep = keep & ~work["vntr_rescue"].fillna(False).astype(bool)
+        if "mei_hit_source" in work.columns:
+            src = work["mei_hit_source"].fillna("").astype(str)
             keep = keep & ~src.isin({"polya_rescue", "vntr_rescue"})
-        return df.loc[keep].copy()
+        return work.loc[keep].copy()
 
-    split_disease_mei = _mei_rows_only(disease_hits)
-    split_control_mei = _mei_rows_only(control_hits)
+    split_disease_mei = _mei_rows_only(disease_hits, is_split=True)
+    split_control_mei = _mei_rows_only(control_hits, is_split=True)
     # MEI_MAPPED for DPE: exclude same-chr mates within 1 kb (nearby ref MEIs).
-    discordant_disease_mei = _discordant_rows_for_mei_mapped_support(_mei_rows_only(disease_disc_hits))
-    discordant_control_mei = _discordant_rows_for_mei_mapped_support(_mei_rows_only(control_disc_hits))
+    discordant_disease_mei = _discordant_rows_for_mei_mapped_support(
+        _mei_rows_only(disease_disc_hits, is_split=False)
+    )
+    discordant_control_mei = _discordant_rows_for_mei_mapped_support(
+        _mei_rows_only(control_disc_hits, is_split=False)
+    )
 
     metrics_t0 = time.monotonic()
     disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits, sample_prefix="disease")

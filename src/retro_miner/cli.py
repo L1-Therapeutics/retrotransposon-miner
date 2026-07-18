@@ -51,6 +51,7 @@ def _extract_one_sample(
     poly_tail_rescue_min_clip_len: int,
     poly_tail_rescue_min_run: int,
     poly_tail_rescue_min_frac: float,
+    short_mei_rescue_min_clip_len: int,
     with_discordant: bool,
     discordant_quantile: float,
     discordant_min_abs_tlen: int,
@@ -80,6 +81,7 @@ def _extract_one_sample(
         poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
         poly_tail_rescue_min_run=poly_tail_rescue_min_run,
         poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+        short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
     )
     split_elapsed = time.monotonic() - split_t0
     print(
@@ -163,13 +165,20 @@ def _extract_one_sample(
     type=int,
     help="Minimum discordant-read anchor mapping quality.",
 )
-@click.option("--min-clip-len", default=20, show_default=True, type=int, help="Minimum soft-clip length.")
+@click.option("--min-clip-len", default=20, show_default=True, type=int, help="Minimum soft-clip length for primary SR clips.")
 @click.option(
     "--poly-tail-rescue-min-clip-len",
     default=8,
     show_default=True,
     type=int,
     help="Minimum soft-clip length to rescue reads with strong polyA/polyT tails at breakpoint.",
+)
+@click.option(
+    "--short-mei-rescue-min-clip-len",
+    default=12,
+    show_default=True,
+    type=int,
+    help="Minimum soft-clip length kept as short-MEI rescue candidates (counted only if consistent with ≥min-clip-len MEI SR).",
 )
 @click.option(
     "--poly-tail-rescue-min-run",
@@ -283,6 +292,7 @@ def extract_split_evidence_cmd(
     poly_tail_rescue_min_clip_len: int,
     poly_tail_rescue_min_run: int,
     poly_tail_rescue_min_frac: float,
+    short_mei_rescue_min_clip_len: int,
     with_discordant: bool,
     discordant_quantile: float,
     discordant_min_abs_tlen: int,
@@ -342,6 +352,7 @@ def extract_split_evidence_cmd(
             "poly_tail_rescue_min_clip_len": poly_tail_rescue_min_clip_len,
             "poly_tail_rescue_min_run": poly_tail_rescue_min_run,
             "poly_tail_rescue_min_frac": poly_tail_rescue_min_frac,
+            "short_mei_rescue_min_clip_len": short_mei_rescue_min_clip_len,
             "with_discordant": with_discordant,
             "discordant_quantile": discordant_quantile,
             "discordant_min_abs_tlen": discordant_min_abs_tlen,
@@ -894,7 +905,18 @@ def build_candidate_loci_cmd(
     help=(
         "Prior annotate output directory containing supporting_reads_detail.mei.{parquet,tsv}. "
         "Hydrate MEI hits from that detail table and re-label only — skips indel BAM scan, "
-        "mate-seq fetch, and minimap2 remaps."
+        "mate-seq fetch, and MEI consensus remaps (bwa mem)."
+    ),
+)
+@click.option(
+    "--bwa-threads",
+    type=int,
+    default=1,
+    show_default=True,
+    help=(
+        "bwa mem -t for MEI consensus remaps. Default 1 is safe under multi-chromosome "
+        "concurrency; override for single-chrom / standalone runs (e.g. --bwa-threads $(nproc)). "
+        "When disease∥control remaps run together, threads are split across the two samples."
     ),
 )
 def annotate_mei_support_cmd(
@@ -949,6 +971,7 @@ def annotate_mei_support_cmd(
     assembly_locus_workers: int,
     assembly_reuse_cache_only: bool,
     reuse_mei_annotate_dir: Path | None,
+    bwa_threads: int,
 ) -> None:
     """Annotate candidate loci with MEI family/subfamily support and insertion span estimates."""
     t0 = time.monotonic()
@@ -958,7 +981,10 @@ def annotate_mei_support_cmd(
             "(skip indel+mate-fetch+minimap2)"
         )
     else:
-        click.echo("[mei-annotate] starting minimap2 clip-to-MEI alignment and locus annotation")
+        click.echo(
+            "[mei-annotate] starting bwa mem clip/mate-to-MEI alignment and locus annotation "
+            f"(bwa_threads={max(1, int(bwa_threads))})"
+        )
     if (disease_bam_depth is None) ^ (control_bam_depth is None):
         raise click.ClickException("Provide both --disease-bam-depth and --control-bam-depth, or neither.")
     out_path = annotate_candidate_loci_with_mei(
@@ -1013,6 +1039,7 @@ def annotate_mei_support_cmd(
         assembly_reuse_cache_only=assembly_reuse_cache_only,
         mei_full_fasta=mei_full_fasta,
         reuse_mei_annotate_dir=reuse_mei_annotate_dir,
+        bwa_threads=bwa_threads,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 

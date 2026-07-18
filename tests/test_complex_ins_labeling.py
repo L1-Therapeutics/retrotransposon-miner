@@ -20,11 +20,11 @@ def _base_row(**overrides) -> dict:
         "junk_flag_count": 0,
         "coherence_score": 0.5,
         "disease_supporting_reads": (
-            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,BRK_CLP_L=5,BRK_CLP_R=4,"
+            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,"
             "MEI_MAPPED=1,polyA_MAPPED=0"
         ),
         "control_supporting_reads": (
-            "SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,BRK_CLP_L=0,BRK_CLP_R=0,"
+            "SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,"
             "MEI_MAPPED=0,polyA_MAPPED=0"
         ),
         "disease_discordant_mei_mapped_fraction": 0.10,
@@ -116,7 +116,7 @@ def test_mei_with_complex_can_remain_gold():
         disease_L_mei_supported_reads=4,
         disease_R_mei_supported_reads=4,
         disease_supporting_reads=(
-            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,BRK_CLP_L=5,BRK_CLP_R=4,"
+            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,"
             "MEI_MAPPED=10,polyA_MAPPED=0"
         ),
     )
@@ -139,7 +139,7 @@ def test_classic_polya_mei_sidepair_not_complex_ins():
         disease_discordant_mei_supported_reads=5,
         disease_discordant_mei_mapped_fraction=0.20,
         disease_supporting_reads=(
-            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,BRK_CLP_L=5,BRK_CLP_R=4,"
+            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,"
             "MEI_MAPPED=5,polyA_MAPPED=3"
         ),
     )
@@ -158,7 +158,7 @@ def test_mei_majority_with_complex_companion_is_mei_with_complex():
         disease_L_mei_supported_reads=4,
         disease_R_mei_supported_reads=4,
         disease_supporting_reads=(
-            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,BRK_CLP_L=5,BRK_CLP_R=4,"
+            "SR_L=5,SR_R=6,DPE_L=4,DPE_R=40,"
             "MEI_MAPPED=10,polyA_MAPPED=0"
         ),
     )
@@ -179,7 +179,7 @@ def test_mei_majority_stays_simple_when_classic():
         disease_mei_supported_reads=8,
         disease_discordant_mei_supported_reads=8,
         disease_supporting_reads=(
-            "SR_L=4,SR_R=4,DPE_L=3,DPE_R=3,BRK_CLP_L=3,BRK_CLP_R=3,"
+            "SR_L=4,SR_R=4,DPE_L=3,DPE_R=3,"
             "MEI_MAPPED=8,polyA_MAPPED=2"
         ),
     )

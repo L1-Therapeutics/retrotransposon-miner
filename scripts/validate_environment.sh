@@ -9,6 +9,7 @@ required_bins=(
   samtools
   bedtools
   minimap2
+  bwa
   bwa-mem2
   bcftools
   liftOver
@@ -78,6 +79,7 @@ echo "All required tools detected."
 samtools --version | awk 'NR==1 {print "samtools:", $0}'
 bedtools --version | awk '{print "bedtools:", $0}'
 minimap2 --version | awk '{print "minimap2:", $0}'
+bwa 2>&1 | awk 'NR==1 {print "bwa:", $0}' || true
 bwa-mem2 version 2>&1 | awk 'NR==1 {print "bwa-mem2:", $0}'
 bcftools --version | awk 'NR==1 {print "bcftools:", $0}'
 if command -v liftOver >/dev/null 2>&1; then
