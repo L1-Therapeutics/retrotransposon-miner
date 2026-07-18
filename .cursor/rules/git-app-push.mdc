@@ -1,0 +1,55 @@
+---
+description: Use scripts/git_app_push.sh for push/PR (deploy key is read-only)
+alwaysApply: true
+---
+
+# Git push / PR via GitHub App helper
+
+`origin` SSH (deploy key) is **read-only**. Bare `git push`, `gh` (unauthenticated), or HTTPS without a token will fail with permission denied.
+
+## When the user asks to push and/or open a PR
+
+1. Create the local commit as usual (`git add` / `git commit`) — do **not** update git config; follow the usual commit safety rules.
+2. Push + open/reuse PR with:
+
+```bash
+bash scripts/git_app_push.sh \
+  --title "PR title" \
+  --body "$(cat <<'EOF'
+## Summary
+- …
+
+## Test plan
+- [ ] …
+EOF
+)"
+```
+
+Optional:
+
+```bash
+# Push only (no PR)
+bash scripts/git_app_push.sh --no-pr
+
+# Explicit feature branch name (still never main/master)
+bash scripts/git_app_push.sh --branch feat/my-change --title "…" --body "…"
+
+# Base branch (default: main)
+bash scripts/git_app_push.sh --base main --title "…" --body "…"
+```
+
+3. Return the printed **PR:** URL (or the compare URL if PR create failed).
+
+## Defaults / behavior
+
+- Mints a short-lived GitHub App installation token (key default: `$HOME/.config/gh-app/retrotransposon-miner-vm-pusher.pem`).
+- Pushes `HEAD` to a **writable** feature branch (default: timestamped `feat/<commit-subject-slug>--<stamp>`).
+- Opens or reuses a PR into `main` (or `--base`).
+- Never pushes directly to `main` / `master`. If `--branch` is protected, falls back to a fresh timestamped branch.
+- Does **not** use `git push -u` with the tokenized URL (avoids storing the token in git config); sets upstream to `origin/<branch>` after push.
+
+## Do not
+
+- Retry `git push origin HEAD` / `gh pr create` after deploy-key denial — use this script instead.
+- Push to `main`/`master`.
+- Print or commit the App private key or minted token.
