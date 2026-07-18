@@ -204,6 +204,7 @@ def extract_split_evidence(
     poly_tail_rescue_min_clip_len: int = 8,
     poly_tail_rescue_min_run: int = 8,
     poly_tail_rescue_min_frac: float = 0.8,
+    short_mei_rescue_min_clip_len: int = 12,
 ) -> ExtractionSummary:
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -230,7 +231,11 @@ def extract_split_evidence(
             if read.is_paired and not read.mate_is_unmapped and read.next_reference_id >= 0:
                 mate_chrom = bam.get_reference_name(read.next_reference_id)
                 mate_pos_1based = read.next_reference_start + 1
-            collect_clip_len = min(int(min_clip_len), max(1, int(poly_tail_rescue_min_clip_len)))
+            collect_clip_len = min(
+                int(min_clip_len),
+                max(1, int(poly_tail_rescue_min_clip_len)),
+                max(1, int(short_mei_rescue_min_clip_len)),
+            )
             clips = _collect_soft_clips(read, min_clip_len=collect_clip_len)
             if not clips:
                 continue
@@ -266,7 +271,11 @@ def extract_split_evidence(
                     and poly_run >= max(1, int(poly_tail_rescue_min_run))
                     and poly_frac >= float(poly_tail_rescue_min_frac)
                 )
-                if clip_len < min_clip_len and not poly_tail_rescued:
+                short_mei_candidate = (
+                    clip_len < int(min_clip_len)
+                    and clip_len >= max(1, int(short_mei_rescue_min_clip_len))
+                )
+                if clip_len < min_clip_len and not poly_tail_rescued and not short_mei_candidate:
                     continue
                 rows.append(
                     {
@@ -284,6 +293,7 @@ def extract_split_evidence(
                         "sa_raw": sa_raw,
                         "clip_seq": clip_seq,
                         "nm": nm,
+                        "short_mei_candidate": bool(short_mei_candidate and not poly_tail_rescued),
                         "clip_poly_at_run": int(poly_run),
                         "clip_poly_at_fraction": float(poly_frac),
                         "clip_poly_base": poly_base,
@@ -311,6 +321,7 @@ def extract_split_evidence(
                 "sa_raw",
                 "clip_seq",
                 "nm",
+                "short_mei_candidate",
                 "clip_poly_at_run",
                 "clip_poly_at_fraction",
                 "clip_poly_base",

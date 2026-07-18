@@ -1,4 +1,4 @@
-"""BRK_CLP pileup counts and polyA_side in supporting-reads strings."""
+"""Supporting-reads strings: no BRK_CLP; polyA_side still reported."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ def _empty_mei() -> pd.DataFrame:
     )
 
 
-def test_brk_clp_counts_modal_pileup_and_skips_strict_gate():
-    """Clips near the mode count as BRK_CLP even when SR is strict-filtered."""
+def test_untagged_softclips_do_not_count_as_sr():
+    """Soft-clips without MEI mapping must not inflate SR."""
     candidates = pd.DataFrame(
         [
             {
@@ -26,21 +26,15 @@ def test_brk_clp_counts_modal_pileup_and_skips_strict_gate():
             }
         ]
     )
-    # Disease: five L clips at mode 108 (±2), one outlier at 130.
-    # Control has MEI so disease can enter strict mode; disease MEI is weak
-    # (only disc MEI ≤2, no split MEI / poly split) → SR uses strict reads only.
     split_disease = pd.DataFrame(
         [
             {"chrom": "chr22", "window_start": 100, "window_end": 120, "read_name": f"dL{i}", "clip_side": "L", "pos": 108}
             for i in range(5)
         ]
         + [
-            {"chrom": "chr22", "window_start": 100, "window_end": 120, "read_name": "dL_out", "clip_side": "L", "pos": 130},
             {"chrom": "chr22", "window_start": 100, "window_end": 120, "read_name": "dR1", "clip_side": "R", "pos": 112},
-            {"chrom": "chr22", "window_start": 100, "window_end": 120, "read_name": "dR2", "clip_side": "R", "pos": 113},
         ]
     )
-    # Only one disease disc MEI read → weak_mei_only_discordant; control has MEI.
     disc_disease_mei = pd.DataFrame(
         [
             {
@@ -65,24 +59,20 @@ def test_brk_clp_counts_modal_pileup_and_skips_strict_gate():
             }
         ]
     )
-    disc_disease = disc_disease_mei.copy()
-    disc_control = disc_control_mei.copy()
 
     out = _add_candidate_support_info_fields(
         candidates,
         split_disease=split_disease,
         split_control=pd.DataFrame(columns=split_disease.columns),
-        discordant_disease=disc_disease,
-        discordant_control=disc_control,
+        discordant_disease=disc_disease_mei.copy(),
+        discordant_control=disc_control_mei.copy(),
         split_disease_mei=_empty_mei(),
         split_control_mei=_empty_mei(),
         discordant_disease_mei=disc_disease_mei,
         discordant_control_mei=disc_control_mei,
     )
     support = str(out.iloc[0]["disease_supporting_reads"])
-    assert "BRK_CLP_L=5" in support  # modal pileup; outlier excluded
-    assert "BRK_CLP_R=2" in support
-    # Strict mode: disease SR should not credit untagged clips.
+    assert "BRK_CLP" not in support
     assert "SR_L=0" in support
     assert "SR_R=0" in support
 
@@ -126,7 +116,6 @@ def test_polya_side_majority_from_split_clips():
             }
         ]
     )
-    # Give the locus MEI support so counts are emitted.
     disc_mei = pd.DataFrame(
         [
             {
@@ -153,3 +142,82 @@ def test_polya_side_majority_from_split_clips():
     support = str(out.iloc[0]["disease_supporting_reads"])
     assert "polyA_side=R" in support
     assert "polyA_MAPPED=4" in support
+    assert "BRK_CLP" not in support
+    # PolyA is not SR.
+    assert "SR_L=0" in support
+    assert "SR_R=0" in support
+
+
+def test_indel_evidence_does_not_count_as_sr():
+    """CIGAR indels must not inflate SR; only MEI-mapped splits do."""
+    candidates = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 200,
+                "window_end": 220,
+                "insertion_breakpoint_pos": 210,
+                "consensus_mei_family": "LINE1",
+            }
+        ]
+    )
+    split_disease = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 200,
+                "window_end": 220,
+                "read_name": "mei_sr1",
+                "clip_side": "L",
+                "pos": 209,
+                "clip_len": 25,
+                "mei_hit": True,
+            }
+        ]
+    )
+    indel_disease = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 200,
+                "window_end": 220,
+                "read_name": f"indel{i}",
+                "clip_side": "R",
+                "pos": 211,
+                "clip_len": 40,
+                "evidence_type": "indel",
+                "indel_type": "I",
+                "indel_len": 40,
+            }
+            for i in range(10)
+        ]
+    )
+    disc_mei = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 200,
+                "window_end": 220,
+                "read_name": "dMei1",
+                "pos": 211,
+                "mei_hit": True,
+            }
+        ]
+    )
+    out = _add_candidate_support_info_fields(
+        candidates,
+        split_disease=split_disease,
+        split_control=pd.DataFrame(columns=split_disease.columns),
+        discordant_disease=disc_mei,
+        discordant_control=pd.DataFrame(columns=disc_mei.columns),
+        split_disease_mei=split_disease.copy(),
+        split_control_mei=_empty_mei(),
+        discordant_disease_mei=disc_mei,
+        discordant_control_mei=_empty_mei(),
+        indel_disease=indel_disease,
+        indel_control=pd.DataFrame(columns=indel_disease.columns),
+    )
+    support = str(out.iloc[0]["disease_supporting_reads"])
+    assert "SR_L=1" in support
+    assert "SR_R=0" in support
+    assert "MEI_MAPPED=" in support

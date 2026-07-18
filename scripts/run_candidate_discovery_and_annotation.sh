@@ -33,6 +33,12 @@ CHR_CONCURRENCY="6"
 # Disease∥control extract workers. Empty = adaptive: 1 under multi-chrom concurrency,
 # 2 for single-chromosome (or CHR_CONCURRENCY=1) so chrom slots leave enough CPU.
 SAMPLE_WORKERS=""
+# bwa mem -t for MEI remaps. Empty = auto after chrom list is known:
+#   multi-chrom with CHR_CONCURRENCY>1 → 1
+#   single-chrom (or serial chroms) → nproc
+# Explicit --bwa-threads always wins. annotate-mei-support CLI default is also 1.
+BWA_THREADS=""
+BWA_THREADS_EXPLICIT="0"
 CHR_ALL_MODE="0"
 # Default resume-safe behavior: skip chromosomes already complete in this outdir.
 SKIP_COMPLETE_EXISTING="1"
@@ -191,6 +197,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --chr_concurrency|--chr-concurrency)
       CHR_CONCURRENCY="$2"
+      shift 2
+      ;;
+    --bwa-threads|--bwa_threads)
+      BWA_THREADS="$2"
+      BWA_THREADS_EXPLICIT="1"
       shift 2
       ;;
     --sample-workers|--sample_workers)
@@ -588,6 +599,7 @@ run_annotate_mei_support() {
   if [[ "${LOCAL_ASSEMBLY}" == "1" ]]; then
     annotate_cmd+=(--local-assembly)
   fi
+  annotate_cmd+=(--bwa-threads "${BWA_THREADS}")
   annotate_cmd+=(--out-tsv "${run_outdir}/candidate_loci.mei.tsv")
   run_cli "${annotate_cmd[@]}"
   echo "[candidate-pipeline] stage=annotate-mei-support done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
@@ -664,6 +676,19 @@ if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
   echo "ERROR: resolved empty chromosome list from --chr '${CHR_ARG}'." >&2
   exit 1
 fi
+
+# Resolve bwa threads once chrom plan is known (CLI --bwa-threads overrides auto).
+if [[ "${BWA_THREADS_EXPLICIT}" == "1" ]]; then
+  if ! [[ "${BWA_THREADS}" =~ ^[0-9]+$ ]] || [[ "${BWA_THREADS}" -lt 1 ]]; then
+    echo "ERROR: --bwa-threads must be a positive integer." >&2
+    exit 1
+  fi
+elif [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${CHR_CONCURRENCY}" -gt 1 ]]; then
+  BWA_THREADS="1"
+else
+  BWA_THREADS="$(nproc)"
+fi
+echo "[candidate-pipeline] bwa_threads=${BWA_THREADS} (explicit=${BWA_THREADS_EXPLICIT}; chr_count=${#CHR_LIST[@]}; chr_concurrency=${CHR_CONCURRENCY})"
 
 if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; then
   filtered_chr_list=()

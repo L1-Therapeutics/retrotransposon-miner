@@ -1323,6 +1323,138 @@ def _build_mei_full_consensus_panel(outdir: Path, ds_map: dict[str, Dataset], ti
     }
 
 
+_CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+
+# Consensus-to-consensus (ancient L1 *_5end → modern L1*_full) needs softer BWA
+# scoring than short-read MEI remap. -k8 -T0 plus weak match/gap penalties recover
+# L1MCa/L1MB* 5ends that default bwa mem leaves unmapped. -a keeps secondary
+# hits so L1HS_5end→L1HS_full is available even when L1PA2 wins as primary.
+_BWA_FRAG2FULL_ARGS = (
+    "mem",
+    "-t",
+    "4",
+    "-a",
+    "-k",
+    "8",
+    "-T",
+    "0",
+    "-A",
+    "1",
+    "-B",
+    "1",
+    "-O",
+    "1",
+    "-E",
+    "1",
+)
+
+
+def _cigar_query_ref_spans(cigar: str) -> tuple[int, int, int, int, int]:
+    """Return (q_aln, r_span, alnlen, left_clip, right_clip) from CIGAR."""
+    q_aln = 0
+    r_span = 0
+    alnlen = 0
+    left_clip = 0
+    right_clip = 0
+    seen_aln = False
+    for n_s, op in _CIGAR_RE.findall(cigar or ""):
+        n = int(n_s)
+        if op in {"M", "=", "X"}:
+            q_aln += n
+            r_span += n
+            alnlen += n
+            seen_aln = True
+        elif op == "I":
+            q_aln += n
+            alnlen += n
+            seen_aln = True
+        elif op in {"D", "N"}:
+            r_span += n
+            alnlen += n
+            seen_aln = True
+        elif op in {"S", "H"}:
+            if not seen_aln:
+                left_clip += n
+            else:
+                right_clip += n
+    return q_aln, r_span, alnlen, left_clip, right_clip
+
+
+def _iter_sam_mapped_alignments(sam_text: str, *, include_secondary: bool = False):
+    """Yield mapped SAM alignments as dicts (fragment→full prep).
+
+    Skips unmapped and supplementary. Secondaries are optional so exact
+    ``{subfamily}_full`` targets can outrank a higher-scoring primary onto a
+    sibling subfamily (e.g. L1HS_5end→L1PA2 primary vs L1HS_full secondary).
+    """
+    tlen_map: dict[str, int] = {}
+    for line in (sam_text or "").splitlines():
+        if not line:
+            continue
+        if line.startswith("@"):
+            if line.startswith("@SQ"):
+                sn = ln = None
+                for field in line.split("\t")[1:]:
+                    if field.startswith("SN:"):
+                        sn = field[3:]
+                    elif field.startswith("LN:"):
+                        ln = int(field[3:])
+                if sn and ln:
+                    tlen_map[sn] = ln
+            continue
+        parts = line.split("\t")
+        if len(parts) < 11:
+            continue
+        flag = int(parts[1])
+        if flag & 0x4 or flag & 0x800:
+            continue
+        if (flag & 0x100) and not include_secondary:
+            continue
+        tname = parts[2]
+        if not tname or tname == "*":
+            continue
+        cigar = parts[5]
+        q_aln, r_span, alnlen, left_clip, right_clip = _cigar_query_ref_spans(cigar)
+        if alnlen <= 0 or q_aln <= 0 or r_span <= 0:
+            continue
+        qlen = left_clip + q_aln + right_clip
+        if qlen <= 0:
+            continue
+        # Query coords on the original forward fragment (1-based inclusive).
+        if flag & 0x10:
+            qstart_0 = right_clip
+            strand = "-"
+        else:
+            qstart_0 = left_clip
+            strand = "+"
+        qend_0 = qstart_0 + q_aln
+        tstart_1 = int(parts[3])
+        tend_1 = tstart_1 + r_span - 1
+        nm = 0
+        for field in parts[11:]:
+            if field.startswith("NM:i:"):
+                try:
+                    nm = int(field.split(":")[-1])
+                except ValueError:
+                    nm = 0
+                break
+        nmatch = max(0, alnlen - nm)
+        yield {
+            "qname": parts[0],
+            "qlen": qlen,
+            "qstart_0": qstart_0,
+            "qend_0": qend_0,
+            "strand": strand,
+            "tname": tname,
+            "tlen": int(tlen_map.get(tname, 0)),
+            "tstart_1": tstart_1,
+            "tend_1": tend_1,
+            "alnlen": alnlen,
+            "nmatch": nmatch,
+            "mapq": int(parts[4]),
+        }
+
+
 def _build_mei_fragment_to_full_coord_map(
     outdir: Path,
     ds_map: dict[str, Dataset],
@@ -1332,9 +1464,9 @@ def _build_mei_fragment_to_full_coord_map(
     """One-time map of each Dfam MEI fragment onto a full-length consensus.
 
     Aligns ``dfam_human_mei_l1_alu_sva.fasta`` records to the full-consensus
-    panel (prefer matching ``{subfamily}_full``, else family canonical
-    L1HS/AluY/SVA_F). Writes a TSV used at annotate time to project panel
-    hit coordinates onto the full-length axis — no per-read full remap.
+    panel with sensitive ``bwa mem`` (prefer matching ``{subfamily}_full``, else
+    family canonical L1HS/AluY/SVA_F). Writes a TSV used at annotate time to
+    project panel hit coordinates onto the full-length axis — no per-read full remap.
     """
     del ds_map, timeout_sec  # signature matches other prepare steps
     dfam_subset = outdir / "retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta"
@@ -1353,8 +1485,8 @@ def _build_mei_fragment_to_full_coord_map(
             "panel_fasta": str(panel_fa),
             "canonical_fasta": str(canonical_fa),
         }
-    if shutil.which("minimap2") is None:
-        return {"status": "failed", "error": "minimap2_not_found"}
+    if shutil.which("bwa") is None:
+        return {"status": "failed", "error": "bwa_not_found"}
 
     panel_seqs: dict[str, str] = {}
     for path in (panel_fa, canonical_fa):
@@ -1396,41 +1528,27 @@ def _build_mei_fragment_to_full_coord_map(
                 handle.write(f">{name}\n")
                 for i in range(0, len(seq), 60):
                     handle.write(seq[i : i + 60] + "\n")
-        _run_cmd(["samtools", "faidx", str(target_fa)], required=True)
-        ok, paf_text = _run_cmd(
-            ["minimap2", "-c", "--cs", "-N", "5", str(target_fa), str(query_fa)],
+        _run_cmd(["bwa", "index", str(target_fa)], required=True)
+        ok, sam_text = _run_cmd(
+            ["bwa", *_BWA_FRAG2FULL_ARGS, str(target_fa), str(query_fa)],
             required=True,
         )
         if not ok:
-            return {"status": "failed", "error": "minimap2_failed", "detail": paf_text}
+            return {"status": "failed", "error": "bwa_mem_failed", "detail": sam_text}
 
     # Prefer primary hits onto the matching subfamily full, else family canonical.
-    best_by_query: dict[str, tuple[float, list[str]]] = {}
-    for line in paf_text.splitlines():
-        if not line.strip():
-            continue
-        cols = line.split("\t")
-        if len(cols) < 12:
-            continue
-        qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alnlen, mapq = cols[:12]
-        try:
-            qlen_i = int(qlen)
-            qstart_i = int(qstart)
-            qend_i = int(qend)
-            tlen_i = int(tlen)
-            tstart_i = int(tstart)
-            tend_i = int(tend)
-            nmatch_i = int(nmatch)
-            alnlen_i = max(1, int(alnlen))
-            mapq_i = int(mapq)
-        except ValueError:
-            continue
+    best_by_query: dict[str, tuple[tuple, list[str]]] = {}
+    qlen_by_name = {hdr: len(seq) for hdr, _fam, seq in fragments}
+    for hit in _iter_sam_mapped_alignments(sam_text, include_secondary=True):
+        qname = hit["qname"]
+        tname = hit["tname"]
         fam = _mei_family_from_header(qname)
+        if fam == "OTHER" or _mei_family_from_header(tname) != fam:
+            continue
         norm = _normalize_dfam_subfamily_for_full(qname)
         preferred = f"{norm}_full"
         t_base = tname.split("#", 1)[0]
-        rank = 0
-        if t_base == preferred or tname.startswith(preferred):
+        if t_base == preferred or tname.startswith(preferred + "#") or tname.startswith(preferred):
             rank = 3
         elif tname == family_canonical.get(fam, "") or t_base == family_canonical.get(fam, "").split("#", 1)[0]:
             rank = 2
@@ -1438,20 +1556,28 @@ def _build_mei_fragment_to_full_coord_map(
             rank = 1
         else:
             continue
+        qlen_i = int(qlen_by_name.get(qname, hit["qlen"]))
+        qstart_i = int(hit["qstart_0"])
+        qend_i = int(hit["qend_0"])
+        alnlen_i = max(1, int(hit["alnlen"]))
+        nmatch_i = int(hit["nmatch"])
         identity = nmatch_i / float(alnlen_i)
         cov = (qend_i - qstart_i) / float(max(1, qlen_i))
-        score = (rank, identity, cov, mapq_i, alnlen_i)
+        mapq_i = int(hit["mapq"])
+        # Prefer exact/canonical target, then longer fragment coverage — not a short
+        # high-identity secondary onto a sibling subfamily.
+        score = (rank, cov, alnlen_i, identity, mapq_i)
         # 1-based inclusive coords for annotate-time projection.
         row = [
             qname,
             str(qlen_i),
             tname,
-            str(tlen_i),
+            str(int(hit["tlen"])),
             str(qstart_i + 1),
             str(qend_i),
-            str(tstart_i + 1),
-            str(tend_i),
-            strand,
+            str(int(hit["tstart_1"])),
+            str(int(hit["tend_1"])),
+            hit["strand"],
             str(alnlen_i),
             str(nmatch_i),
             f"{identity:.6f}",
@@ -1496,6 +1622,8 @@ def _build_mei_fragment_to_full_coord_map(
     return {
         "status": "prepared",
         "path": str(map_tsv),
+        "aligner": "bwa_mem",
+        "bwa_args": " ".join(_BWA_FRAG2FULL_ARGS),
         "fragments_total": len(fragments),
         "fragments_mapped": mapped,
         "fragments_unmapped": len(fragments) - mapped,
