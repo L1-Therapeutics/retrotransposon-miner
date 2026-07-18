@@ -656,9 +656,12 @@ def _resolve_full_consensus_fasta(
 
     mei_fasta = Path(mei_fasta)
     packaged = [
-        mei_fasta.parent.parent / "full_consensus" / "mei_full_canonical.ucsc_repeatbrowser.fa",
-        mei_fasta.parent.parent / "full_consensus" / "mei_full_canonical.ucsc_repeatbrowser.panel.fa",
+        # Prefer the full Dfam-matched panel (polyA-trimmed at prep) over the
+        # tiny 3-sequence RepeatBrowser stub.
         mei_fasta.parent.parent / "full_consensus" / "mei_full_canonical.panel.fa",
+        mei_fasta.parent.parent / "full_consensus" / "mei_full_canonical.ucsc_repeatbrowser.panel.fa",
+        mei_fasta.parent.parent / "full_consensus" / "mei_full_canonical.ucsc_repeatbrowser.fa",
+        mei_fasta.parent / "full_consensus" / "mei_full_canonical.panel.fa",
         mei_fasta.parent / "full_consensus" / "mei_full_canonical.ucsc_repeatbrowser.fa",
     ]
     for cand in packaged:
@@ -834,7 +837,9 @@ def _trim_poly_at_from_clip(seq: str, side: str = "") -> str:
     if len(backup) >= _MEI_ALIGN_MIN_TRIMMED_BP:
         return backup
     joined = (left + right).strip()
-    return joined if len(joined) >= _MEI_ALIGN_MIN_TRIMMED_BP else s
+    # Pure / near-pure polyA clips: do not fall back to the untrimmed sequence
+    # (that remaps onto consensus A-tails and inflates MEI_MAPPED).
+    return joined if len(joined) >= _MEI_ALIGN_MIN_TRIMMED_BP else ""
 
 
 def _mei_align_quality_ok(
@@ -1088,6 +1093,87 @@ def _best_hits_from_sam(sam_text: str, *, target_lengths: dict[str, int] | None 
     return _pick_best_mei_hits(rows)
 
 
+# Terminal polyA on Alu/SVA/L1 consensus is not MEI body — remap against a
+# trimmed copy so polyA soft-clips cannot "MEI-map" onto the consensus tail.
+_MEI_CONSENSUS_POLYA_MIN_TRIM = 8
+
+
+def trim_mei_consensus_terminal_polya(seq: str, *, min_run: int = _MEI_CONSENSUS_POLYA_MIN_TRIM) -> str:
+    """Strip terminal polyA (and leading polyT) from a consensus sequence."""
+    s = (seq or "").upper().replace("U", "T")
+    if not s:
+        return ""
+    end = len(s)
+    while end > 0 and s[end - 1] == "A":
+        end -= 1
+    if (len(s) - end) >= int(min_run):
+        s = s[:end]
+    start = 0
+    while start < len(s) and s[start] == "T":
+        start += 1
+    if start >= int(min_run):
+        s = s[start:]
+    return s
+
+
+def _write_polya_trimmed_fasta(src: Path, dst: Path, *, min_run: int = _MEI_CONSENSUS_POLYA_MIN_TRIM) -> int:
+    """Write ``dst`` with terminal polyA/T stripped from each record. Returns n trimmed."""
+    src = Path(src)
+    dst = Path(dst)
+    n_trimmed = 0
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("r", encoding="utf-8") as hin, dst.open("w", encoding="utf-8") as hout:
+        name: str | None = None
+        seq_parts: list[str] = []
+
+        def _flush() -> None:
+            nonlocal n_trimmed, name, seq_parts
+            if name is None:
+                return
+            raw = "".join(seq_parts)
+            trimmed = trim_mei_consensus_terminal_polya(raw, min_run=min_run)
+            if len(trimmed) != len(raw.upper().replace("U", "T")):
+                n_trimmed += 1
+            if not trimmed:
+                name = None
+                seq_parts = []
+                return
+            # ``name`` is the full FASTA header line including the leading '>'.
+            hout.write(name if name.endswith("\n") else f"{name}\n")
+            for i in range(0, len(trimmed), 60):
+                hout.write(trimmed[i : i + 60] + "\n")
+            name = None
+            seq_parts = []
+
+        for line in hin:
+            if line.startswith(">"):
+                _flush()
+                name = line.rstrip("\n")
+                seq_parts = []
+            else:
+                seq_parts.append(line.strip())
+        _flush()
+    return n_trimmed
+
+
+def _ensure_polya_trimmed_mei_fasta(mei_fasta: Path) -> Path:
+    """Return a polyA-trimmed MEI FASTA (sidecar ``*.nopolya.fa``), refreshing when stale."""
+    src = Path(mei_fasta)
+    if not src.exists():
+        raise FileNotFoundError(f"MEI FASTA not found: {src}")
+    dst = src.with_name(f"{src.stem}.nopolya{src.suffix}")
+    src_mtime = src.stat().st_mtime
+    needs = (not dst.exists()) or (dst.stat().st_mtime < src_mtime) or (dst.stat().st_size <= 0)
+    if needs:
+        _write_polya_trimmed_fasta(src, dst)
+        # Drop stale bwa index so _ensure_bwa_index rebuilds.
+        for suffix in (".amb", ".ann", ".bwt", ".pac", ".sa"):
+            idx = Path(f"{dst}{suffix}")
+            if idx.exists():
+                idx.unlink()
+    return dst
+
+
 def _ensure_bwa_index(mei_fasta: Path) -> None:
     """Build classic bwa index next to ``mei_fasta`` when missing."""
     if Path(f"{mei_fasta}.bwt").exists() and Path(f"{mei_fasta}.sa").exists():
@@ -1107,8 +1193,9 @@ def _align_queries_to_mei_bwa(
     bwa_threads: int = 1,
 ) -> pd.DataFrame:
     """Remap query FASTA to MEI consensus with ``bwa mem -k10 -T10``."""
-    _ensure_bwa_index(mei_fasta)
-    cmd = ["bwa", *_bwa_mem_mei_args(bwa_threads=bwa_threads), str(mei_fasta), str(query_fa)]
+    remap_fa = _ensure_polya_trimmed_mei_fasta(mei_fasta)
+    _ensure_bwa_index(remap_fa)
+    cmd = ["bwa", *_bwa_mem_mei_args(bwa_threads=bwa_threads), str(remap_fa), str(query_fa)]
     proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return _best_hits_from_sam(proc.stdout or "")
 
@@ -1152,70 +1239,102 @@ def _align_clips_with_minimap2(
             "split evidence table is missing 'clip_seq'. Re-run extract-split-evidence with the current code."
         )
 
-    clips = split_df.copy()
-    clips = clips.loc[clips["clip_seq"].fillna("").astype(str).str.len() > 0].copy()
-    clips["clip_id"] = [f"{sample}_{i}" for i in range(len(clips))]
-    # Primary MEI remap uses polyA/T-trimmed clip sequence; coord fields mirror
-    # the same gated hit (no second bwa pass).
-    clips["clip_seq_coord"] = [
+    # Keep every input clip (including pure polyA) so polyA_MAPPED counting still
+    # sees them; only non-empty trimmed queries are remapped to MEI.
+    out = split_df.copy()
+    out = out.loc[out["clip_seq"].fillna("").astype(str).str.len() > 0].copy()
+    out["clip_id"] = [f"{sample}_{i}" for i in range(len(out))]
+    out["clip_seq_coord"] = [
         _trim_poly_at_from_clip(str(seq), str(side))
-        for seq, side in zip(clips["clip_seq"].fillna(""), clips["clip_side"].fillna(""))
+        for seq, side in zip(out["clip_seq"].fillna(""), out["clip_side"].fillna(""))
     ]
-    clips["mei_query_seq"] = clips["clip_seq_coord"].fillna("").astype(str)
-    clips = clips.loc[clips["mei_query_seq"].str.len() >= _MEI_ALIGN_MIN_TRIMMED_BP].copy()
-    if clips.empty:
-        summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
-        return clips, summary
+    out["mei_query_seq"] = out["clip_seq_coord"].fillna("").astype(str)
+    for col, default in (
+        ("mei_hit", False),
+        ("family", ""),
+        ("target", ""),
+        ("target_strand", ""),
+        ("target_start", 0),
+        ("target_end", 0),
+        ("target_len", 0),
+        ("alnlen", 0),
+        ("mapq", 0),
+        ("pid", 0.0),
+        ("qcov", 0.0),
+        ("mei_score", 0.0),
+    ):
+        if col not in out.columns:
+            out[col] = default
 
-    with tempfile.TemporaryDirectory(prefix=f"rtm_mei_{sample}_") as tmpdir:
-        tmp = Path(tmpdir)
-        query_fa = tmp / "clips.fa"
+    remap = out.loc[out["mei_query_seq"].str.len() >= _MEI_ALIGN_MIN_TRIMMED_BP].copy()
+    if not remap.empty:
+        with tempfile.TemporaryDirectory(prefix=f"rtm_mei_{sample}_") as tmpdir:
+            tmp = Path(tmpdir)
+            query_fa = tmp / "clips.fa"
 
-        with query_fa.open("w", encoding="utf-8") as handle:
-            for row in clips.itertuples(index=False):
-                handle.write(f">{row.clip_id}\n{row.mei_query_seq}\n")
+            with query_fa.open("w", encoding="utf-8") as handle:
+                for row in remap.itertuples(index=False):
+                    handle.write(f">{row.clip_id}\n{row.mei_query_seq}\n")
 
-        # bwa mem -k10 -T10: recovers ~20 bp Alu/L1/SVA tips that minimap2 -x sr misses.
-        best_hits = _align_queries_to_mei_bwa(query_fa, mei_fasta, bwa_threads=bwa_threads)
-        out = clips.merge(best_hits, left_on="clip_id", right_on="qname", how="left")
-        out = _canonicalize_alignment_hit_columns(out)
-        out = _apply_mei_align_quality_gate(
-            out,
-            query_len=out["mei_query_seq"].fillna("").astype(str).str.len(),
-        )
-        out["mei_hit"] = out["target"].notna() & out["target"].fillna("").astype(str).ne("")
-        out["family"] = out["family"].fillna("")
-        out["target"] = out["target"].fillna("")
-        out["target_strand"] = out["target_strand"].fillna("")
-        out["target_start"] = out["target_start"].fillna(0).astype(int)
-        out["target_end"] = out["target_end"].fillna(0).astype(int)
-        out["target_len"] = out["target_len"].fillna(0).astype(int)
-        out["alnlen"] = out["alnlen"].fillna(0).astype(int)
-        for _col, _default in (("mapq", 0), ("pid", 0.0), ("qcov", 0.0), ("mei_score", 0.0)):
-            if _col not in out.columns:
-                out[_col] = _default
-        out["mapq"] = out["mapq"].fillna(0).astype(int)
-        out["pid"] = out["pid"].fillna(0.0).astype(float)
-        out["qcov"] = out["qcov"].fillna(0.0).astype(float)
-        out["mei_score"] = out["mei_score"].fillna(0.0).astype(float)
+            # bwa mem -k10 -T10: recovers ~20 bp Alu/L1/SVA tips that minimap2 -x sr misses.
+            best_hits = _align_queries_to_mei_bwa(query_fa, mei_fasta, bwa_threads=bwa_threads)
+            hit_rows = remap.merge(best_hits, left_on="clip_id", right_on="qname", how="left")
+            hit_rows = _canonicalize_alignment_hit_columns(hit_rows)
+            hit_rows = _apply_mei_align_quality_gate(
+                hit_rows,
+                query_len=hit_rows["mei_query_seq"].fillna("").astype(str).str.len(),
+            )
+            hit_rows["mei_hit"] = hit_rows["target"].notna() & hit_rows["target"].fillna("").astype(str).ne("")
+            hit_cols = [
+                "clip_id",
+                "mei_hit",
+                "family",
+                "target",
+                "target_strand",
+                "target_start",
+                "target_end",
+                "target_len",
+                "alnlen",
+                "mapq",
+                "pid",
+                "qcov",
+                "mei_score",
+            ]
+            hit_cols = [c for c in hit_cols if c in hit_rows.columns]
+            hit_slim = hit_rows.loc[:, hit_cols].copy()
+            out = out.drop(columns=[c for c in hit_cols if c != "clip_id" and c in out.columns], errors="ignore")
+            out = out.merge(hit_slim, on="clip_id", how="left")
 
-        # Coord columns: same trimmed+gated alignment (legacy consumers).
-        out["target_coord"] = out["target"]
-        out["family_coord"] = out["family"]
-        out["target_strand_coord"] = out["target_strand"]
-        out["target_start_coord"] = out["target_start"]
-        out["target_end_coord"] = out["target_end"]
-        out["target_len_coord"] = out["target_len"]
-        out["alnlen_coord"] = out["alnlen"]
-        out["mapq_coord"] = out["mapq"]
-        out["pid_coord"] = out["pid"]
-        out["qcov_coord"] = out["qcov"]
-        out["mei_score_coord"] = out["mei_score"]
-        out["mei_hit_coord"] = out["mei_hit"]
+    out["mei_hit"] = out["mei_hit"].fillna(False).astype(bool)
+    out["family"] = out["family"].fillna("")
+    out["target"] = out["target"].fillna("")
+    out["target_strand"] = out["target_strand"].fillna("")
+    out["target_start"] = out["target_start"].fillna(0).astype(int)
+    out["target_end"] = out["target_end"].fillna(0).astype(int)
+    out["target_len"] = out["target_len"].fillna(0).astype(int)
+    out["alnlen"] = out["alnlen"].fillna(0).astype(int)
+    out["mapq"] = out["mapq"].fillna(0).astype(int)
+    out["pid"] = out["pid"].fillna(0.0).astype(float)
+    out["qcov"] = out["qcov"].fillna(0.0).astype(float)
+    out["mei_score"] = out["mei_score"].fillna(0.0).astype(float)
+
+    # Coord columns: same trimmed+gated alignment (legacy consumers).
+    out["target_coord"] = out["target"]
+    out["family_coord"] = out["family"]
+    out["target_strand_coord"] = out["target_strand"]
+    out["target_start_coord"] = out["target_start"]
+    out["target_end_coord"] = out["target_end"]
+    out["target_len_coord"] = out["target_len"]
+    out["alnlen_coord"] = out["alnlen"]
+    out["mapq_coord"] = out["mapq"]
+    out["pid_coord"] = out["pid"]
+    out["qcov_coord"] = out["qcov"]
+    out["mei_score_coord"] = out["mei_score"]
+    out["mei_hit_coord"] = out["mei_hit"]
 
     summary = ClipAlignmentSummary(
         sample=sample,
-        clip_count=len(clips),
+        clip_count=len(out),
         paf_hits=int(out["mei_hit"].sum()),
     )
     return out, summary
@@ -1887,6 +2006,8 @@ def _remap_one_sample_mei_evidence(
     disc_hits = _rescue_vntr_like_discordant_mei_hits(disc_hits)
     disc_hits = _rescue_polya_like_discordant_mei_hits(disc_hits)
     split_hits = _enrich_split_hits_with_mate_positions(split_hits, bam_path)
+    # PolyA/T soft-clips → polyA_MAPPED only (never MEI_MAPPED/SR/side coords).
+    split_hits = _demote_polya_split_mei_hits(split_hits)
     # CCCTCT / SVA-VNTR soft-clips → VNTR_MAPPED (never MEI-SR), before short rescue.
     split_hits = _annotate_vntr_like_split_clips(split_hits, discordant_df=disc_hits)
     # Short-clip rescue after DPE remap so DPE can seed when SR≥20 is absent.
@@ -2318,6 +2439,73 @@ def _rescue_vntr_like_discordant_mei_hits(df: pd.DataFrame) -> pd.DataFrame:
             f"across {int(eligible.drop_duplicates(['chrom','window_start','window_end']).shape[0])} SVA-supported loci"
         )
     out = out.drop(columns=["_fam_norm", "top_family", "support_reads"], errors="ignore")
+    return out
+
+
+def _demote_polya_split_mei_hits(split_df: pd.DataFrame) -> pd.DataFrame:
+    """Clear MEI hits on polyA/T junction clips (polyA_MAPPED only).
+
+    Soft-clips with a polyA/T run (≥8) or ``poly_tail_rescued`` must not
+    contribute to MEI_MAPPED, SR, side MEI coords, or family votes — even if a
+    residual tip (or untrimmed fallback) remapped to consensus.
+    """
+    if split_df is None or split_df.empty:
+        return split_df
+    out = split_df.copy()
+    polya = _split_polya_member_mask(out)
+    if not bool(polya.any()):
+        return out
+    mei_hit = (
+        out["mei_hit"].fillna(False).astype(bool)
+        if "mei_hit" in out.columns
+        else pd.Series(False, index=out.index)
+    )
+    mei_hit_coord = (
+        out["mei_hit_coord"].fillna(False).astype(bool)
+        if "mei_hit_coord" in out.columns
+        else pd.Series(False, index=out.index)
+    )
+    demote = polya & (mei_hit | mei_hit_coord)
+    n = int(demote.sum())
+    if not n:
+        return out
+    out.loc[demote, "mei_hit"] = False
+    if "mei_hit_coord" in out.columns:
+        out.loc[demote, "mei_hit_coord"] = False
+    if "short_mei_seed_rescued" in out.columns:
+        out.loc[demote, "short_mei_seed_rescued"] = False
+    for col in (
+        "target",
+        "family",
+        "target_strand",
+        "target_coord",
+        "family_coord",
+        "target_strand_coord",
+    ):
+        if col in out.columns:
+            out.loc[demote, col] = ""
+    for col in (
+        "target_start",
+        "target_end",
+        "target_len",
+        "alnlen",
+        "mapq",
+        "target_start_coord",
+        "target_end_coord",
+        "target_len_coord",
+        "alnlen_coord",
+        "mapq_coord",
+    ):
+        if col in out.columns:
+            out.loc[demote, col] = 0
+    for col in ("pid", "qcov", "mei_score", "pid_coord", "qcov_coord", "mei_score_coord"):
+        if col in out.columns:
+            out.loc[demote, col] = 0.0
+    print(
+        f"[mei-annotate] polyA split demote: cleared MEI hits on {n} polyA/T soft-clips "
+        "(counted as polyA_MAPPED only)",
+        flush=True,
+    )
     return out
 
 
@@ -3372,6 +3560,8 @@ def _split_mei_support_eligible_mask(split_df: pd.DataFrame) -> pd.Series:
     if "mei_hit_source" in split_df.columns:
         src = split_df["mei_hit_source"].fillna("").astype(str)
         has_mei = has_mei & ~src.eq("vntr_rescue")
+    # PolyA/T junction clips are polyA_MAPPED only — never also MEI_MAPPED/SR.
+    has_mei = has_mei & ~_split_polya_member_mask(split_df)
     if "clip_len" not in split_df.columns:
         return has_mei
     clip_len = pd.to_numeric(split_df["clip_len"], errors="coerce").fillna(int(_STRICT_MEI_CLIP_MIN_BP)).astype(int)
@@ -4161,6 +4351,74 @@ def _assign_rows_to_candidate_loci(split_df: pd.DataFrame, candidates: pd.DataFr
     return pd.DataFrame(assigned_rows)
 
 
+def _poly_at_artifact_tsd_mask(tsd_seq: pd.Series) -> pd.Series:
+    """True for sequences that are polyA/polyT tails, not real TSDs."""
+    tsd_seq_s = tsd_seq.fillna("").astype(str).str.upper()
+    tsd_len_s = tsd_seq_s.str.len().astype(int)
+    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).astype(float)
+    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).astype(float)
+    dominant_poly_fraction = pd.concat([a_fraction, t_fraction], axis=1).max(axis=1)
+    longest_at_run = tsd_seq_s.str.findall(r"[AT]+").map(
+        lambda parts: max((len(p) for p in parts), default=0)
+    ).astype(int)
+    longest_a_run = tsd_seq_s.str.findall(r"A+").map(
+        lambda parts: max((len(p) for p in parts), default=0)
+    ).astype(int)
+    longest_t_run = tsd_seq_s.str.findall(r"T+").map(
+        lambda parts: max((len(p) for p in parts), default=0)
+    ).astype(int)
+    poly_at_only = tsd_len_s.ge(4) & tsd_seq_s.str.fullmatch(r"[AT]+", na=False)
+    near_poly_at = tsd_len_s.ge(8) & dominant_poly_fraction.ge(0.85) & longest_at_run.ge(6)
+    # Long A/T homopolymer (≥12) is a poly-tail fragment even with a short GC tip.
+    long_homopolymer = (longest_a_run.ge(12) | longest_t_run.ge(12)) & tsd_len_s.ge(12)
+    return (poly_at_only | near_poly_at | long_homopolymer).fillna(False).astype(bool)
+
+
+def _clear_poly_at_artifact_tsd_fields(
+    out: pd.DataFrame,
+    *,
+    seq_col: str = "tsd_seq",
+    len_col: str = "tsd_len_estimate",
+    detected_col: str = "tsd_detected",
+    source_col: str = "tsd_evidence_source",
+    filter_flag_col: str = "tsd_poly_at_filter_applied",
+) -> pd.Series:
+    """Blank polyA/T artifact TSDs (all evidence sources). Returns filter mask."""
+    if out is None or out.empty or seq_col not in out.columns:
+        empty = pd.Series(False, index=(out.index if out is not None else None))
+        if out is not None and filter_flag_col not in out.columns:
+            out[filter_flag_col] = False
+        return empty
+    mask = _poly_at_artifact_tsd_mask(out[seq_col])
+    prev = (
+        out[filter_flag_col].fillna(False).astype(bool)
+        if filter_flag_col in out.columns
+        else pd.Series(False, index=out.index)
+    )
+    out[filter_flag_col] = (prev | mask).astype(bool)
+    if not bool(mask.any()):
+        if detected_col in out.columns and len_col in out.columns:
+            out[detected_col] = pd.to_numeric(out[len_col], errors="coerce").fillna(0).astype(int) >= 4
+        return mask
+    if "tsd_left_breakpoint" in out.columns:
+        out.loc[mask, "tsd_left_breakpoint"] = 0
+    if "tsd_right_breakpoint" in out.columns:
+        out.loc[mask, "tsd_right_breakpoint"] = 0
+    if len_col in out.columns:
+        out.loc[mask, len_col] = 0
+    out.loc[mask, seq_col] = ""
+    if detected_col in out.columns:
+        if len_col in out.columns:
+            out[detected_col] = pd.to_numeric(out[len_col], errors="coerce").fillna(0).astype(int) >= 4
+        else:
+            out.loc[mask, detected_col] = False
+    if source_col in out.columns:
+        src = out.loc[mask, source_col].fillna("").astype(str)
+        already = src.str.contains("filtered_poly_at", regex=False)
+        out.loc[mask & ~already, source_col] = src.loc[mask & ~already] + "_filtered_poly_at_only"
+    return mask
+
+
 def _poly_at_stats(seq: str) -> tuple[int, float, str]:
     """PolyA/T stats: longest dominant-base run, dominant-base fraction, base.
 
@@ -4570,6 +4828,8 @@ def _add_candidate_support_info_fields(
     - SR counts only MEI-mapped split clips: strict (≥20bp) or short clips
       rescued when consistent with a MEI seed. PolyA and CIGAR indels do
       not count toward SR (polyA is reported separately as polyA_MAPPED).
+    - PolyA/T junction clips are never MEI_MAPPED (even if a residual tip
+      remapped); they count only toward polyA_MAPPED.
     - support strings also include MEI_MAPPED (consensus remap), then
       polyA_MAPPED (mate polyA rescue ∪ junction-clip / anchor polyA) and
       VNTR_MAPPED (discordant VNTR rescue ∪ VNTR-like soft-clips demoted
@@ -7872,37 +8132,12 @@ def _infer_disease_insertion_metrics(
             out["breakpoint_yyrrrr_best_offset"] = yyrrrr_best_offsets
             out["breakpoint_yyrrrr_logodds_shift1_mt_adj"] = yyrrrr_shift1_mt_adj_scores
 
-    # Guardrail: pure polyA/polyT-only TSDs from rescue heuristics are often
-    # reference-tail artifacts (especially in low-MEI-mapping contexts). Treat
-    # these as non-TSD and fall back to non-TSD breakpoint evidence.
-    tsd_src = out.get("tsd_evidence_source", "").fillna("").astype(str)
-    tsd_seq_s = out.get("tsd_seq", "").fillna("").astype(str).str.upper()
-    rescue_src = tsd_src.str.contains("_rescue", regex=False)
-    tsd_len_s = tsd_seq_s.str.len().astype(int)
-    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).astype(float)
-    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).astype(float)
-    dominant_poly_fraction = pd.concat([a_fraction, t_fraction], axis=1).max(axis=1)
-    longest_at_run = tsd_seq_s.str.findall(r"[AT]+").map(
-        lambda parts: max((len(p) for p in parts), default=0)
-    ).astype(int)
-    # Filter both strict polyA/T-only and near-pure A/T tails that contain only
-    # a tiny number of non-A/T bases (common alignment jitter around homopolymers).
-    poly_at_only_tsd = tsd_len_s.ge(4) & tsd_seq_s.str.fullmatch(r"[AT]+", na=False)
-    # Keep rescue-derived TSDs conservative in low-complexity sequence:
-    # a long pure/poly-A/T-like signature with >=6bp dominant run is often a
-    # repeat-context artifact rather than a true short duplication footprint.
-    near_poly_at_tsd = tsd_len_s.ge(8) & dominant_poly_fraction.ge(0.90) & longest_at_run.ge(6)
-    poly_at_filter_mask = rescue_src & (poly_at_only_tsd | near_poly_at_tsd)
-    out["tsd_poly_at_filter_applied"] = poly_at_filter_mask.astype(bool)
-    if poly_at_filter_mask.any():
-        out.loc[poly_at_filter_mask, "tsd_left_breakpoint"] = 0
-        out.loc[poly_at_filter_mask, "tsd_right_breakpoint"] = 0
-        out.loc[poly_at_filter_mask, "tsd_len_estimate"] = 0
-        out.loc[poly_at_filter_mask, "tsd_seq"] = ""
-        out.loc[poly_at_filter_mask, "tsd_detected"] = False
-        out.loc[poly_at_filter_mask, "tsd_evidence_source"] = (
-            out.loc[poly_at_filter_mask, "tsd_evidence_source"].astype(str) + "_filtered_poly_at_only"
-        )
+    # Guardrail: pure/near-pure polyA/polyT "TSDs" are poly-tail / reference-tail
+    # artifacts, not target-site duplications. Apply to ALL evidence sources
+    # (tsd_disease/tsd_control as well as *_rescue) — previously only rescue
+    # rows were filtered, so primary pairs could publish AAAA…/TTTT… as TSD.
+    poly_at_filter_mask = _clear_poly_at_artifact_tsd_fields(out)
+    if bool(poly_at_filter_mask.any()):
         bp_fields = out.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
         bp_fields.columns = ["insertion_breakpoint_pos", "breakpoint_evidence_source"]
         out["insertion_breakpoint_pos"] = bp_fields["insertion_breakpoint_pos"].astype(int)
@@ -7990,6 +8225,8 @@ def _apply_assembly_refinement_overrides(candidates: pd.DataFrame) -> pd.DataFra
     out["tsd_seq"] = asm_tsd_seq.where(asm_tsd_detected & (asm_tsd_seq.str.len() > 0), s("tsd_seq", "").fillna("").astype(str))
     out["tsd_len_estimate"] = asm_tsd_len.where(asm_tsd_detected, s("tsd_len_estimate", 0)).fillna(0).astype(int)
     out["tsd_detected"] = out["tsd_len_estimate"].astype(float) >= 4.0
+    # Assembly can also emit polyA/T tails as TSD; reject those too.
+    _clear_poly_at_artifact_tsd_fields(out)
 
     asm_poly = pd.to_numeric(s("asm_polyA_max_run", float("nan")), errors="coerce")
     base_poly = pd.to_numeric(s("poly_at_max_run", 0), errors="coerce")
@@ -11697,6 +11934,11 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     )
     base_tsd_len = pd.to_numeric(_series_or_default("tsd_len_estimate", float("nan")), errors="coerce")
     out["consensus_tsd_len_estimate"] = asm_tsd_len.where(asm_tsd_detected, base_tsd_len)
+    # Final consensus guard: never publish polyA/T tails as TSD.
+    poly_consensus = _poly_at_artifact_tsd_mask(out["consensus_tsd_seq"])
+    if bool(poly_consensus.any()):
+        out.loc[poly_consensus, "consensus_tsd_seq"] = ""
+        out.loc[poly_consensus, "consensus_tsd_len_estimate"] = 0
     # Keep TSD sequence/length internally consistent in review output. Some upstream
     # rows can carry sequence but a zero/missing length estimate.
     consensus_tsd_seq_len = out["consensus_tsd_seq"].fillna("").astype(str).str.len().astype(float)

@@ -55,51 +55,6 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 - Other short-read platforms (for example, Ultima Genomics) are not yet validated/supported.
 - Local assembly is parallelized but still compute-expensive; it is optional and not recommended by default for routine runs.
 
-## MEI Consensus Remapping (Why `bwa mem`)
-
-Split-read soft-clips and discordant clipped ends are remapped to the Dfam Alu / LINE-1 / SVA consensus FASTA with:
-
-```bash
-bwa mem -t <N> -k 10 -T 10 <mei.fasta> <queries.fa>
-```
-
-`<N>` comes from `annotate-mei-support --bwa-threads` (CLI default **1**). The pipeline wrapper sets it automatically: `nproc` for single-chrom / serial chroms, and **1** under multi-chrom concurrency (`--chr_concurrency > 1`). Override anytime with `--bwa-threads N` on the CLI or wrapper.
-
-Before remap, longest A/T homopolymers (≥8 bp) are trimmed from the query so polyA+tip clips are scored on the tip. Hits then pass a length-aware gate: short trimmed queries (≤30 bp) need qcov ≥ 0.80 and pid ≥ 0.90; longer queries may tip-align (pid ≥ 0.90 and alnlen ≥ 20) without requiring full-query coverage. Primary and coord hit fields share this single trimmed+gated alignment (no second bwa pass). SAM parsing keeps primary alignments only and scores qcov against the full CIGAR query length (so hard-clipped supplementaries cannot fake qcov=1).
-
-Local assembly contig-to-MEI alignment still uses `minimap2` (longer sequences).
-
-Panel hit coordinates (e.g. `L1HS_5end`, `L1HS_3end`) are projected onto a shared full-length consensus axis at annotate time using a one-time prep table (`mei_fragment_to_full_coords.tsv`). That table is built with sensitive `bwa mem -a` of each Dfam fragment onto the full-consensus panel (prefer `{subfamily}_full`, else family canonical). Gold unions never mix Alu and LINE-1 axes (or different `*_full` targets).
-
-### Why not default `minimap2 -x sr`?
-
-Default short-read minimap2 uses ~21 bp seeds. Perfect 20–30 bp Alu / L1 / SVA tips therefore often produce **no hit**, so they never enter `SR_*` / `MEI_MAPPED` even when the clip is an exact consensus substring. That under-counts real MEI split support relative to polyA (which is sequence-rule based from ~8 bp).
-
-### Benchmark (reproducible)
-
-`scripts/benchmark_mei_aligners.py` samples random substrings (and reverse complements) from every Alu, LINE-1, and SVA entry in `dfam_human_mei_l1_alu_sva.fasta`, then realigns them with each tool.
-
-Recent run on this machine (840 queries = 40 tips × 3 families × 7 lengths `{20,22,25,30,40,60,100}` × ~50% RC; plus a 5000 × 40 bp timing batch):
-
-| method | overall hit% | 20 bp Alu / L1 / SVA | 5000×40 bp wall time | notes |
-|---|---:|---|---:|---|
-| `minimap2 -x sr` (old default) | 38% | 0% / 0% / 0% | **0.045 s** (fastest) | misses all ≤30 bp tips |
-| `minimap2 -x sr -k10 -w5` | 52% | 0% / 0% / 0% | 0.27 s | helps ≥30 bp only |
-| `bwa mem` (defaults) | 56% | 0% / 0% / 0% | 0.19 s | seed `k=19` too long for 20 bp |
-| **`bwa mem -k10 -T10` (chosen)** | **99.9%** | **100% / 100% / 100%** | 0.25 s | best short-tip recall; stays ~100% at 100 bp |
-| `bwa aln -l10` | 98% | 100% / 98% / 100% | **0.07 s** | great at 20 bp; drops on longer L1/SVA (~85–95% at 100 bp) |
-| `bowtie2 --very-sensitive-local` | 83% | 0% / 0% / 0% | 0.17 s | good from ~22–30 bp; misses 20 bp |
-
-**Runtime:** on this small MEI database, `bwa aln` is slightly faster than `bwa mem -k10 -T10`, and both are far cheaper than annotation I/O. We still prefer **`bwa mem -k10 -T10`** because (1) it matches `aln` on 20 bp tips for Alu **and** LINE-1 **and** SVA, (2) it does not lose long L1/SVA fragments the way `aln` does, and (3) it is a single-pass aligner (no `aln`+`samse` staging). Bowtie2 is competitive for ≥22 bp but not for the 20 bp SR gate.
-
-Re-run:
-
-```bash
-conda activate rtm-miner || micromamba activate rtm-miner
-PYTHONPATH=src python scripts/benchmark_mei_aligners.py \
-  --mei-fasta "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta"
-```
-
 ## Example Variant Calls (GRCh38)
 
 The table below lists candidate insertion calls from a tumor/normal chr22 run.  
@@ -107,36 +62,40 @@ In the example table, `SR` denotes split-read evidence and `DPE` denotes discord
 
 ### Example output from sample tumor/normal data
 
-Gold-tier calls from the SEQC2 tumor/normal chr22 annotate run with `bwa mem` MEI remap + polyA/T trim/gate, family-safe full-axis projection, and BWA-built fragment→full map (top 25 of n=1335 by `read_support_heuristic_score`; top 100 family mix ≈ 85% Alu / 14% LINE1 / 1% SVA).
+Gold-tier calls from the SEQC2 tumor/normal chr22 annotate run with polyA-trimmed MEI consensus remap, polyA-only (not MEI_MAPPED) junction clips, and polyA/T TSD filtering (top 30 of n=1042 by review rank; mix 22 Alu / 7 LINE1 / 1 SVA).
 
 | chrom | consensus_insertion_breakpoint_pos | window_start | window_end | control_supporting_reads | disease_supporting_reads | sample_status_label | consensus_tsd_seq | consensus_poly_at_min_bp | consensus_mei_family | consensus_mei_subfamily | known_mei_polymorphism_id | known_mei_polymorphism_source | consensus_insertion_orientation | nested_in_same_MEI | consensus_insertion_mei_span_full | consensus_insertion_mei_5p_coord_full | consensus_insertion_mei_3p_coord_full |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| chr22 | 49029650 | 49029645 | 49029656 | SR_L=11,SR_R=0,DPE_L=2,DPE_R=152,MEI_MAPPED=154,polyA_MAPPED=46,VNTR_MAPPED=0,polyA_side=L | SR_L=32,SR_R=0,DPE_L=8,DPE_R=373,MEI_MAPPED=372,polyA_MAPPED=92,VNTR_MAPPED=1,polyA_side=L | shared | AAGAAAACTCCT | 50 | SVA | SVA_D#Retroposon/SVA | nssv14064350 | melt_1kg | + | unnested | 1380 | 1 | 1380 |
-| chr22 | 37529127 | 37529108 | 37529146 | SR_L=0,SR_R=2,DPE_L=151,DPE_R=2,MEI_MAPPED=66,polyA_MAPPED=47,polyA_side=L | SR_L=0,SR_R=6,DPE_L=365,DPE_R=16,MEI_MAPPED=171,polyA_MAPPED=86,polyA_side=L | shared | GAAGCGGAGGTTGCAGTGAGCCGAGATTGCGCCACTGCA | 90 | ALU | AluYb8#SINE/Alu |  |  | + | nested | 318 | 1 | 318 |
-| chr22 | 20075438 | 20075432 | 20075444 | SR_L=18,SR_R=23,DPE_L=128,DPE_R=19,MEI_MAPPED=156,polyA_MAPPED=51,polyA_side=L | SR_L=8,SR_R=17,DPE_L=89,DPE_R=16,MEI_MAPPED=93,polyA_MAPPED=40,polyA_side=R | shared | AGATTTCTTTTCT | 39 | ALU | AluYk12#SINE/Alu |  |  | - | unnested | 311 | 1 | 311 |
-| chr22 | 50495046 | 50494596 | 50495497 | SR_L=2,SR_R=0,DPE_L=59,DPE_R=82,MEI_MAPPED=71,polyA_MAPPED=34,polyA_side=R | SR_L=8,SR_R=1,DPE_L=102,DPE_R=174,MEI_MAPPED=141,polyA_MAPPED=49,polyA_side=R | shared |  | 14 | ALU | AluYa5#SINE/Alu |  |  | - | unnested | 310 | 2 | 311 |
-| chr22 | 45595784 | 45595639 | 45595930 | SR_L=0,SR_R=0,DPE_L=384,DPE_R=2,MEI_MAPPED=125,polyA_MAPPED=106,polyA_side=L | SR_L=0,SR_R=0,DPE_L=452,DPE_R=0,MEI_MAPPED=130,polyA_MAPPED=102,polyA_side=L | shared |  | 91 | ALU | AluJb_short_#SINE/Alu |  |  | - | unnested | 293 | 10 | 302 |
-| chr22 | 31355872 | 31355858 | 31355887 | SR_L=12,SR_R=0,DPE_L=7,DPE_R=148,MEI_MAPPED=110,polyA_MAPPED=6 | SR_L=15,SR_R=0,DPE_L=19,DPE_R=273,MEI_MAPPED=187,polyA_MAPPED=16,polyA_side=R | shared | CCGCCTCGGCTTCCCAAAGTGCTGGGATTA | 71 | ALU | AluY_short_#SINE/Alu |  |  | - | nested | 311 | 1 | 311 |
-| chr22 | 34034616 | 34034610 | 34034623 | SR_L=14,SR_R=10,DPE_L=62,DPE_R=1,MEI_MAPPED=73,polyA_MAPPED=14,polyA_side=R | SR_L=22,SR_R=27,DPE_L=92,DPE_R=2,MEI_MAPPED=119,polyA_MAPPED=32,polyA_side=R | shared | CAAATGGAACTTTT | 64 | ALU | AluYb8#SINE/Alu | nssv14071620 | melt_1kg | - | unnested | 309 | 1 | 309 |
-| chr22 | 45166725 | 45166719 | 45166731 | SR_L=11,SR_R=8,DPE_L=28,DPE_R=3,MEI_MAPPED=30,polyA_MAPPED=14,polyA_side=L | SR_L=47,SR_R=16,DPE_L=66,DPE_R=3,MEI_MAPPED=86,polyA_MAPPED=54,polyA_side=L | shared | AAAGAATTATGTC | 64 | ALU | AluYc#SINE/Alu | g1k:nssv14054938;lr:chr22-45651200-INS->s904290<s909202>s904291-125 | melt_1kg,long_read_1kg_ont_vienna | + | unnested | 30 | 270 | 299 |
-| chr22 | 33132520 | 33132513 | 33132527 | SR_L=28,SR_R=7,DPE_L=44,DPE_R=7,MEI_MAPPED=69,polyA_MAPPED=31,polyA_side=L | SR_L=19,SR_R=7,DPE_L=76,DPE_R=31,MEI_MAPPED=109,polyA_MAPPED=23,polyA_side=L | shared | AAAAGTCATTATTAG | 56 | ALU | AluYg6#SINE/Alu | nssv14075885 | melt_1kg | + | unnested | 311 | 1 | 311 |
-| chr22 | 41050312 | 41050276 | 41050348 | SR_L=3,SR_R=0,DPE_L=1,DPE_R=85,MEI_MAPPED=64,polyA_MAPPED=27,polyA_side=R | SR_L=1,SR_R=0,DPE_L=4,DPE_R=166,MEI_MAPPED=124,polyA_MAPPED=44,polyA_side=R | shared |  | 34 | ALU | AluSz#SINE/Alu |  |  | + | unnested | 312 | 1 | 312 |
-| chr22 | 45872288 | 45872282 | 45872294 | SR_L=10,SR_R=0,DPE_L=30,DPE_R=8,MEI_MAPPED=24,polyA_MAPPED=35,polyA_side=L | SR_L=31,SR_R=11,DPE_L=41,DPE_R=35,MEI_MAPPED=65,polyA_MAPPED=66,polyA_side=L | shared | AAAAAAAAAAAAA | 41 | ALU | AluSg#SINE/Alu |  |  | + | nested | 27 | 280 | 306 |
-| chr22 | 28994190 | 28994177 | 28994203 | SR_L=0,SR_R=0,DPE_L=13,DPE_R=5,MEI_MAPPED=34,polyA_MAPPED=28,polyA_side=R | SR_L=0,SR_R=28,DPE_L=41,DPE_R=10,MEI_MAPPED=69,polyA_MAPPED=66,polyA_side=R | shared | TTTTTTTTTTTTTTTTTTTTTTTTTTT | 47 | ALU | AluYb8#SINE/Alu |  |  | - | nested | 43 | 270 | 312 |
-| chr22 | 47908556 | 47908553 | 47908560 | SR_L=0,SR_R=2,DPE_L=2,DPE_R=2,MEI_MAPPED=16,polyA_MAPPED=18,polyA_side=R | SR_L=1,SR_R=35,DPE_L=5,DPE_R=26,MEI_MAPPED=58,polyA_MAPPED=76,polyA_side=R | disease_only | TTTTTTTT | 28 | ALU | AluSz#SINE/Alu |  |  | - | unnested | 284 | 28 | 311 |
-| chr22 | 38557968 | 38557957 | 38557980 | SR_L=4,SR_R=7,DPE_L=11,DPE_R=15,MEI_MAPPED=24,polyA_MAPPED=23,polyA_side=R | SR_L=7,SR_R=33,DPE_L=23,DPE_R=25,MEI_MAPPED=62,polyA_MAPPED=54,polyA_side=R | shared | TTTTTTTTTTTTTTTTTTTTTTTT | 43 | ALU | AluYb8#SINE/Alu |  |  | - | nested | 56 | 262 | 317 |
-| chr22 | 19223382 | 19223373 | 19223390 | SR_L=17,SR_R=14,DPE_L=60,DPE_R=27,MEI_MAPPED=108,polyA_MAPPED=17,polyA_side=L | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=0,polyA_MAPPED=0 | control_only | AAAAACCACCTATGCTGG | 66 | LINE1 | L1HS_5end#LINE/L1 | g1k:nssv14064681;lr:chr22-19600083-INS->s899391<s914453>s899392-6059 | melt_1kg,long_read_1kg_ont_vienna | + | unnested | 6018 | 1 | 6018 |
-| chr22 | 47882294 | 47882287 | 47882300 | SR_L=0,SR_R=5,DPE_L=1,DPE_R=7,MEI_MAPPED=12,polyA_MAPPED=13,polyA_side=R | SR_L=0,SR_R=38,DPE_L=5,DPE_R=27,MEI_MAPPED=58,polyA_MAPPED=67,polyA_side=R | shared | TTTTTTTTTTTTTT | 32 | ALU | AluY#SINE/Alu |  |  | - | nested | 41 | 266 | 306 |
-| chr22 | 33878142 | 33878130 | 33878154 | SR_L=2,SR_R=0,DPE_L=7,DPE_R=21,MEI_MAPPED=38,polyA_MAPPED=32,polyA_side=R | SR_L=18,SR_R=20,DPE_L=11,DPE_R=32,MEI_MAPPED=62,polyA_MAPPED=50,polyA_side=R | shared | TTTTTTTTTTTTTTTTTTTTTTTTT | 56 | ALU | AluYb9#SINE/Alu |  |  | - | nested | 45 | 272 | 316 |
-| chr22 | 42859704 | 42859696 | 42859712 | SR_L=17,SR_R=0,DPE_L=14,DPE_R=12,MEI_MAPPED=29,polyA_MAPPED=33,polyA_side=L | SR_L=36,SR_R=0,DPE_L=14,DPE_R=15,MEI_MAPPED=57,polyA_MAPPED=64,polyA_side=L | shared |  | 38 | ALU | AluSq4#SINE/Alu |  |  | + | unnested | 40 | 272 | 311 |
-| chr22 | 47896792 | 47896640 | 47896943 | SR_L=0,SR_R=0,DPE_L=3,DPE_R=3,MEI_MAPPED=3,polyA_MAPPED=43,polyA_side=L | SR_L=20,SR_R=6,DPE_L=3,DPE_R=14,MEI_MAPPED=44,polyA_MAPPED=133,polyA_side=L | disease_only |  | 35 | ALU | 7SLRNA#SINE/Alu |  |  | + | unnested | 49 | 263 | 311 |
-| chr22 | 34539961 | 34539493 | 34540429 | SR_L=15,SR_R=0,DPE_L=2,DPE_R=23,MEI_MAPPED=27,polyA_MAPPED=22,polyA_side=L | SR_L=30,SR_R=0,DPE_L=11,DPE_R=54,MEI_MAPPED=61,polyA_MAPPED=49,polyA_side=L | shared |  | 47 | ALU | AluJo#SINE/Alu |  |  | + | unnested | 33 | 280 | 312 |
-| chr22 | 17224410 | 17224401 | 17224418 | SR_L=7,SR_R=16,DPE_L=31,DPE_R=50,MEI_MAPPED=82,polyA_MAPPED=27,polyA_side=R | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=0,polyA_MAPPED=0 | control_only | AACAAGTGCTAATAATTT | 68 | ALU | AluYb8#SINE/Alu | g1k:nssv14074719;lr:chr22-17900865-INS->s898731>s907592>s898732-334 | melt_1kg,long_read_1kg_ont_vienna | - | unnested | 291 | 1 | 291 |
-| chr22 | 17567662 | 17567655 | 17567669 | SR_L=1,SR_R=13,DPE_L=33,DPE_R=44,MEI_MAPPED=72,polyA_MAPPED=7,polyA_side=R | SR_L=2,SR_R=25,DPE_L=57,DPE_R=80,MEI_MAPPED=122,polyA_MAPPED=9,polyA_side=R | shared | TATCCTTGCTTTTAT | 61 | ALU | AluYb8#SINE/Alu | chr22-18235412-INS->s898803>s907604>s907605>s907606>s898804-358 | long_read_1kg_ont_vienna | - | unnested | 318 | 1 | 318 |
-| chr22 | 28371561 | 28371510 | 28371612 | SR_L=1,SR_R=9,DPE_L=16,DPE_R=10,MEI_MAPPED=29,polyA_MAPPED=60,polyA_side=R | SR_L=2,SR_R=0,DPE_L=32,DPE_R=25,MEI_MAPPED=44,polyA_MAPPED=116,polyA_side=L | shared |  | 34 | ALU | AluYi6#SINE/Alu |  |  | + | nested | 110 | 201 | 310 |
-| chr22 | 29236892 | 29236685 | 29237100 | SR_L=0,SR_R=8,DPE_L=37,DPE_R=18,MEI_MAPPED=44,polyA_MAPPED=18,polyA_side=R | SR_L=0,SR_R=22,DPE_L=50,DPE_R=35,MEI_MAPPED=82,polyA_MAPPED=22,polyA_side=R | shared |  | 71 | LINE1 | L1MCa_5end#LINE/L1 |  |  | - | unnested | 1483 | 96 | 1578 |
-| chr22 | 41639674 | 41639668 | 41639680 | SR_L=6,SR_R=5,DPE_L=15,DPE_R=2,MEI_MAPPED=35,polyA_MAPPED=44,polyA_side=R | SR_L=0,SR_R=1,DPE_L=31,DPE_R=3,MEI_MAPPED=54,polyA_MAPPED=77,polyA_side=R | shared | TTTTTTTTTTTTT | 42 | ALU | FLAM_C#SINE/Alu |  |  | - | nested | 0 | -1 | -1 |
-
+| chr22 | 49029650 | 49029645 | 49029656 | SR_L=0,SR_R=0,DPE_L=2,DPE_R=152,MEI_MAPPED=127,polyA_MAPPED=46,VNTR_MAPPED=0,polyA_side=L | SR_L=0,SR_R=0,DPE_L=8,DPE_R=373,MEI_MAPPED=306,polyA_MAPPED=92,VNTR_MAPPED=1,polyA_side=L | shared | AAGAAAACTCCT | 50 | SVA | SVA_D#Retroposon/SVA | nssv14064350 | melt_1kg | - | unnested | 1366 | 1 | 1366 |
+| chr22 | 31355872 | 31355858 | 31355887 | SR_L=12,SR_R=0,DPE_L=7,DPE_R=148,MEI_MAPPED=108,polyA_MAPPED=6 | SR_L=15,SR_R=0,DPE_L=19,DPE_R=273,MEI_MAPPED=188,polyA_MAPPED=16,polyA_side=R | shared | CCGCCTCGGCTTCCCAAAGTGCTGGGATTA | 71 | ALU | AluY_short_#SINE/Alu |  |  | - | nested | 281 | 1 | 281 |
+| chr22 | 37529127 | 37529108 | 37529146 | SR_L=0,SR_R=1,DPE_L=151,DPE_R=2,MEI_MAPPED=66,polyA_MAPPED=47,polyA_side=L | SR_L=0,SR_R=3,DPE_L=365,DPE_R=16,MEI_MAPPED=167,polyA_MAPPED=86,polyA_side=L | shared | GAAGCGGAGGTTGCAGTGAGCCGAGATTGCGCCACTGCA | 90 | ALU | AluYb8#SINE/Alu |  |  | + | nested | 288 | 1 | 288 |
+| chr22 | 17567662 | 17567655 | 17567669 | SR_L=6,SR_R=6,DPE_L=33,DPE_R=44,MEI_MAPPED=71,polyA_MAPPED=7,polyA_side=R | SR_L=23,SR_R=17,DPE_L=57,DPE_R=80,MEI_MAPPED=139,polyA_MAPPED=9,polyA_side=R | shared | TATCCTTGCTTTTAT | 61 | ALU | AluYb8#SINE/Alu | chr22-18235412-INS->s898803>s907604>s907605>s907606>s898804-358 | long_read_1kg_ont_vienna | - | unnested | 288 | 1 | 288 |
+| chr22 | 50495066 | 50494596 | 50495537 | SR_L=2,SR_R=0,DPE_L=59,DPE_R=82,MEI_MAPPED=71,polyA_MAPPED=34,polyA_side=R | SR_L=8,SR_R=1,DPE_L=102,DPE_R=174,MEI_MAPPED=138,polyA_MAPPED=49,polyA_side=R | shared |  | 14 | ALU | AluYa5#SINE/Alu |  |  | - | unnested | 280 | 2 | 281 |
+| chr22 | 45595784 | 45595639 | 45595930 | SR_L=0,SR_R=0,DPE_L=384,DPE_R=2,MEI_MAPPED=119,polyA_MAPPED=106,polyA_side=L | SR_L=0,SR_R=0,DPE_L=452,DPE_R=0,MEI_MAPPED=128,polyA_MAPPED=102,polyA_side=L | shared |  | 91 | ALU | AluJb_short_#SINE/Alu |  |  | - | unnested | 282 | 1 | 282 |
+| chr22 | 41050312 | 41050276 | 41050348 | SR_L=3,SR_R=0,DPE_L=1,DPE_R=85,MEI_MAPPED=65,polyA_MAPPED=27,polyA_side=R | SR_L=1,SR_R=0,DPE_L=4,DPE_R=166,MEI_MAPPED=125,polyA_MAPPED=44,polyA_side=R | shared |  | 34 | ALU | AluSq#SINE/Alu |  |  | - | nested | 283 | 1 | 283 |
+| chr22 | 20075438 | 20075432 | 20075444 | SR_L=12,SR_R=8,DPE_L=128,DPE_R=19,MEI_MAPPED=111,polyA_MAPPED=51,polyA_side=L | SR_L=7,SR_R=3,DPE_L=89,DPE_R=16,MEI_MAPPED=65,polyA_MAPPED=40,polyA_side=R | shared | AGATTTCTTTTCT | 39 | ALU | AluYk12#SINE/Alu |  |  | + | unnested | 281 | 1 | 281 |
+| chr22 | 40007330 | 40007328 | 40007332 | SR_L=0,SR_R=0,DPE_L=76,DPE_R=12,MEI_MAPPED=68,polyA_MAPPED=1,polyA_side=R | SR_L=4,SR_R=0,DPE_L=98,DPE_R=25,MEI_MAPPED=98,polyA_MAPPED=3,polyA_side=R | shared | CTCCT | 114 | ALU | AluYb8#SINE/Alu |  |  | - | unnested | 288 | 1 | 288 |
+| chr22 | 19223382 | 19223373 | 19223390 | SR_L=0,SR_R=14,DPE_L=60,DPE_R=27,MEI_MAPPED=91,polyA_MAPPED=17,polyA_side=L | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=0,polyA_MAPPED=0 | control_only | AAAAACCACCTATGCTGG | 66 | LINE1 | L1HS_5end#LINE/L1 | g1k:nssv14064681;lr:chr22-19600083-INS->s899391<s914453>s899392-6059 | melt_1kg,long_read_1kg_ont_vienna | + | unnested | 6018 | 1 | 6018 |
+| chr22 | 34034616 | 34034610 | 34034623 | SR_L=14,SR_R=2,DPE_L=62,DPE_R=1,MEI_MAPPED=61,polyA_MAPPED=14,polyA_side=R | SR_L=22,SR_R=6,DPE_L=92,DPE_R=2,MEI_MAPPED=90,polyA_MAPPED=32,polyA_side=R | shared | CAAATGGAACTTTT | 64 | ALU | AluYb8#SINE/Alu | nssv14071620 | melt_1kg | - | unnested | 288 | 1 | 288 |
+| chr22 | 50351083 | 50350826 | 50351340 | SR_L=0,SR_R=0,DPE_L=121,DPE_R=18,MEI_MAPPED=50,polyA_MAPPED=12,polyA_side=R | SR_L=0,SR_R=0,DPE_L=218,DPE_R=16,MEI_MAPPED=85,polyA_MAPPED=38,polyA_side=R | shared |  | 38 | ALU | AluSc5#SINE/Alu |  |  | - | nested | 264 | 1 | 264 |
+| chr22 | 33132520 | 33132513 | 33132527 | SR_L=0,SR_R=7,DPE_L=44,DPE_R=7,MEI_MAPPED=37,polyA_MAPPED=31,polyA_side=L | SR_L=1,SR_R=7,DPE_L=76,DPE_R=31,MEI_MAPPED=85,polyA_MAPPED=23,polyA_side=L | shared | AAAAGTCATTATTAG | 56 | ALU | AluYg6#SINE/Alu | nssv14075885 | melt_1kg | + | unnested | 281 | 1 | 281 |
+| chr22 | 36746494 | 36746492 | 36746495 | SR_L=0,SR_R=2,DPE_L=7,DPE_R=77,MEI_MAPPED=44,polyA_MAPPED=2 | SR_L=1,SR_R=11,DPE_L=11,DPE_R=157,MEI_MAPPED=85,polyA_MAPPED=2,polyA_side=R | shared | CTCC | 48 | ALU | AluSz#SINE/Alu |  |  | - | unnested | 221 | 10 | 230 |
+| chr22 | 29236892 | 29236685 | 29237100 | SR_L=0,SR_R=6,DPE_L=37,DPE_R=18,MEI_MAPPED=43,polyA_MAPPED=18,polyA_side=R | SR_L=0,SR_R=24,DPE_L=50,DPE_R=35,MEI_MAPPED=83,polyA_MAPPED=22,polyA_side=R | shared |  | 71 | LINE1 | L1MCa_5end#LINE/L1 |  |  | - | unnested | 1483 | 96 | 1578 |
+| chr22 | 20521112 | 20521097 | 20521126 | SR_L=0,SR_R=0,DPE_L=39,DPE_R=19,MEI_MAPPED=50,polyA_MAPPED=19,polyA_side=R | SR_L=0,SR_R=1,DPE_L=55,DPE_R=33,MEI_MAPPED=78,polyA_MAPPED=20,polyA_side=R | shared |  | 28 | ALU | AluYa5#SINE/Alu |  |  | + | unnested | 281 | 1 | 281 |
+| chr22 | 19919244 | 19919236 | 19919251 | SR_L=0,SR_R=5,DPE_L=21,DPE_R=117,MEI_MAPPED=78,polyA_MAPPED=16,polyA_side=L | SR_L=0,SR_R=5,DPE_L=17,DPE_R=97,MEI_MAPPED=63,polyA_MAPPED=3,polyA_side=L | shared | CCCAGGCTGGAGTGCA | 71 | ALU | AluSp#SINE/Alu | nssv14053291 | melt_1kg | - | nested | 273 | 1 | 273 |
+| chr22 | 20595738 | 20595139 | 20596336 | SR_L=0,SR_R=9,DPE_L=3,DPE_R=43,MEI_MAPPED=30,polyA_MAPPED=0 | SR_L=0,SR_R=26,DPE_L=5,DPE_R=77,MEI_MAPPED=78,polyA_MAPPED=0 | shared |  | 75 | ALU | AluSx3#SINE/Alu |  |  | - | nested | 67 | 69 | 135 |
+| chr22 | 41835230 | 41835229 | 41835232 | SR_L=27,SR_R=18,DPE_L=19,DPE_R=2,MEI_MAPPED=46,polyA_MAPPED=5,polyA_side=L | SR_L=50,SR_R=6,DPE_L=43,DPE_R=6,MEI_MAPPED=70,polyA_MAPPED=10,polyA_side=L | shared | ATAG | 84 | ALU | AluJo#SINE/Alu |  |  | - | nested | 238 | 44 | 281 |
+| chr22 | 36752165 | 36751652 | 36752678 | SR_L=0,SR_R=0,DPE_L=66,DPE_R=8,MEI_MAPPED=29,polyA_MAPPED=3,polyA_side=R | SR_L=1,SR_R=0,DPE_L=145,DPE_R=18,MEI_MAPPED=68,polyA_MAPPED=6,polyA_side=R | shared |  | 14 | ALU | AluSz#SINE/Alu |  |  | - | unnested | 210 | 10 | 219 |
+| chr22 | 42818644 | 42818163 | 42819124 | SR_L=0,SR_R=0,DPE_L=51,DPE_R=25,MEI_MAPPED=67,polyA_MAPPED=19,polyA_side=R | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=2,polyA_MAPPED=0 | control_only |  | 26 | ALU | AluYa5#SINE/Alu | chr22-43299733-INS->s903600<s909229>s903601-318 | long_read_1kg_ont_vienna | + | unnested | 281 | 1 | 281 |
+| chr22 | 29239707 | 29239402 | 29240012 | SR_L=1,SR_R=0,DPE_L=44,DPE_R=4,MEI_MAPPED=34,polyA_MAPPED=1,polyA_side=L | SR_L=4,SR_R=1,DPE_L=72,DPE_R=16,MEI_MAPPED=65,polyA_MAPPED=5,polyA_side=R | shared |  | 59 | LINE1 | L1MCa_5end#LINE/L1 |  |  | - | nested | 364 | 96 | 459 |
+| chr22 | 17224410 | 17224401 | 17224418 | SR_L=7,SR_R=0,DPE_L=31,DPE_R=50,MEI_MAPPED=63,polyA_MAPPED=27,polyA_side=R | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=1,polyA_MAPPED=0 | control_only | AACAAGTGCTAATAATTT | 68 | ALU | AluYb8#SINE/Alu | g1k:nssv14074719;lr:chr22-17900865-INS->s898731>s907592>s898732-334 | melt_1kg,long_read_1kg_ont_vienna | - | unnested | 288 | 1 | 288 |
+| chr22 | 42705164 | 42704870 | 42705458 | SR_L=0,SR_R=2,DPE_L=6,DPE_R=71,MEI_MAPPED=35,polyA_MAPPED=2 | SR_L=0,SR_R=5,DPE_L=21,DPE_R=121,MEI_MAPPED=63,polyA_MAPPED=6,polyA_side=L | shared |  | 48 | ALU | AluYm1#SINE/Alu |  |  | + | unnested | 280 | 2 | 281 |
+| chr22 | 33124372 | 33124353 | 33124392 | SR_L=1,SR_R=14,DPE_L=9,DPE_R=19,MEI_MAPPED=32,polyA_MAPPED=1,polyA_side=R | SR_L=15,SR_R=17,DPE_L=12,DPE_R=47,MEI_MAPPED=63,polyA_MAPPED=0 | shared | GAAAGAAGGAAGGAAGGAAGGAAGGAAGGAAGGGAGGAAG | 16 | LINE1 | L1M1_5end#LINE/L1 |  |  | + | unnested | 1462 | 72 | 1533 |
+| chr22 | 49760480 | 49760479 | 49760482 | SR_L=27,SR_R=10,DPE_L=3,DPE_R=7,MEI_MAPPED=39,polyA_MAPPED=0 | SR_L=27,SR_R=27,DPE_L=2,DPE_R=10,MEI_MAPPED=63,polyA_MAPPED=1,polyA_side=R | shared | CATG | 81 | LINE1 | L1M2a1_5end#LINE/L1 |  |  | + | nested | 189 | 149 | 337 |
+| chr22 | 31380162 | 31379890 | 31380433 | SR_L=0,SR_R=9,DPE_L=10,DPE_R=30,MEI_MAPPED=26,polyA_MAPPED=1,polyA_side=L | SR_L=0,SR_R=22,DPE_L=17,DPE_R=63,MEI_MAPPED=61,polyA_MAPPED=0 | shared |  | 66 | LINE1 | L1PREC2_orf2#LINE/L1 |  |  | - | unnested | 2154 | 2070 | 4223 |
+| chr22 | 23938127 | 23937906 | 23938348 | SR_L=0,SR_R=0,DPE_L=44,DPE_R=20,MEI_MAPPED=21,polyA_MAPPED=33,polyA_side=R | SR_L=0,SR_R=0,DPE_L=79,DPE_R=50,MEI_MAPPED=60,polyA_MAPPED=60,polyA_side=R | shared |  | 70 | ALU | AluYc#SINE/Alu |  |  | + | nested | 262 | 8 | 269 |
+| chr22 | 41051286 | 41050603 | 41051968 | SR_L=0,SR_R=0,DPE_L=67,DPE_R=0,MEI_MAPPED=36,polyA_MAPPED=19,polyA_side=R | SR_L=0,SR_R=0,DPE_L=96,DPE_R=4,MEI_MAPPED=59,polyA_MAPPED=30,polyA_side=R | shared |  | 31 | ALU | AluSp#SINE/Alu |  |  | - | unnested | 283 | 1 | 283 |
+| chr22 | 17289460 | 17289460 | 17289460 | SR_L=0,SR_R=11,DPE_L=0,DPE_R=38,MEI_MAPPED=45,polyA_MAPPED=0 | SR_L=0,SR_R=13,DPE_L=3,DPE_R=60,MEI_MAPPED=59,polyA_MAPPED=0 | shared |  | 74 | LINE1 | L1P2_5end#LINE/L1 |  |  | - | unnested | 499 | 1056 | 1554 |
 
 ## Examples
 
@@ -165,6 +124,10 @@ Top-ranked shared Alu (`AluYh7`) with a long TSD (`GCCCGCCTCGGCTTCCCAAAGTGCTGGGA
 <img src="docs/examples/grch38_line1_read_arch_chr22_22131552_22132407.png" alt="GRCh38 chr22 LINE-1 read architecture" width="1470" />
 
 Known control-only LINE-1 (`L1HS`, `nssv14066334`) with split-read and discordant paired-end support. Panel `L1HS_5end` / `L1HS_3end` hits are projected onto the shared full-length L1 axis (near-full ~3–6018), not min/max’d on short fragment references.
+
+## MEI consensus remapping
+
+Soft-clips and discordant clipped ends remap to the Dfam Alu/LINE-1/SVA panel with `bwa mem -k10 -T10` (`--bwa-threads`; wrapper auto: `nproc` single-chrom, `1` under multi-chrom concurrency). Queries are polyA/T-trimmed (≥8 bp) before align; consensus targets are also terminal-polyA-trimmed (sidecar `*.nopolya.fa`, and prep writes body-only Dfam/panel FASTAs) so clips cannot map onto the A-tail. Junction clips that are themselves polyA/T count as `polyA_MAPPED` only — never also `MEI_MAPPED`/SR. Short tips (≤30 bp) need qcov≥0.80 and pid≥0.90, longer clips need pid≥0.90 and alnlen≥20. Panel fragment hits project onto one family-consistent `*_full` axis via `mei_fragment_to_full_coords.tsv` (prep: `bwa mem -a` on trimmed sequences). Assembly contig-to-MEI still uses minimap2. Benchmark: `scripts/benchmark_mei_aligners.py`.
 
 ## Getting Started on Amazon EC2 (Elastic Compute Cloud)
 

@@ -1078,24 +1078,74 @@ def _ensure_famdb_repo(famdb_tools_dir: Path, timeout_sec: int) -> tuple[str | N
     return None, f"missing_famdb_tool ({msg})"
 
 
+_MEI_CONSENSUS_POLYA_MIN_TRIM = 8
+
+
+def _trim_mei_consensus_terminal_polya(seq: str, *, min_run: int = _MEI_CONSENSUS_POLYA_MIN_TRIM) -> str:
+    """Strip terminal polyA (and leading polyT) from Alu/SVA/L1 consensus.
+
+    Dfam/UCSC MEI consensuses end in long A-tails; aligning soft-clips to that
+    tail produces tiny spurious 3'-end footprints. Remap and fragment→full maps
+    must use the body-only sequence.
+    """
+    s = (seq or "").upper().replace("U", "T")
+    if not s:
+        return ""
+    end = len(s)
+    while end > 0 and s[end - 1] == "A":
+        end -= 1
+    if (len(s) - end) >= int(min_run):
+        s = s[:end]
+    start = 0
+    while start < len(s) and s[start] == "T":
+        start += 1
+    if start >= int(min_run):
+        s = s[start:]
+    return s
+
+
 def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dict[str, Any]:
     header_re = re.compile(r"#SINE/Alu|#LINE/L1|(^|[^A-Za-z])SVA([^A-Za-z]|$)", re.IGNORECASE)
     kept = 0
+    trimmed = 0
     in_families = 0
     keep_seq = False
-    with curated_fasta.open("r", encoding="utf-8") as in_handle, mei_subset_fasta.open("w", encoding="utf-8") as out_handle:
+    cur_header: str | None = None
+    seq_parts: list[str] = []
+
+    def _flush(out_handle) -> None:
+        nonlocal kept, trimmed, cur_header, seq_parts
+        if cur_header is None:
+            return
+        raw = "".join(seq_parts)
+        body = _trim_mei_consensus_terminal_polya(raw)
+        if len(body) != len(raw.upper().replace("U", "T")):
+            trimmed += 1
+        if body:
+            kept += 1
+            out_handle.write(cur_header if cur_header.endswith("\n") else cur_header + "\n")
+            for i in range(0, len(body), 60):
+                out_handle.write(body[i : i + 60] + "\n")
+        cur_header = None
+        seq_parts = []
+
+    with curated_fasta.open("r", encoding="utf-8") as in_handle, mei_subset_fasta.open(
+        "w", encoding="utf-8"
+    ) as out_handle:
         for line in in_handle:
             if line.startswith(">"):
+                _flush(out_handle)
                 in_families += 1
                 keep_seq = bool(header_re.search(line))
-                if keep_seq:
-                    kept += 1
-                    out_handle.write(line)
+                cur_header = line if keep_seq else None
+                seq_parts = []
             elif keep_seq:
-                out_handle.write(line)
+                seq_parts.append(line.strip())
+        _flush(out_handle)
     return {
         "input_families": in_families,
         "mei_families": kept,
+        "polya_trimmed_families": trimmed,
         "output_path": str(mei_subset_fasta),
         "bytes": mei_subset_fasta.stat().st_size if mei_subset_fasta.exists() else 0,
     }
@@ -1260,7 +1310,7 @@ def _build_mei_full_consensus_panel(outdir: Path, ds_map: dict[str, Dataset], ti
         if key in seen_norm:
             continue
         seen_norm.add(key)
-        full_seq = ucsc_sequences.get(norm, "")
+        full_seq = _trim_mei_consensus_terminal_polya(ucsc_sequences.get(norm, ""))
         if not full_seq:
             missing_records.append((hdr, norm, fam))
             continue
@@ -1269,6 +1319,8 @@ def _build_mei_full_consensus_panel(outdir: Path, ds_map: dict[str, Dataset], ti
             continue
         out_hdr = f"{norm}_full#{cls}" if cls else f"{norm}_full"
         selected_records.append((out_hdr, norm, hdr, fam, len(full_seq)))
+        # Keep trimmed body for writing (avoid re-trimming / length mismatch).
+        ucsc_sequences[norm] = full_seq
 
     if not selected_records:
         return {
@@ -1494,8 +1546,9 @@ def _build_mei_fragment_to_full_coord_map(
             continue
         for hdr, seq in _iter_fasta(path):
             key = hdr.split("|", 1)[0]
-            if key and seq and key not in panel_seqs:
-                panel_seqs[key] = seq
+            body = _trim_mei_consensus_terminal_polya(seq)
+            if key and body and key not in panel_seqs:
+                panel_seqs[key] = body
     if not panel_seqs:
         return {"status": "failed", "error": "empty_full_consensus_sequences"}
 
@@ -1508,9 +1561,10 @@ def _build_mei_fragment_to_full_coord_map(
     fragments: list[tuple[str, str, str]] = []
     for hdr, seq in _iter_fasta(dfam_subset):
         fam = _mei_family_from_header(hdr)
-        if fam not in {"ALU", "SVA", "LINE1"} or not seq:
+        body = _trim_mei_consensus_terminal_polya(seq)
+        if fam not in {"ALU", "SVA", "LINE1"} or not body:
             continue
-        fragments.append((hdr, fam, seq))
+        fragments.append((hdr, fam, body))
     if not fragments:
         return {"status": "failed", "error": "no_dfam_mei_fragments"}
 
