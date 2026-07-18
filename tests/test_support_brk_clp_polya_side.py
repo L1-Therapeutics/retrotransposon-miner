@@ -77,6 +77,84 @@ def test_untagged_softclips_do_not_count_as_sr():
     assert "SR_R=0" in support
 
 
+def test_polya_clip_with_mei_hit_counts_polya_only_not_mei_mapped():
+    """PolyA soft-clips must not also inflate MEI_MAPPED."""
+    candidates = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 100,
+                "window_end": 120,
+                "insertion_breakpoint_pos": 110,
+                "consensus_mei_family": "ALU",
+            }
+        ]
+    )
+    # Pretend a polyA clip also remapped to Alu 3' (legacy double-count path).
+    polya_mei = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 100,
+                "window_end": 120,
+                "read_name": "poly1",
+                "clip_side": "L",
+                "pos": 108,
+                "clip_len": 40,
+                "clip_poly_at_run": 30,
+                "poly_tail_rescued": True,
+                "mei_hit": True,
+                "target": "AluSq4#SINE/Alu",
+                "target_start": 272,
+                "target_end": 311,
+            }
+        ]
+    )
+    real_mei = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 100,
+                "window_end": 120,
+                "read_name": "mei1",
+                "clip_side": "R",
+                "pos": 112,
+                "clip_len": 40,
+                "clip_poly_at_run": 0,
+                "poly_tail_rescued": False,
+                "mei_hit": True,
+                "target": "AluSq4#SINE/Alu",
+                "target_start": 1,
+                "target_end": 40,
+            }
+        ]
+    )
+    from retro_miner.mei_support import (
+        _demote_polya_split_mei_hits,
+        _split_mei_support_eligible_mask,
+    )
+
+    split_all = pd.concat([polya_mei, real_mei], ignore_index=True)
+    split_all = _demote_polya_split_mei_hits(split_all)
+    split_mei = split_all.loc[_split_mei_support_eligible_mask(split_all)].copy()
+    out = _add_candidate_support_info_fields(
+        candidates,
+        split_disease=split_all,
+        split_control=pd.DataFrame(columns=split_all.columns),
+        discordant_disease=pd.DataFrame(columns=["chrom", "window_start", "window_end", "read_name"]),
+        discordant_control=pd.DataFrame(columns=["chrom", "window_start", "window_end", "read_name"]),
+        split_disease_mei=split_mei,
+        split_control_mei=_empty_mei(),
+        discordant_disease_mei=_empty_mei(),
+        discordant_control_mei=_empty_mei(),
+    )
+    support = str(out.iloc[0]["disease_supporting_reads"])
+    assert "polyA_MAPPED=1" in support
+    assert "MEI_MAPPED=1" in support
+    assert "SR_L=0" in support  # polyA side not SR
+    assert "SR_R=1" in support
+
+
 def test_polya_side_majority_from_split_clips():
     candidates = pd.DataFrame(
         [
