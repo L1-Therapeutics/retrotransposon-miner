@@ -69,7 +69,7 @@ def _extract_one_sample(
     only its own sample-named output files under ``outdir``.
     """
     sample_t0 = time.monotonic()
-    print(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}", flush=True)
+    click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
     split_t0 = time.monotonic()
     split_summary = extract_split_evidence(
         bam_path=bam,
@@ -84,18 +84,17 @@ def _extract_one_sample(
         short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
     )
     split_elapsed = time.monotonic() - split_t0
-    print(
+    click.echo(
         f"[done] sample={sample} scanned={split_summary.total_reads_scanned} "
         f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows} "
-        f"elapsed={split_elapsed:.1f}s",
-        flush=True,
+        f"elapsed={split_elapsed:.1f}s"
     )
 
     discordant_summary: ExtractionSummary | None = None
     discordant_elapsed = 0.0
     if with_discordant:
         disc_t0 = time.monotonic()
-        print(f"[extract-discordant] sample={sample} regions={','.join(region_list)}", flush=True)
+        click.echo(f"[extract-discordant] sample={sample} regions={','.join(region_list)}")
         discordant_summary = extract_discordant_evidence(
             bam_path=bam,
             sample_name=sample,
@@ -114,15 +113,14 @@ def _extract_one_sample(
             fetch_mate_seq=fetch_mate_seq,
         )
         discordant_elapsed = time.monotonic() - disc_t0
-        print(
+        click.echo(
             f"[done-discordant] sample={sample} scanned={discordant_summary.total_reads_scanned} "
             f"passing={discordant_summary.passing_reads} discordant_rows={discordant_summary.discordant_evidence_rows} "
             f"insert_threshold={discordant_summary.insert_size_threshold} "
             f"mate_seq_fetched={discordant_summary.mate_seq_fetched_rows} "
             f"mate_seq_missing_interchrom={discordant_summary.mate_seq_missing_interchrom_rows} "
             f"weak_only_filtered={discordant_summary.weak_only_discordant_filtered_rows} "
-            f"elapsed={discordant_elapsed:.1f}s",
-            flush=True,
+            f"elapsed={discordant_elapsed:.1f}s"
         )
 
     return _SampleExtractResult(

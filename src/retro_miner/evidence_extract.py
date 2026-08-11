@@ -119,8 +119,7 @@ def _poly_at_stats(seq: str) -> tuple[int, float, str]:
     for ch in s:
         if ch == base:
             cur += 1
-            if cur > best:
-                best = cur
+            best = max(best, cur)
         else:
             cur = 0
     return (int(best), float(frac), base)
@@ -174,7 +173,6 @@ def _clip_to_poly_at_region(seq: str, *, min_dom_frac: float = 0.90) -> str:
     """Return the longest mostly-A or mostly-T substring (empty if none)."""
     _length, _frac, _base, span = _longest_poly_at_span(seq, min_frac=float(min_dom_frac))
     return span
-
 
 
 def _poly_at_breakpoint_proximal_stats(
