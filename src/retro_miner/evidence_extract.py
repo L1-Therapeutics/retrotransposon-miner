@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import click
 import numpy as np
 import pandas as pd
 import pysam
