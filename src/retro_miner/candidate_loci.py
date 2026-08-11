@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+import click
 import pandas as pd
 from intervaltree import IntervalTree
 
@@ -16,9 +17,9 @@ _RUN_T0: float | None = None
 
 def _progress(msg: str) -> None:
     if _RUN_T0 is None:
-        print(f"[candidate-loci] {msg}", flush=True)
+        click.echo(f"[candidate-loci] {msg}")
     else:
-        print(f"[candidate-loci] +{(time.monotonic() - _RUN_T0):.1f}s {msg}", flush=True)
+        click.echo(f"[candidate-loci] +{(time.monotonic() - _RUN_T0):.1f}s {msg}")
 
 
 def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
@@ -35,6 +36,11 @@ def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame
 
 
 def _read_passing_counts(summary_path: Path) -> dict[str, int]:
+    if not summary_path.exists():
+        raise FileNotFoundError(
+            f"Split evidence summary not found: {summary_path}\n"
+            "Run 'rtm extract-split-evidence' first to generate this file."
+        )
     summary = pd.read_csv(summary_path, sep="\t", usecols=["sample", "passing_reads"])
     return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int)))
 
