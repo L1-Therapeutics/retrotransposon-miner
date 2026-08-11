@@ -35,11 +35,8 @@ def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame
 
 
 def _read_passing_counts(summary_path: Path) -> dict[str, int]:
-    summary = pd.read_csv(summary_path, sep="\t")
-    counts: dict[str, int] = {}
-    for _, row in summary.iterrows():
-        counts[str(row["sample"])] = int(row["passing_reads"])
-    return counts
+    summary = pd.read_csv(summary_path, sep="\t", usecols=["sample", "passing_reads"])
+    return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int)))
 
 
 def _windowize(df: pd.DataFrame, window_size: int) -> pd.DataFrame:
@@ -253,11 +250,8 @@ def _merge_overlapping_loci(
     n_in = len(loci)
     for chrom, grp in loci.groupby("chrom", sort=False):
         intervals = sorted(
-            (
-                (int(r.window_start), int(r.window_end))
-                for r in grp.itertuples(index=False)
-            ),
-            key=lambda x: (x[0], x[1]),
+            (int(r.window_start), int(r.window_end))
+            for r in grp.itertuples(index=False)
         )
         if not intervals:
             continue
