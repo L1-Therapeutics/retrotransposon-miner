@@ -251,9 +251,7 @@ def _safe_snapshot_stem(rank: int, chrom: str, start: int, end: int, *, contig_i
     return f"rank{rank:03d}_{chrom_safe}_{start}_{end}"
 
 
-def _safe_locus_id(chrom: str, start: int, end: int) -> str:
-    chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
-    return f"{chrom_safe}_{int(start)}_{int(end)}"
+from retro_miner._utils import safe_locus_id as _safe_locus_id  # shared with local_assembly
 
 
 def _window_locus_id(chrom: str, window_start: int, window_end: int) -> str:
