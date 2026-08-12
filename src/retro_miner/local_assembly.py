@@ -24,9 +24,7 @@ _MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
 _ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
 
 
-def _safe_locus_id(chrom: str, start: int, end: int) -> str:
-    chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
-    return f"{chrom_safe}_{int(start)}_{int(end)}"
+from retro_miner._utils import safe_locus_id as _safe_locus_id  # shared with igv_plots
 
 
 def _window_locus_id_from_row(row: pd.Series) -> str:
@@ -272,7 +270,7 @@ def _is_non_perfect_primary_alignment(read: pysam.AlignedSegment) -> bool:
     try:
         if read.has_tag("NM") and int(read.get_tag("NM")) > 0:
             return True
-    except Exception:
+    except (KeyError, ValueError):
         pass
     if read.mate_is_unmapped or (not read.is_proper_pair):
         return True
@@ -1139,7 +1137,7 @@ def _parse_existing_manifest(manifest_path: Path) -> dict[str, object] | None:
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         return raw if isinstance(raw, dict) else None
-    except Exception:
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return None
 
 
