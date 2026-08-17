@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import click
 import matplotlib
 
 matplotlib.use("Agg")
@@ -2340,8 +2341,6 @@ def _draw_read_pair(
             elif aw == mate_w:
                 pass
             else:
-                # Prefer explicit sum when both raw pieces are present.
-                raw_anchor = int(pair.get("anchor_polya_width", 0) or 0)
                 # If pair already combined, polya_width == anchor_polya_width == sum.
                 aw = max(aw, mate_w)
         aw = min(max(1, aw), int(layout.polya_zone_bp))
@@ -2770,7 +2769,7 @@ def generate_gold_read_architecture_plots(
     """Plot read architecture for gold-tier loci (batch; tables loaded once)."""
     variants = _select_gold_rows(gold_review, gold_only=gold_only, top_n=top_n)
     if variants.empty:
-        print("[read-arch] no variants selected for plots; skipping", flush=True)
+        click.echo("[read-arch] no variants selected for plots; skipping")
         return pd.DataFrame()
 
     if cache is None:
@@ -2810,7 +2809,7 @@ def generate_gold_read_architecture_plots(
     index_rows: list[dict[str, object]] = []
     t0 = time.monotonic()
     n = len(variants)
-    print(f"[read-arch] generating {n} plots in {out_dir}", flush=True)
+    click.echo(f"[read-arch] generating {n} plots in {out_dir}")
     for rank, (_, row) in enumerate(variants.iterrows(), start=1):
         chrom = str(row.get("chrom", "") or "")
         ws = int(row.get("window_start", 0) or 0)
@@ -2842,7 +2841,7 @@ def generate_gold_read_architecture_plots(
         except Exception as exc:  # noqa: BLE001 - keep batch going
             status = "error"
             err = str(exc)
-            print(f"[read-arch] failed {chrom}:{ws}-{we}: {exc}", flush=True)
+            click.echo(f"[read-arch] failed {chrom}:{ws}-{we}: {exc}")
         index_rows.append(
             {
                 "plot_rank": rank,
@@ -2865,20 +2864,18 @@ def generate_gold_read_architecture_plots(
         if progress_every > 0 and (rank % progress_every == 0 or rank == n):
             elapsed = time.monotonic() - t0
             rate = rank / elapsed if elapsed > 0 else 0.0
-            print(
+            click.echo(
                 f"[read-arch] {rank}/{n} plots "
-                f"({rate:.1f}/s, elapsed={elapsed:.1f}s)",
-                flush=True,
+                f"({rate:.1f}/s, elapsed={elapsed:.1f}s)"
             )
 
     index = pd.DataFrame(index_rows)
     index_path = out_dir / "read_architecture_index.tsv"
     index.to_csv(index_path, sep="\t", index=False)
     ok = int((index["status"] == "ok").sum()) if not index.empty else 0
-    print(
+    click.echo(
         f"[read-arch] wrote {ok}/{len(index)} plots to {out_dir} "
-        f"(index={index_path}, elapsed={time.monotonic() - t0:.1f}s)",
-        flush=True,
+        f"(index={index_path}, elapsed={time.monotonic() - t0:.1f}s)"
     )
     return index
 
@@ -2962,8 +2959,8 @@ def main() -> None:
             seed=args.seed,
             cache=cache,
         )
-        print(out_dir)
-        print(f"plots={len(index)} elapsed_sec={time.time() - t0:.2f}")
+        click.echo(str(out_dir))
+        click.echo(f"plots={len(index)} elapsed_sec={time.time() - t0:.2f}")
         return
 
     if args.chrom is None or args.pos is None or args.out_png is None:
@@ -2985,8 +2982,8 @@ def main() -> None:
     if args.out_detail_tsv is not None:
         args.out_detail_tsv.parent.mkdir(parents=True, exist_ok=True)
         detail.to_csv(args.out_detail_tsv, sep="\t", index=False)
-    print(out)
-    print(f"detail_rows={len(detail)} elapsed_sec={time.time() - t0:.2f}")
+    click.echo(str(out))
+    click.echo(f"detail_rows={len(detail)} elapsed_sec={time.time() - t0:.2f}")
 
 
 if __name__ == "__main__":
