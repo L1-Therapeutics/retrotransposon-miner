@@ -16,17 +16,30 @@ dependencies = [
   "click>=8.1",
   "pysam>=0.22",
   "pandas>=2.2",
-  "pyarrow>=16",
+  "pyarrow>=16",        # implicit pandas Parquet engine
   "numpy>=1.26",
-  "biopython>=1.84",
-  "pyfaidx>=0.8",
+  "matplotlib>=3.9",   # read_architecture.py plots
   "intervaltree>=3.1",
-  "pyyaml>=6.0",
-  "rich>=13.7"
 ]
 
 [project.scripts]
 rtm = "retro_miner.cli:cli"
+
+[tool.ruff]
+target-version = "py311"
+line-length    = 120
+exclude        = ["scripts"]   # standalone scripts, not part of the installable package
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "BLE"]
+ignore = [
+  "E501",   # long lines are common in generated/table-heavy modules
+  "E731",   # lambda aliases (s = lambda ...) are intentional shorthand in large pipeline functions
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = ["-q", "--tb=short"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

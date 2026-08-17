@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import pysam
 
+from ._utils import _longest_poly_at_span, _poly_at_stats
+
 
 @dataclass
 class ExtractionSummary:
@@ -93,81 +95,6 @@ def _longest_soft_clip_from_read(
         return ("", 0, 0, "")
     side, clip_len, clip_pos = max(candidates, key=lambda x: x[1])
     return (side, clip_len, clip_pos, _soft_clip_query_seq(query_seq, side, clip_len))
-
-
-def _poly_at_stats(seq: str) -> tuple[int, float, str]:
-    """PolyA/T stats: longest dominant-base run, dominant-base fraction, base.
-
-    Purity is ``max(n_A, n_T) / length`` — mostly A **or** mostly T — not
-    combined A+T. Mixed AT sequence scores ~0.5 and fails typical thresholds.
-    """
-    s = (seq or "").upper()
-    if not s:
-        return (0, 0.0, "")
-    n_a = s.count("A")
-    n_t = s.count("T")
-    if n_a <= 0 and n_t <= 0:
-        return (0, 0.0, "")
-    if n_a >= n_t:
-        base = "A"
-        n_dom = n_a
-    else:
-        base = "T"
-        n_dom = n_t
-    frac = float(n_dom) / float(len(s))
-    best = 0
-    cur = 0
-    for ch in s:
-        if ch == base:
-            cur += 1
-            best = max(best, cur)
-        else:
-            cur = 0
-    return (int(best), float(frac), base)
-
-
-def _longest_poly_at_span(
-    seq: str,
-    *,
-    min_frac: float = 0.90,
-    min_len: int = 25,
-) -> tuple[int, float, str, str]:
-    """Longest substring that is mostly polyA or mostly polyT (see mei_support)."""
-    s = "".join(ch for ch in (seq or "").upper() if ch in {"A", "C", "G", "T"})
-    n = len(s)
-    if n < int(min_len):
-        return (0, 0.0, "", "")
-    best_len = 0
-    best_frac = 0.0
-    best_base = ""
-    best_ij = (0, 0)
-    thr = float(min_frac)
-    for base in ("A", "T"):
-        left = 0
-        n_base = 0
-        for right in range(n):
-            if s[right] == base:
-                n_base += 1
-            while left <= right and (n_base / float(right - left + 1)) < thr:
-                if s[left] == base:
-                    n_base -= 1
-                left += 1
-            cur_len = right - left + 1
-            if cur_len >= int(min_len) and n_base > 0:
-                frac = float(n_base) / float(cur_len)
-                if cur_len > best_len or (cur_len == best_len and frac > best_frac):
-                    best_len = cur_len
-                    best_frac = frac
-                    best_base = base
-                    best_ij = (left, right + 1)
-    if best_len <= 0:
-        return (0, 0.0, "", "")
-    span = s[best_ij[0] : best_ij[1]]
-    if best_len >= 140 or best_len >= n - 2:
-        best_len = n
-        best_frac = float(span.count(best_base)) / float(len(span)) if span else best_frac
-        span = s
-    return (int(best_len), float(best_frac), best_base, span)
 
 
 def _clip_to_poly_at_region(seq: str, *, min_dom_frac: float = 0.90) -> str:
@@ -392,7 +319,7 @@ def _validate_mate_fetch_bam(
 ) -> None:
     """Warn when region-scanned BAM cannot resolve interchrom mate sequences."""
     if mate_bam_path is not None and mate_bam_path != scan_bam_path:
-        print(
+        click.echo(
             f"[extract-discordant] using mate-resolution BAM {mate_bam_path} "
             f"(scan BAM {scan_bam_path})"
         )
@@ -411,12 +338,12 @@ def _validate_mate_fetch_bam(
                 if i < len(stats) and (int(stats[i].mapped) + int(stats[i].unmapped)) > 0:
                     other_with_reads += 1
             if other_with_reads == 0:
-                print(
+                click.echo(
                     "[extract-discordant] warning: scan BAM appears chromosome-subset "
                     f"({scan_bam_path}); interchrom mate sequences will be missing unless "
                     "--disease-mate-bam/--control-mate-bam points to a full-genome BAM."
                 )
-    except Exception:
+    except (OSError, ValueError, RuntimeError):
         return
 
 
@@ -667,7 +594,7 @@ def extract_discordant_evidence(
     if not df.empty and mate_seq_missing_interchrom_rows > 0:
         interchrom_total = int(df["discordant_reasons"].fillna("").astype(str).str.contains("interchrom").sum())
         missing_frac = mate_seq_missing_interchrom_rows / max(interchrom_total, 1)
-        print(
+        click.echo(
             f"[extract-discordant] sample={sample_name} interchrom_rows={interchrom_total} "
             f"mate_seq_missing={mate_seq_missing_interchrom_rows} ({missing_frac:.1%}); "
             "MEI_MAPPED discordant support may be undercounted."
