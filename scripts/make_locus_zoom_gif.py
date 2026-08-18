@@ -21,7 +21,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from retro_miner.igv_plots import (  # noqa: E402
     _estimate_panel_height,
+    _quote_igv_path,
     _resolve_bam_index,
+    _validate_igv_chrom,
     resolve_igv_launcher,
     run_igv_batch,
 )
@@ -280,13 +282,14 @@ def build_single_bam_igv_batch(
 
     lines: list[str] = [
         "new",
-        f"genome {reference_fasta.resolve()}",
-        f"snapshotDirectory {snapshot_dir.resolve()}",
+        f"genome {_quote_igv_path(reference_fasta.resolve())}",
+        f"snapshotDirectory {_quote_igv_path(snapshot_dir.resolve())}",
         "preference SAM.SHOW_SOFT_CLIPPED true",
-        f"load {bam_path.resolve()} index={bam_index.resolve()}",
+        f"load {_quote_igv_path(bam_path.resolve())} index={_quote_igv_path(bam_index.resolve())}",
     ]
 
     for idx, (chrom, start, end) in enumerate(windows, start=1):
+        _validate_igv_chrom(chrom)
         height = panel_heights[idx - 1] if idx - 1 < len(panel_heights) else panel_height
         stem = f"frame_{idx:02d}_{chrom}_{start}_{end}"
         lines.extend(
