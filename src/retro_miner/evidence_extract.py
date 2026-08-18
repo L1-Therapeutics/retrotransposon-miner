@@ -35,9 +35,52 @@ def _normalize_regions(regions: list[str] | str) -> list[str]:
     return clean
 
 
+def _parse_region_to_bounds(region: str) -> tuple[str, int | None, int | None]:
+    """Parse a samtools-style region string into (contig, start0, end0).
+
+    Returned *start0* and *end0* are **0-based half-open** for
+    ``pysam.AlignmentFile.fetch(contig, start0, end0)`` — identical to what
+    pysam's own region parser produces but computed once per region rather
+    than on every BAM fetch call.  A bare chromosome name (no ``:``)
+    returns ``(chrom, None, None)`` so the full contig is fetched.
+
+    Samtools region syntax uses 1-based inclusive coordinates, e.g.
+    ``chr1:1000-2000`` covers positions 1000–2000 (1-based).  The
+    0-based half-open equivalent passed to HTSlib is [999, 2000).
+    """
+    r = (region or "").strip()
+    if not r:
+        raise ValueError("Empty region string.")
+    if ":" not in r:
+        # Bare chromosome name — fetch the full contig.
+        return (r, None, None)
+    chrom, coords = r.split(":", 1)
+    coords = coords.replace(",", "")  # tolerate thousand-separator commas
+    if "-" in coords:
+        s_str, e_str = coords.split("-", 1)
+        # 1-based inclusive → 0-based half-open
+        start0 = max(0, int(s_str) - 1)
+        end0 = int(e_str)
+    else:
+        # Single-position region (e.g. "chr1:5000")
+        start0 = max(0, int(coords) - 1)
+        end0 = start0 + 1
+    return (chrom, start0, end0)
+
+
 def _iter_reads_for_regions(bam: pysam.AlignmentFile, regions: list[str]):
+    """Yield reads from a BAM over a list of samtools-style region strings.
+
+    Region strings are parsed to integer (contig, start0, end0) bounds **once**
+    before entering the HTSlib fetch loop.  Using integer bounds avoids the
+    per-call string-parse overhead inside ``pysam.AlignmentFile.fetch`` and
+    matches the recommended HTSlib calling convention for repeated fetches.
+    """
     for region in regions:
-        for read in bam.fetch(region=region):
+        contig, start0, end0 = _parse_region_to_bounds(region)
+        # pysam.fetch(contig) with no bounds fetches the full contig;
+        # pysam.fetch(contig, start0, end0) uses 0-based half-open HTSlib coords.
+        for read in bam.fetch(contig, start0, end0):
             yield read
 
 

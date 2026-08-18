@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gzip
 import re
+import warnings
 from pathlib import Path
 from typing import IO
 
@@ -124,6 +125,11 @@ def _iter_fasta_records(path: Path) -> list[tuple[str, str]]:
     Returns an empty list if *path* does not exist.  Sequences are uppercased
     and blank lines are skipped.  Only the first word of each header line is
     used as the record name.
+
+    Records with a blank or whitespace-only header (e.g. a bare ``>``) are
+    **skipped** and a :class:`UserWarning` is emitted so the caller can detect
+    the malformed input.  This prevents an :exc:`IndexError` that would
+    otherwise crash the parser.
     """
     if not path.exists():
         return []
@@ -138,8 +144,18 @@ def _iter_fasta_records(path: Path) -> list[tuple[str, str]]:
             if line.startswith(">"):
                 if name:
                     out.append((name, "".join(seq_parts)))
-                name = line[1:].split()[0]
-                seq_parts = []
+                raw_header = line[1:].strip()
+                if not raw_header:
+                    warnings.warn(
+                        f"Skipping FASTA record with blank header in {path!s}",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    name = ""
+                    seq_parts = []
+                else:
+                    name = raw_header.split()[0]
+                    seq_parts = []
             else:
                 seq_parts.append(line.upper())
     if name:

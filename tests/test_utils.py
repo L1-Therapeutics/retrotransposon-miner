@@ -1,7 +1,11 @@
 """Unit tests for retro_miner._utils."""
 from __future__ import annotations
 
-from retro_miner._utils import _iter_fasta_records, safe_locus_id
+import gzip
+
+import pytest
+
+from retro_miner._utils import _iter_fasta_records, _open_textmaybe_gz, safe_locus_id
 
 
 class TestSafeLocusId:
@@ -79,3 +83,89 @@ class TestIterFastaRecords:
         p = tmp_path / "t.fa"
         p.write_text(">seq1\nACGT\nTGCA\n")
         assert _iter_fasta_records(p) == [("seq1", "ACGTTGCA")]
+
+    # ------------------------------------------------------------------
+    # Malformed-header robustness (previously caused IndexError)
+    # ------------------------------------------------------------------
+
+    def test_blank_header_skips_record_and_warns(self, tmp_path):
+        """A bare '>' header must not raise IndexError; the record is skipped."""
+        p = tmp_path / "blank.fa"
+        p.write_text(">\nACGT\n")
+        with pytest.warns(UserWarning, match="blank header"):
+            records = _iter_fasta_records(p)
+        assert records == []
+
+    def test_whitespace_header_skips_record_and_warns(self, tmp_path):
+        """A header that is only whitespace after '>' is treated the same as blank."""
+        p = tmp_path / "ws.fa"
+        p.write_text(">   \nACGT\n")
+        with pytest.warns(UserWarning, match="blank header"):
+            records = _iter_fasta_records(p)
+        assert records == []
+
+    def test_blank_header_followed_by_valid_records(self, tmp_path):
+        """Valid records that follow a blank header are still returned correctly."""
+        p = tmp_path / "mixed.fa"
+        p.write_text(">\nACGT\n>seq1\nTTTT\n")
+        with pytest.warns(UserWarning):
+            records = _iter_fasta_records(p)
+        assert records == [("seq1", "TTTT")]
+
+    def test_multiple_blank_headers_each_warn(self, tmp_path):
+        """Each distinct blank header emits its own warning; valid records survive."""
+        p = tmp_path / "multi.fa"
+        p.write_text(">\nACGT\n>\nGGGG\n>seq1\nCCCC\n")
+        with pytest.warns(UserWarning) as warned:
+            records = _iter_fasta_records(p)
+        assert records == [("seq1", "CCCC")]
+        assert len(warned) == 2, "expected one warning per blank header"
+
+
+class TestOpenTextMaybeGz:
+    def test_plain_file_readable_as_text(self, tmp_path):
+        p = tmp_path / "data.txt"
+        p.write_text("hello\nworld\n", encoding="utf-8")
+        with _open_textmaybe_gz(p) as fh:
+            assert fh.read() == "hello\nworld\n"
+
+    def test_gz_file_decompresses_transparently(self, tmp_path):
+        p = tmp_path / "data.txt.gz"
+        with gzip.open(p, "wt", encoding="utf-8") as fh:
+            fh.write("hello\nworld\n")
+        with _open_textmaybe_gz(p) as fh:
+            assert fh.read() == "hello\nworld\n"
+
+    def test_plain_file_preserves_unicode(self, tmp_path):
+        p = tmp_path / "utf8.txt"
+        p.write_text("héllo wörld\n", encoding="utf-8")
+        with _open_textmaybe_gz(p) as fh:
+            assert fh.read() == "héllo wörld\n"
+
+    def test_gz_file_preserves_unicode(self, tmp_path):
+        p = tmp_path / "utf8.txt.gz"
+        with gzip.open(p, "wt", encoding="utf-8") as fh:
+            fh.write("héllo wörld\n")
+        with _open_textmaybe_gz(p) as fh:
+            assert fh.read() == "héllo wörld\n"
+
+    def test_plain_file_empty(self, tmp_path):
+        p = tmp_path / "empty.txt"
+        p.write_text("", encoding="utf-8")
+        with _open_textmaybe_gz(p) as fh:
+            assert fh.read() == ""
+
+    def test_gz_file_empty(self, tmp_path):
+        p = tmp_path / "empty.txt.gz"
+        with gzip.open(p, "wt", encoding="utf-8") as fh:
+            fh.write("")
+        with _open_textmaybe_gz(p) as fh:
+            assert fh.read() == ""
+
+    def test_nonexistent_plain_file_raises(self, tmp_path):
+        with pytest.raises((FileNotFoundError, OSError)):
+            _open_textmaybe_gz(tmp_path / "missing.txt")
+
+    def test_nonexistent_gz_file_raises(self, tmp_path):
+        with pytest.raises((FileNotFoundError, OSError)):
+            _open_textmaybe_gz(tmp_path / "missing.txt.gz")

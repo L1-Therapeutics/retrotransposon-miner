@@ -254,6 +254,23 @@ def _safe_snapshot_stem(rank: int, chrom: str, start: int, end: int, *, contig_i
     return f"rank{rank:03d}_{chrom_safe}_{start}_{end}"
 
 
+_IGV_BATCH_FORBIDDEN: frozenset[str] = frozenset("\n\r\t")
+
+
+def _validate_igv_chrom(chrom: str) -> None:
+    """Raise ValueError if *chrom* contains characters that would corrupt an IGV batch command.
+
+    Newlines, carriage returns, and tabs are forbidden because a ``goto`` line such as
+    ``goto chr22\\nBAD:100-200`` would be split into two separate batch commands, causing
+    IGV to receive an unintended command and to navigate to the wrong locus.
+    """
+    for ch in _IGV_BATCH_FORBIDDEN:
+        if ch in chrom:
+            raise ValueError(
+                f"IGV batch chromosome contains a forbidden character (0x{ord(ch):02x}): {chrom!r}"
+            )
+
+
 def _window_locus_id(chrom: str, window_start: int, window_end: int) -> str:
     s = int(window_start)
     e = int(window_end)
@@ -337,11 +354,52 @@ def _build_assembly_contig_track(
             oh.write(f">{name}\n{seq}\n")
 
     bam_path = snapshot_dir / "assembly_selected_contigs.bam"
-    cmd = f'minimap2 -a -x asm5 "{reference_fasta.resolve()}" "{query_fa.resolve()}" | samtools sort -o "{bam_path.resolve()}" -'
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)
-    if proc.returncode != 0 or not bam_path.exists():
-        detail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-2000:]
+    try:
+        minimap2_proc = subprocess.Popen(
+            [
+                "minimap2",
+                "-a",
+                "-x",
+                "asm5",
+                str(reference_fasta.resolve()),
+                str(query_fa.resolve()),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        samtools_proc = subprocess.Popen(
+            [
+                "samtools",
+                "sort",
+                "-o",
+                str(bam_path.resolve()),
+                "-",
+            ],
+            stdin=minimap2_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        click.echo(f"[igv-plots] failed contig track alignment; skipping ({exc})")
+        return None
+    assert minimap2_proc.stdout is not None  # always set when stdout=PIPE; satisfies type checkers
+    minimap2_proc.stdout.close()  # release our reference so minimap2 receives SIGPIPE if samtools exits early
+    _, samtools_stderr = samtools_proc.communicate()
+    minimap2_stderr = minimap2_proc.stderr.read() if minimap2_proc.stderr is not None else b""
+    minimap2_rc = minimap2_proc.wait()
+    samtools_rc = samtools_proc.returncode
+    if minimap2_rc != 0 or samtools_rc != 0 or not bam_path.exists():
+        detail = (
+            samtools_stderr.decode("utf-8", errors="replace")
+            + "\n"
+            + minimap2_stderr.decode("utf-8", errors="replace")
+        ).strip()[-2000:]
         click.echo(f"[igv-plots] failed contig track alignment; skipping ({detail})")
+        if bam_path.exists():
+            try:
+                bam_path.unlink()
+            except OSError:
+                pass
         return None
     idx_proc = subprocess.run(["samtools", "index", str(bam_path)], capture_output=True, text=True, check=False)
     if idx_proc.returncode != 0 or _resolve_bam_index(bam_path) is None:
@@ -433,6 +491,11 @@ def build_igv_batch_script(
             view_start = max(1, mid - 100)
             view_end = mid + 100
         if not chrom or start <= 0 or end < start:
+            continue
+        try:
+            _validate_igv_chrom(chrom)
+        except ValueError as exc:
+            click.echo(f"[igv-plots] skipping row {rank}: invalid chromosome \u2014 {exc}")
             continue
         panel_height = _estimate_panel_height(
             disease_bam,
