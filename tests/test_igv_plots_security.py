@@ -147,7 +147,6 @@ class TestNoShellInvocation:
 
     def test_popen_args_are_lists_not_shell_strings(self, track_setup):
         """Every subprocess.Popen call must receive a list, not a shell command string."""
-        bam_path = track_setup["bam_path"]
         captured: list[dict] = []
 
         def _spy(args, **kwargs):
@@ -212,7 +211,6 @@ class TestNoShellInvocation:
 
     def test_minimap2_is_first_popen_arg(self, track_setup):
         """The first subprocess.Popen call must invoke minimap2 as a list element."""
-        bam_path = track_setup["bam_path"]
         captured: list[list] = []
 
         def _spy(args, **kwargs):
@@ -264,7 +262,6 @@ class TestPathArgumentHandling:
         _create_assembly_cache(cache_dir)
         snap = tmp_path / "snap"
         snap.mkdir()
-        bam_path = snap / "assembly_selected_contigs.bam"
 
         captured_minimap2_args: list[str] = []
         call_count = [0]
@@ -302,7 +299,6 @@ class TestPathArgumentHandling:
         ref.write_text(">chr1\nACGT\n", encoding="utf-8")
         snap = tmp_path / "snap"
         snap.mkdir()
-        bam_path = snap / "assembly_selected_contigs.bam"
 
         all_args: list[str] = []
         call_count = [0]
