@@ -13,11 +13,14 @@ import pandas as pd
 import pytest
 
 from retro_miner.candidate_loci import (
+    _DISCORDANT_EVIDENCE_REQUIRED_COLS,
+    _SPLIT_EVIDENCE_REQUIRED_COLS,
     _cluster_sorted_positions,
     _distance_to_closed_interval,
     _merge_overlapping_loci,
     _read_passing_counts,
     _split_cluster_positions,
+    _validate_evidence_columns,
 )
 
 
@@ -240,3 +243,80 @@ class TestReadPassingCounts:
         summary.write_text("sample\tpassing_reads\ndisease\t500\n")
         result = _read_passing_counts(summary)
         assert isinstance(result["disease"], int)
+
+    def test_wrong_columns_raises_clear_error_naming_required_columns(self, tmp_path):
+        """A summary TSV missing 'passing_reads' produces a ValueError that names it."""
+        summary = tmp_path / "split_evidence.summary.tsv"
+        summary.write_text("sample\ttotal_reads_scanned\ndisease\t10000\n")
+        with pytest.raises(ValueError) as exc_info:
+            _read_passing_counts(summary)
+        msg = str(exc_info.value)
+        assert "passing_reads" in msg, f"Expected 'passing_reads' in error, got: {msg!r}"
+
+    def test_wrong_columns_suggests_extract_split_evidence(self, tmp_path):
+        """A summary TSV with wrong columns tells the user which command regenerates it."""
+        summary = tmp_path / "split_evidence.summary.tsv"
+        summary.write_text("sample\told_counts_column\ndisease\t500\n")
+        with pytest.raises(ValueError, match="extract-split-evidence"):
+            _read_passing_counts(summary)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _validate_evidence_columns
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestValidateEvidenceColumns:
+    """_validate_evidence_columns raises a clear ValueError for missing columns."""
+
+    def test_complete_split_table_does_not_raise(self):
+        """A DataFrame with all required split columns passes silently."""
+        df = pd.DataFrame(columns=[
+            "chrom", "pos", "read_name", "mapq", "clip_len", "has_sa", "extra_col",
+        ])
+        _validate_evidence_columns(df, "split_evidence", "disease", _SPLIT_EVIDENCE_REQUIRED_COLS)
+
+    def test_complete_discordant_table_does_not_raise(self):
+        """A DataFrame with all required discordant columns passes silently."""
+        df = pd.DataFrame(columns=[
+            "chrom", "pos", "read_name", "mapq", "discordant_reasons", "template_len",
+        ])
+        _validate_evidence_columns(df, "discordant_evidence", "control", _DISCORDANT_EVIDENCE_REQUIRED_COLS)
+
+    def test_missing_single_column_raises_with_column_name(self):
+        """Missing 'has_sa' produces a ValueError that names the missing column."""
+        df = pd.DataFrame(columns=["chrom", "pos", "read_name", "mapq", "clip_len"])
+        with pytest.raises(ValueError, match="has_sa"):
+            _validate_evidence_columns(df, "split_evidence", "disease", _SPLIT_EVIDENCE_REQUIRED_COLS)
+
+    def test_missing_multiple_columns_all_reported(self):
+        """All missing columns appear in the error message."""
+        df = pd.DataFrame(columns=["chrom"])  # missing pos, read_name, mapq, clip_len, has_sa
+        with pytest.raises(ValueError) as exc_info:
+            _validate_evidence_columns(df, "split_evidence", "disease", _SPLIT_EVIDENCE_REQUIRED_COLS)
+        msg = str(exc_info.value)
+        for col in ("pos", "read_name", "mapq", "clip_len", "has_sa"):
+            assert col in msg, f"expected '{col}' in error message, got: {msg!r}"
+
+    def test_error_message_names_stem_and_sample(self):
+        """The stem and sample identifiers appear in the error for context."""
+        df = pd.DataFrame(columns=["unrelated_col"])
+        with pytest.raises(ValueError) as exc_info:
+            _validate_evidence_columns(
+                df, "discordant_evidence", "disease", _DISCORDANT_EVIDENCE_REQUIRED_COLS
+            )
+        msg = str(exc_info.value)
+        assert "discordant_evidence" in msg
+        assert "disease" in msg
+
+    def test_empty_dataframe_no_columns_raises(self):
+        """A completely empty DataFrame (no columns) fails validation."""
+        df = pd.DataFrame()
+        with pytest.raises(ValueError):
+            _validate_evidence_columns(df, "split_evidence", "control", _SPLIT_EVIDENCE_REQUIRED_COLS)
+
+    def test_error_message_mentions_extract_command(self):
+        """The error message advises the user to regenerate evidence with extract-split-evidence."""
+        df = pd.DataFrame(columns=["col_a", "col_b"])
+        with pytest.raises(ValueError, match="extract-split-evidence"):
+            _validate_evidence_columns(df, "split_evidence", "disease", _SPLIT_EVIDENCE_REQUIRED_COLS)
