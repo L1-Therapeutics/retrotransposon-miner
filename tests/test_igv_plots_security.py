@@ -17,7 +17,13 @@ import pandas as pd
 import pytest
 
 from retro_miner._utils import safe_locus_id
-from retro_miner.igv_plots import _build_assembly_contig_track, _validate_igv_chrom, build_igv_batch_script
+from retro_miner.igv_plots import (
+    _build_assembly_contig_track,
+    _quote_igv_path,
+    _safe_snapshot_stem,
+    _validate_igv_chrom,
+    build_igv_batch_script,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -595,3 +601,136 @@ class TestIgvBatchValidation:
         """_validate_igv_chrom does not raise for standard chromosome names."""
         for chrom in ("chr1", "chr22", "chrX", "chrY", "chrM"):
             _validate_igv_chrom(chrom)  # must not raise
+
+# ---------------------------------------------------------------------------
+# _safe_snapshot_stem — collision-resistance
+# ---------------------------------------------------------------------------
+
+
+class TestSafeSnapshotStem:
+    """_safe_snapshot_stem must produce distinct filenames for chromosomes that
+    sanitise to the same ASCII string."""
+
+    def test_canonical_chrom_no_digest(self):
+        """Standard chromosome names produce the expected stem without a digest."""
+        assert _safe_snapshot_stem(1, "chr22", 100, 200) == "rank001_chr22_100_200"
+        assert _safe_snapshot_stem(3, "chrX", 1000, 2000) == "rank003_chrX_1000_2000"
+
+    def test_already_safe_chrom_no_digest(self):
+        """A name containing only safe characters is unchanged and has no digest."""
+        stem = _safe_snapshot_stem(1, "chr1_a", 100, 200)
+        assert stem == "rank001_chr1_a_100_200"
+
+    def test_slash_chrom_gets_digest(self):
+        """A chromosome with a slash is sanitised and receives a 6-char digest."""
+        stem = _safe_snapshot_stem(1, "chr1/a", 100, 200)
+        # sanitised prefix + 6-hex digest + coords
+        assert stem.startswith("rank001_chr1_a_")
+        assert stem.endswith("_100_200")
+        assert stem != "rank001_chr1_a_100_200"  # digest was inserted
+
+    def test_slash_and_underscore_chroms_do_not_collide(self):
+        """chr1/a and chr1_a must produce distinct stems at the same coordinates."""
+        stem_slash = _safe_snapshot_stem(1, "chr1/a", 100, 200)
+        stem_under = _safe_snapshot_stem(1, "chr1_a", 100, 200)
+        assert stem_slash != stem_under
+
+    def test_colon_and_slash_chroms_do_not_collide(self):
+        """chr1:a and chr1/a both sanitise to chr1_a but must have distinct stems."""
+        stem_colon = _safe_snapshot_stem(1, "chr1:a", 100, 200)
+        stem_slash = _safe_snapshot_stem(1, "chr1/a", 100, 200)
+        assert stem_colon != stem_slash
+
+    def test_space_in_chrom_gets_digest(self):
+        """A chromosome with a space is sanitised and receives a digest."""
+        stem = _safe_snapshot_stem(1, "chr1 a", 100, 200)
+        assert " " not in stem
+        assert stem != "rank001_chr1_a_100_200"
+
+    def test_contig_id_appended_after_coords(self):
+        """Contig ID is still appended after the coordinates."""
+        stem = _safe_snapshot_stem(2, "chr22", 100, 200, contig_id="NODE_1")
+        assert stem == "rank002_chr22_100_200_NODE_1"
+
+    def test_contig_id_truncated_to_32(self):
+        """Contig IDs longer than 32 characters are truncated."""
+        long_contig = "A" * 40
+        stem = _safe_snapshot_stem(1, "chr22", 100, 200, contig_id=long_contig)
+        parts = stem.split("_")
+        contig_part = parts[-1]
+        assert len(contig_part) <= 32
+
+
+# ---------------------------------------------------------------------------
+# _quote_igv_path and IGV batch path quoting
+# ---------------------------------------------------------------------------
+
+
+class TestIgvBatchPathQuoting:
+    """Paths in batch script header and load commands are double-quoted.
+
+    IGV batch files support double-quoted paths (IGV >=2.x), allowing spaces
+    in file and directory names without breaking the batch parser.
+    """
+
+    def _call(self, batch_setup):
+        with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
+            return build_igv_batch_script(
+                _make_batch_variants("chr1"), **batch_setup
+            )
+
+    def test_genome_line_is_quoted(self, batch_setup):
+        """The 'genome' batch command wraps the reference FASTA path in double quotes."""
+        batch = self._call(batch_setup)
+        ref = str(batch_setup["reference_fasta"].resolve())
+        assert f'genome "{ref}"' in batch
+
+    def test_snapshotdirectory_line_is_quoted(self, batch_setup):
+        """The 'snapshotDirectory' batch command wraps the directory path in double quotes."""
+        batch = self._call(batch_setup)
+        snap = str(batch_setup["snapshot_dir"].resolve())
+        assert f'snapshotDirectory "{snap}"' in batch
+
+    def test_load_bam_path_is_quoted(self, batch_setup):
+        """The 'load' batch command wraps the BAM and index paths in double quotes."""
+        batch = self._call(batch_setup)
+        disease_bam = str(batch_setup["disease_bam"].resolve())
+        assert f'load "{disease_bam}"' in batch
+
+    def test_space_in_genome_path_survives_untruncated(self, tmp_path):
+        """A genome path containing spaces is quoted and the full path appears in the batch."""
+        space_dir = tmp_path / "ref dir with spaces"
+        space_dir.mkdir()
+        ref = space_dir / "ref genome.fa"
+        ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+        disease_bam = tmp_path / "d.bam"
+        disease_bam.write_bytes(b"")
+        Path(f"{disease_bam}.bai").write_bytes(b"")
+        control_bam = tmp_path / "c.bam"
+        control_bam.write_bytes(b"")
+        Path(f"{control_bam}.bai").write_bytes(b"")
+        snap = tmp_path / "snap"
+        snap.mkdir()
+        setup = {
+            "reference_fasta": ref,
+            "disease_bam": disease_bam,
+            "control_bam": control_bam,
+            "snapshot_dir": snap,
+        }
+        with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
+            batch = build_igv_batch_script(_make_batch_variants("chr1"), **setup)
+        # The full space-containing path must appear quoted on the genome line.
+        ref_str = str(ref.resolve())
+        assert f'genome "{ref_str}"' in batch
+
+    def test_path_with_double_quote_raises_value_error(self):
+        """A path containing a double-quote character is rejected with ValueError."""
+        bad = Path('/tmp/bad"name.fa')
+        with pytest.raises(ValueError, match="double-quote"):
+            _quote_igv_path(bad)
+
+    def test_path_without_special_chars_is_just_quoted(self, tmp_path):
+        """A plain path (no spaces, no special chars) is returned with surrounding quotes."""
+        p = tmp_path / "plain.fa"
+        result = _quote_igv_path(p)
+        assert result == f'"{p}"'

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import platform
@@ -246,7 +247,19 @@ def _estimate_panel_height(
 
 
 def _safe_snapshot_stem(rank: int, chrom: str, start: int, end: int, *, contig_id: str = "") -> str:
+    """Return a filesystem-safe IGV snapshot stem.
+
+    Special characters in *chrom* are replaced with underscores.  When
+    sanitisation changes the value, a 6-hex-character SHA-256 digest of the
+    original string is embedded to prevent distinct chromosome names that
+    sanitise identically (e.g. ``chr1/a`` and ``chr1_a``) from producing the
+    same snapshot filename and silently overwriting each other.  Canonical
+    names such as ``chr22`` are unaffected.
+    """
     chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
+    if chrom_safe != str(chrom):
+        digest = hashlib.sha256(str(chrom).encode()).hexdigest()[:6]
+        chrom_safe = f"{chrom_safe}_{digest}"
     contig_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(contig_id or "")).strip("_")
     if contig_safe:
         contig_safe = contig_safe[:32]
@@ -269,6 +282,21 @@ def _validate_igv_chrom(chrom: str) -> None:
             raise ValueError(
                 f"IGV batch chromosome contains a forbidden character (0x{ord(ch):02x}): {chrom!r}"
             )
+
+
+def _quote_igv_path(p: Path) -> str:
+    """Return *p* wrapped in double quotes for use in an IGV batch command.
+
+    IGV batch files support double-quoted paths, which allows file and directory
+    names that contain spaces.  A path that itself contains a double-quote
+    character cannot be safely embedded and raises :exc:`ValueError`.
+    """
+    s = str(p)
+    if '"' in s:
+        raise ValueError(
+            f"IGV batch path contains a forbidden double-quote character: {s!r}"
+        )
+    return f'"{s}"'
 
 
 def _window_locus_id(chrom: str, window_start: int, window_end: int) -> str:
@@ -469,18 +497,18 @@ def build_igv_batch_script(
 
     lines: list[str] = [
         "new",
-        f"genome {reference_fasta.resolve()}",
-        f"snapshotDirectory {snapshot_dir.resolve()}",
+        f"genome {_quote_igv_path(reference_fasta.resolve())}",
+        f"snapshotDirectory {_quote_igv_path(snapshot_dir.resolve())}",
         "preference SAM.SHOW_SOFT_CLIPPED true",
-        f"load {disease_bam.resolve()} index={disease_index.resolve()}",
-        f"load {control_bam.resolve()} index={control_index.resolve()}",
+        f"load {_quote_igv_path(disease_bam.resolve())} index={_quote_igv_path(disease_index.resolve())}",
+        f"load {_quote_igv_path(control_bam.resolve())} index={_quote_igv_path(control_index.resolve())}",
     ]
     if contig_alignment_bam is not None:
         contig_idx = _resolve_bam_index(contig_alignment_bam)
         if contig_idx is not None:
-            lines.append(f"load {contig_alignment_bam.resolve()} index={contig_idx.resolve()}")
+            lines.append(f"load {_quote_igv_path(contig_alignment_bam.resolve())} index={_quote_igv_path(contig_idx.resolve())}")
     if contig_annotation_bed is not None and contig_annotation_bed.exists():
-        lines.append(f"load {contig_annotation_bed.resolve()}")
+        lines.append(f"load {_quote_igv_path(contig_annotation_bed.resolve())}")
 
     for rank, row in enumerate(variants.itertuples(index=False), start=1):
         chrom, start, end = _row_discovery_window(row)
