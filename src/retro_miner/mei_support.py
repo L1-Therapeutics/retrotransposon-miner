@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import math
 import random
 import re
@@ -14,6 +15,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import pandas as pd
 import pysam
@@ -97,7 +100,8 @@ def _load_fragment_to_full_map(path: Path | None) -> dict[str, FragmentToFullMap
         return {}
     try:
         df = pd.read_csv(path, sep="\t")
-    except Exception:
+    except (OSError, ValueError) as exc:
+        logger.debug("could not load fragment-to-full map %s: %s", path, exc)
         return {}
     required = {
         "fragment_name",
@@ -355,7 +359,8 @@ def _make_reference_fetcher(ref: pysam.FastaFile):
             return ""
         try:
             return ref.fetch(resolved, int(start0), int(end0)).upper()
-        except Exception:
+        except (ValueError, KeyError) as exc:
+            logger.debug("reference fetch %s:%d-%d failed: %s", resolved, start0, end0, exc)
             return ""
 
     return fetch
@@ -670,8 +675,8 @@ def _resolve_full_consensus_fasta(
             if not fai.exists():
                 try:
                     subprocess.run(["samtools", "faidx", str(cand)], check=False, capture_output=True, text=True)
-                except Exception:
-                    pass
+                except OSError as exc:
+                    logger.debug("samtools faidx on %s failed: %s", cand, exc)
             return cand
 
     if not mei_fasta.exists():
@@ -687,7 +692,8 @@ def _resolve_full_consensus_fasta(
             names=["name", "length", "offset", "line_bases", "line_width"],
             usecols=[0, 1],
         )
-    except Exception:
+    except (OSError, ValueError) as exc:
+        logger.debug("could not parse fai %s: %s", fai, exc)
         return None
     if fai_df.empty:
         return None
@@ -734,7 +740,8 @@ def _resolve_full_consensus_fasta(
                 continue
             try:
                 seq = ref.fetch(target)
-            except Exception:
+            except (ValueError, KeyError) as exc:
+                logger.debug("fetch of full consensus target %s failed: %s", target, exc)
                 continue
             if not seq:
                 continue
@@ -745,8 +752,8 @@ def _resolve_full_consensus_fasta(
         return None
     try:
         subprocess.run(["samtools", "faidx", str(full_fa)], check=False, capture_output=True, text=True)
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.debug("samtools faidx on %s failed: %s", full_fa, exc)
     return full_fa
 
 
@@ -10117,10 +10124,13 @@ def _sample_random_windows(
         )
         if not sampled.empty:
             return sampled
-    except Exception:
+    except (OSError, subprocess.SubprocessError) as exc:
         # Fall back to pure-Python sampling if bedtools shuffle is unavailable/fails.
-        print("[mei-annotate] empirical stage: bedtools sampling unavailable; using python fallback", flush=True)
-        pass
+        print(
+            "[mei-annotate] empirical stage: bedtools sampling unavailable; using python fallback "
+            f"({type(exc).__name__}: {exc})",
+            flush=True,
+        )
 
     allowed_intervals = _load_bed_intervals(highconf_bed) if highconf_bed is not None else {}
     if highconf_bed is not None:
@@ -10407,7 +10417,13 @@ def _annotate_bam_depth_for_consistent_loci(
                     f"rows={len(random_disease_df)}",
                     flush=True,
                 )
-            except Exception:
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "[mei-annotate] empirical cache key=%s unreadable (%s: %s); recomputing",
+                    cache_key,
+                    type(exc).__name__,
+                    exc,
+                )
                 cache_hit = False
         else:
             print(f"[mei-annotate] empirical cache miss key={cache_key}", flush=True)
@@ -12948,11 +12964,13 @@ def _extract_float_from_info(value: object, default: float = -1.0) -> float:
             return default
         try:
             return float(max(vals))
-        except Exception:
+        except (ValueError, TypeError) as exc:
+            logger.debug("non-numeric float INFO value %r: %s", value, exc)
             return default
     try:
         return float(value)
-    except Exception:
+    except (ValueError, TypeError) as exc:
+        logger.debug("non-numeric float INFO value %r: %s", value, exc)
         return default
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -14,6 +15,8 @@ from pathlib import Path
 
 import pandas as pd
 import pysam
+
+logger = logging.getLogger(__name__)
 
 _MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
 _MINIMAP2_INDEX_LOCK = threading.Lock()
@@ -195,7 +198,8 @@ def _read_recruited_qnames_from_fastq(path: Path) -> set[str]:
                 if not qname:
                     continue
                 out.add(qname)
-    except Exception:
+    except (OSError, EOFError, UnicodeError) as exc:
+        logger.debug("could not read recruited qnames from %s: %s", path, exc)
         return set()
     return out
 
@@ -272,7 +276,7 @@ def _is_non_perfect_primary_alignment(read: pysam.AlignedSegment) -> bool:
     try:
         if read.has_tag("NM") and int(read.get_tag("NM")) > 0:
             return True
-    except Exception:
+    except (ValueError, KeyError, TypeError):
         pass
     if read.mate_is_unmapped or (not read.is_proper_pair):
         return True
@@ -440,7 +444,7 @@ def _run_minimap2_paf(
                     "mapq": mapq,
                 }
             )
-        except Exception:
+        except (ValueError, KeyError, TypeError, IndexError):
             continue
     return rows
 
@@ -489,7 +493,8 @@ def _load_fasta_lengths(fasta_path: Path) -> dict[str, int]:
         with pysam.FastaFile(str(fasta_path)) as fa:
             for name, length in zip(fa.references, fa.lengths):
                 lengths[str(name)] = int(length)
-    except Exception:
+    except (OSError, ValueError, KeyError) as exc:
+        logger.debug("could not read fasta lengths from %s: %s", fasta_path, exc)
         lengths = {}
     with _MEI_FASTA_LENGTH_CACHE_LOCK:
         _MEI_FASTA_LENGTH_CACHE[key] = lengths
@@ -1031,7 +1036,8 @@ def _extract_sample_assembly_features(
                     bp = int((left_bp + right_bp) // 2)
                     bp_left_chrom = lchrom
                     tsd_len = alt_tsd_len
-        except Exception:
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.debug("side-anchor TSD rescue failed: %s", exc)
             pass
     tsd_seq = ""
     if reference_fasta is not None and bp_left_chrom and tsd_len > 0 and tsd_len <= 50:
@@ -1040,7 +1046,8 @@ def _extract_sample_assembly_features(
                 start0 = max(0, int(bp) - (tsd_len // 2) - 1)
                 end0 = start0 + int(tsd_len)
                 tsd_seq = ref.fetch(bp_left_chrom, start0, end0).upper()
-        except Exception:
+        except (ValueError, KeyError, OSError) as exc:
+            logger.debug("TSD reference fetch failed for %s: %s", bp_left_chrom, exc)
             tsd_seq = ""
     microhomology_sequence = _extract_microhomology_sequence(
         mei_hit=best,
@@ -1079,7 +1086,8 @@ def _extract_sample_assembly_features(
                             microhomology_sequence = str(mh_seq)
                         if mh_seq and not junction_overlap_sequence:
                             junction_overlap_sequence = str(mh_seq)
-        except Exception:
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            logger.debug("microhomology reference fetch failed: %s", exc)
             pass
     if not junction_overlap_sequence:
         qname = str(best.get("qname", ""))
@@ -1140,7 +1148,8 @@ def _parse_existing_manifest(manifest_path: Path) -> dict[str, object] | None:
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         return raw if isinstance(raw, dict) else None
-    except Exception:
+    except (OSError, ValueError) as exc:
+        logger.debug("could not parse existing manifest %s: %s", manifest_path, exc)
         return None
 
 
@@ -1629,7 +1638,8 @@ def _detect_total_memory_gb() -> int:
                 if len(parts) >= 2:
                     # /proc/meminfo reports kB.
                     return max(0, int(int(parts[1]) / (1024 * 1024)))
-    except Exception:
+    except (OSError, ValueError) as exc:
+        logger.debug("could not detect total memory from /proc/meminfo: %s", exc)
         return 0
     return 0
 
