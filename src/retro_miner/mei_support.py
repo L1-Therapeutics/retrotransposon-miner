@@ -2255,6 +2255,22 @@ def _attach_mei_hits_to_discordant_rows(
     return out
 
 
+# ---------------------------------------------------------------------------
+# TSD geometry constants
+# ---------------------------------------------------------------------------
+# 0-bp blunt insertions (tsd_len == 0) are biologically real, common in
+# 5'-truncated LINE-1 events that insert without duplicating a target site.
+# Target-site *deletions* (tsd_len < 0, where the insertion excised a few bp
+# of reference sequence) also occur and should not be hard-rejected.  The
+# canonical TSD window (2–30 bp) is kept as the preferred range; 0-bp blunt
+# insertions and small deletions up to _TSD_MAX_DELETION_BP are accepted via
+# the extended range.
+_TSD_MIN_LEN: int = 0          # accept 0-bp blunt insertions
+_TSD_MAX_DELETION_BP: int = 10 # accept target-site deletions down to -10 bp
+
+# ---------------------------------------------------------------------------
+# SVA VNTR + SINE-R domain classification constants
+# ---------------------------------------------------------------------------
 _VNTR_HEXAMERS = ("CCCTCT", "CTCTCC", "CTCCCT", "TCCCTC", "CCCTCTC", "GGGAGA")
 _VNTR_MIN_SEQ_LEN = 40
 # Soft-clips can be shorter than discordant mates; still require clear hexamer content.
@@ -2304,6 +2320,76 @@ def _is_sva_vntr_like(
     return _sva_vntr_like_score(seq, min_seq_len=min_seq_len) >= float(min_score)
 
 
+# ---------------------------------------------------------------------------
+# SVA SINE-R domain scoring
+# ---------------------------------------------------------------------------
+# SVA structure (5'→3'): [SINE-R (HERV-K LTR-derived)] [central VNTR] [Alu-like].
+# Short-read alignments that only cover the Alu-like 3' domain (~80 % identity
+# to Alu consensus over ~300 bp) can be mis-labelled as Alu insertions.  The
+# SINE-R domain contains conserved HERV-K K-box motifs and envelope-like
+# k-mers that are absent from Alu, so detecting them in an anchor or mate
+# sequence provides strong evidence that the call is SVA rather than Alu.
+#
+# References:
+#   Wang et al. (2005) Genome Research 15:1160–1169 (SVA structure)
+#   Hancks & Kazazian (2012) Mobile DNA 3:2 (SVA biology review)
+_SINER_KMERS: tuple[str, ...] = (
+    # K-box / R-region motifs conserved in HERV-K SINE-R component
+    "TTGCAAACCAA",    # K-box core (reverse-complement of consensus ORF probe)
+    "AACGCAAACCAA",   # extended K-box variant
+    "TGCATGGCA",      # HERV-K envelope-like stem
+    "CCAGCAGGCA",     # SINE-R body conserved patch
+    "TGCAGCAGCA",     # additional envelope repeat unit
+)
+_SINER_MIN_SEQ_LEN: int = 30
+
+
+def _sva_siner_domain_score(seq: str, *, min_seq_len: int | None = None) -> float:
+    """Score SINE-R domain presence in *seq*, returning a value in [0, 1].
+
+    SINE-R is the HERV-K-derived LTR that forms the 5'-terminal domain of SVA
+    retrotransposons.  Its conserved k-mers are absent from Alu and LINE-1,
+    making this score a discriminating feature for SVA vs. Alu classification
+    when the central VNTR is not captured by short reads.
+
+    A score >= 0.4 (i.e. >= 2 k-mer hits) is considered positive evidence for
+    the SINE-R domain.  Scores are combined with the VNTR score in
+    :func:`_sva_combined_domain_score` to improve SVA vs. Alu specificity.
+    """
+    s = (seq or "").upper().replace("U", "T")
+    min_len = int(_SINER_MIN_SEQ_LEN if min_seq_len is None else min_seq_len)
+    if len(s) < min_len:
+        return 0.0
+    hits = sum(1 for motif in _SINER_KMERS if motif in s)
+    # Normalise: full score requires hits on >= 2 distinct k-mers.
+    return min(1.0, float(hits) / max(1, len(_SINER_KMERS) - 3))
+
+
+def _sva_combined_domain_score(
+    seq: str,
+    *,
+    vntr_weight: float = 0.65,
+    siner_weight: float = 0.35,
+    min_seq_len: int | None = None,
+) -> float:
+    """Weighted combination of VNTR hexamer and SINE-R k-mer scores.
+
+    Using both domains reduces false-positive SVA calls from Alu insertions
+    that accidentally score on VNTR hexamers (all-hexamer short sequences can
+    appear by chance in GC-rich reads).
+
+    Parameters
+    ----------
+    vntr_weight, siner_weight:
+        Relative weights; sum should be <= 1.0.  VNTR evidence is more
+        abundant in discordant mates (the whole 150-bp mate can span VNTR),
+        so it receives the higher weight by default.
+    """
+    v = _sva_vntr_like_score(seq, min_seq_len=min_seq_len)
+    r = _sva_siner_domain_score(seq, min_seq_len=min_seq_len)
+    return float(vntr_weight * v + siner_weight * r)
+
+
 def _rescue_vntr_like_discordant_mei_hits(df: pd.DataFrame) -> pd.DataFrame:
     """
     Second-pass VNTR_MAPPED rescue for VNTR-like discordant sequences.
@@ -2337,7 +2423,10 @@ def _rescue_vntr_like_discordant_mei_hits(df: pd.DataFrame) -> pd.DataFrame:
     read_seq = out["read_seq"].fillna("").astype(str) if "read_seq" in out.columns else pd.Series("", index=out.index)
     prefer_mate = mate_seq.str.len() >= _VNTR_MIN_SEQ_LEN
     seqs = mate_seq.where(prefer_mate, read_seq)
-    out["vntr_like_score"] = seqs.map(_sva_vntr_like_score).astype(float)
+    # Use multi-domain SVA score: VNTR hexamers + SINE-R k-mers.
+    # The combined score reduces false rescues from GC-rich Alu reads that
+    # spuriously match VNTR hexamers but lack SINE-R signal.
+    out["vntr_like_score"] = seqs.map(_sva_combined_domain_score).astype(float)
     # Consensus-only gate: do not treat prior rescues as mapped support.
     consensus_mapped = _discordant_row_mei_mapped(out)
     vntr_cand = (~consensus_mapped) & (~out["vntr_rescue"].fillna(False).astype(bool)) & (out["vntr_like_score"] >= 0.35)
@@ -6844,6 +6933,88 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
     return pivot
 
 
+def _resolve_tsd_pair_from_candidates(
+    candidates: list[tuple[int, int, int, str]],
+) -> tuple[int, int, int, str]:
+    """Select the best TSD (target-site duplication) coordinates from a list of
+    breakpoint-pair candidates.
+
+    This is the module-level, directly testable implementation of the TSD
+    selection logic.  The nested ``_pick_tsd_pair`` closure inside
+    ``_infer_disease_insertion_metrics`` delegates here so the algorithm is
+    covered by unit tests without needing a full candidates DataFrame.
+
+    Parameters
+    ----------
+    candidates:
+        List of ``(left_bp, right_bp, support, source)`` tuples where
+        ``left_bp`` and ``right_bp`` are **1-based** genomic positions of the
+        two TSD flanks (left <= right for a canonical TSD; right == left-1 for
+        a 0-bp blunt insertion; right < left-1 for a target-site deletion).
+        ``support`` is the number of reads supporting the pair.
+        ``source`` is a label string (e.g. ``"tsd_disease"``).
+
+    Returns
+    -------
+    (best_left, best_right, tsd_len, source)
+        ``tsd_len = right - left + 1``; this is 0 for blunt insertions and
+        negative for target-site deletions.  Returns ``(0, 0, 0, "")`` when
+        no valid candidate is found.
+
+    TSD geometry
+    ------------
+    * tsd_len >= 2 : canonical TSD (most common, 5-25 bp)
+    * tsd_len == 1 : 1-bp micro-TSD
+    * tsd_len == 0 : blunt insertion (right == left - 1), common in
+                     5'-truncated LINE-1 events
+    * tsd_len < 0  : target-site deletion (reference bases deleted at the
+                     insertion site), accepted down to ``-_TSD_MAX_DELETION_BP``
+    """
+    if not candidates:
+        return (0, 0, 0, "")
+
+    # --- Strict pass: exact breakpoint coordinates -------------------------
+    # Accept 0-bp blunt insertions (tsd_len == 0) and target-site deletions
+    # (tsd_len down to -_TSD_MAX_DELETION_BP) alongside canonical TSDs.
+    # Prefer higher support, then longer non-negative TSD (canonical TSDs
+    # rank above blunt insertions which rank above target-site deletions).
+    strict_ok: list[tuple[int, int, int, str]] = []
+    for left, right, support, source in candidates:
+        tsd_len = int(right) - int(left) + 1
+        if -_TSD_MAX_DELETION_BP <= tsd_len <= 30:
+            strict_ok.append((support, left, right, source))
+    if strict_ok:
+        strict_ok.sort(
+            key=lambda x: (x[0], max(0, x[2] - x[1])),  # support, then non-negative len
+            reverse=True,
+        )
+        _support, best_l, best_r, source = strict_ok[0]
+        return (best_l, best_r, int(best_r) - int(best_l) + 1, source)
+
+    # --- Rescue pass: ±2 bp coordinate shift ------------------------------
+    # When breakpoint modes are slightly off due to short-read ambiguity,
+    # allow a small shift to recover a valid TSD.  The same extended range
+    # applies: blunt insertions and small target-site deletions are accepted.
+    rescue: list[tuple[int, int, int, str, int, int]] = []
+    for left, right, support, source in candidates:
+        sample_priority = 0 if source == "tsd_disease" else 1
+        for dl in (-2, -1, 0, 1, 2):
+            for dr in (-2, -1, 0, 1, 2):
+                ll = int(left) + dl
+                rr = int(right) + dr
+                if ll <= 0 or rr <= 0:
+                    continue
+                tsd_len = rr - ll + 1
+                if -_TSD_MAX_DELETION_BP <= tsd_len <= 30:
+                    shift_penalty = abs(dl) + abs(dr)
+                    rescue.append((shift_penalty, -support, sample_priority, source, ll, rr))
+    if not rescue:
+        return (0, 0, 0, "")
+    rescue.sort()
+    _shift, _neg_sup, _pri, source, best_l, best_r = rescue[0]
+    return (best_l, best_r, best_r - best_l + 1, source)
+
+
 def _infer_disease_insertion_metrics(
     candidates: pd.DataFrame,
     reference_fasta: Path | None = None,
@@ -6914,36 +7085,7 @@ def _infer_disease_insertion_metrics(
         if not candidates:
             return (0, 0, 0, "")
 
-        # Try strict first (no coordinate adjustment).
-        strict_ok: list[tuple[int, int, int, str]] = []
-        for left, right, support, source in candidates:
-            tsd_len = int(right - left + 1)
-            if 2 <= tsd_len <= 30:
-                strict_ok.append((support, left, right, source))
-        if strict_ok:
-            strict_ok.sort(key=lambda x: (x[0], x[2] - x[1]), reverse=True)
-            _support, best_l, best_r, source = strict_ok[0]
-            return (best_l, best_r, int(best_r - best_l + 1), source)
-
-        # Rescue with ±2 bp shift when strict pairing misses by a few bases.
-        rescue: list[tuple[int, int, int, str, int, int]] = []
-        for left, right, support, source in candidates:
-            sample_priority = 0 if source == "tsd_disease" else 1
-            for dl in (-2, -1, 0, 1, 2):
-                for dr in (-2, -1, 0, 1, 2):
-                    ll = int(left + dl)
-                    rr = int(right + dr)
-                    if ll <= 0 or rr <= 0 or rr < ll:
-                        continue
-                    tsd_len = int(rr - ll + 1)
-                    if 2 <= tsd_len <= 30:
-                        shift_penalty = abs(dl) + abs(dr)
-                        rescue.append((shift_penalty, -support, sample_priority, source, ll, rr))
-        if not rescue:
-            return (0, 0, 0, "")
-        rescue.sort()
-        _shift_penalty, _neg_support, _sample_priority, source, best_l, best_r = rescue[0]
-        return (best_l, best_r, int(best_r - best_l + 1), source)
+        return _resolve_tsd_pair_from_candidates(candidates)
 
     tsd_pairs = out.apply(_pick_tsd_pair, axis=1, result_type="expand")
     tsd_pairs.columns = ["tsd_left_breakpoint", "tsd_right_breakpoint", "tsd_len_estimate", "tsd_evidence_source"]
