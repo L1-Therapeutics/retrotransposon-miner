@@ -11,8 +11,11 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import click
 import pandas as pd
 import pysam
+
+from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
 
 _XVFB_PROC: subprocess.Popen[bytes] | None = None
 
@@ -49,7 +52,7 @@ def _igv_singleton_lock(
                 raw = lock_file.read_text(encoding="utf-8").strip()
                 owner_pid = int(raw.split("\t")[0]) if raw else 0
                 stale = not _pid_is_alive(owner_pid)
-            except Exception:
+            except (OSError, ValueError, IndexError):
                 stale = True
             if stale:
                 try:
@@ -77,7 +80,7 @@ def _igv_singleton_lock(
                 owner_pid = int(raw.split("\t")[0]) if raw else 0
                 if owner_pid == os.getpid():
                     lock_file.unlink()
-        except Exception:
+        except (OSError, ValueError, IndexError):
             pass
 
 
@@ -251,11 +254,6 @@ def _safe_snapshot_stem(rank: int, chrom: str, start: int, end: int, *, contig_i
     return f"rank{rank:03d}_{chrom_safe}_{start}_{end}"
 
 
-def _safe_locus_id(chrom: str, start: int, end: int) -> str:
-    chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
-    return f"{chrom_safe}_{int(start)}_{int(end)}"
-
-
 def _window_locus_id(chrom: str, window_start: int, window_end: int) -> str:
     s = int(window_start)
     e = int(window_end)
@@ -281,32 +279,9 @@ def _read_json_dict(path: Path) -> dict[str, object] | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
-
-
-def _iter_fasta_records(path: Path) -> list[tuple[str, str]]:
-    if not path.exists():
-        return []
-    out: list[tuple[str, str]] = []
-    name = ""
-    seq_parts: list[str] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                if name:
-                    out.append((name, "".join(seq_parts)))
-                name = line[1:].split()[0]
-                seq_parts = []
-            else:
-                seq_parts.append(line.upper())
-    if name:
-        out.append((name, "".join(seq_parts)))
-    return out
 
 
 def _build_assembly_contig_track(
@@ -317,7 +292,7 @@ def _build_assembly_contig_track(
     snapshot_dir: Path,
 ) -> Path | None:
     if shutil.which("minimap2") is None or shutil.which("samtools") is None:
-        print("[igv-plots] minimap2/samtools unavailable; skipping contig alignment track", flush=True)
+        click.echo("[igv-plots] minimap2/samtools unavailable; skipping contig alignment track")
         return None
 
     contig_entries: list[tuple[str, str]] = []
@@ -353,7 +328,7 @@ def _build_assembly_contig_track(
         contig_entries.append((header, seq))
 
     if not contig_entries:
-        print("[igv-plots] no assembly contigs resolved for IGV track", flush=True)
+        click.echo("[igv-plots] no assembly contigs resolved for IGV track")
         return None
 
     query_fa = snapshot_dir / "assembly_selected_contigs.fa"
@@ -366,12 +341,12 @@ def _build_assembly_contig_track(
     proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)
     if proc.returncode != 0 or not bam_path.exists():
         detail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-2000:]
-        print(f"[igv-plots] failed contig track alignment; skipping ({detail})", flush=True)
+        click.echo(f"[igv-plots] failed contig track alignment; skipping ({detail})")
         return None
     idx_proc = subprocess.run(["samtools", "index", str(bam_path)], capture_output=True, text=True, check=False)
     if idx_proc.returncode != 0 or _resolve_bam_index(bam_path) is None:
         detail = ((idx_proc.stderr or "") + "\n" + (idx_proc.stdout or "")).strip()[-1000:]
-        print(f"[igv-plots] failed indexing contig track; skipping ({detail})", flush=True)
+        click.echo(f"[igv-plots] failed indexing contig track; skipping ({detail})")
         return None
     return bam_path
 
@@ -539,10 +514,9 @@ def run_igv_batch(
             last_detail = detail
             if bind_error and attempt < max_attempts:
                 wait_sec = bind_sleep * float(attempt)
-                print(
+                click.echo(
                     f"[igv-plots] transient BindException on attempt {attempt}/{max_attempts}; "
-                    f"retrying in {wait_sec:.1f}s",
-                    flush=True,
+                    f"retrying in {wait_sec:.1f}s"
                 )
                 time.sleep(wait_sec)
                 continue
@@ -567,7 +541,7 @@ def generate_gold_review_igv_plots(
 ) -> Path | None:
     variants = _select_variants_for_plots(gold_review, top_n=top_n, gold_only=gold_only)
     if variants.empty:
-        print("[igv-plots] no variants selected for snapshots; skipping", flush=True)
+        click.echo("[igv-plots] no variants selected for snapshots; skipping")
         return None
 
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -625,16 +599,14 @@ def generate_gold_review_igv_plots(
     pd.DataFrame(index_rows).to_csv(index_path, sep="\t", index=False)
 
     t0 = time.monotonic()
-    print(
+    click.echo(
         f"[igv-plots] generating {len(index_rows)} snapshots in {snapshot_dir} "
-        f"(top_n={'all' if top_n <= 0 else top_n}, gold_only={gold_only})",
-        flush=True,
+        f"(top_n={'all' if top_n <= 0 else top_n}, gold_only={gold_only})"
     )
     run_igv_batch(batch_script_path, launcher=launcher, timeout_sec=timeout_sec)
     created = _verify_snapshot_pngs(index_rows)
-    print(
+    click.echo(
         f"[igv-plots] wrote {created}/{len(index_rows)} snapshot PNGs; "
-        f"index at {index_path} elapsed={time.monotonic() - t0:.1f}s",
-        flush=True,
+        f"index at {index_path} elapsed={time.monotonic() - t0:.1f}s"
     )
     return index_path

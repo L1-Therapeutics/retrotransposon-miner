@@ -12,8 +12,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import click
 import pandas as pd
 import pysam
+
+from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
 
 _MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
 _MINIMAP2_INDEX_LOCK = threading.Lock()
@@ -22,11 +25,6 @@ _MEI_FASTA_LENGTH_CACHE_LOCK = threading.Lock()
 _MIN_SIDE_ANCHOR_ALN_LEN = 30
 _MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
 _ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
-
-
-def _safe_locus_id(chrom: str, start: int, end: int) -> str:
-    chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
-    return f"{chrom_safe}_{int(start)}_{int(end)}"
 
 
 def _window_locus_id_from_row(row: pd.Series) -> str:
@@ -195,7 +193,7 @@ def _read_recruited_qnames_from_fastq(path: Path) -> set[str]:
                 if not qname:
                     continue
                 out.add(qname)
-    except Exception:
+    except (OSError, gzip.BadGzipFile, UnicodeDecodeError):
         return set()
     return out
 
@@ -272,7 +270,7 @@ def _is_non_perfect_primary_alignment(read: pysam.AlignedSegment) -> bool:
     try:
         if read.has_tag("NM") and int(read.get_tag("NM")) > 0:
             return True
-    except Exception:
+    except (KeyError, ValueError):
         pass
     if read.mate_is_unmapped or (not read.is_proper_pair):
         return True
@@ -343,29 +341,6 @@ def _summarize_contigs(contigs_fasta: Path) -> tuple[int, int]:
         if cur > 0:
             max_len = max(max_len, cur)
     return count, max_len
-
-
-def _iter_fasta_records(path: Path) -> list[tuple[str, str]]:
-    if not path.exists():
-        return []
-    out: list[tuple[str, str]] = []
-    name = ""
-    seq_parts: list[str] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                if name:
-                    out.append((name, "".join(seq_parts)))
-                name = line[1:].split()[0]
-                seq_parts = []
-            else:
-                seq_parts.append(line.upper())
-    if name:
-        out.append((name, "".join(seq_parts)))
-    return out
 
 
 def _run_minimap2_paf(
@@ -439,7 +414,7 @@ def _run_minimap2_paf(
                     "mapq": mapq,
                 }
             )
-        except Exception:
+        except (ValueError, IndexError):
             continue
     return rows
 
@@ -488,7 +463,7 @@ def _load_fasta_lengths(fasta_path: Path) -> dict[str, int]:
         with pysam.FastaFile(str(fasta_path)) as fa:
             for name, length in zip(fa.references, fa.lengths):
                 lengths[str(name)] = int(length)
-    except Exception:
+    except (OSError, ValueError, RuntimeError):
         lengths = {}
     with _MEI_FASTA_LENGTH_CACHE_LOCK:
         _MEI_FASTA_LENGTH_CACHE[key] = lengths
@@ -1030,7 +1005,7 @@ def _extract_sample_assembly_features(
                     bp = int((left_bp + right_bp) // 2)
                     bp_left_chrom = lchrom
                     tsd_len = alt_tsd_len
-        except Exception:
+        except (ValueError, TypeError):
             pass
     tsd_seq = ""
     if reference_fasta is not None and bp_left_chrom and tsd_len > 0 and tsd_len <= 50:
@@ -1039,7 +1014,7 @@ def _extract_sample_assembly_features(
                 start0 = max(0, int(bp) - (tsd_len // 2) - 1)
                 end0 = start0 + int(tsd_len)
                 tsd_seq = ref.fetch(bp_left_chrom, start0, end0).upper()
-        except Exception:
+        except (OSError, ValueError, KeyError, RuntimeError):
             tsd_seq = ""
     microhomology_sequence = _extract_microhomology_sequence(
         mei_hit=best,
@@ -1078,7 +1053,7 @@ def _extract_sample_assembly_features(
                             microhomology_sequence = str(mh_seq)
                         if mh_seq and not junction_overlap_sequence:
                             junction_overlap_sequence = str(mh_seq)
-        except Exception:
+        except (OSError, ValueError, KeyError, RuntimeError):
             pass
     if not junction_overlap_sequence:
         qname = str(best.get("qname", ""))
@@ -1139,7 +1114,7 @@ def _parse_existing_manifest(manifest_path: Path) -> dict[str, object] | None:
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         return raw if isinstance(raw, dict) else None
-    except Exception:
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return None
 
 
@@ -1628,7 +1603,7 @@ def _detect_total_memory_gb() -> int:
                 if len(parts) >= 2:
                     # /proc/meminfo reports kB.
                     return max(0, int(int(parts[1]) / (1024 * 1024)))
-    except Exception:
+    except (OSError, ValueError):
         return 0
     return 0
 
@@ -1766,13 +1741,12 @@ def annotate_silver_with_local_assembly(
         spades_threads=int(spades_threads),
         spades_memory_gb=int(spades_memory_gb),
     )
-    print(
+    click.echo(
         f"[local-assembly] starting loci={total_loci} "
         f"spades={spades_exe or 'not-needed-unless-cache-miss'} "
         f"requested_locus_workers={int(locus_workers)} "
         f"minimap2_threads={max(1, int(minimap2_threads))} "
-        f"locus_workers={workers}",
-        flush=True,
+        f"locus_workers={workers}"
     )
     row_records = silver.to_dict(orient="records")
     if workers == 1:
@@ -1799,7 +1773,7 @@ def annotate_silver_with_local_assembly(
                 control_preferred_read_names_by_locus=control_preferred_read_names_by_locus,
             )
             rows.append(result)
-            print(log_line, flush=True)
+            click.echo(log_line)
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
@@ -1830,5 +1804,5 @@ def annotate_silver_with_local_assembly(
             for fut in as_completed(futures):
                 result, log_line = fut.result()
                 rows.append(result)
-                print(log_line, flush=True)
+                click.echo(log_line)
     return pd.DataFrame(rows)

@@ -16,8 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+import click
 import pysam
 from intervaltree import IntervalTree
+
+from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
@@ -97,7 +100,7 @@ def _load_fragment_to_full_map(path: Path | None) -> dict[str, FragmentToFullMap
         return {}
     try:
         df = pd.read_csv(path, sep="\t")
-    except Exception:
+    except (OSError, pd.errors.ParserError, ValueError):
         return {}
     required = {
         "fragment_name",
@@ -355,7 +358,7 @@ def _make_reference_fetcher(ref: pysam.FastaFile):
             return ""
         try:
             return ref.fetch(resolved, int(start0), int(end0)).upper()
-        except Exception:
+        except (OSError, ValueError, KeyError, RuntimeError):
             return ""
 
     return fetch
@@ -670,7 +673,7 @@ def _resolve_full_consensus_fasta(
             if not fai.exists():
                 try:
                     subprocess.run(["samtools", "faidx", str(cand)], check=False, capture_output=True, text=True)
-                except Exception:
+                except OSError:
                     pass
             return cand
 
@@ -687,7 +690,7 @@ def _resolve_full_consensus_fasta(
             names=["name", "length", "offset", "line_bases", "line_width"],
             usecols=[0, 1],
         )
-    except Exception:
+    except (OSError, pd.errors.ParserError, ValueError):
         return None
     if fai_df.empty:
         return None
@@ -734,7 +737,7 @@ def _resolve_full_consensus_fasta(
                 continue
             try:
                 seq = ref.fetch(target)
-            except Exception:
+            except (OSError, ValueError, KeyError, RuntimeError):
                 continue
             if not seq:
                 continue
@@ -745,7 +748,7 @@ def _resolve_full_consensus_fasta(
         return None
     try:
         subprocess.run(["samtools", "faidx", str(full_fa)], check=False, capture_output=True, text=True)
-    except Exception:
+    except OSError:
         pass
     return full_fa
 
@@ -1604,10 +1607,9 @@ def _align_discordant_mates_with_minimap2(
     """Map discordant mates to MEI consensus (clip-only when mate is soft-clipped)."""
     fetch_t0 = time.monotonic()
     enriched = _fetch_discordant_mate_sequences(discordant_df, bam_path)
-    print(
+    click.echo(
         f"[mei-annotate] sample={sample} mate_fetch rows={len(discordant_df)} "
-        f"elapsed={time.monotonic() - fetch_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - fetch_t0:.1f}s"
     )
     if enriched.empty:
         summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
@@ -1653,10 +1655,9 @@ def _align_discordant_mates_with_minimap2(
     hits, summary = _align_discordant_reads_with_minimap2(
         mate_query, mei_fasta, sample=sample, bwa_threads=bwa_threads
     )
-    print(
+    click.echo(
         f"[mei-annotate] sample={sample} mate_bwa_mem queries={len(mate_query)} "
-        f"mei_hits={summary.paf_hits} elapsed={time.monotonic() - aln_t0:.1f}s",
-        flush=True,
+        f"mei_hits={summary.paf_hits} elapsed={time.monotonic() - aln_t0:.1f}s"
     )
     keep_cols = [
         "read_name",
@@ -1946,11 +1947,10 @@ def _hydrate_sample_mei_hits_from_detail(
         clip_count=int(len(discordant_df) if discordant_df is not None else 0),
         paf_hits=mate_paf,
     )
-    print(
+    click.echo(
         f"[mei-annotate] sample={sample} reused detail hits "
         f"split_mei={split_paf} disc_anchor_mei={disc_paf} disc_mate_mei={mate_paf} "
-        f"elapsed={time.monotonic() - t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - t0:.1f}s"
     )
     return {
         "sample": sample,
@@ -1974,25 +1974,23 @@ def _remap_one_sample_mei_evidence(
 ) -> dict[str, object]:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
     t0 = time.monotonic()
-    print(f"[mei-annotate] sample={sample} remap start bwa_threads={max(1, int(bwa_threads))}", flush=True)
+    click.echo(f"[mei-annotate] sample={sample} remap start bwa_threads={max(1, int(bwa_threads))}")
     split_t0 = time.monotonic()
     split_hits, split_summary = _align_clips_with_minimap2(
         split_df, mei_fasta, sample=sample, bwa_threads=bwa_threads
     )
-    print(
+    click.echo(
         f"[mei-annotate] sample={sample} split_bwa_mem rows={len(split_df)} "
         f"mei_hits={split_summary.paf_hits} "
-        f"elapsed={time.monotonic() - split_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - split_t0:.1f}s"
     )
     disc_t0 = time.monotonic()
     disc_anchor_hits, disc_summary = _align_discordant_reads_with_minimap2(
         discordant_df, mei_fasta, sample=sample, bwa_threads=bwa_threads
     )
-    print(
+    click.echo(
         f"[mei-annotate] sample={sample} disc_anchor_bwa_mem rows={len(discordant_df)} "
-        f"mei_hits={disc_summary.paf_hits} elapsed={time.monotonic() - disc_t0:.1f}s",
-        flush=True,
+        f"mei_hits={disc_summary.paf_hits} elapsed={time.monotonic() - disc_t0:.1f}s"
     )
     disc_mate_hits, disc_mate_summary = _align_discordant_mates_with_minimap2(
         discordant_df,
@@ -2022,18 +2020,16 @@ def _remap_one_sample_mei_evidence(
         if "vntr_rescue" in split_hits.columns
         else 0
     )
-    print(
+    click.echo(
         f"[mei-annotate] sample={sample} attach/rescue/enrich "
         f"short_mei_rescued={n_short_rescue} vntr_split={n_vntr_split} "
-        f"elapsed={time.monotonic() - post_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - post_t0:.1f}s"
     )
-    print(
+    click.echo(
         f"[mei-annotate] sample={sample} remap done elapsed={time.monotonic() - t0:.1f}s "
         f"split_mei={getattr(split_summary, 'paf_hits', 0)} "
         f"disc_anchor_mei={getattr(disc_summary, 'paf_hits', 0)} "
-        f"disc_mate_mei={getattr(disc_mate_summary, 'paf_hits', 0)}",
-        flush=True,
+        f"disc_mate_mei={getattr(disc_mate_summary, 'paf_hits', 0)}"
     )
     return {
         "sample": sample,
@@ -2434,7 +2430,7 @@ def _rescue_vntr_like_discordant_mei_hits(df: pd.DataFrame) -> pd.DataFrame:
             if "mate_mei_score" in out.columns:
                 out.loc[used_mate, "mate_mei_score"] = out.loc[used_mate, "mei_score"]
         _impute_rescue_mei_coords(out, rescue, kind="vntr", mapped=mapped_before)
-        print(
+        click.echo(
             f"[mei-annotate] VNTR-like rescue: flagged {n_rescue} discordant rows as VNTR_MAPPED "
             f"across {int(eligible.drop_duplicates(['chrom','window_start','window_end']).shape[0])} SVA-supported loci"
         )
@@ -2501,10 +2497,9 @@ def _demote_polya_split_mei_hits(split_df: pd.DataFrame) -> pd.DataFrame:
     for col in ("pid", "qcov", "mei_score", "pid_coord", "qcov_coord", "mei_score_coord"):
         if col in out.columns:
             out.loc[demote, col] = 0.0
-    print(
+    click.echo(
         f"[mei-annotate] polyA split demote: cleared MEI hits on {n} polyA/T soft-clips "
-        "(counted as polyA_MAPPED only)",
-        flush=True,
+        "(counted as polyA_MAPPED only)"
     )
     return out
 
@@ -2613,10 +2608,9 @@ def _annotate_vntr_like_split_clips(
     if "target" in out.columns:
         out.loc[rescue, "target"] = "SVA_VNTR_rescue#Retroposon/SVA"
     out.loc[rescue, "mei_score"] = out.loc[rescue, "vntr_like_score"].clip(lower=0.35, upper=0.85)
-    print(
+    click.echo(
         f"[mei-annotate] VNTR-like split rescue: flagged {n} soft-clips as VNTR_MAPPED "
-        f"(demoted_mei_hits={int(demote.sum())})",
-        flush=True,
+        f"(demoted_mei_hits={int(demote.sum())})"
     )
     return out
 
@@ -2640,59 +2634,6 @@ _VNTR_RESCUE_IMPUTE_WIDTH = 40
 # ~pair insert (300) minus a short uniquely mapped flank anchor (~20).
 _MAX_POLYA_SINGLE_BP = 151
 _MAX_POLYA_PAIR_BP = 280
-
-
-def _longest_poly_at_span(
-    seq: str,
-    *,
-    min_frac: float = _POLYA_MIN_FRAC,
-    min_len: int = _POLYA_MIN_SEQ_LEN,
-) -> tuple[int, float, str, str]:
-    """Longest substring that is mostly polyA **or** mostly polyT.
-
-    For each base in {A,T}, two-pointer search for the longest window with
-    ``count(base) / window_len ≥ min_frac``. Returns
-    ``(length, purity, base, span_seq)``. Length 0 if none found.
-
-    If the span covers essentially the whole read (≥140 bp or within 2 bp of
-    read length), that is a full-read polyA/T (few mismatches allowed).
-    """
-    s = "".join(ch for ch in (seq or "").upper() if ch in {"A", "C", "G", "T"})
-    n = len(s)
-    if n < int(min_len):
-        return (0, 0.0, "", "")
-    best_len = 0
-    best_frac = 0.0
-    best_base = ""
-    best_ij = (0, 0)
-    thr = float(min_frac)
-    for base in ("A", "T"):
-        left = 0
-        n_base = 0
-        for right in range(n):
-            if s[right] == base:
-                n_base += 1
-            while left <= right and (n_base / float(right - left + 1)) < thr:
-                if s[left] == base:
-                    n_base -= 1
-                left += 1
-            cur_len = right - left + 1
-            if cur_len >= int(min_len) and n_base > 0:
-                frac = float(n_base) / float(cur_len)
-                if cur_len > best_len or (cur_len == best_len and frac > best_frac):
-                    best_len = cur_len
-                    best_frac = frac
-                    best_base = base
-                    best_ij = (left, right + 1)
-    if best_len <= 0:
-        return (0, 0.0, "", "")
-    span = s[best_ij[0] : best_ij[1]]
-    # Whole-read polyA/T with a few end mismatches → report full read length.
-    if best_len >= 140 or best_len >= n - 2:
-        best_len = n
-        best_frac = float(span.count(best_base)) / float(len(span)) if span else best_frac
-        span = s
-    return (int(best_len), float(best_frac), best_base, span)
 
 
 def _polya_tail_width_bp(seq: str) -> int:
@@ -3040,7 +2981,7 @@ def _rescue_polya_like_discordant_mei_hits(df: pd.DataFrame) -> pd.DataFrame:
             .value_counts()
             .to_dict()
         )
-        print(
+        click.echo(
             f"[mei-annotate] polyA-like rescue: flagged {n_rescue} discordant rows as polyA_MAPPED "
             f"across {int(eligible.drop_duplicates(['chrom','window_start','window_end']).shape[0])} "
             f"ALU/LINE1/SVA-supported loci (both flanks; sides={sides})"
@@ -4311,7 +4252,6 @@ def _merge_detail_mei_extents(candidates: pd.DataFrame, detail: pd.DataFrame | N
             if end_col not in out.columns:
                 out[end_col] = 0
             cur_start = pd.to_numeric(out[start_col], errors="coerce").fillna(0)
-            cur_end = pd.to_numeric(out[end_col], errors="coerce").fillna(0)
             new_start = pd.to_numeric(out[d_start], errors="coerce")
             new_end = pd.to_numeric(out[d_end], errors="coerce")
             replace = cur_start.le(0) & new_start.gt(0) & new_end.ge(new_start)
@@ -4417,38 +4357,6 @@ def _clear_poly_at_artifact_tsd_fields(
         already = src.str.contains("filtered_poly_at", regex=False)
         out.loc[mask & ~already, source_col] = src.loc[mask & ~already] + "_filtered_poly_at_only"
     return mask
-
-
-def _poly_at_stats(seq: str) -> tuple[int, float, str]:
-    """PolyA/T stats: longest dominant-base run, dominant-base fraction, base.
-
-    Purity is ``max(n_A, n_T) / length`` — mostly A **or** mostly T — not
-    combined A+T. Mixed AT sequence scores ~0.5 and fails typical thresholds.
-    """
-    s = (seq or "").upper()
-    if not s:
-        return (0, 0.0, "")
-    n_a = s.count("A")
-    n_t = s.count("T")
-    if n_a <= 0 and n_t <= 0:
-        return (0, 0.0, "")
-    if n_a >= n_t:
-        base = "A"
-        n_dom = n_a
-    else:
-        base = "T"
-        n_dom = n_t
-    frac = float(n_dom) / float(len(s))
-    best = 0
-    cur = 0
-    for ch in s:
-        if ch == base:
-            cur += 1
-            if cur > best:
-                best = cur
-        else:
-            cur = 0
-    return (int(best), float(frac), base)
 
 
 def _clip_to_poly_at_region(seq: str, *, min_dom_frac: float | None = None) -> str:
@@ -4655,13 +4563,13 @@ def _collect_indel_breakpoint_evidence(
                 ref_pos = int(read.reference_start) + 1  # 1-based
                 query_pos = 0
                 for op, length in read.cigartuples:
-                    l = int(length)
+                    op_len = int(length)
                     if op in {0, 7, 8}:  # M/=/X
-                        ref_pos += l
-                        query_pos += l
+                        ref_pos += op_len
+                        query_pos += op_len
                         continue
                     if op == 1:  # insertion relative to reference
-                        if l >= int(min_indel_bp):
+                        if op_len >= int(min_indel_bp):
                             pos = max(1, int(ref_pos))
                             overlaps = list(tree.at(pos))
                             if overlaps:
@@ -4670,10 +4578,10 @@ def _collect_indel_breakpoint_evidence(
                                     key=lambda iv: (iv.end - iv.begin, abs(((iv.begin + iv.end) // 2) - pos)),
                                 )
                                 window_start, window_end = best.data
-                                ins_seq = query_seq[query_pos : query_pos + l]
+                                ins_seq = query_seq[query_pos : query_pos + op_len]
                                 if len(ins_seq) < 8:
                                     q0 = max(0, query_pos - int(query_context_bases))
-                                    q1 = min(len(query_seq), query_pos + l + int(query_context_bases))
+                                    q1 = min(len(query_seq), query_pos + op_len + int(query_context_bases))
                                     ins_seq = query_seq[q0:q1]
                                 poly_run, poly_frac, poly_base = _poly_at_stats(ins_seq)
                                 rows.append(
@@ -4684,7 +4592,7 @@ def _collect_indel_breakpoint_evidence(
                                         "window_end": int(window_end),
                                         "pos": int(pos),
                                         "clip_side": "",
-                                        "clip_len": int(l),
+                                        "clip_len": int(op_len),
                                         "mapq": int(read.mapping_quality),
                                         "is_reverse": bool(read.is_reverse),
                                         "read_name": str(read.query_name or ""),
@@ -4698,14 +4606,14 @@ def _collect_indel_breakpoint_evidence(
                                         "poly_tail_rescued": bool(poly_run >= 8 and poly_frac >= 0.8),
                                         "evidence_type": "indel",
                                         "indel_type": "I",
-                                        "indel_len": int(l),
+                                        "indel_len": int(op_len),
                                     }
                                 )
-                        query_pos += l
+                        query_pos += op_len
                         continue
                     if op == 2:  # deletion relative to reference
-                        if l >= int(min_indel_bp):
-                            pos = max(1, int(ref_pos + (l // 2)))
+                        if op_len >= int(min_indel_bp):
+                            pos = max(1, int(ref_pos + (op_len // 2)))
                             overlaps = list(tree.at(pos))
                             if overlaps:
                                 best = min(
@@ -4725,7 +4633,7 @@ def _collect_indel_breakpoint_evidence(
                                         "window_end": int(window_end),
                                         "pos": int(pos),
                                         "clip_side": "",
-                                        "clip_len": int(l),
+                                        "clip_len": int(op_len),
                                         "mapq": int(read.mapping_quality),
                                         "is_reverse": bool(read.is_reverse),
                                         "read_name": str(read.query_name or ""),
@@ -4739,16 +4647,16 @@ def _collect_indel_breakpoint_evidence(
                                         "poly_tail_rescued": bool(poly_run >= 8 and poly_frac >= 0.8),
                                         "evidence_type": "indel",
                                         "indel_type": "D",
-                                        "indel_len": int(l),
+                                        "indel_len": int(op_len),
                                     }
                                 )
-                        ref_pos += l
+                        ref_pos += op_len
                         continue
                     if op == 3:  # N
-                        ref_pos += l
+                        ref_pos += op_len
                         continue
                     if op == 4:  # S
-                        query_pos += l
+                        query_pos += op_len
                         continue
                     if op == 5:  # H
                         continue
@@ -5520,8 +5428,6 @@ def _add_candidate_support_info_fields(
             | weak_window_only_dpe
         )
 
-        sr_l_strict = pd.to_numeric(merged.get(f"{prefix}_sr_l_strict", 0), errors="coerce").fillna(0).astype(int)
-        sr_r_strict = pd.to_numeric(merged.get(f"{prefix}_sr_r_strict", 0), errors="coerce").fillna(0).astype(int)
         dpe_l_strict = pd.to_numeric(merged.get(f"{prefix}_dpe_l_strict", 0), errors="coerce").fillna(0).astype(int)
         dpe_r_strict = pd.to_numeric(merged.get(f"{prefix}_dpe_r_strict", 0), errors="coerce").fillna(0).astype(int)
         mei_mapped_total = pd.to_numeric(merged.get(f"{prefix}_mei_mapped", 0), errors="coerce").fillna(0).astype(int)
@@ -5861,11 +5767,6 @@ def _aggregate_side_metrics(
         .sort_values(["chrom", "window_start", "window_end", "mei_score_effective"], ascending=[True, True, True, False])
         .drop_duplicates(["chrom", "window_start", "window_end"], keep="first")
         .rename(columns={"target_strand_effective": f"{sample_prefix}_{side}_mei_strand"})
-    )
-    subfamily_totals = (
-        side_df.groupby(["chrom", "window_start", "window_end", "target_effective"], as_index=False)["mei_score_effective"]
-        .sum()
-        .rename(columns={"mei_score_effective": "subfamily_score_sum"})
     )
     subfamily_sum = (
         side_df.groupby(["chrom", "window_start", "window_end"], as_index=False)["mei_score_effective"]
@@ -7015,10 +6916,10 @@ def _infer_disease_insertion_metrics(
 
         # Try strict first (no coordinate adjustment).
         strict_ok: list[tuple[int, int, int, str]] = []
-        for l, r, support, source in candidates:
-            tsd_len = int(r - l + 1)
+        for left, right, support, source in candidates:
+            tsd_len = int(right - left + 1)
             if 2 <= tsd_len <= 30:
-                strict_ok.append((support, l, r, source))
+                strict_ok.append((support, left, right, source))
         if strict_ok:
             strict_ok.sort(key=lambda x: (x[0], x[2] - x[1]), reverse=True)
             _support, best_l, best_r, source = strict_ok[0]
@@ -7026,12 +6927,12 @@ def _infer_disease_insertion_metrics(
 
         # Rescue with ±2 bp shift when strict pairing misses by a few bases.
         rescue: list[tuple[int, int, int, str, int, int]] = []
-        for l, r, support, source in candidates:
+        for left, right, support, source in candidates:
             sample_priority = 0 if source == "tsd_disease" else 1
             for dl in (-2, -1, 0, 1, 2):
                 for dr in (-2, -1, 0, 1, 2):
-                    ll = int(l + dl)
-                    rr = int(r + dr)
+                    ll = int(left + dl)
+                    rr = int(right + dr)
                     if ll <= 0 or rr <= 0 or rr < ll:
                         continue
                     tsd_len = int(rr - ll + 1)
@@ -7525,10 +7426,10 @@ def _infer_disease_insertion_metrics(
         max_len: int = 40,
     ) -> tuple[int, int, int, str]:
         if int(row.get("tsd_len_estimate", 0)) >= int(min_len):
-            l = int(row.get("tsd_left_breakpoint", 0))
-            r = int(row.get("tsd_right_breakpoint", 0))
+            tsd_l = int(row.get("tsd_left_breakpoint", 0))
+            tsd_r = int(row.get("tsd_right_breakpoint", 0))
             src = str(row.get("tsd_evidence_source", "") or "")
-            return (l, r, int(max(0, row.get("tsd_len_estimate", 0))), src)
+            return (tsd_l, tsd_r, int(max(0, row.get("tsd_len_estimate", 0))), src)
 
         chrom = str(row.get("chrom", "") or "").strip()
         if not chrom:
@@ -7548,7 +7449,7 @@ def _infer_disease_insertion_metrics(
         if not seed_pairs:
             return (0, 0, 0, "")
 
-        seed_midpoints = [int((l + r) // 2) for l, r, _support, _source in seed_pairs if l > 0 and r > 0]
+        seed_midpoints = [int((left + right) // 2) for left, right, _support, _source in seed_pairs if left > 0 and right > 0]
         bp_seed = int(seed_midpoints[0]) if seed_midpoints else 0
 
         best_key: tuple[int, int, int, int, int] | None = None
@@ -7878,10 +7779,6 @@ def _infer_disease_insertion_metrics(
 
             candidates: list[tuple[int, int, int, int, str]] = []
             for sample in ("disease", "control"):
-                l_bp = _to_int_safe(row.get(f"{sample}_L_mei_breakpoint_mode", 0), 0)
-                r_bp = _to_int_safe(row.get(f"{sample}_R_mei_breakpoint_mode", 0), 0)
-                l_support = _to_int_safe(row.get(f"{sample}_L_mei_supported_reads", 0), 0)
-                r_support = _to_int_safe(row.get(f"{sample}_R_mei_supported_reads", 0), 0)
                 sample_pri = 0 if sample == "disease" else 1
 
                 # Disable fixed-length one-sided rescue; keep only interval-resolved
@@ -7931,40 +7828,40 @@ def _infer_disease_insertion_metrics(
         out["tsd_detected"] = out["tsd_len_estimate"].fillna(0).astype(int) >= 4
 
     def _breakpoint_pos_and_source(row: pd.Series) -> tuple[int, str]:
-        l = int(row.get("tsd_left_breakpoint", 0))
-        r = int(row.get("tsd_right_breakpoint", 0))
-        if l > 0 and r > 0:
+        bp_l = int(row.get("tsd_left_breakpoint", 0))
+        bp_r = int(row.get("tsd_right_breakpoint", 0))
+        if bp_l > 0 and bp_r > 0:
             source = str(row.get("tsd_evidence_source", "") or "").strip() or "tsd_unknown"
-            return int((l + r) // 2), source
+            return int((bp_l + bp_r) // 2), source
         # Prefer MEI-mapped split modes, then raw split-clip modes. Soft-clipped
         # anchors (including one-sided) are junction-resolving.
         for prefix, label in (
             ("disease", "disease"),
             ("control", "control"),
         ):
-            l = int(row.get(f"{prefix}_L_mei_breakpoint_mode", 0))
-            r = int(row.get(f"{prefix}_R_mei_breakpoint_mode", 0))
-            if l > 0 and r > 0:
-                return int((l + r) // 2), f"{label}_split"
-            if l > 0:
-                return l, f"{label}_single"
-            if r > 0:
-                return r, f"{label}_single"
+            bp_l = int(row.get(f"{prefix}_L_mei_breakpoint_mode", 0))
+            bp_r = int(row.get(f"{prefix}_R_mei_breakpoint_mode", 0))
+            if bp_l > 0 and bp_r > 0:
+                return int((bp_l + bp_r) // 2), f"{label}_split"
+            if bp_l > 0:
+                return bp_l, f"{label}_single"
+            if bp_r > 0:
+                return bp_r, f"{label}_single"
         for prefix, label in (
             ("disease", "disease"),
             ("control", "control"),
         ):
-            l = int(row.get(f"{prefix}_L_split_breakpoint_mode", 0))
-            r = int(row.get(f"{prefix}_R_split_breakpoint_mode", 0))
+            bp_l = int(row.get(f"{prefix}_L_split_breakpoint_mode", 0))
+            bp_r = int(row.get(f"{prefix}_R_split_breakpoint_mode", 0))
             l_sup = int(row.get(f"{prefix}_L_split_breakpoint_support", 0))
             r_sup = int(row.get(f"{prefix}_R_split_breakpoint_support", 0))
-            if l > 0 and r > 0:
-                return int((l + r) // 2), f"{label}_split_clip"
+            if bp_l > 0 and bp_r > 0:
+                return int((bp_l + bp_r) // 2), f"{label}_split_clip"
             # One-sided soft-clip / split-clip is enough for a point estimate.
-            if l > 0 and l_sup >= 1:
-                return l, f"{label}_single_clip"
-            if r > 0 and r_sup >= 1:
-                return r, f"{label}_single_clip"
+            if bp_l > 0 and l_sup >= 1:
+                return bp_l, f"{label}_single_clip"
+            if bp_r > 0 and r_sup >= 1:
+                return bp_r, f"{label}_single_clip"
         return 0, ""
 
     bp_fields = out.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
@@ -9839,11 +9736,6 @@ def _context_quality_metrics_for_interval(
 
 
 def _load_bed_intervals(path: Path) -> dict[str, list[tuple[int, int]]]:
-    def _open_textmaybe_gz(p: Path):
-        if str(p).endswith(".gz"):
-            return gzip.open(p, "rt", encoding="utf-8")
-        return p.open("r", encoding="utf-8")
-
     def _parse_interval_parts(parts: list[str]) -> tuple[str, int, int] | None:
         if len(parts) >= 3 and parts[0].startswith("chr"):
             chrom = parts[0]
@@ -9980,10 +9872,9 @@ def _sample_random_windows_with_bedtools(
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
     rng = random.Random(int(random_seed))
-    print(
+    click.echo(
         f"[mei-annotate] empirical stage: bedtools shuffle start "
-        f"scope={scope} n={n_windows} chroms={len(target_chroms)} span={sampled_span}",
-        flush=True,
+        f"scope={scope} n={n_windows} chroms={len(target_chroms)} span={sampled_span}"
     )
     with tempfile.TemporaryDirectory(prefix="rtm_empirical_shuffle_") as tmpdir:
         tmp = Path(tmpdir)
@@ -10066,9 +9957,8 @@ def _sample_random_windows_with_bedtools(
             if end0 <= start0:
                 continue
             rows.append({"chrom": chrom, "window_start": start0 + 1, "window_end": end0})
-        print(
-            f"[mei-annotate] empirical stage: bedtools shuffle done windows={len(rows)}",
-            flush=True,
+        click.echo(
+            f"[mei-annotate] empirical stage: bedtools shuffle done windows={len(rows)}"
         )
         return pd.DataFrame(rows)
 
@@ -10103,7 +9993,7 @@ def _sample_random_windows(
 
     # Prefer bedtools shuffle for interval randomization speed/reliability.
     try:
-        print("[mei-annotate] empirical stage: trying bedtools-based random sampling", flush=True)
+        click.echo("[mei-annotate] empirical stage: trying bedtools-based random sampling")
         sampled = _sample_random_windows_with_bedtools(
             target_chroms=target_chroms,
             reference_lengths=reference_lengths,
@@ -10118,10 +10008,8 @@ def _sample_random_windows(
         )
         if not sampled.empty:
             return sampled
-    except Exception:
-        # Fall back to pure-Python sampling if bedtools shuffle is unavailable/fails.
-        print("[mei-annotate] empirical stage: bedtools sampling unavailable; using python fallback", flush=True)
-        pass
+    except Exception:  # noqa: BLE001 - bedtools shuffle may raise anything; fall back to Python sampler
+        click.echo("[mei-annotate] empirical stage: bedtools sampling unavailable; using python fallback")
 
     allowed_intervals = _load_bed_intervals(highconf_bed) if highconf_bed is not None else {}
     if highconf_bed is not None:
@@ -10173,10 +10061,9 @@ def _sample_random_windows(
                 continue
         windows.append({"chrom": chrom, "window_start": int(start), "window_end": int(end)})
 
-    print(
+    click.echo(
         f"[mei-annotate] empirical stage: python fallback sampling done windows={len(windows)} "
-        f"attempts={attempts}",
-        flush=True,
+        f"attempts={attempts}"
     )
     return pd.DataFrame(windows)
 
@@ -10246,7 +10133,7 @@ def _apply_empirical_context_scores(
             out.at[idx, f"{sample_prefix}_empirical_{metric}_percentile"] = _empirical_percentile(series, value)
             out.at[idx, f"{sample_prefix}_empirical_{metric}_p_{tail}"] = _empirical_tail_prob(series, value, tail=tail)
         if progress_every > 0 and (i % progress_every == 0 or i == total):
-            print(f"[mei-annotate] empirical scoring {sample_prefix}: {i}/{total} loci", flush=True)
+            click.echo(f"[mei-annotate] empirical scoring {sample_prefix}: {i}/{total} loci")
     return out
 
 
@@ -10372,7 +10259,7 @@ def _annotate_bam_depth_for_consistent_loci(
     out["depth_filter_pass"] = depth_mask
     idxs = out.index[depth_mask].tolist()
     if not idxs:
-        print("[mei-annotate] empirical stage skipped: no loci passed empirical prefilter", flush=True)
+        click.echo("[mei-annotate] empirical stage skipped: no loci passed empirical prefilter")
         return out
 
     loci_for_empirical = out.loc[depth_mask, ["chrom", "window_start", "window_end"]].copy()
@@ -10403,18 +10290,17 @@ def _annotate_bam_depth_for_consistent_loci(
                 random_disease_df = pd.read_parquet(disease_cache_path)
                 random_control_df = pd.read_parquet(control_cache_path)
                 cache_hit = True
-                print(
+                click.echo(
                     f"[mei-annotate] empirical cache hit key={cache_key} "
-                    f"rows={len(random_disease_df)}",
-                    flush=True,
+                    f"rows={len(random_disease_df)}"
                 )
-            except Exception:
+            except (OSError, ValueError, RuntimeError):
                 cache_hit = False
         else:
-            print(f"[mei-annotate] empirical cache miss key={cache_key}", flush=True)
+            click.echo(f"[mei-annotate] empirical cache miss key={cache_key}")
 
     prep_t0 = time.monotonic()
-    print("[mei-annotate] empirical stage: preparing junk exclusion masks", flush=True)
+    click.echo("[mei-annotate] empirical stage: preparing junk exclusion masks")
     merged_exclusion_ready = (
         empirical_exclude_merged_bed is not None and Path(empirical_exclude_merged_bed).exists()
     )
@@ -10428,18 +10314,15 @@ def _annotate_bam_depth_for_consistent_loci(
             encode_blacklist_bed=empirical_exclude_blacklist_bed,
         )
         junk_interval_count = sum(len(tree) for tree in junk_trees.values())
-        print(
-            f"[mei-annotate] empirical stage: junk masks ready chroms={len(junk_trees)} intervals={junk_interval_count}",
-            flush=True,
+        click.echo(
+            f"[mei-annotate] empirical stage: junk masks ready chroms={len(junk_trees)} intervals={junk_interval_count}"
         )
     elif not cache_hit and merged_exclusion_ready:
-        print(
-            f"[mei-annotate] empirical stage: using merged exclusion bed {empirical_exclude_merged_bed}",
-            flush=True,
+        click.echo(
+            f"[mei-annotate] empirical stage: using merged exclusion bed {empirical_exclude_merged_bed}"
         )
-    print(
-        f"[mei-annotate] empirical stage: exclusion mask prep elapsed={time.monotonic() - prep_t0:.1f}s",
-        flush=True,
+    click.echo(
+        f"[mei-annotate] empirical stage: exclusion mask prep elapsed={time.monotonic() - prep_t0:.1f}s"
     )
 
     with pysam.AlignmentFile(str(disease_bam_path), "rb") as disease_bam, pysam.AlignmentFile(
@@ -10447,7 +10330,7 @@ def _annotate_bam_depth_for_consistent_loci(
     ) as control_bam:
         total_loci = int(len(idxs))
         loci_progress_every = 100
-        print(f"[mei-annotate] empirical stage: computing context metrics for {total_loci} loci", flush=True)
+        click.echo(f"[mei-annotate] empirical stage: computing context metrics for {total_loci} loci")
         for i, idx in enumerate(idxs, start=1):
             row = out.loc[idx]
             chrom = str(row["chrom"])
@@ -10471,14 +10354,13 @@ def _annotate_bam_depth_for_consistent_loci(
             out.at[idx, "control_context_nm_per_100bp_p90"] = float(n_metrics["context_nm_per_100bp_p90"])
             if i % loci_progress_every == 0 or i == total_loci:
                 elapsed = time.monotonic() - t0
-                print(
+                click.echo(
                     f"[mei-annotate] empirical stage: locus metrics {i}/{total_loci} "
-                    f"(elapsed={elapsed:.1f}s)",
-                    flush=True,
+                    f"(elapsed={elapsed:.1f}s)"
                 )
 
         if not cache_hit:
-            print("[mei-annotate] empirical stage: building random-window background metrics", flush=True)
+            click.echo("[mei-annotate] empirical stage: building random-window background metrics")
             random_windows = _sample_random_windows(
                 candidates=out.loc[depth_mask].copy() if depth_mask.any() else out.copy(),
                 bam=disease_bam,
@@ -10489,10 +10371,9 @@ def _annotate_bam_depth_for_consistent_loci(
                 junk_trees=junk_trees,
                 junk_exclusion_bed=empirical_exclude_merged_bed if merged_exclusion_ready else None,
             )
-            print(
+            click.echo(
                 f"[mei-annotate] empirical stage: sampled {len(random_windows)} random windows "
-                f"(scope={empirical_random_scope}, n={empirical_random_windows})",
-                flush=True,
+                f"(scope={empirical_random_scope}, n={empirical_random_windows})"
             )
             random_disease_rows: list[dict[str, float | int | str]] = []
             random_control_rows: list[dict[str, float | int | str]] = []
@@ -10530,10 +10411,9 @@ def _annotate_bam_depth_for_consistent_loci(
                 )
                 if i % random_progress_every == 0 or i == total_random:
                     elapsed = time.monotonic() - t0
-                    print(
+                    click.echo(
                         f"[mei-annotate] empirical stage: random-window metrics {i}/{total_random} "
-                        f"(elapsed={elapsed:.1f}s)",
-                        flush=True,
+                        f"(elapsed={elapsed:.1f}s)"
                     )
             random_disease_df = pd.DataFrame(random_disease_rows)
             random_control_df = pd.DataFrame(random_control_rows)
@@ -10542,13 +10422,12 @@ def _annotate_bam_depth_for_consistent_loci(
                 control_cache_path = empirical_cache_dir / f"{cache_key}.control.parquet"
                 random_disease_df.to_parquet(disease_cache_path, index=False)
                 random_control_df.to_parquet(control_cache_path, index=False)
-                print(
+                click.echo(
                     f"[mei-annotate] empirical cache write key={cache_key} "
-                    f"rows={len(random_disease_df)}",
-                    flush=True,
+                    f"rows={len(random_disease_df)}"
                 )
         else:
-            print("[mei-annotate] empirical stage: using cached random-window metrics", flush=True)
+            click.echo("[mei-annotate] empirical stage: using cached random-window metrics")
 
     t_mei = _df_col_series(out, "disease_mei_supported_reads", 0).astype(float)
     n_mei = _df_col_series(out, "control_mei_supported_reads", 0).astype(float)
@@ -10626,10 +10505,10 @@ def _annotate_bam_depth_for_consistent_loci(
         for col in control_scored.columns:
             if col.startswith("control_empirical_"):
                 out.loc[score_idx, col] = control_scored[col].values
-    print("[mei-annotate] empirical stage: applying empirical p-value scoring complete", flush=True)
+    click.echo("[mei-annotate] empirical stage: applying empirical p-value scoring complete")
     elapsed_total = time.monotonic() - t0
-    print(f"[mei-annotate] empirical stage complete (elapsed={elapsed_total:.1f}s)", flush=True)
-    print(f"[mei-annotate] empirical stage walltime={time.monotonic() - stage_start:.1f}s", flush=True)
+    click.echo(f"[mei-annotate] empirical stage complete (elapsed={elapsed_total:.1f}s)")
+    click.echo(f"[mei-annotate] empirical stage walltime={time.monotonic() - stage_start:.1f}s")
     return out
 
 
@@ -10957,10 +10836,9 @@ def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
 
     out["analysis_stage_tier"] = "bronze"
     out.loc[out["silver_stage_pass"], "analysis_stage_tier"] = "silver"
-    print(
+    click.echo(
         "[mei-annotate] stage counts "
-        f"bronze={len(out)} silver={int(out['silver_stage_pass'].sum())}",
-        flush=True,
+        f"bronze={len(out)} silver={int(out['silver_stage_pass'].sum())}"
     )
     return out
 
@@ -11102,11 +10980,10 @@ def _assign_gold_stage(
     out["stage_fail_reason"] = stage_fail_reason
 
     out.loc[out["gold_stage_pass"], "analysis_stage_tier"] = "gold"
-    print(
+    click.echo(
         "[mei-annotate] stage counts "
         f"silver={int(silver.sum())} gold={int(out['gold_stage_pass'].sum())} "
-        f"(min_mei_mapped>={int(min_mei_mapped)})",
-        flush=True,
+        f"(min_mei_mapped>={int(min_mei_mapped)})"
     )
     return out
 
@@ -11974,7 +11851,6 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     # MEI 5'/3' coords and orientation come from split reads first, then DPE.
     # Local assembly is intentionally excluded: contigs rarely span the full MEI
     # and previously truncated/inverted consensus footprints (e.g. SVA stubs).
-    asm_span = pd.to_numeric(_series_or_default("asm_insertion_length", float("nan")), errors="coerce")
     base_span = pd.to_numeric(_series_or_default("insertion_mei_span", float("nan")), errors="coerce")
     asm_mei_start = pd.to_numeric(_series_or_default("asm_insertion_mei_start", float("nan")), errors="coerce")
     asm_mei_end = pd.to_numeric(_series_or_default("asm_insertion_mei_end", float("nan")), errors="coerce")
@@ -12949,11 +12825,11 @@ def _extract_float_from_info(value: object, default: float = -1.0) -> float:
             return default
         try:
             return float(max(vals))
-        except Exception:
+        except (ValueError, TypeError):
             return default
     try:
         return float(value)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -12966,11 +12842,11 @@ def _extract_int_from_info(value: object, default: int = -1) -> int:
             return default
         try:
             return int(max(vals))
-        except Exception:
+        except (ValueError, TypeError):
             return default
     try:
         return int(value)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -13082,14 +12958,13 @@ def _run_bedtools_checked(
         return proc
     err = (proc.stderr or "").strip()
     out = (proc.stdout or "").strip()
-    print(
-        f"[mei-annotate] {label} failed exit={proc.returncode} cmd={' '.join(cmd)}",
-        flush=True,
+    click.echo(
+        f"[mei-annotate] {label} failed exit={proc.returncode} cmd={' '.join(cmd)}"
     )
     if err:
-        print(f"[mei-annotate] {label} stderr:\n{err}", flush=True)
+        click.echo(f"[mei-annotate] {label} stderr:\n{err}")
     if out:
-        print(f"[mei-annotate] {label} stdout (truncated):\n{out[:2000]}", flush=True)
+        click.echo(f"[mei-annotate] {label} stdout (truncated):\n{out[:2000]}")
     raise RuntimeError(
         f"{label} failed (exit={proc.returncode}): {' '.join(cmd)}"
         + (f"\nstderr:\n{err}" if err else "")
@@ -13188,7 +13063,7 @@ def _annotate_g1k_mei_overlap(
         tmp = Path(tmpdir)
         source_bed = tmp / "g1k_mei_from_vcf.bed"
         kept = _build_g1k_mei_bed_from_vcf(g1k_mei_vcf, source_bed)
-        print(f"[mei-annotate] parsed g1k MEI VCF records kept={kept} path={g1k_mei_vcf}")
+        click.echo(f"[mei-annotate] parsed g1k MEI VCF records kept={kept} path={g1k_mei_vcf}")
 
         query_bed = tmp / "candidate_g1k_query.bed"
         with query_bed.open("w", encoding="utf-8") as handle:
@@ -13299,7 +13174,6 @@ def _build_lr_mei_bed_from_vcf(vcf_path: Path, out_bed_path: Path) -> int:
                 # keep only insertion-like records by ID signature (e.g. chrXX-YYYYYY-INS)
                 # and ignore DTYPE_N fallback (which can include deletion-like classes).
                 itype_n = _first_info_str(_safe_info_get(info, "ITYPE_N", "")).strip()
-                itype_u = itype_n.upper()
                 rid_u = rid.upper()
                 is_insertion_like = ("-INS" in rid_u) or rid_u.endswith("INS") or (":INS" in rid_u)
                 if not is_insertion_like:
@@ -13361,7 +13235,7 @@ def _annotate_lr_mei_overlap(
         tmp = Path(tmpdir)
         source_bed = tmp / "lr_mei_from_vcf.bed"
         kept = _build_lr_mei_bed_from_vcf(lr_mei_vcf, source_bed)
-        print(f"[mei-annotate] parsed long-read SVAN MEI VCF records kept={kept} path={lr_mei_vcf}")
+        click.echo(f"[mei-annotate] parsed long-read SVAN MEI VCF records kept={kept} path={lr_mei_vcf}")
 
         query_bed = tmp / "candidate_lr_query.bed"
         with query_bed.open("w", encoding="utf-8") as handle:
@@ -13813,10 +13687,9 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
 
         bed_t0 = time.monotonic()
         n_rmsk = _write_rmsk_mei_bed(rmsk_table_path, rmsk_bed, chroms=chroms)
-        print(
+        click.echo(
             f"[mei-annotate] nested-rmsk wrote MEI BED rows={n_rmsk} "
-            f"chroms={len(chroms)} elapsed={time.monotonic() - bed_t0:.1f}s",
-            flush=True,
+            f"chroms={len(chroms)} elapsed={time.monotonic() - bed_t0:.1f}s"
         )
         if n_rmsk == 0:
             raise ValueError(
@@ -13845,10 +13718,9 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
                     hout,
                     [chrom, pos0, pos0 + 1, i, 0, ".", event_family, event_orientation],
                 )
-        print(
+        click.echo(
             f"[mei-annotate] nested-rmsk wrote candidate point BED "
-            f"rows={len(out)} elapsed={time.monotonic() - cand_t0:.1f}s",
-            flush=True,
+            f"rows={len(out)} elapsed={time.monotonic() - cand_t0:.1f}s"
         )
 
         inter_t0 = time.monotonic()
@@ -13856,10 +13728,9 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             [bedtools_bin, "intersect", "-wa", "-wb", "-a", str(cand_bed), "-b", str(rmsk_bed)],
             label="nested-rmsk bedtools intersect",
         )
-        print(
+        click.echo(
             f"[mei-annotate] nested-rmsk bedtools intersect "
-            f"elapsed={time.monotonic() - inter_t0:.1f}s",
-            flush=True,
+            f"elapsed={time.monotonic() - inter_t0:.1f}s"
         )
 
         # a(8) + b(9): pick best same-family hit (prefer same-orient, then longer).
@@ -13911,10 +13782,9 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             for idx, (_score, rec) in best.items():
                 for key, val in rec.items():
                     out.at[idx, key] = val
-        print(
+        click.echo(
             f"[mei-annotate] nested-rmsk post-select hits={len(best)}/{len(out)} "
-            f"elapsed={time.monotonic() - post_t0:.1f}s",
-            flush=True,
+            f"elapsed={time.monotonic() - post_t0:.1f}s"
         )
     return out
 
@@ -13984,13 +13854,12 @@ def annotate_candidate_loci_with_mei(
     split_control_raw = _load_table(evidence_dir, "split_evidence", "control")
     discordant_disease_raw = _load_table(evidence_dir, "discordant_evidence", "disease")
     discordant_control_raw = _load_table(evidence_dir, "discordant_evidence", "control")
-    print(
+    click.echo(
         f"[mei-annotate] loaded evidence "
         f"candidates={len(candidate)} "
         f"split_d={len(split_disease_raw)} split_c={len(split_control_raw)} "
         f"disc_d={len(discordant_disease_raw)} disc_c={len(discordant_control_raw)} "
-        f"elapsed={time.monotonic() - load_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - load_t0:.1f}s"
     )
 
     assign_t0 = time.monotonic()
@@ -13998,22 +13867,20 @@ def annotate_candidate_loci_with_mei(
     split_control = _assign_rows_to_candidate_loci(split_control_raw, candidate)
     discordant_disease = _assign_rows_to_candidate_loci(discordant_disease_raw, candidate)
     discordant_control = _assign_rows_to_candidate_loci(discordant_control_raw, candidate)
-    print(
+    click.echo(
         f"[mei-annotate] assigned evidence to loci "
         f"split_d={len(split_disease)} split_c={len(split_control)} "
         f"disc_d={len(discordant_disease)} disc_c={len(discordant_control)} "
-        f"elapsed={time.monotonic() - assign_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - assign_t0:.1f}s"
     )
 
     if reuse_dir is not None:
         # Re-label path: hydrate MEI hits from a prior annotate detail table.
         # Skips indel BAM scan, mate fetch, and MEI consensus remaps.
         detail_path = _resolve_supporting_reads_detail_path(reuse_dir)
-        print(
+        click.echo(
             f"[mei-annotate] reuse-mei-annotate-dir={reuse_dir} "
-            f"detail={detail_path.name} (skip indel+remap)",
-            flush=True,
+            f"detail={detail_path.name} (skip indel+remap)"
         )
         reuse_detail = _load_supporting_reads_detail_table(detail_path)
         indel_disease = pd.DataFrame()
@@ -14033,9 +13900,8 @@ def annotate_candidate_loci_with_mei(
                 detail=reuse_detail,
             ),
         }
-        print(
-            f"[mei-annotate] hydrated MEI hits from detail wall elapsed={time.monotonic() - remap_t0:.1f}s",
-            flush=True,
+        click.echo(
+            f"[mei-annotate] hydrated MEI hits from detail wall elapsed={time.monotonic() - remap_t0:.1f}s"
         )
         # Re-apply sequence-based rescues (mate_seq is on discordant evidence; prior
         # detail often omitted polyA-only DPE rows, so hydrate alone cannot restore them).
@@ -14047,7 +13913,7 @@ def annotate_candidate_loci_with_mei(
                 remap_by_sample[sample]["disc_hits"] = disc  # type: ignore[index]
     else:
         # Indel collection + MEI remaps: disease∥control (I/O and bwa mem release the GIL).
-        print("[mei-annotate] running disease∥control indel + MEI remaps", flush=True)
+        click.echo("[mei-annotate] running disease∥control indel + MEI remaps")
         indel_t0 = time.monotonic()
         indel_jobs: dict[str, object] = {}
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -14074,20 +13940,18 @@ def annotate_candidate_loci_with_mei(
                 indel_jobs[indel_futs[fut]] = fut.result()
         indel_disease = indel_jobs.get("disease", pd.DataFrame())
         indel_control = indel_jobs.get("control", pd.DataFrame())
-        print(
+        click.echo(
             f"[mei-annotate] indel collection disease={len(indel_disease)} "
-            f"control={len(indel_control)} elapsed={time.monotonic() - indel_t0:.1f}s",
-            flush=True,
+            f"control={len(indel_control)} elapsed={time.monotonic() - indel_t0:.1f}s"
         )
 
         remap_t0 = time.monotonic()
         # disease∥control remaps can run together; split bwa threads across them
         # when the caller asked for more than one thread.
         per_sample_bwa_threads = max(1, bwa_threads // 2) if bwa_threads > 1 else 1
-        print(
+        click.echo(
             f"[mei-annotate] bwa_threads total={bwa_threads} "
-            f"per_sample={per_sample_bwa_threads} (disease∥control)",
-            flush=True,
+            f"per_sample={per_sample_bwa_threads} (disease∥control)"
         )
         remap_by_sample = {}
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -14116,9 +13980,8 @@ def annotate_candidate_loci_with_mei(
             for fut in as_completed(remap_futs):
                 sample = remap_futs[fut]
                 remap_by_sample[sample] = fut.result()
-        print(
-            f"[mei-annotate] disease∥control MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s",
-            flush=True,
+        click.echo(
+            f"[mei-annotate] disease∥control MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s"
         )
 
     disease_hits = remap_by_sample["disease"]["split_hits"]  # type: ignore[assignment]
@@ -14157,15 +14020,13 @@ def annotate_candidate_loci_with_mei(
         supporting_reads_detail.to_csv(detail_tsv, sep="\t", index=False)
         supporting_reads_detail.to_parquet(detail_parquet, index=False)
         candidate = _merge_detail_mei_extents(candidate, supporting_reads_detail)
-        print(
+        click.echo(
             f"[mei-annotate] wrote supporting read detail table to {detail_tsv} "
-            f"rows={len(supporting_reads_detail)} elapsed={time.monotonic() - detail_t0:.1f}s",
-            flush=True,
+            f"rows={len(supporting_reads_detail)} elapsed={time.monotonic() - detail_t0:.1f}s"
         )
     else:
-        print(
-            f"[mei-annotate] supporting read detail empty elapsed={time.monotonic() - detail_t0:.1f}s",
-            flush=True,
+        click.echo(
+            f"[mei-annotate] supporting read detail empty elapsed={time.monotonic() - detail_t0:.1f}s"
         )
     frag_map_tsv = _resolve_fragment_to_full_map_tsv(mei_fasta=mei_fasta, mei_full_fasta=mei_full_fasta)
     frag_map = _load_fragment_to_full_map(frag_map_tsv)
@@ -14192,7 +14053,7 @@ def annotate_candidate_loci_with_mei(
             # survive onto disease/control_detail_mei_* used by gold.
             candidate = _merge_detail_mei_extents(candidate, supporting_reads_detail)
         n_frags = len({e.fragment_name for e in frag_map.values()})
-        print(
+        click.echo(
             f"[mei-annotate] projected panel MEI coords onto full-length consensus via "
             f"{frag_map_tsv.name if frag_map_tsv is not None else 'fragment map'} "
             f"(entries={n_frags})"
@@ -14204,13 +14065,12 @@ def annotate_candidate_loci_with_mei(
             mei_full_fasta=mei_full_fasta,
         )
         if reuse_dir is not None:
-            print(
+            click.echo(
                 "[mei-annotate] reuse mode: skipping full-consensus remaps "
-                "(no fragment map; keeping prior detail coords)",
-                flush=True,
+                "(no fragment map; keeping prior detail coords)"
             )
         elif full_consensus_fasta is not None:
-            print(
+            click.echo(
                 "[mei-annotate] warning: mei_fragment_to_full_coords.tsv missing; "
                 "falling back to per-read full-consensus remaps. Re-run "
                 "scripts/download_public_data.py to build the fragment map."
@@ -14285,12 +14145,12 @@ def annotate_candidate_loci_with_mei(
                 supporting_reads_detail.to_csv(detail_tsv, sep="\t", index=False)
                 supporting_reads_detail.to_parquet(detail_parquet, index=False)
                 candidate = _merge_detail_mei_extents(candidate, supporting_reads_detail)
-                print(
+                click.echo(
                     f"[mei-annotate] overlaid full-consensus coords onto supporting read detail "
                     f"({full_consensus_fasta.name})"
                 )
 
-    print(
+    click.echo(
         f"[mei-annotate] disease clips={disease_summary.clip_count} hits={disease_summary.paf_hits}; "
         f"control clips={control_summary.clip_count} hits={control_summary.paf_hits}; "
         f"disease discordant reads={disease_disc_summary.clip_count} hits={disease_disc_summary.paf_hits}; "
@@ -14347,10 +14207,9 @@ def annotate_candidate_loci_with_mei(
     disc_anchor_n = _aggregate_discordant_anchor_side_metrics(control_disc_hits, sample_prefix="control")
     disc_residual_t = _aggregate_discordant_residual_complex_metrics(disease_disc_hits, sample_prefix="disease")
     disc_residual_n = _aggregate_discordant_residual_complex_metrics(control_disc_hits, sample_prefix="control")
-    print(
+    click.echo(
         f"[mei-annotate] aggregated discordant MEI metrics "
-        f"elapsed={time.monotonic() - metrics_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - metrics_t0:.1f}s"
     )
 
     def _preferred_map_from_discordant(df: pd.DataFrame, target_col: str) -> dict[tuple[str, int, int], str]:
@@ -14386,10 +14245,9 @@ def annotate_candidate_loci_with_mei(
                     preferred_subfamily_by_locus=pref_map,
                 )
             )
-    print(
+    click.echo(
         f"[mei-annotate] aggregated side metrics parts={len(anno_parts)} "
-        f"elapsed={time.monotonic() - side_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - side_t0:.1f}s"
     )
 
     merge_t0 = time.monotonic()
@@ -14398,7 +14256,7 @@ def annotate_candidate_loci_with_mei(
             continue
         candidate = candidate.merge(part, on=["chrom", "window_start", "window_end"], how="left")
         if (idx + 1) % 2 == 0:
-            print(f"[mei-annotate] merged side metrics {idx + 1}/{len(anno_parts)}")
+            click.echo(f"[mei-annotate] merged side metrics {idx + 1}/{len(anno_parts)}")
 
     if not disc_t.empty:
         candidate = candidate.merge(disc_t, on=["chrom", "window_start", "window_end"], how="left")
@@ -14416,10 +14274,9 @@ def annotate_candidate_loci_with_mei(
         candidate = candidate.merge(disc_residual_t, on=["chrom", "window_start", "window_end"], how="left")
     if not disc_residual_n.empty:
         candidate = candidate.merge(disc_residual_n, on=["chrom", "window_start", "window_end"], how="left")
-    print(
+    click.echo(
         f"[mei-annotate] merged discordant MEI support metrics "
-        f"elapsed={time.monotonic() - merge_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - merge_t0:.1f}s"
     )
 
     support_t0 = time.monotonic()
@@ -14437,10 +14294,9 @@ def annotate_candidate_loci_with_mei(
         indel_disease=indel_disease,
         indel_control=indel_control,
     )
-    print(
+    click.echo(
         f"[mei-annotate] added candidate support info fields "
-        f"elapsed={time.monotonic() - support_t0:.1f}s",
-        flush=True,
+        f"elapsed={time.monotonic() - support_t0:.1f}s"
     )
 
     for col in candidate.columns:
@@ -14547,9 +14403,8 @@ def annotate_candidate_loci_with_mei(
     candidate = _compute_insertion_model_scores(candidate)
     stage_t0 = time.monotonic()
     candidate = _assign_bronze_silver_stages(candidate)
-    print(
-        f"[mei-annotate] bronze/silver staging elapsed={time.monotonic() - stage_t0:.1f}s",
-        flush=True,
+    click.echo(
+        f"[mei-annotate] bronze/silver staging elapsed={time.monotonic() - stage_t0:.1f}s"
     )
     if local_assembly and disease_bam_path is not None and control_bam_path is not None:
         asm_t0 = time.monotonic()
@@ -14587,7 +14442,7 @@ def annotate_candidate_loci_with_mei(
                 breakpoint_pos_col="insertion_breakpoint_pos",
                 output_prefix="insertion_",
             )
-        print(
+        click.echo(
             f"[mei-annotate] local assembly complete loci={len(asm_df)} "
             f"cache={asm_dir} elapsed={time.monotonic() - asm_t0:.1f}s"
         )
@@ -14608,7 +14463,7 @@ def annotate_candidate_loci_with_mei(
             dpe_padding_max_bp=g1k_dpe_padding_max_bp,
             dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
         )
-        print(
+        click.echo(
             f"[mei-annotate] added 1000G/MELT polymorphism overlap fields "
             f"(elapsed={time.monotonic() - g1k_t0:.1f}s)"
         )
@@ -14622,7 +14477,7 @@ def annotate_candidate_loci_with_mei(
             dpe_padding_max_bp=g1k_dpe_padding_max_bp,
             dpe_padding_tlen_factor=g1k_dpe_padding_tlen_factor,
         )
-        print(
+        click.echo(
             f"[mei-annotate] added long-read SVAN polymorphism overlap fields "
             f"(elapsed={time.monotonic() - lr_t0:.1f}s)"
         )
@@ -14632,7 +14487,7 @@ def annotate_candidate_loci_with_mei(
     if rmsk_table_path is not None:
         rmsk_t0 = time.monotonic()
         candidate = _annotate_nested_retrotransposon(candidate, rmsk_table_path=rmsk_table_path)
-        print(
+        click.echo(
             f"[mei-annotate] added nested-retrotransposon overlap annotation "
             f"(elapsed={time.monotonic() - rmsk_t0:.1f}s)"
         )
@@ -14654,12 +14509,12 @@ def annotate_candidate_loci_with_mei(
             empirical_exclude_blacklist_bed=empirical_exclude_blacklist_bed,
             empirical_cache_dir=empirical_cache_dir if empirical_cache_dir is not None else out_path.parent / "empirical_cache",
         )
-        print(
+        click.echo(
             f"[mei-annotate] added BAM-depth controlization for family-consistent, junk-clean loci "
             f"(elapsed={time.monotonic() - emp_t0:.1f}s)"
         )
     elif not empirical_stage:
-        print("[mei-annotate] empirical stage disabled (--no-empirical-stage)", flush=True)
+        click.echo("[mei-annotate] empirical stage disabled (--no-empirical-stage)")
     candidate = _add_heuristic_assembly_like_vaf_fields(candidate)
     candidate = _assign_gold_stage(candidate, empirical_stage=empirical_stage)
 
@@ -14689,11 +14544,10 @@ def annotate_candidate_loci_with_mei(
     gold_review_path = out_path.with_name(out_path.stem + ".gold_review.tsv")
     gold_review_tsv = _stable_tsv_export_frame(gold_review)
     gold_review_tsv.to_csv(gold_review_path, sep="\t", index=False)
-    print(
+    click.echo(
         f"[mei-annotate] wrote gold review table to {gold_review_path} "
         f"(candidate_rows={len(candidate)} gold_rows={len(gold_review)} "
-        f"elapsed={time.monotonic() - write_t0:.1f}s)",
-        flush=True,
+        f"elapsed={time.monotonic() - write_t0:.1f}s)"
     )
     if (
         igv_plots
@@ -14718,18 +14572,16 @@ def annotate_candidate_loci_with_mei(
                 assembly_cache_dir=asm_dir if local_assembly else None,
             )
         except FileNotFoundError as exc:
-            print(f"[mei-annotate] IGV snapshot generation skipped: {exc}", flush=True)
+            click.echo(f"[mei-annotate] IGV snapshot generation skipped: {exc}")
         except (subprocess.CalledProcessError, RuntimeError) as exc:
-            print(
+            click.echo(
                 f"[mei-annotate] IGV snapshot generation failed: {exc}; "
-                f"batch script remains at {igv_dir / 'igv_batch.txt'}",
-                flush=True,
+                f"batch script remains at {igv_dir / 'igv_batch.txt'}"
             )
     elif igv_plots and (disease_bam_path is None or control_bam_path is None or reference_fasta is None):
-        print(
+        click.echo(
             "[mei-annotate] IGV snapshot generation skipped: require --reference-fasta, "
-            "--disease-bam-depth, and --control-bam-depth",
-            flush=True,
+            "--disease-bam-depth, and --control-bam-depth"
         )
     if read_architecture_plots:
         detail_path = out_path.with_name("supporting_reads_detail.mei.tsv")
@@ -14742,9 +14594,8 @@ def annotate_candidate_loci_with_mei(
         elif detail_path.exists():
             detail_source = detail_path
         if detail_source is None:
-            print(
-                "[mei-annotate] read-architecture plots skipped: missing supporting_reads_detail.mei.tsv",
-                flush=True,
+            click.echo(
+                "[mei-annotate] read-architecture plots skipped: missing supporting_reads_detail.mei.tsv"
             )
         else:
             arch_dir = (
@@ -14763,7 +14614,7 @@ def annotate_candidate_loci_with_mei(
                     top_n=read_architecture_top_n,
                 )
             except Exception as exc:  # noqa: BLE001 - do not fail annotate on plot errors
-                print(f"[mei-annotate] read-architecture plot generation failed: {exc}", flush=True)
-    print(f"[mei-annotate] wrote {len(candidate)} rows to {out_path}")
-    print(f"[mei-annotate] total annotate walltime={time.monotonic() - total_t0:.1f}s")
+                click.echo(f"[mei-annotate] read-architecture plot generation failed: {exc}")
+    click.echo(f"[mei-annotate] wrote {len(candidate)} rows to {out_path}")
+    click.echo(f"[mei-annotate] total annotate walltime={time.monotonic() - total_t0:.1f}s")
     return out_path

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import gzip
 import time
 from collections.abc import Iterable
 from pathlib import Path
 import subprocess
 import tempfile
 
+import click
 import pandas as pd
 from intervaltree import IntervalTree
+
+from ._utils import _open_textmaybe_gz
 
 
 _RUN_T0: float | None = None
@@ -16,9 +18,9 @@ _RUN_T0: float | None = None
 
 def _progress(msg: str) -> None:
     if _RUN_T0 is None:
-        print(f"[candidate-loci] {msg}", flush=True)
+        click.echo(f"[candidate-loci] {msg}")
     else:
-        print(f"[candidate-loci] +{(time.monotonic() - _RUN_T0):.1f}s {msg}", flush=True)
+        click.echo(f"[candidate-loci] +{(time.monotonic() - _RUN_T0):.1f}s {msg}")
 
 
 def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
@@ -34,8 +36,62 @@ def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame
     )
 
 
+# ---------------------------------------------------------------------------
+# Evidence table required-column sets and validator
+# ---------------------------------------------------------------------------
+
+#: Columns that must be present in every split-evidence table loaded by
+#: :func:`build_candidate_loci`.  Optional columns (``nm``,
+#: ``poly_tail_rescued``, ``clip_poly_at_fraction``, ``clip_poly_at_run``)
+#: are tolerated and backfilled with defaults by ``_aggregate_split_metrics``.
+_SPLIT_EVIDENCE_REQUIRED_COLS: frozenset[str] = frozenset({
+    "chrom", "pos", "read_name", "mapq", "clip_len", "has_sa",
+})
+
+#: Columns that must be present in every discordant-evidence table.
+#: Optional columns (``nm``, ``poly_tail_anchor_rescued``,
+#: ``anchor_poly_at_fraction``, ``anchor_poly_at_run``) are backfilled.
+_DISCORDANT_EVIDENCE_REQUIRED_COLS: frozenset[str] = frozenset({
+    "chrom", "pos", "read_name", "mapq", "discordant_reasons", "template_len",
+})
+
+
+def _validate_evidence_columns(
+    df: pd.DataFrame,
+    stem: str,
+    sample: str,
+    required: frozenset[str],
+) -> None:
+    """Raise ValueError with a clear message if *df* is missing required columns.
+
+    Evidence tables loaded from parquet or TSV must contain the columns
+    consumed unconditionally by the downstream pipeline.  A missing column
+    otherwise surfaces as an opaque ``KeyError`` many call frames later.
+    """
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Evidence table '{stem}.{sample}' is missing required columns: "
+            f"{sorted(missing)}.  "
+            f"Present columns: {sorted(df.columns.tolist())}.  "
+            "Was this file produced by 'rtm extract-split-evidence'?"
+        )
+
+
 def _read_passing_counts(summary_path: Path) -> dict[str, int]:
-    summary = pd.read_csv(summary_path, sep="\t", usecols=["sample", "passing_reads"])
+    if not summary_path.exists():
+        raise FileNotFoundError(
+            f"Split evidence summary not found: {summary_path}\n"
+            "Run 'rtm extract-split-evidence' first to generate this file."
+        )
+    try:
+        summary = pd.read_csv(summary_path, sep="\t", usecols=["sample", "passing_reads"])
+    except ValueError as exc:
+        raise ValueError(
+            f"Split evidence summary at '{summary_path}' is missing required columns "
+            "['sample', 'passing_reads'].  "
+            "Run 'rtm extract-split-evidence' to regenerate it."
+        ) from exc
     return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int)))
 
 
@@ -257,8 +313,9 @@ def _merge_overlapping_loci(
             continue
         cur_start, cur_end = intervals[0]
         for start, end in intervals[1:]:
-            # Closed intervals: merge only on true overlap (not mere abutment),
-            # so adjacent-but-distinct insertions stay separate.
+            # Merge when intervals overlap OR share exactly one endpoint
+            # (start <= cur_end).  Touching windows are intentionally collapsed
+            # per the docstring; non-overlapping neighbors stay separate.
             if start <= cur_end:
                 new_end = max(cur_end, end)
                 if (new_end - cur_start + 1) <= max_span:
@@ -478,12 +535,6 @@ def _safe_cpm(count_series: pd.Series, denominator: int) -> pd.Series:
     if denominator <= 0:
         return pd.Series(0.0, index=count_series.index)
     return count_series.astype(float) * 1_000_000.0 / float(denominator)
-
-
-def _open_textmaybe_gz(path: Path):
-    if str(path).endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
 
 
 def _parse_interval_parts(parts: list[str]) -> tuple[str, int, int] | None:
@@ -758,9 +809,13 @@ def build_candidate_loci(
 
         _progress("loading split/discordant evidence tables")
         split_disease_raw = _load_evidence_table(evidence_dir, "split_evidence", "disease")
+        _validate_evidence_columns(split_disease_raw, "split_evidence", "disease", _SPLIT_EVIDENCE_REQUIRED_COLS)
         split_control_raw = _load_evidence_table(evidence_dir, "split_evidence", "control")
+        _validate_evidence_columns(split_control_raw, "split_evidence", "control", _SPLIT_EVIDENCE_REQUIRED_COLS)
         discordant_disease_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "disease")
+        _validate_evidence_columns(discordant_disease_raw, "discordant_evidence", "disease", _DISCORDANT_EVIDENCE_REQUIRED_COLS)
         discordant_control_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "control")
+        _validate_evidence_columns(discordant_control_raw, "discordant_evidence", "control", _DISCORDANT_EVIDENCE_REQUIRED_COLS)
         _progress(
             "loaded evidence rows "
             f"split_disease={len(split_disease_raw)}, split_control={len(split_control_raw)}, "
