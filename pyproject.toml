@@ -19,7 +19,11 @@ dependencies = [
   "pyarrow>=16",        # implicit pandas Parquet engine
   "numpy>=1.26",
   "matplotlib>=3.9",   # read_architecture.py plots
+  "biopython>=1.84",
+  "pyfaidx>=0.8",
   "intervaltree>=3.1",
+  "pyyaml>=6.0",        # scripts/download_public_data.py
+  "rich>=13.7",
 ]
 
 [project.scripts]
