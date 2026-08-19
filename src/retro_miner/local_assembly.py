@@ -26,6 +26,11 @@ _MIN_SIDE_ANCHOR_ALN_LEN = 30
 _MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
 _ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
 
+#: Maximum seconds to wait for a SPAdes assembly run before returning a failure code.
+_SPADES_TIMEOUT: int = 600
+#: Maximum seconds to wait for a minimap2 alignment run before returning failure.
+_MINIMAP2_TIMEOUT: int = 120
+
 
 def _window_locus_id_from_row(row: pd.Series) -> str:
     chrom = str(row.get("chrom", ""))
@@ -298,7 +303,10 @@ def _run_spades(
         "-m",
         str(max(1, int(memory_gb))),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_SPADES_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 1, f"SPAdes assembly timed out after {_SPADES_TIMEOUT}s."
     stderr_tail = (proc.stderr or "")[-2000:]
     stdout_tail = (proc.stdout or "")[-2000:]
     combined = "\n".join([x for x in [stdout_tail, stderr_tail] if x]).strip()
@@ -349,6 +357,7 @@ def _run_minimap2_paf(
     *,
     preset: str = "asm5",
     threads: int = 1,
+    minimap2_idx_dir: Path | None = None,
 ) -> list[dict[str, object]]:
     if not query_fa.exists() or not target_fa.exists():
         return []
@@ -363,17 +372,31 @@ def _run_minimap2_paf(
             preferred_idx = target_fa.with_suffix(target_fa.suffix + ".mmi")
             idx_path = preferred_idx
             if not preferred_idx.exists():
-                idx_dir = Path(tempfile.gettempdir()) / "rtm_minimap2_indexes"
+                if minimap2_idx_dir is not None:
+                    # Store the index inside the project assembly cache so it
+                    # survives across runs and avoids predictable /tmp paths.
+                    idx_dir = minimap2_idx_dir
+                else:
+                    # Fall back to a UID-scoped temp directory when no project
+                    # cache directory is provided (e.g. direct library use).
+                    idx_dir = Path(tempfile.gettempdir()) / f"rtm_minimap2_indexes_{os.getuid()}"
                 idx_dir.mkdir(parents=True, exist_ok=True)
                 digest = hashlib.sha1(target_key.encode("utf-8")).hexdigest()[:16]
                 idx_path = idx_dir / f"{target_fa.stem}.{digest}.mmi"
             if not idx_path.exists():
-                build = subprocess.run(
-                    ["minimap2", "-d", str(idx_path), str(target_fa)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                try:
+                    build = subprocess.run(
+                        ["minimap2", "-d", str(idx_path), str(target_fa)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=_MINIMAP2_TIMEOUT,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        f"minimap2 index build timed out after {_MINIMAP2_TIMEOUT}s "
+                        f"for {target_fa}"
+                    ) from exc
                 if build.returncode == 0 and idx_path.exists():
                     _MINIMAP2_INDEX_CACHE[target_key] = idx_path
                     target_arg = str(idx_path)
@@ -381,7 +404,13 @@ def _run_minimap2_paf(
                 _MINIMAP2_INDEX_CACHE[target_key] = idx_path
                 target_arg = str(idx_path)
     cmd = ["minimap2", "-x", preset, "--secondary=no", "-c", "-t", str(max(1, int(threads))), target_arg, str(query_fa)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=_MINIMAP2_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"minimap2 alignment timed out after {_MINIMAP2_TIMEOUT}s "
+            f"for query={query_fa} target={target_arg}"
+        ) from exc
     if proc.returncode != 0:
         return []
     rows: list[dict[str, object]] = []
@@ -754,6 +783,7 @@ def _extract_sample_assembly_features(
     reference_fasta: Path | None,
     default_breakpoint_pos: int,
     minimap2_threads: int = 1,
+    minimap2_idx_dir: Path | None = None,
 ) -> dict[str, object]:
     records = _iter_fasta_records(contigs_fasta)
     seq_by_name = {name: seq for name, seq in records}
@@ -803,14 +833,14 @@ def _extract_sample_assembly_features(
             for name, seq in records:
                 oh.write(f">{name}\n{seq}\n")
         mei_preset = "asm5"
-        mei_hits = _run_minimap2_paf(query_fa, mei_fasta, preset=mei_preset, threads=minimap2_threads)
+        mei_hits = _run_minimap2_paf(query_fa, mei_fasta, preset=mei_preset, threads=minimap2_threads, minimap2_idx_dir=minimap2_idx_dir)
         if not mei_hits:
             # Contigs can be short/chimeric around breakpoints; sr preset is more
             # sensitive for recovering partial MEI-supporting alignments.
             mei_preset = "sr"
-            mei_hits = _run_minimap2_paf(query_fa, mei_fasta, preset=mei_preset, threads=minimap2_threads)
+            mei_hits = _run_minimap2_paf(query_fa, mei_fasta, preset=mei_preset, threads=minimap2_threads, minimap2_idx_dir=minimap2_idx_dir)
         if reference_fasta is not None:
-            ref_hits = _run_minimap2_paf(query_fa, reference_fasta, preset="asm5", threads=minimap2_threads)
+            ref_hits = _run_minimap2_paf(query_fa, reference_fasta, preset="asm5", threads=minimap2_threads, minimap2_idx_dir=minimap2_idx_dir)
         else:
             ref_hits = []
 
@@ -1335,6 +1365,7 @@ def _process_single_locus(
                         reference_fasta=reference_fasta,
                         default_breakpoint_pos=fallback_bp,
                         minimap2_threads=minimap2_threads,
+                        minimap2_idx_dir=assembly_cache_dir / ".minimap2_idx_cache",
                     )
                     n_feat_seed = _extract_sample_assembly_features(
                         contigs_fasta=n_out_try / "contigs.fasta",
@@ -1342,6 +1373,7 @@ def _process_single_locus(
                         reference_fasta=reference_fasta,
                         default_breakpoint_pos=fallback_bp,
                         minimap2_threads=minimap2_threads,
+                        minimap2_idx_dir=assembly_cache_dir / ".minimap2_idx_cache",
                     )
                     _pick_seed, pick_source_seed, _cx_pick_seed, _cx_source_seed = _choose_consensus_features(
                         d_feat_seed, n_feat_seed
@@ -1399,6 +1431,7 @@ def _process_single_locus(
             reference_fasta=reference_fasta,
             default_breakpoint_pos=fallback_bp,
             minimap2_threads=minimap2_threads,
+            minimap2_idx_dir=assembly_cache_dir / ".minimap2_idx_cache",
         )
         n_feat = _extract_sample_assembly_features(
             contigs_fasta=n_out / "contigs.fasta",
@@ -1406,6 +1439,7 @@ def _process_single_locus(
             reference_fasta=reference_fasta,
             default_breakpoint_pos=fallback_bp,
             minimap2_threads=minimap2_threads,
+            minimap2_idx_dir=assembly_cache_dir / ".minimap2_idx_cache",
         )
     pick, pick_source, complex_pick, complex_source = _choose_consensus_features(d_feat, n_feat)
 
@@ -1460,6 +1494,7 @@ def _process_single_locus(
                         reference_fasta=reference_fasta,
                         default_breakpoint_pos=fallback_bp,
                         minimap2_threads=minimap2_threads,
+                        minimap2_idx_dir=assembly_cache_dir / ".minimap2_idx_cache",
                     )
                     n_feat_hi = _extract_sample_assembly_features(
                         contigs_fasta=n_out_hi / "contigs.fasta",
@@ -1467,6 +1502,7 @@ def _process_single_locus(
                         reference_fasta=reference_fasta,
                         default_breakpoint_pos=fallback_bp,
                         minimap2_threads=minimap2_threads,
+                        minimap2_idx_dir=assembly_cache_dir / ".minimap2_idx_cache",
                     )
                     pick_hi, pick_source_hi, complex_pick_hi, complex_source_hi = _choose_consensus_features(d_feat_hi, n_feat_hi)
                     improved = (
