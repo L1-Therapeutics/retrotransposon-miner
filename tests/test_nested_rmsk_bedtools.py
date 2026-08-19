@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -34,6 +35,7 @@ def test_write_bed_row_avoids_trailing_empty_fields(tmp_path: Path):
     assert all(not ln.endswith("\t") for ln in lines)
 
 
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not installed on PATH")
 def test_nested_rmsk_accepts_missing_orientation(tmp_path: Path):
     """Empty orientation used to emit trailing tabs and crash bedtools."""
     rmsk = tmp_path / "rmsk.txt"
@@ -69,6 +71,7 @@ def test_nested_rmsk_accepts_missing_orientation(tmp_path: Path):
     assert bool(out.loc[1, "nested_repeat_overlap"]) is False
 
 
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not installed on PATH")
 def test_nested_rmsk_bedtools_flags_same_family_hits(tmp_path: Path):
     # BED-like parser expects: chrom start end . . strand repName repClass repFamily
     rmsk = tmp_path / "rmsk.txt"
