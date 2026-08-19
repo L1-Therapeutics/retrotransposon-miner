@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,8 +39,12 @@ def _igv_singleton_lock(
     timeout_sec: float = 600.0,
     poll_sec: float = 1.0,
 ):
-    """Serialize IGV batch runs to avoid java.net.BindException port collisions."""
-    lock_file = lock_path or Path("/tmp/retro_miner_igv.lock")
+    """Serialize IGV batch runs to avoid java.net.BindException port collisions.
+
+    The default lock path includes the current user's UID so distinct OS users
+    cannot interfere with each other's IGV singleton coordination.
+    """
+    lock_file = lock_path or Path(tempfile.gettempdir()) / f"retro_miner_igv_{os.getuid()}.lock"
     start = time.monotonic()
     owner_fd: int | None = None
     while owner_fd is None:
@@ -249,12 +254,10 @@ def _estimate_panel_height(
 def _safe_snapshot_stem(rank: int, chrom: str, start: int, end: int, *, contig_id: str = "") -> str:
     """Return a filesystem-safe IGV snapshot stem.
 
-    Special characters in *chrom* are replaced with underscores.  When
+    Special characters in *chrom* are replaced with underscores. When
     sanitisation changes the value, a 6-hex-character SHA-256 digest of the
     original string is embedded to prevent distinct chromosome names that
-    sanitise identically (e.g. ``chr1/a`` and ``chr1_a``) from producing the
-    same snapshot filename and silently overwriting each other.  Canonical
-    names such as ``chr22`` are unaffected.
+    sanitise identically from producing the same snapshot filename.
     """
     chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
     if chrom_safe != str(chrom):
@@ -285,12 +288,7 @@ def _validate_igv_chrom(chrom: str) -> None:
 
 
 def _quote_igv_path(p: Path) -> str:
-    """Return *p* wrapped in double quotes for use in an IGV batch command.
-
-    IGV batch files support double-quoted paths, which allows file and directory
-    names that contain spaces.  A path that itself contains a double-quote
-    character cannot be safely embedded and raises :exc:`ValueError`.
-    """
+    """Return *p* wrapped in double quotes for use in an IGV batch command."""
     s = str(p)
     if '"' in s:
         raise ValueError(
@@ -506,7 +504,9 @@ def build_igv_batch_script(
     if contig_alignment_bam is not None:
         contig_idx = _resolve_bam_index(contig_alignment_bam)
         if contig_idx is not None:
-            lines.append(f"load {_quote_igv_path(contig_alignment_bam.resolve())} index={_quote_igv_path(contig_idx.resolve())}")
+            lines.append(
+                f"load {_quote_igv_path(contig_alignment_bam.resolve())} index={_quote_igv_path(contig_idx.resolve())}"
+            )
     if contig_annotation_bed is not None and contig_annotation_bed.exists():
         lines.append(f"load {_quote_igv_path(contig_annotation_bed.resolve())}")
 

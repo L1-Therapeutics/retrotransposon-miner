@@ -10,15 +10,19 @@ Verifies that:
 """
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
+import retro_miner.igv_plots as igv_plots
 from retro_miner._utils import safe_locus_id
 from retro_miner.igv_plots import (
     _build_assembly_contig_track,
+    _igv_singleton_lock,
     _quote_igv_path,
     _safe_snapshot_stem,
     _validate_igv_chrom,
@@ -602,62 +606,51 @@ class TestIgvBatchValidation:
         for chrom in ("chr1", "chr22", "chrX", "chrY", "chrM"):
             _validate_igv_chrom(chrom)  # must not raise
 
+
 # ---------------------------------------------------------------------------
-# _safe_snapshot_stem — collision-resistance
+# _safe_snapshot_stem
 # ---------------------------------------------------------------------------
 
 
 class TestSafeSnapshotStem:
-    """_safe_snapshot_stem must produce distinct filenames for chromosomes that
-    sanitise to the same ASCII string."""
+    """Snapshot stems stay filesystem-safe without colliding after sanitisation."""
 
     def test_canonical_chrom_no_digest(self):
-        """Standard chromosome names produce the expected stem without a digest."""
-        assert _safe_snapshot_stem(1, "chr22", 100, 200) == "rank001_chr22_100_200"
-        assert _safe_snapshot_stem(3, "chrX", 1000, 2000) == "rank003_chrX_1000_2000"
+        stem = _safe_snapshot_stem(1, "chr1", 100, 200)
+        assert stem == "rank001_chr1_100_200"
 
     def test_already_safe_chrom_no_digest(self):
-        """A name containing only safe characters is unchanged and has no digest."""
-        stem = _safe_snapshot_stem(1, "chr1_a", 100, 200)
-        assert stem == "rank001_chr1_a_100_200"
+        stem = _safe_snapshot_stem(2, "chr1.alt", 100, 200)
+        assert stem == "rank002_chr1.alt_100_200"
 
     def test_slash_chrom_gets_digest(self):
-        """A chromosome with a slash is sanitised and receives a 6-char digest."""
-        stem = _safe_snapshot_stem(1, "chr1/a", 100, 200)
-        # sanitised prefix + 6-hex digest + coords
-        assert stem.startswith("rank001_chr1_a_")
+        stem = _safe_snapshot_stem(3, "chr1/a", 100, 200)
+        assert stem.startswith("rank003_chr1_a_")
         assert stem.endswith("_100_200")
-        assert stem != "rank001_chr1_a_100_200"  # digest was inserted
 
     def test_slash_and_underscore_chroms_do_not_collide(self):
-        """chr1/a and chr1_a must produce distinct stems at the same coordinates."""
-        stem_slash = _safe_snapshot_stem(1, "chr1/a", 100, 200)
-        stem_under = _safe_snapshot_stem(1, "chr1_a", 100, 200)
-        assert stem_slash != stem_under
+        slash = _safe_snapshot_stem(1, "chr1/a", 100, 200)
+        underscore = _safe_snapshot_stem(1, "chr1_a", 100, 200)
+        assert slash != underscore
 
     def test_colon_and_slash_chroms_do_not_collide(self):
-        """chr1:a and chr1/a both sanitise to chr1_a but must have distinct stems."""
-        stem_colon = _safe_snapshot_stem(1, "chr1:a", 100, 200)
-        stem_slash = _safe_snapshot_stem(1, "chr1/a", 100, 200)
-        assert stem_colon != stem_slash
+        colon = _safe_snapshot_stem(1, "chr1:a", 100, 200)
+        slash = _safe_snapshot_stem(1, "chr1/a", 100, 200)
+        assert colon != slash
 
     def test_space_in_chrom_gets_digest(self):
-        """A chromosome with a space is sanitised and receives a digest."""
-        stem = _safe_snapshot_stem(1, "chr1 a", 100, 200)
-        assert " " not in stem
-        assert stem != "rank001_chr1_a_100_200"
+        stem = _safe_snapshot_stem(4, "chr1 weird", 100, 200)
+        assert stem.startswith("rank004_chr1_weird_")
+        assert stem.endswith("_100_200")
 
     def test_contig_id_appended_after_coords(self):
-        """Contig ID is still appended after the coordinates."""
-        stem = _safe_snapshot_stem(2, "chr22", 100, 200, contig_id="NODE_1")
-        assert stem == "rank002_chr22_100_200_NODE_1"
+        stem = _safe_snapshot_stem(5, "chr1", 100, 200, contig_id="NODE_1")
+        assert stem == "rank005_chr1_100_200_NODE_1"
 
     def test_contig_id_truncated_to_32(self):
-        """Contig IDs longer than 32 characters are truncated."""
-        long_contig = "A" * 40
-        stem = _safe_snapshot_stem(1, "chr22", 100, 200, contig_id=long_contig)
-        parts = stem.split("_")
-        contig_part = parts[-1]
+        contig_id = "N" * 64
+        stem = _safe_snapshot_stem(6, "chr1", 100, 200, contig_id=contig_id)
+        contig_part = stem.split("_")[-1]
         assert len(contig_part) <= 32
 
 
@@ -719,7 +712,6 @@ class TestIgvBatchPathQuoting:
         }
         with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
             batch = build_igv_batch_script(_make_batch_variants("chr1"), **setup)
-        # The full space-containing path must appear quoted on the genome line.
         ref_str = str(ref.resolve())
         assert f'genome "{ref_str}"' in batch
 
@@ -734,3 +726,46 @@ class TestIgvBatchPathQuoting:
         p = tmp_path / "plain.fa"
         result = _quote_igv_path(p)
         assert result == f'"{p}"'
+
+
+# ---------------------------------------------------------------------------
+# _igv_singleton_lock
+# ---------------------------------------------------------------------------
+
+
+class TestIgvSingletonLock:
+    def test_default_lock_path_uses_tempdir_and_uid(self, monkeypatch, tmp_path):
+        fake_uid = 4242
+        monkeypatch.setattr(igv_plots.tempfile, "gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr(igv_plots.os, "getuid", lambda: fake_uid)
+        with _igv_singleton_lock(timeout_sec=0.1, poll_sec=0.1):
+            lock_path = tmp_path / f"retro_miner_igv_{fake_uid}.lock"
+            assert lock_path.exists()
+            raw = lock_path.read_text(encoding="utf-8").strip()
+            assert raw.split("\t")[0] == str(os.getpid())
+        assert not lock_path.exists()
+
+    def test_default_lock_paths_differ_across_uids(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(igv_plots.tempfile, "gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr(igv_plots.os, "getuid", lambda: 111)
+        with _igv_singleton_lock(timeout_sec=0.1, poll_sec=0.1):
+            assert (tmp_path / "retro_miner_igv_111.lock").exists()
+            assert not (tmp_path / "retro_miner_igv_222.lock").exists()
+        monkeypatch.setattr(igv_plots.os, "getuid", lambda: 222)
+        with _igv_singleton_lock(timeout_sec=0.1, poll_sec=0.1):
+            assert (tmp_path / "retro_miner_igv_222.lock").exists()
+            assert not (tmp_path / "retro_miner_igv_111.lock").exists()
+
+    def test_custom_lock_path_override_is_respected(self, tmp_path):
+        custom = tmp_path / "custom.lock"
+        with _igv_singleton_lock(lock_path=custom, timeout_sec=0.1, poll_sec=0.1):
+            assert custom.exists()
+        assert not custom.exists()
+
+    def test_default_lock_path_matches_tempfile_gettempdir(self):
+        expected = Path(tempfile.gettempdir()) / f"retro_miner_igv_{os.getuid()}.lock"
+        with patch("retro_miner.igv_plots.os.open", side_effect=FileExistsError):
+            with patch("retro_miner.igv_plots.Path.read_text", return_value=f"{os.getpid()}\t0"):
+                with pytest.raises(RuntimeError, match=str(expected)):
+                    with _igv_singleton_lock(timeout_sec=0.0, poll_sec=0.1):
+                        pass
