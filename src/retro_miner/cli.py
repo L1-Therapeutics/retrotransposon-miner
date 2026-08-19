@@ -155,15 +155,15 @@ def _extract_one_sample(
     default=None,
     help="Optional comma-separated region/chromosome list (overrides --region), e.g. chr15,chr16,chr17.",
 )
-@click.option("--min-mapq", default=20, show_default=True, type=int, help="Minimum split-read anchor mapping quality.")
+@click.option("--min-mapq", default=20, show_default=True, type=click.IntRange(min=0, max=255), help="Minimum split-read anchor mapping quality.")
 @click.option(
     "--min-mapq-discordant",
     default=0,
     show_default=True,
-    type=int,
+    type=click.IntRange(min=0, max=255),
     help="Minimum discordant-read anchor mapping quality.",
 )
-@click.option("--min-clip-len", default=20, show_default=True, type=int, help="Minimum soft-clip length for primary SR clips.")
+@click.option("--min-clip-len", default=20, show_default=True, type=click.IntRange(min=1), help="Minimum soft-clip length for primary SR clips.")
 @click.option(
     "--poly-tail-rescue-min-clip-len",
     default=8,
@@ -439,7 +439,7 @@ def extract_split_evidence_cmd(
     default=None,
     help="Output directory for candidate loci table (defaults to evidence-dir).",
 )
-@click.option("--window-size", type=int, default=200, show_default=True, help="Window size in bp for locus binning.")
+@click.option("--window-size", type=click.IntRange(min=1), default=200, show_default=True, help="Window size in bp for locus binning.")
 @click.option(
     "--split-cluster-bp",
     type=int,
