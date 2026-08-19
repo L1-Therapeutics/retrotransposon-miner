@@ -13,11 +13,12 @@ from unittest.mock import MagicMock
 
 import pandas as _pd
 
-# Opt into pandas 2.2+ future behavior for fillna/ffill/bfill on object-dtype
-# Series.  Every callsite in this codebase already performs an explicit
-# .astype() after fillna, so the new non-downcasting behavior is safe and
-# this eliminates FutureWarnings during test runs.
-_pd.set_option("future.no_silent_downcasting", True)
+# Pandas 2.2 emits FutureWarning when fillna() silently downcasts object
+# Series. Opt into the 2.2+ behavior so those warnings are not test noise.
+# Pandas 3 already uses that behavior and deprecates the option (Pandas4Warning).
+_pd_major_minor = tuple(int(x) for x in _pd.__version__.split(".")[:2])
+if _pd_major_minor < (3, 0):
+    _pd.set_option("future.no_silent_downcasting", True)
 
 try:
     import pysam  # noqa: F401
