@@ -12965,11 +12965,13 @@ def _extract_int_from_info(value: object, default: int = -1) -> int:
             return default
         try:
             return int(max(vals))
-        except Exception:
+        except (ValueError, TypeError) as exc:
+            logger.debug("non-numeric int INFO value %r: %s", value, exc)
             return default
     try:
         return int(value)
-    except Exception:
+    except (ValueError, TypeError) as exc:
+        logger.debug("non-numeric int INFO value %r: %s", value, exc)
         return default
 
 
