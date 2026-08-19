@@ -14,6 +14,7 @@ width is the longest observed polyA/T support at the locus.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import random
 import re
 import textwrap
@@ -2445,7 +2446,21 @@ def _safe_plot_stem(
     sample: str,
     rank: int | None = None,
 ) -> str:
-    safe_chrom = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
+    """Return a filesystem-safe read-architecture plot filename stem.
+
+    Special characters in *chrom* and *sample* are replaced with underscores.
+    When sanitisation changes *chrom*, a 6-hex-character SHA-256 digest of
+    the original string is embedded between the sanitised name and the
+    coordinates to prevent distinct chromosome names that sanitise identically
+    (e.g. ``chr1/a`` and ``chr1_a``) from producing the same filename and
+    silently overwriting each other.  Canonical names such as ``chr22`` are
+    unaffected.
+    """
+    chrom_str = str(chrom)
+    safe_chrom = re.sub(r"[^A-Za-z0-9_.-]+", "_", chrom_str)
+    if safe_chrom != chrom_str:
+        digest = hashlib.sha256(chrom_str.encode("utf-8")).hexdigest()[:6]
+        safe_chrom = f"{safe_chrom}_{digest}"
     safe_sample = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sample))
     body = f"read_arch_{safe_sample}_{safe_chrom}_{int(window_start)}_{int(window_end)}"
     if rank is None:
@@ -2744,9 +2759,11 @@ def plot_locus_architecture(
     for spine in ax.spines.values():
         spine.set_color(COLOR_BLACK)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=100)
-    plt.close(fig)
-    return out_png, detail
+    try:
+        fig.savefig(out_png, dpi=100)
+        return out_png, detail
+    finally:
+        plt.close(fig)
 
 
 def generate_gold_read_architecture_plots(
