@@ -300,7 +300,8 @@ def _iter_fasta_records(path: Path) -> list[tuple[str, str]]:
             if line.startswith(">"):
                 if name:
                     out.append((name, "".join(seq_parts)))
-                name = line[1:].split()[0]
+                tokens = line[1:].split()
+                name = tokens[0] if tokens else "unnamed_record"
                 seq_parts = []
             else:
                 seq_parts.append(line.upper())

@@ -1239,7 +1239,8 @@ def _iter_fasta(path: Path):
             if line.startswith(">"):
                 if header is not None:
                     yield header, "".join(seq_parts).upper()
-                header = line[1:].split()[0]
+                tokens = line[1:].split()
+                header = tokens[0] if tokens else "unnamed_record"
                 seq_parts = []
             else:
                 seq_parts.append(line)
