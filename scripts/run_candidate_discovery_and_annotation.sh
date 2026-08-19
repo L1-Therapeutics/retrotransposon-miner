@@ -35,7 +35,7 @@ CHR_CONCURRENCY="6"
 SAMPLE_WORKERS=""
 # bwa mem -t for MEI remaps. Empty = auto after chrom list is known:
 #   multi-chrom with CHR_CONCURRENCY>1 → 1
-#   single-chrom (or serial chroms) → nproc
+#   single-chrom (or serial chroms) → nproc (or sysctl -n hw.ncpu on macOS)
 # Explicit --bwa-threads always wins. annotate-mei-support CLI default is also 1.
 BWA_THREADS=""
 BWA_THREADS_EXPLICIT="0"
@@ -92,7 +92,9 @@ resolve_chr_list() {
     echo "${REGION}"
     return 0
   fi
-  if [[ "${chr_arg,,}" == "all" ]]; then
+  local chr_arg_lower
+  chr_arg_lower="$(printf '%s' "${chr_arg}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${chr_arg_lower}" == "all" ]]; then
     local i
     for i in $(seq 22 -1 1); do
       echo "chr${i}"
@@ -266,7 +268,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --reference-build|--reference)
-      REFERENCE_BUILD="${2,,}"
+      REFERENCE_BUILD="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
       shift 2
       ;;
     --window-size)
@@ -631,12 +633,17 @@ run_single_pipeline() {
       sample_workers=2
     fi
   fi
+  # Collect optional --*-mate-bam arguments into a local array so that any
+  # path containing spaces is word-split correctly.  Unquoted command
+  # substitution ($(...)) is unsafe for such paths (SC2046).
+  local _mate_bam_args=()
+  [[ -n "${DISEASE_MATE_BAM}" ]] && _mate_bam_args+=(--disease-mate-bam "${DISEASE_MATE_BAM}")
+  [[ -n "${CONTROL_MATE_BAM}" ]] && _mate_bam_args+=(--control-mate-bam "${CONTROL_MATE_BAM}")
   echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir} (sample_workers=${sample_workers}; no-fetch-mate-seq)"
   run_cli extract-split-evidence \
     --disease-bam "${DISEASE_BAM}" \
     --control-bam "${CONTROL_BAM}" \
-    $( [[ -n "${DISEASE_MATE_BAM}" ]] && printf '%s ' --disease-mate-bam "${DISEASE_MATE_BAM}" ) \
-    $( [[ -n "${CONTROL_MATE_BAM}" ]] && printf '%s ' --control-mate-bam "${CONTROL_MATE_BAM}" ) \
+    "${_mate_bam_args[@]}" \
     --outdir "${run_outdir}" \
     --region "${run_region}" \
     --min-mapq 20 \
@@ -671,7 +678,10 @@ if ! [[ "${CHR_CONCURRENCY}" =~ ^[0-9]+$ ]] || [[ "${CHR_CONCURRENCY}" -lt 1 ]];
   exit 1
 fi
 
-mapfile -t CHR_LIST < <(resolve_chr_list "${CHR_ARG}")
+CHR_LIST=()
+while IFS= read -r _chr_line; do
+  CHR_LIST+=("${_chr_line}")
+done < <(resolve_chr_list "${CHR_ARG}")
 if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
   echo "ERROR: resolved empty chromosome list from --chr '${CHR_ARG}'." >&2
   exit 1
@@ -686,7 +696,7 @@ if [[ "${BWA_THREADS_EXPLICIT}" == "1" ]]; then
 elif [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${CHR_CONCURRENCY}" -gt 1 ]]; then
   BWA_THREADS="1"
 else
-  BWA_THREADS="$(nproc)"
+  BWA_THREADS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
 fi
 echo "[candidate-pipeline] bwa_threads=${BWA_THREADS} (explicit=${BWA_THREADS_EXPLICIT}; chr_count=${#CHR_LIST[@]}; chr_concurrency=${CHR_CONCURRENCY})"
 
@@ -716,7 +726,7 @@ if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; th
   fi
 fi
 
-if [[ -n "${CHR_ARG}" ]] && [[ "${CHR_ARG,,}" == "all" ]]; then
+if [[ -n "${CHR_ARG}" ]] && [[ "$(printf '%s' "${CHR_ARG}" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
   CHR_ALL_MODE="1"
 fi
 
