@@ -854,34 +854,51 @@ def _infer_orientation(
         return None
 
     def _collect(evidence: str) -> tuple[list[float], list[float]]:
-        left_mids: list[float] = []
-        right_mids: list[float] = []
-        for rec in work.itertuples(index=False):
-            if bool(getattr(rec, "polya_rescue", False)):
-                continue
-            if str(getattr(rec, "mei_hit_source", "") or "") == "polya_rescue":
-                continue
-            et = str(rec.evidence_type)
-            if evidence == "DPE":
-                if et != "DPE" or not bool(getattr(rec, "mate_mei_hit", False)):
-                    continue
-                start = int(getattr(rec, "mate_mei_start", 0) or 0)
-                end = int(getattr(rec, "mate_mei_end", 0) or 0)
-            else:
-                if et != "SR" or not bool(getattr(rec, "mei_hit", False)):
-                    continue
-                start = int(getattr(rec, "mei_start", 0) or 0)
-                end = int(getattr(rec, "mei_end", 0) or 0)
-            if start <= 0 or end <= 0:
-                continue
-            side = _junction_side(rec, evidence=evidence)
-            if side not in {"L", "R"}:
-                continue
-            mid = (start + end) / 2.0
-            if side == "L":
-                left_mids.append(mid)
-            else:
-                right_mids.append(mid)
+        def _col(name: str, default: object) -> pd.Series:
+            if name in work.columns:
+                return work[name]
+            return pd.Series(default, index=work.index)
+
+        base_mask = (~_col("polya_rescue", False).map(bool)) & (
+            _col("mei_hit_source", "").fillna("").astype(str) != "polya_rescue"
+        )
+        evidence_type = _col("evidence_type", "").fillna("").astype(str)
+
+        if evidence == "DPE":
+            starts = pd.to_numeric(_col("mate_mei_start", 0), errors="coerce").fillna(0)
+            ends = pd.to_numeric(_col("mate_mei_end", 0), errors="coerce").fillna(0)
+            mask = base_mask & evidence_type.eq("DPE") & _col("mate_mei_hit", False).map(bool)
+
+            genomic_pos = pd.to_numeric(_col("genomic_pos", 0), errors="coerce").fillna(0)
+            anchor_side = _col("anchor_side", "").fillna("").astype(str).str.upper()
+            side = pd.Series(pd.NA, index=work.index, dtype="object")
+            genomic_mask = genomic_pos.gt(0)
+
+            if bp_l is not None and bp_r is not None:
+                side.loc[genomic_mask & genomic_pos.le(bp_l)] = "L"
+                side.loc[genomic_mask & genomic_pos.ge(bp_r)] = "R"
+            if bp is not None:
+                side.loc[side.isna() & genomic_mask & genomic_pos.le(bp)] = "L"
+                side.loc[side.isna() & genomic_mask & genomic_pos.gt(bp)] = "R"
+            side.loc[side.isna() & anchor_side.isin(["L", "R"])] = anchor_side.loc[
+                side.isna() & anchor_side.isin(["L", "R"])
+            ]
+        else:
+            starts = pd.to_numeric(_col("mei_start", 0), errors="coerce").fillna(0)
+            ends = pd.to_numeric(_col("mei_end", 0), errors="coerce").fillna(0)
+            mask = base_mask & evidence_type.eq("SR") & _col("mei_hit", False).map(bool)
+
+            clip_side = _col("clip_side", "").fillna("").astype(str)
+            anchor_side = _col("anchor_side", "").fillna("").astype(str)
+            junction_source = clip_side.where(clip_side != "", anchor_side).str.upper()
+            side = pd.Series(pd.NA, index=work.index, dtype="object")
+            side.loc[junction_source.eq("L")] = "R"
+            side.loc[junction_source.eq("R")] = "L"
+
+        valid = mask & starts.gt(0) & ends.gt(0) & side.isin(["L", "R"])
+        mids = (starts + ends) / 2.0
+        left_mids = mids.loc[valid & side.eq("L")].tolist()
+        right_mids = mids.loc[valid & side.eq("R")].tolist()
         return left_mids, right_mids
 
     def _call(left_mids: list[float], right_mids: list[float]) -> str | None:
