@@ -150,7 +150,6 @@ def _distance_to_closed_interval(pos: int, start: int, end: int) -> int:
         return pos - end
     return 0
 
-
 def _build_loci_from_evidence(
     split_disease: pd.DataFrame,
     split_control: pd.DataFrame,
@@ -588,13 +587,22 @@ def _normalize_track_to_bed(
 
 
 def _write_candidate_windows_bed(loci: pd.DataFrame, output_path: Path) -> None:
-    with output_path.open("w", encoding="utf-8") as handle:
-        for row in loci.itertuples(index=False):
-            # BED uses 0-based start, half-open end.
-            start0 = int(row.window_start) - 1
-            end0 = int(row.window_end)
-            handle.write(f"{row.chrom}\t{start0}\t{end0}\t{row.row_id}\n")
+    """Write candidate window BED file using vectorized string joins."""
+    if loci.empty:
+        output_path.write_text("", encoding="utf-8")
+        return
 
+    chroms = loci["chrom"].astype(str)
+    starts0 = (
+        pd.to_numeric(loci["window_start"], errors="coerce").fillna(1).astype(int) - 1
+    ).astype(str)
+    ends0 = (
+        pd.to_numeric(loci["window_end"], errors="coerce").fillna(0).astype(int)
+    ).astype(str)
+    row_ids = loci["row_id"].astype(str)
+
+    lines = chroms + "\t" + starts0 + "\t" + ends0 + "\t" + row_ids + "\n"
+    output_path.write_text("".join(lines), encoding="utf-8")
 
 def _get_overlapping_row_ids(a_bed: Path, b_bed: Path) -> set[int]:
     cmd = ["bedtools", "intersect", "-a", str(a_bed), "-b", str(b_bed), "-wa", "-u"]
