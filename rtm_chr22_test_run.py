@@ -61,210 +61,200 @@ import os
 import shutil
 from pathlib import Path
 
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.identity import ClientSecretCredential
+from azure.storage.filedatalake import DataLakeServiceClient
 
-def ensure_runtime_dirs(root: Path) -> None:
+
+storage_account = dbutils.widgets.get("rtm_storage_account").strip()
+container = dbutils.widgets.get("rtm_container").strip() or "l1tx-rtm-miner-output"
+tenant_id = dbutils.widgets.get("rtm_tenant_id_key").strip()
+client_id = dbutils.widgets.get("rtm_client_id_key").strip()
+client_secret = dbutils.widgets.get("rtm_client_secret_key").strip()
+keep_intermediates = dbutils.widgets.get("rtm_keep_intermediates").strip() == "1"
+
+missing = [
+    name
+    for name, value in [
+        ("rtm_storage_account", storage_account),
+        ("rtm_container", container),
+        ("rtm_tenant_id_key", tenant_id),
+        ("rtm_client_id_key", client_id),
+        ("rtm_client_secret_key", client_secret),
+    ]
+    if not value
+]
+if missing:
+    raise ValueError("Missing required parameters: " + ", ".join(missing))
+
+account_fqdn = f"{storage_account}.dfs.core.windows.net"
+account_url = f"https://{account_fqdn}"
+workdir_prefix = "retrotransposon-workdir"
+source_uri = f"abfss://{container}@{account_fqdn}/"
+rtm_persistent_workdir = f"{source_uri}{workdir_prefix}"
+rtm_public_data_dir = f"{rtm_persistent_workdir}/data/public"
+rtm_results_dir = f"{rtm_persistent_workdir}/results"
+local_workdir = Path("/local_disk0/tmp/retrotransposon-workdir")
+local_public_data_dir = local_workdir / "data" / "public"
+local_results_dir = local_workdir / "results"
+local_logs_dir = local_workdir / "logs"
+
+
+def ensure_local_dirs(root: Path) -> None:
     (root / "data" / "public").mkdir(parents=True, exist_ok=True)
     (root / "results").mkdir(parents=True, exist_ok=True)
     (root / "logs").mkdir(parents=True, exist_ok=True)
 
 
-def normalize_fuse_path(path_value: str) -> str:
-    path_value = path_value.strip()
-    if path_value.startswith("dbfs:/"):
-        return "/dbfs/" + path_value[len("dbfs:/"):].lstrip("/")
-    return path_value
+def normalize_remote_path(path: str) -> str:
+    return path.strip("/")
 
 
-def is_ephemeral_path(path: Path) -> bool:
-    path_str = str(path)
-    return path_str.startswith("/local_disk0/") or path_str.startswith("/tmp/") or path_str.startswith(str(Path.home()))
+credential = ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
+service_client = DataLakeServiceClient(account_url=account_url, credential=credential)
+file_system_client = service_client.get_file_system_client(container)
+
+spark.conf.set(f"fs.azure.account.auth.type.{account_fqdn}", "OAuth")
+spark.conf.set(
+    f"fs.azure.account.oauth.provider.type.{account_fqdn}",
+    "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider",
+)
+spark.conf.set(f"fs.azure.account.oauth2.client.id.{account_fqdn}", client_id)
+spark.conf.set(f"fs.azure.account.oauth2.client.secret.{account_fqdn}", client_secret)
+spark.conf.set(
+    f"fs.azure.account.oauth2.client.endpoint.{account_fqdn}",
+    f"https://login.microsoftonline.com/{tenant_id}/oauth2/token",
+)
 
 
-def copy_path(src: Path, dst: Path) -> None:
-    if src.is_dir():
-        shutil.copytree(src, dst, dirs_exist_ok=True)
-    else:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-
-
-def set_text_widget(name: str, default_value: str) -> str:
+for remote_dir in [workdir_prefix, f"{workdir_prefix}/data", f"{workdir_prefix}/data/public", f"{workdir_prefix}/results", f"{workdir_prefix}/logs"]:
     try:
-        dbutils.widgets.text(name, default_value)
-        return dbutils.widgets.get(name).strip()
-    except Exception:
-        return default_value.strip()
+        file_system_client.create_directory(normalize_remote_path(remote_dir))
+    except ResourceExistsError:
+        pass
+
+ensure_local_dirs(local_workdir)
 
 
-def set_dropdown_widget(name: str, default_value: str, choices: list[str]) -> str:
+def _download_dir(remote_dir: str, local_dir: Path) -> bool:
+    remote_dir = normalize_remote_path(remote_dir)
     try:
-        dbutils.widgets.dropdown(name, default_value, choices)
-        return dbutils.widgets.get(name).strip()
-    except Exception:
-        return default_value.strip()
+        paths = list(file_system_client.get_paths(path=remote_dir, recursive=True))
+    except ResourceNotFoundError:
+        return False
+    if not paths:
+        return False
+    local_dir.mkdir(parents=True, exist_ok=True)
+    for path_info in paths:
+        rel_path = Path(path_info.name).relative_to(remote_dir)
+        local_path = local_dir / rel_path
+        if path_info.is_directory:
+            local_path.mkdir(parents=True, exist_ok=True)
+            continue
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        file_bytes = file_system_client.get_file_client(path_info.name).download_file().readall()
+        local_path.write_bytes(file_bytes)
+    return True
 
 
-def validate_persistent_root(path: Path) -> tuple[bool, str]:
-    path_str = str(path)
-    if path_str.startswith("/dbfs/mnt/"):
-        parts = path.parts
-        if len(parts) < 4:
-            return False, "DBFS mount paths must look like /dbfs/mnt/<mount-name>/..."
-        mount_root = Path("/dbfs/mnt") / parts[3]
-        if not mount_root.exists():
-            return False, f"DBFS mount not found: {mount_root}"
-    elif path_str.startswith("/dbfs/Volumes/"):
-        parts = path.parts
-        if len(parts) < 6:
-            return False, "UC Volume paths must look like /dbfs/Volumes/<catalog>/<schema>/<volume>/..."
-        volume_root = Path("/dbfs/Volumes") / parts[3] / parts[4] / parts[5]
-        if not volume_root.exists():
-            return False, f"UC Volume not found: {volume_root}"
-    elif path_str.startswith("/Volumes/"):
-        parts = path.parts
-        if len(parts) < 5:
-            return False, "UC Volume paths must look like /Volumes/<catalog>/<schema>/<volume>/..."
-        volume_root = Path("/Volumes") / parts[2] / parts[3] / parts[4]
-        if not volume_root.exists():
-            return False, f"UC Volume not found: {volume_root}"
-    return True, ""
+def _upload_file(local_file: Path, remote_file: str) -> None:
+    remote_file = normalize_remote_path(remote_file)
+    file_client = file_system_client.get_file_client(remote_file)
+    with local_file.open("rb") as handle:
+        file_client.upload_data(handle, overwrite=True)
 
 
-widget_mount_name_default = os.environ.get("RTM_MOUNT_NAME", "rtm-miner-output")
-widget_persistent_default = os.environ.get("RTM_PERSISTENT_WORKDIR", "")
-widget_use_local_cache_default = os.environ.get("RTM_USE_LOCAL_CACHE", "1")
-widget_require_persistent_default = os.environ.get("RTM_REQUIRE_PERSISTENT_STORAGE", "1")
-widget_keep_intermediates_default = os.environ.get("RTM_KEEP_INTERMEDIATES", "1")
-
-mount_name = set_text_widget("rtm_mount_name", widget_mount_name_default)
-persistent_workdir_value = set_text_widget("rtm_persistent_workdir", widget_persistent_default)
-use_local_cache = set_dropdown_widget("rtm_use_local_cache", widget_use_local_cache_default, ["1", "0"]) == "1"
-require_persistent_storage = set_dropdown_widget("rtm_require_persistent_storage", widget_require_persistent_default, ["1", "0"]) == "1"
-keep_intermediates = set_dropdown_widget("rtm_keep_intermediates", widget_keep_intermediates_default, ["1", "0"]) == "1"
-
-preferred_persistent_candidates = []
-if mount_name:
-    preferred_persistent_candidates.append(Path(f"/dbfs/mnt/{mount_name}/retrotransposon-workdir"))
-
-if not persistent_workdir_value:
-    for candidate in preferred_persistent_candidates:
-        is_valid, _ = validate_persistent_root(candidate)
-        if is_valid:
-            persistent_workdir_value = str(candidate)
-            break
-
-persistent_workdir_value = normalize_fuse_path(persistent_workdir_value) if persistent_workdir_value else ""
-workdir_value = normalize_fuse_path(os.environ.get("RTM_WORKDIR", "")) if os.environ.get("RTM_WORKDIR") else ""
-
-local_cache_candidates = [
-    Path("/local_disk0/tmp/retrotransposon-workdir"),
-    Path("/tmp/retrotransposon-workdir"),
-]
-
-rtm_persistent_workdir = Path(persistent_workdir_value) if persistent_workdir_value else None
-if rtm_persistent_workdir is None and workdir_value:
-    candidate = Path(workdir_value)
-    if not is_ephemeral_path(candidate):
-        rtm_persistent_workdir = candidate
-
-if rtm_persistent_workdir is not None:
-    is_valid_root, validation_msg = validate_persistent_root(rtm_persistent_workdir)
-    if not is_valid_root:
-        raise RuntimeError(
-            f"Persistent workdir path is not ready: {rtm_persistent_workdir}. {validation_msg}. "
-            "Mount the new blob container first, then set rtm_persistent_workdir to a mounted DBFS FUSE path "
-            "such as /dbfs/mnt/<mount-name>/retrotransposon-workdir or a UC Volume path."
-        )
-elif require_persistent_storage:
-    raise RuntimeError(
-        "Persistent storage is required for this notebook run. Set rtm_persistent_workdir to a mounted blob-backed "
-        "DBFS FUSE path or a UC Volume path before rerunning from the top."
-    )
-
-local_cache_workdir = None
-last_error = None
-for candidate in local_cache_candidates:
+def _upload_dir(local_dir: Path, remote_dir: str) -> None:
+    remote_dir = normalize_remote_path(remote_dir)
     try:
-        ensure_runtime_dirs(candidate)
-        local_cache_workdir = candidate
-        break
-    except OSError as exc:
-        last_error = exc
-
-if rtm_persistent_workdir is not None:
-    ensure_runtime_dirs(rtm_persistent_workdir)
-    os.environ["RTM_PERSISTENT_WORKDIR"] = str(rtm_persistent_workdir)
-    os.environ["RTM_MOUNT_NAME"] = mount_name
-    rtm_workdir = local_cache_workdir if use_local_cache and local_cache_workdir is not None else rtm_persistent_workdir
-elif workdir_value:
-    rtm_workdir = Path(workdir_value)
-    ensure_runtime_dirs(rtm_workdir)
-else:
-    if local_cache_workdir is None:
-        raise RuntimeError(f"Could not create a writable RTM workdir: {last_error}")
-    rtm_workdir = local_cache_workdir
-
-ensure_runtime_dirs(rtm_workdir)
-rtm_public_data_dir = rtm_workdir / "data" / "public"
-rtm_results_dir = rtm_workdir / "results"
-
-os.environ["RTM_WORKDIR"] = str(rtm_workdir)
-os.environ["RTM_PUBLIC_DATA_DIR"] = str(rtm_public_data_dir)
-os.environ["RTM_RESULTS_DIR"] = str(rtm_results_dir)
-os.environ["RTM_USE_LOCAL_CACHE"] = "1" if use_local_cache else "0"
-os.environ["RTM_REQUIRE_PERSISTENT_STORAGE"] = "1" if require_persistent_storage else "0"
-os.environ["RTM_KEEP_INTERMEDIATES"] = "1" if keep_intermediates else "0"
+        file_system_client.create_directory(remote_dir)
+    except ResourceExistsError:
+        pass
+    for child in local_dir.rglob("*"):
+        rel_path = child.relative_to(local_dir)
+        remote_path = f"{remote_dir}/{rel_path.as_posix()}"
+        if child.is_dir():
+            try:
+                file_system_client.create_directory(remote_path)
+            except ResourceExistsError:
+                pass
+        else:
+            _upload_file(child, remote_path)
 
 
-def persistent_path_for(path_like) -> Path | None:
-    if rtm_persistent_workdir is None:
-        return None
+def _local_relpath(path_like) -> Path | None:
     path = Path(path_like)
     try:
-        rel = path.relative_to(rtm_workdir)
+        return path.relative_to(local_workdir)
     except ValueError:
         return None
-    return rtm_persistent_workdir / rel
 
 
-def sync_path_to_persistent(path_like) -> Path | None:
-    dst = persistent_path_for(path_like)
-    if dst is None:
+def persistent_path_for(path_like) -> str | None:
+    rel = _local_relpath(path_like)
+    if rel is None:
         return None
+    return f"{rtm_persistent_workdir}/{rel.as_posix()}"
+
+
+def sync_local_to_abfss(path_like) -> str | None:
     src = Path(path_like)
-    if not src.exists():
+    rel = _local_relpath(src)
+    if rel is None or not src.exists():
         return None
-    copy_path(src, dst)
-    return dst
+    remote_path = f"{workdir_prefix}/{rel.as_posix()}"
+    if src.is_dir():
+        _upload_dir(src, remote_path)
+    else:
+        _upload_file(src, remote_path)
+    return f"{source_uri}{remote_path}"
+
+
+def restore_abfss_dir(path_like) -> Path | None:
+    dst = Path(path_like)
+    rel = _local_relpath(dst)
+    if rel is None:
+        return None
+    restored = _download_dir(f"{workdir_prefix}/{rel.as_posix()}", dst)
+    return dst if restored else None
+
+
+def sync_path_to_persistent(path_like) -> str | None:
+    return sync_local_to_abfss(path_like)
 
 
 def restore_path_from_persistent(path_like) -> Path | None:
-    src = persistent_path_for(path_like)
-    if src is None or not src.exists():
-        return None
-    dst = Path(path_like)
-    copy_path(src, dst)
-    return dst
+    return restore_abfss_dir(path_like)
 
 
-if rtm_persistent_workdir is not None and rtm_workdir != rtm_persistent_workdir:
-    for relative_dir in [Path("results"), Path("data/public")]:
-        local_dir = rtm_workdir / relative_dir
-        persistent_dir = rtm_persistent_workdir / relative_dir
-        if persistent_dir.exists() and not any(local_dir.iterdir()):
-            shutil.copytree(persistent_dir, local_dir, dirs_exist_ok=True)
-            print(f"Restored {relative_dir} from persistent storage: {persistent_dir}")
+for local_dir, label in [(local_results_dir, "results"), (local_public_data_dir, "public data")]:
+    if any(local_dir.iterdir()):
+        continue
+    restored = restore_abfss_dir(local_dir)
+    if restored is not None:
+        print(f"Restored {label} from ABFSS: {persistent_path_for(local_dir)}")
 
+os.environ["RTM_STORAGE_ACCOUNT"] = storage_account
+os.environ["RTM_CONTAINER"] = container
+os.environ["RTM_PERSISTENT_WORKDIR"] = rtm_persistent_workdir
+os.environ["RTM_WORKDIR"] = rtm_persistent_workdir
+os.environ["RTM_PUBLIC_DATA_DIR"] = rtm_public_data_dir
+os.environ["RTM_RESULTS_DIR"] = rtm_results_dir
+os.environ["RTM_LOCAL_WORKDIR"] = str(local_workdir)
+os.environ["RTM_LOCAL_PUBLIC_DATA_DIR"] = str(local_public_data_dir)
+os.environ["RTM_LOCAL_RESULTS_DIR"] = str(local_results_dir)
+os.environ["RTM_KEEP_INTERMEDIATES"] = "1" if keep_intermediates else "0"
+
+print(f"RTM_PERSISTENT_WORKDIR={rtm_persistent_workdir}")
+print(f"Blob source={source_uri}")
 print(f"RTM_WORKDIR={os.environ['RTM_WORKDIR']}")
 print(f"RTM_PUBLIC_DATA_DIR={os.environ['RTM_PUBLIC_DATA_DIR']}")
 print(f"RTM_RESULTS_DIR={os.environ['RTM_RESULTS_DIR']}")
+print(f"RTM_LOCAL_WORKDIR={os.environ['RTM_LOCAL_WORKDIR']}")
+print(f"RTM_LOCAL_PUBLIC_DATA_DIR={os.environ['RTM_LOCAL_PUBLIC_DATA_DIR']}")
+print(f"RTM_LOCAL_RESULTS_DIR={os.environ['RTM_LOCAL_RESULTS_DIR']}")
 print(f"RTM_KEEP_INTERMEDIATES={keep_intermediates}")
-if rtm_persistent_workdir is not None:
-    print(f"RTM_PERSISTENT_WORKDIR={rtm_persistent_workdir}")
-    print(f"RTM_USE_LOCAL_CACHE={use_local_cache}")
-    print(f"RTM_MOUNT_NAME={mount_name}")
-else:
-    print("WARNING: using ephemeral local storage only.")
+
 
 # COMMAND ----------
 
