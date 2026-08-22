@@ -852,36 +852,58 @@ def _infer_orientation(
             return "L"
         return None
 
-    def _collect(evidence: str) -> tuple[list[float], list[float]]:
-        left_mids: list[float] = []
-        right_mids: list[float] = []
-        for rec in work.itertuples(index=False):
-            if bool(getattr(rec, "polya_rescue", False)):
-                continue
-            if str(getattr(rec, "mei_hit_source", "") or "") == "polya_rescue":
-                continue
-            et = str(rec.evidence_type)
-            if evidence == "DPE":
-                if et != "DPE" or not bool(getattr(rec, "mate_mei_hit", False)):
-                    continue
-                start = int(getattr(rec, "mate_mei_start", 0) or 0)
-                end = int(getattr(rec, "mate_mei_end", 0) or 0)
-            else:
-                if et != "SR" or not bool(getattr(rec, "mei_hit", False)):
-                    continue
-                start = int(getattr(rec, "mei_start", 0) or 0)
-                end = int(getattr(rec, "mei_end", 0) or 0)
-            if start <= 0 or end <= 0:
-                continue
-            side = _junction_side(rec, evidence=evidence)
-            if side not in {"L", "R"}:
-                continue
-            mid = (start + end) / 2.0
-            if side == "L":
-                left_mids.append(mid)
-            else:
-                right_mids.append(mid)
-        return left_mids, right_mids
+    def _collect_vec(df: pd.DataFrame, evidence: str) -> tuple[list[float], list[float]]:
+        """
+        Vectorized alternative to _collect with boolean mask operations.
+    
+        Returns:
+        (left_midpoints, right_midpoints): list of float coordinates
+        """
+        if df.empty:
+            return [], []
+
+        # Boolean filter conditions
+        # 1. Exclude polya rescue rows
+        rescue = df.get("polya_rescue", False).fillna(False).astype(bool)
+    
+        # 2. Filter by evidence type and MEI hit status
+        et = df.get("evidence_type", "").fillna("").astype(str)
+        if evidence == "DPE":
+            hit_col = df.get("mate_mei_hit", False).fillna(False).astype(bool)
+            type_mask = (et == "DPE") & hit_col
+            start_col, end_col = "mate_mei_start", "mate_mei_end"
+        else:  # evidence == "SR"
+            hit_col = df.get("mei_hit", False).fillna(False).astype(bool)
+            type_mask = (et == "SR") & hit_col
+            start_col, end_col = "mei_start", "mei_end"
+
+        valid_mask = ~rescue
+        final_mask = valid_mask & type_mask
+
+        if (final_mask.sum() == 0):
+            return [], []
+
+        # Vectorized filtering
+        work_sub = df[final_mask].copy()
+        
+        # Vectorized coordinate conversion and validation
+        starts = pd.to_numeric(work_sub.get(start_col, 0), errors="coerce").fillna(0).astype(int)
+        ends = pd.to_numeric(work_sub.get(end_col, 0), errors="coerce").fillna(0).astype(int)
+        
+        valid_coords_mask = (starts > 0) & (ends > 0)
+        work_sub = work_sub[valid_coords_mask]
+        
+        if work_sub.empty:
+            return [], []
+
+        # Vectorized midpoint calculation
+        mids = (starts + ends) / 2.0
+        
+        # Vectorized junction side classification
+        sides = work_sub.apply(lambda r: _junction_side(r, evidence=evidence), axis=1)
+        
+        # Return lists for visualization
+        return mids[sides == "L"].tolist(), mids[sides == "R"].tolist()
 
     def _call(left_mids: list[float], right_mids: list[float]) -> str | None:
         if not left_mids or not right_mids:
@@ -1618,7 +1640,7 @@ def _dedupe_detail_rows(detail: pd.DataFrame) -> pd.DataFrame:
         s = out.get(col, False)
         if not isinstance(s, pd.Series):
             return pd.Series(False, index=out.index)
-        return s.fillna(False).infer_objects(copy=False).astype(bool)
+        return s.fillna(False).infer_objects().astype(bool)
 
     out["_mei_rank"] = (
         _flag("mate_mei_hit").astype(int) * 4
@@ -1640,7 +1662,7 @@ def _detail_support_mask(detail: pd.DataFrame) -> pd.Series:
         s = detail.get(col, False)
         if not isinstance(s, pd.Series):
             return pd.Series(False, index=detail.index)
-        return s.fillna(False).infer_objects(copy=False).astype(bool)
+        return s.fillna(False).infer_objects().astype(bool)
 
     poly_run = pd.Series(False, index=detail.index)
     if "clip_poly_at_run" in detail.columns:
