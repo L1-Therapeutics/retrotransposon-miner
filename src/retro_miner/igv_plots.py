@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,8 +39,12 @@ def _igv_singleton_lock(
     timeout_sec: float = 600.0,
     poll_sec: float = 1.0,
 ):
-    """Serialize IGV batch runs to avoid java.net.BindException port collisions."""
-    lock_file = lock_path or Path("/tmp/retro_miner_igv.lock")
+    """Serialize IGV batch runs to avoid java.net.BindException port collisions.
+
+    The default lock path includes the current user's UID so distinct OS users
+    cannot interfere with each other's IGV singleton coordination.
+    """
+    lock_file = lock_path or Path(tempfile.gettempdir()) / f"retro_miner_igv_{os.getuid()}.lock"
     start = time.monotonic()
     owner_fd: int | None = None
     while owner_fd is None:
@@ -246,12 +252,49 @@ def _estimate_panel_height(
 
 
 def _safe_snapshot_stem(rank: int, chrom: str, start: int, end: int, *, contig_id: str = "") -> str:
+    """Return a filesystem-safe IGV snapshot stem.
+
+    Special characters in *chrom* are replaced with underscores. When
+    sanitisation changes the value, a 6-hex-character SHA-256 digest of the
+    original string is embedded to prevent distinct chromosome names that
+    sanitise identically from producing the same snapshot filename.
+    """
     chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
+    if chrom_safe != str(chrom):
+        digest = hashlib.sha256(str(chrom).encode()).hexdigest()[:6]
+        chrom_safe = f"{chrom_safe}_{digest}"
     contig_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(contig_id or "")).strip("_")
     if contig_safe:
         contig_safe = contig_safe[:32]
         return f"rank{rank:03d}_{chrom_safe}_{start}_{end}_{contig_safe}"
     return f"rank{rank:03d}_{chrom_safe}_{start}_{end}"
+
+
+_IGV_BATCH_FORBIDDEN: frozenset[str] = frozenset("\n\r\t")
+
+
+def _validate_igv_chrom(chrom: str) -> None:
+    """Raise ValueError if *chrom* contains characters that would corrupt an IGV batch command.
+
+    Newlines, carriage returns, and tabs are forbidden because a ``goto`` line such as
+    ``goto chr22\\nBAD:100-200`` would be split into two separate batch commands, causing
+    IGV to receive an unintended command and to navigate to the wrong locus.
+    """
+    for ch in _IGV_BATCH_FORBIDDEN:
+        if ch in chrom:
+            raise ValueError(
+                f"IGV batch chromosome contains a forbidden character (0x{ord(ch):02x}): {chrom!r}"
+            )
+
+
+def _quote_igv_path(p: Path) -> str:
+    """Return *p* wrapped in double quotes for use in an IGV batch command."""
+    s = str(p)
+    if '"' in s:
+        raise ValueError(
+            f"IGV batch path contains a forbidden double-quote character: {s!r}"
+        )
+    return f'"{s}"'
 
 
 def _window_locus_id(chrom: str, window_start: int, window_end: int) -> str:
@@ -337,11 +380,52 @@ def _build_assembly_contig_track(
             oh.write(f">{name}\n{seq}\n")
 
     bam_path = snapshot_dir / "assembly_selected_contigs.bam"
-    cmd = f'minimap2 -a -x asm5 "{reference_fasta.resolve()}" "{query_fa.resolve()}" | samtools sort -o "{bam_path.resolve()}" -'
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)
-    if proc.returncode != 0 or not bam_path.exists():
-        detail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-2000:]
+    try:
+        minimap2_proc = subprocess.Popen(
+            [
+                "minimap2",
+                "-a",
+                "-x",
+                "asm5",
+                str(reference_fasta.resolve()),
+                str(query_fa.resolve()),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        samtools_proc = subprocess.Popen(
+            [
+                "samtools",
+                "sort",
+                "-o",
+                str(bam_path.resolve()),
+                "-",
+            ],
+            stdin=minimap2_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        click.echo(f"[igv-plots] failed contig track alignment; skipping ({exc})")
+        return None
+    assert minimap2_proc.stdout is not None  # always set when stdout=PIPE; satisfies type checkers
+    minimap2_proc.stdout.close()  # release our reference so minimap2 receives SIGPIPE if samtools exits early
+    _, samtools_stderr = samtools_proc.communicate()
+    minimap2_stderr = minimap2_proc.stderr.read() if minimap2_proc.stderr is not None else b""
+    minimap2_rc = minimap2_proc.wait()
+    samtools_rc = samtools_proc.returncode
+    if minimap2_rc != 0 or samtools_rc != 0 or not bam_path.exists():
+        detail = (
+            samtools_stderr.decode("utf-8", errors="replace")
+            + "\n"
+            + minimap2_stderr.decode("utf-8", errors="replace")
+        ).strip()[-2000:]
         click.echo(f"[igv-plots] failed contig track alignment; skipping ({detail})")
+        if bam_path.exists():
+            try:
+                bam_path.unlink()
+            except OSError:
+                pass
         return None
     idx_proc = subprocess.run(["samtools", "index", str(bam_path)], capture_output=True, text=True, check=False)
     if idx_proc.returncode != 0 or _resolve_bam_index(bam_path) is None:
@@ -411,18 +495,20 @@ def build_igv_batch_script(
 
     lines: list[str] = [
         "new",
-        f"genome {reference_fasta.resolve()}",
-        f"snapshotDirectory {snapshot_dir.resolve()}",
+        f"genome {_quote_igv_path(reference_fasta.resolve())}",
+        f"snapshotDirectory {_quote_igv_path(snapshot_dir.resolve())}",
         "preference SAM.SHOW_SOFT_CLIPPED true",
-        f"load {disease_bam.resolve()} index={disease_index.resolve()}",
-        f"load {control_bam.resolve()} index={control_index.resolve()}",
+        f"load {_quote_igv_path(disease_bam.resolve())} index={_quote_igv_path(disease_index.resolve())}",
+        f"load {_quote_igv_path(control_bam.resolve())} index={_quote_igv_path(control_index.resolve())}",
     ]
     if contig_alignment_bam is not None:
         contig_idx = _resolve_bam_index(contig_alignment_bam)
         if contig_idx is not None:
-            lines.append(f"load {contig_alignment_bam.resolve()} index={contig_idx.resolve()}")
+            lines.append(
+                f"load {_quote_igv_path(contig_alignment_bam.resolve())} index={_quote_igv_path(contig_idx.resolve())}"
+            )
     if contig_annotation_bed is not None and contig_annotation_bed.exists():
-        lines.append(f"load {contig_annotation_bed.resolve()}")
+        lines.append(f"load {_quote_igv_path(contig_annotation_bed.resolve())}")
 
     for rank, row in enumerate(variants.itertuples(index=False), start=1):
         chrom, start, end = _row_discovery_window(row)
@@ -433,6 +519,11 @@ def build_igv_batch_script(
             view_start = max(1, mid - 100)
             view_end = mid + 100
         if not chrom or start <= 0 or end < start:
+            continue
+        try:
+            _validate_igv_chrom(chrom)
+        except ValueError as exc:
+            click.echo(f"[igv-plots] skipping row {rank}: invalid chromosome \u2014 {exc}")
             continue
         panel_height = _estimate_panel_height(
             disease_bam,
