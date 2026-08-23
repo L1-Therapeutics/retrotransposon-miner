@@ -10,12 +10,15 @@ import shutil
 import subprocess
 import tempfile
 import time
+import traceback
+import warnings
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import click
 import pysam
 from intervaltree import IntervalTree
@@ -39,6 +42,17 @@ _MIN_MEI_ANCHOR_BP = 25
 _MIN_POLYA_RUN_FOR_END_IMPUTE = 12
 _MIN_MEI_ANCHOR_BP_RELAXED = 15
 _MIN_REPORTABLE_MEI_SPAN_BP = 20
+#: Maximum seconds to wait for ``bwa index`` on the MEI consensus FASTA.
+#: The panel is typically small (~500 records × ~6 kb), so indexing should
+#: complete in a few seconds; 600 s is a safety cap against filesystem hangs.
+_BWA_INDEX_TIMEOUT: int = 600
+#: Maximum seconds to wait for a single ``bwa mem`` remapping run.
+#: Clip/discordant query batches are usually small; matches _MINIMAP2_TIMEOUT.
+_BWA_MEM_TIMEOUT: int = 120
+#: Maximum seconds to wait for a ``bedtools intersect`` or ``bedtools sort`` call.
+#: Genome-wide intersections on large annotation files can take several minutes;
+#: 300 s is a conservative cap that still bounds an indefinite hang.
+_BEDTOOLS_TIMEOUT: int = 300
 
 
 @dataclass(frozen=True)
@@ -518,13 +532,16 @@ def _discordant_rows_for_mei_identity(mei_df: pd.DataFrame) -> pd.DataFrame:
 
 def _format_vote_map(counts: dict[str, int]) -> str:
     """Serialize ``{label: weight}`` as ``LABEL:N,LABEL:N`` (stable key order)."""
-    parts = []
-    for key in sorted(counts):
-        weight = int(counts[key])
-        label = str(key or "").strip()
-        if label and weight > 0:
-            parts.append(f"{label}:{weight}")
-    return ",".join(parts)
+    if not counts:
+        return ""
+    items = [
+        (label, int(weight))
+        for key, weight in counts.items()
+        if (label := str(key or "").strip())
+        if int(weight) > 0
+    ]
+    items.sort(key=lambda item: item[0])
+    return ",".join(f"{label}:{weight}" for label, weight in items)
 
 
 def _parse_vote_map(text: object) -> dict[str, int]:
@@ -535,15 +552,23 @@ def _parse_vote_map(text: object) -> dict[str, int]:
     out: dict[str, int] = {}
     for part in raw.split(","):
         part = part.strip()
-        if not part or ":" not in part:
+        if not part:
             continue
-        label, weight_s = part.rsplit(":", 1)
-        label = label.strip()
+        label_raw, sep, weight_raw = part.partition(":")
+        if sep != ":":
+            continue
+        label = label_raw.strip()
+        if not label:
+            continue
+        weight_raw = weight_raw.strip()
         try:
-            weight = int(float(weight_s))
+            weight = int(weight_raw)
         except (TypeError, ValueError):
-            continue
-        if label and weight > 0:
+            try:
+                weight = int(float(weight_raw))
+            except (TypeError, ValueError):
+                continue
+        if weight > 0:
             out[label] = out.get(label, 0) + weight
     return out
 
@@ -990,13 +1015,28 @@ def _best_hits_from_paf(paf_path: Path) -> pd.DataFrame:
 _CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
 
 
+def _iter_cigar_ops(cigar: str):
+    """Yield ``(length, op)`` CIGAR tokens using a single-pass scanner."""
+    num = 0
+    have_num = False
+    for ch in cigar or "":
+        if "0" <= ch <= "9":
+            num = (num * 10) + (ord(ch) - ord("0"))
+            have_num = True
+            continue
+        if have_num and ch in "MIDNSHP=X":
+            yield num, ch
+        num = 0
+        have_num = False
+
+
+
 def _cigar_alignment_spans(cigar: str) -> tuple[int, int, int]:
     """Return (query_aligned_bp, ref_span_bp, alnlen) from a CIGAR string."""
     q_aln = 0
     r_span = 0
     alnlen = 0
-    for n_s, op in _CIGAR_RE.findall(cigar or ""):
-        n = int(n_s)
+    for n, op in _iter_cigar_ops(cigar):
         if op in {"M", "=", "X"}:
             q_aln += n
             r_span += n
@@ -1010,13 +1050,37 @@ def _cigar_alignment_spans(cigar: str) -> tuple[int, int, int]:
     return q_aln, r_span, alnlen
 
 
+
 def _cigar_query_len(cigar: str) -> int:
     """Full query length implied by CIGAR (M/I/=/X/S/H)."""
     qlen = 0
-    for n_s, op in _CIGAR_RE.findall(cigar or ""):
+    for n, op in _iter_cigar_ops(cigar):
         if op in {"M", "I", "=", "X", "S", "H"}:
-            qlen += int(n_s)
+            qlen += n
     return qlen
+
+
+def _cigar_mismatches(cigar: str) -> int | None:
+    """Count mismatch base-pairs from extended-CIGAR ``X`` ops.
+
+    Returns the total ``X`` (sequence-mismatch) base count when the CIGAR uses
+    extended operators (``=`` for matches, ``X`` for mismatches).  Returns
+    ``None`` when the CIGAR uses only basic ``M`` operations and therefore
+    cannot distinguish matches from mismatches without the ``NM`` SAM tag.
+
+    Callers should treat a ``None`` return as "identity unresolvable from
+    CIGAR alone" and either use the ``NM`` tag or fall back to a conservative
+    value (e.g. ``pid = 0.0``).
+    """
+    has_extended = False
+    x_bp = 0
+    for n_s, op in _CIGAR_RE.findall(cigar or ""):
+        if op == "X":
+            x_bp += int(n_s)
+            has_extended = True
+        elif op == "=":
+            has_extended = True
+    return x_bp if has_extended else None
 
 
 def _best_hits_from_sam(sam_text: str, *, target_lengths: dict[str, int] | None = None) -> pd.DataFrame:
@@ -1067,9 +1131,28 @@ def _best_hits_from_sam(sam_text: str, *, target_lengths: dict[str, int] | None 
         q_aln, r_span, alnlen = _cigar_alignment_spans(cigar)
         if alnlen <= 0:
             continue
-        nm = int(tags["NM"]) if "NM" in tags and str(tags["NM"]).lstrip("-").isdigit() else 0
-        nmatch = max(0, alnlen - nm)
-        pid = (nmatch / alnlen) if alnlen > 0 else 0.0
+        if "NM" in tags and str(tags["NM"]).lstrip("-").isdigit():
+            nm = int(tags["NM"])
+            nmatch = max(0, alnlen - nm)
+            pid = (nmatch / alnlen) if alnlen > 0 else 0.0
+        else:
+            # NM tag absent — attempt to derive mismatches from extended-CIGAR
+            # X ops (present when the aligner was invoked with -x / extended
+            # CIGAR output).  _cigar_mismatches returns None for basic M-only
+            # CIGAR where matches and mismatches are indistinguishable.
+            x_nm = _cigar_mismatches(cigar)
+            if x_nm is not None:
+                # Extended CIGAR: use X bp as the mismatch count.  Note that
+                # indels contribute to alnlen but not x_nm, so this slightly
+                # overestimates pid when indels are present — but it is still
+                # far more accurate than defaulting nm=0 (pid=1.0).
+                nmatch = max(0, alnlen - x_nm)
+                pid = (nmatch / alnlen) if alnlen > 0 else 0.0
+            else:
+                # Basic M-only CIGAR without NM tag: percent identity is
+                # unresolvable.  Assign 0.0 to avoid falsely claiming 100%
+                # identity for reads whose alignment quality is unknown.
+                pid = 0.0
         # Prefer CIGAR-implied full query length so soft/hard clips count in qcov.
         qlen = _cigar_query_len(cigar)
         if qlen <= 0:
@@ -1120,42 +1203,54 @@ def trim_mei_consensus_terminal_polya(seq: str, *, min_run: int = _MEI_CONSENSUS
 
 
 def _write_polya_trimmed_fasta(src: Path, dst: Path, *, min_run: int = _MEI_CONSENSUS_POLYA_MIN_TRIM) -> int:
-    """Write ``dst`` with terminal polyA/T stripped from each record. Returns n trimmed."""
+    """Write ``dst`` with terminal polyA/T stripped from each record.  Returns n trimmed.
+
+    The destination is written through an adjacent ``.tmp`` sidecar file that
+    is atomically renamed into place on success.  An interruption therefore
+    cannot leave a partial ``dst`` that the caller's mtime/size freshness check
+    in :func:`_ensure_polya_trimmed_mei_fasta` would silently accept as valid.
+    """
     src = Path(src)
     dst = Path(dst)
     n_trimmed = 0
     dst.parent.mkdir(parents=True, exist_ok=True)
-    with src.open("r", encoding="utf-8") as hin, dst.open("w", encoding="utf-8") as hout:
-        name: str | None = None
-        seq_parts: list[str] = []
+    tmp = dst.with_name(dst.name + ".tmp")
+    try:
+        with src.open("r", encoding="utf-8") as hin, tmp.open("w", encoding="utf-8") as hout:
+            name: str | None = None
+            seq_parts: list[str] = []
 
-        def _flush() -> None:
-            nonlocal n_trimmed, name, seq_parts
-            if name is None:
-                return
-            raw = "".join(seq_parts)
-            trimmed = trim_mei_consensus_terminal_polya(raw, min_run=min_run)
-            if len(trimmed) != len(raw.upper().replace("U", "T")):
-                n_trimmed += 1
-            if not trimmed:
+            def _flush() -> None:
+                nonlocal n_trimmed, name, seq_parts
+                if name is None:
+                    return
+                raw = "".join(seq_parts)
+                trimmed = trim_mei_consensus_terminal_polya(raw, min_run=min_run)
+                if len(trimmed) != len(raw.upper().replace("U", "T")):
+                    n_trimmed += 1
+                if not trimmed:
+                    name = None
+                    seq_parts = []
+                    return
+                # ``name`` is the full FASTA header line including the leading '>'.
+                hout.write(name if name.endswith("\n") else f"{name}\n")
+                for i in range(0, len(trimmed), 60):
+                    hout.write(trimmed[i : i + 60] + "\n")
                 name = None
                 seq_parts = []
-                return
-            # ``name`` is the full FASTA header line including the leading '>'.
-            hout.write(name if name.endswith("\n") else f"{name}\n")
-            for i in range(0, len(trimmed), 60):
-                hout.write(trimmed[i : i + 60] + "\n")
-            name = None
-            seq_parts = []
 
-        for line in hin:
-            if line.startswith(">"):
-                _flush()
-                name = line.rstrip("\n")
-                seq_parts = []
-            else:
-                seq_parts.append(line.strip())
-        _flush()
+            for line in hin:
+                if line.startswith(">"):
+                    _flush()
+                    name = line.rstrip("\n")
+                    seq_parts = []
+                else:
+                    seq_parts.append(line.strip())
+            _flush()
+        tmp.replace(dst)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     return n_trimmed
 
 
@@ -1178,15 +1273,26 @@ def _ensure_polya_trimmed_mei_fasta(mei_fasta: Path) -> Path:
 
 
 def _ensure_bwa_index(mei_fasta: Path) -> None:
-    """Build classic bwa index next to ``mei_fasta`` when missing."""
+    """Build classic bwa index next to ``mei_fasta`` when missing.
+
+    Raises :exc:`RuntimeError` if ``bwa index`` does not complete within
+    :data:`_BWA_INDEX_TIMEOUT` seconds, preventing an indefinite hang on a
+    corrupted or unexpectedly large FASTA file.
+    """
     if Path(f"{mei_fasta}.bwt").exists() and Path(f"{mei_fasta}.sa").exists():
         return
-    subprocess.run(
-        ["bwa", "index", str(mei_fasta)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        subprocess.run(
+            ["bwa", "index", str(mei_fasta)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_BWA_INDEX_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"bwa index timed out after {_BWA_INDEX_TIMEOUT}s for {mei_fasta}"
+        ) from exc
 
 
 def _align_queries_to_mei_bwa(
@@ -1195,11 +1301,21 @@ def _align_queries_to_mei_bwa(
     *,
     bwa_threads: int = 1,
 ) -> pd.DataFrame:
-    """Remap query FASTA to MEI consensus with ``bwa mem -k10 -T10``."""
+    """Remap query FASTA to MEI consensus with ``bwa mem -k10 -T10``.
+
+    Raises :exc:`RuntimeError` if ``bwa mem`` does not complete within
+    :data:`_BWA_MEM_TIMEOUT` seconds.
+    """
     remap_fa = _ensure_polya_trimmed_mei_fasta(mei_fasta)
     _ensure_bwa_index(remap_fa)
     cmd = ["bwa", *_bwa_mem_mei_args(bwa_threads=bwa_threads), str(remap_fa), str(query_fa)]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=_BWA_MEM_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"bwa mem timed out after {_BWA_MEM_TIMEOUT}s "
+            f"for query={query_fa} mei={remap_fa}"
+        ) from exc
     return _best_hits_from_sam(proc.stdout or "")
 
 
@@ -4384,8 +4500,8 @@ def _poly_at_artifact_tsd_mask(tsd_seq: pd.Series) -> pd.Series:
     """True for sequences that are polyA/polyT tails, not real TSDs."""
     tsd_seq_s = tsd_seq.fillna("").astype(str).str.upper()
     tsd_len_s = tsd_seq_s.str.len().astype(int)
-    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects(copy=False).astype(float)
-    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects(copy=False).astype(float)
+    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects().astype(float)
+    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects().astype(float)
     dominant_poly_fraction = pd.concat([a_fraction, t_fraction], axis=1).max(axis=1)
     longest_at_run = tsd_seq_s.str.findall(r"[AT]+").map(
         lambda parts: max((len(p) for p in parts), default=0)
@@ -7040,33 +7156,23 @@ def _infer_disease_insertion_metrics(
             out[col] = 0
         out[col] = out[col].fillna(0).astype(int)
 
-    disease_metrics = out.apply(
-        lambda r: _sample_insertion_span_and_orientation(r, "disease"),
-        axis=1,
-        result_type="expand",
-    )
-    disease_metrics.columns = [
-        "disease_insertion_mei_start",
-        "disease_insertion_mei_end",
-        "disease_insertion_mei_span",
-        "disease_insertion_orientation",
+    disease_metrics = [
+        _sample_insertion_span_and_orientation(row, "disease")
+        for row in out.itertuples(index=False)
     ]
-    for col in disease_metrics.columns:
-        out[col] = disease_metrics[col]
+    out["disease_insertion_mei_start"] = [r[0] for r in disease_metrics]
+    out["disease_insertion_mei_end"] = [r[1] for r in disease_metrics]
+    out["disease_insertion_mei_span"] = [r[2] for r in disease_metrics]
+    out["disease_insertion_orientation"] = [r[3] for r in disease_metrics]
 
-    control_metrics = out.apply(
-        lambda r: _sample_insertion_span_and_orientation(r, "control"),
-        axis=1,
-        result_type="expand",
-    )
-    control_metrics.columns = [
-        "control_insertion_mei_start",
-        "control_insertion_mei_end",
-        "control_insertion_mei_span",
-        "control_insertion_orientation",
+    control_metrics = [
+        _sample_insertion_span_and_orientation(row, "control")
+        for row in out.itertuples(index=False)
     ]
-    for col in control_metrics.columns:
-        out[col] = control_metrics[col]
+    out["control_insertion_mei_start"] = [r[0] for r in control_metrics]
+    out["control_insertion_mei_end"] = [r[1] for r in control_metrics]
+    out["control_insertion_mei_span"] = [r[2] for r in control_metrics]
+    out["control_insertion_orientation"] = [r[3] for r in control_metrics]
 
     def _pick_tsd_pair(row: pd.Series) -> tuple[int, int, int, str]:
         # Prefer strict bilateral pairs from either disease or control.
@@ -7413,17 +7519,16 @@ def _infer_disease_insertion_metrics(
         _sample_pri, _neg_total, _neg_poly, _neg_len, ll, rr, src = candidates[0]
         return (int(ll), int(rr), int(rr - ll + 1), str(src))
 
-    gap_seed = out.apply(
-        lambda r: _split_gap_tsd_rescue(r),
-        axis=1,
-        result_type="expand",
+    gap_seed_records = [_split_gap_tsd_rescue(row) for row in out.itertuples(index=False)]
+    gap_seed = pd.DataFrame(
+        {
+            "gap_tsd_left_breakpoint": [r[0] for r in gap_seed_records],
+            "gap_tsd_right_breakpoint": [r[1] for r in gap_seed_records],
+            "gap_tsd_len_estimate": [r[2] for r in gap_seed_records],
+            "gap_tsd_evidence_source": [r[3] for r in gap_seed_records],
+        },
+        index=out.index,
     )
-    gap_seed.columns = [
-        "gap_tsd_left_breakpoint",
-        "gap_tsd_right_breakpoint",
-        "gap_tsd_len_estimate",
-        "gap_tsd_evidence_source",
-    ]
     gap_len = pd.to_numeric(gap_seed["gap_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
     gap_mask = (out["tsd_len_estimate"].fillna(0).astype(int) < 4) & (gap_len >= 4)
     out.loc[gap_mask, "tsd_left_breakpoint"] = (
@@ -7530,17 +7635,19 @@ def _infer_disease_insertion_metrics(
             return (0, 0, 0, "")
         return (int(ll), int(rr), int(rr - ll + 1), str(src))
 
-    one_sided_seed = out.apply(
-        lambda r: _one_sided_polyA_tsd_bridge_rescue(r),
-        axis=1,
-        result_type="expand",
-    )
-    one_sided_seed.columns = [
-        "seed_tsd_left_breakpoint",
-        "seed_tsd_right_breakpoint",
-        "seed_tsd_len_estimate",
-        "seed_tsd_evidence_source",
+    one_sided_seed_records = [
+        _one_sided_polyA_tsd_bridge_rescue(row)
+        for row in out.itertuples(index=False)
     ]
+    one_sided_seed = pd.DataFrame(
+        {
+            "seed_tsd_left_breakpoint": [r[0] for r in one_sided_seed_records],
+            "seed_tsd_right_breakpoint": [r[1] for r in one_sided_seed_records],
+            "seed_tsd_len_estimate": [r[2] for r in one_sided_seed_records],
+            "seed_tsd_evidence_source": [r[3] for r in one_sided_seed_records],
+        },
+        index=out.index,
+    )
     seed_len = pd.to_numeric(one_sided_seed["seed_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
     seed_mask = (out["tsd_len_estimate"].fillna(0).astype(int) < 4) & (seed_len >= 4)
     out.loc[seed_mask, "tsd_left_breakpoint"] = (
@@ -7663,17 +7770,19 @@ def _infer_disease_insertion_metrics(
 
         with pysam.FastaFile(str(reference_fasta)) as ref:
             fetch_ref = _make_reference_fetcher(ref)
-            rescued = out.apply(
-                lambda r: _rescue_tsd_pair_with_reference(r, fetch_ref),
-                axis=1,
-                result_type="expand",
+            rescued_records = [
+                _rescue_tsd_pair_with_reference(row, fetch_ref)
+                for row in out.itertuples(index=False)
+            ]
+            rescued = pd.DataFrame(
+                {
+                    "resc_tsd_left_breakpoint": [r[0] for r in rescued_records],
+                    "resc_tsd_right_breakpoint": [r[1] for r in rescued_records],
+                    "resc_tsd_len_estimate": [r[2] for r in rescued_records],
+                    "resc_tsd_evidence_source": [r[3] for r in rescued_records],
+                },
+                index=out.index,
             )
-        rescued.columns = [
-            "resc_tsd_left_breakpoint",
-            "resc_tsd_right_breakpoint",
-            "resc_tsd_len_estimate",
-            "resc_tsd_evidence_source",
-        ]
         resc_len = pd.to_numeric(rescued["resc_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
         replace_mask = (out["tsd_len_estimate"].fillna(0).astype(int) < 4) & (resc_len >= 4)
         out.loc[replace_mask, "tsd_left_breakpoint"] = (
@@ -7844,17 +7953,19 @@ def _infer_disease_insertion_metrics(
                 return (0, 0, 0, "")
             return best_value
 
-        clip_exact = out.apply(
-            lambda r: _clip_exact_tsd_rescue(r, fetch_ref),
-            axis=1,
-            result_type="expand",
-        )
-        clip_exact.columns = [
-            "clip_tsd_left_breakpoint",
-            "clip_tsd_right_breakpoint",
-            "clip_tsd_len_estimate",
-            "clip_tsd_evidence_source",
+        clip_exact_records = [
+            _clip_exact_tsd_rescue(row, fetch_ref)
+            for row in out.itertuples(index=False)
         ]
+        clip_exact = pd.DataFrame(
+            {
+                "clip_tsd_left_breakpoint": [r[0] for r in clip_exact_records],
+                "clip_tsd_right_breakpoint": [r[1] for r in clip_exact_records],
+                "clip_tsd_len_estimate": [r[2] for r in clip_exact_records],
+                "clip_tsd_evidence_source": [r[3] for r in clip_exact_records],
+            },
+            index=out.index,
+        )
         clip_len = pd.to_numeric(clip_exact["clip_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
         # Keep diagnostic columns so we can audit clip-rescue behavior on all loci.
         out["clip_tsd_len_estimate"] = clip_len.astype(int)
@@ -7940,17 +8051,19 @@ def _infer_disease_insertion_metrics(
                 return (ll, rr, int(min_len), src)
             return (0, 0, 0, "")
 
-        one_sided = out.apply(
-            lambda r: _one_sided_polyA_tsd_rescue(r, fetch_ref),
-            axis=1,
-            result_type="expand",
-        )
-        one_sided.columns = [
-            "one_tsd_left_breakpoint",
-            "one_tsd_right_breakpoint",
-            "one_tsd_len_estimate",
-            "one_tsd_evidence_source",
+        one_sided_records = [
+            _one_sided_polyA_tsd_rescue(row, fetch_ref)
+            for row in out.itertuples(index=False)
         ]
+        one_sided = pd.DataFrame(
+            {
+                "one_tsd_left_breakpoint": [r[0] for r in one_sided_records],
+                "one_tsd_right_breakpoint": [r[1] for r in one_sided_records],
+                "one_tsd_len_estimate": [r[2] for r in one_sided_records],
+                "one_tsd_evidence_source": [r[3] for r in one_sided_records],
+            },
+            index=out.index,
+        )
         one_len = pd.to_numeric(one_sided["one_tsd_len_estimate"], errors="coerce").fillna(0).astype(int)
         one_mask = (out["tsd_len_estimate"].fillna(0).astype(int) < 4) & (one_len >= 4)
         out.loc[one_mask, "tsd_left_breakpoint"] = (
@@ -8242,8 +8355,8 @@ def _infer_disease_insertion_metrics(
         * _df_col_series(out, "control_R_mei_supported_reads", 0)
     ) / _df_col_series(out, "control_mei_supported_reads", 0).replace(0, 1)
 
-    out["insertion_orientation"] = out.apply(_choose_consolidated_insertion_orientation, axis=1)
-    out["insertion_mei_span"] = out.apply(_choose_consolidated_insertion_mei_span, axis=1).astype(int)
+    out["insertion_orientation"] = _choose_consolidated_insertion_orientation_vec(out)
+    out["insertion_mei_span"] = _choose_consolidated_insertion_mei_span_vec(out).astype(int)
     return out
 
 
@@ -8572,6 +8685,7 @@ def _row_bool(row: pd.Series, key: str, default: bool = False) -> bool:
 
 
 def _sample_insertion_span_and_orientation(row: pd.Series, prefix: str) -> tuple[int, int, int, str]:
+    row = _ensure_row_gettable(row)
     l_start = _row_int(row, f"{prefix}_L_mei_start")
     r_start = _row_int(row, f"{prefix}_R_mei_start")
     l_end = _row_int(row, f"{prefix}_L_mei_end")
@@ -8590,7 +8704,10 @@ def _sample_insertion_span_and_orientation(row: pd.Series, prefix: str) -> tuple
     raw_end = 0
     strands = [
         s
-        for s in [row.get(f"{prefix}_L_mei_strand", ""), row.get(f"{prefix}_R_mei_strand", "")]
+        for s in [
+            _row_get_attr_or_key(row, f"{prefix}_L_mei_strand", ""),
+            _row_get_attr_or_key(row, f"{prefix}_R_mei_strand", ""),
+        ]
         if s in {"+", "-"}
     ]
     if not strands:
@@ -8684,6 +8801,63 @@ def _sample_has_bilateral_discordant_support(row: pd.Series, prefix: str) -> boo
     return left >= 1 and right >= 1
 
 
+def _vec_orientation_series(df: pd.DataFrame, col: str) -> pd.Series:
+    return _df_col_series(df, col, "").fillna("").astype(str).str.strip()
+
+
+def _vec_int_series(df: pd.DataFrame, col: str) -> pd.Series:
+    return pd.to_numeric(_df_col_series(df, col, 0), errors="coerce").fillna(0).astype(int)
+
+
+def _vec_sample_has_bilateral_support(df: pd.DataFrame, prefix: str) -> pd.Series:
+    split_left = _vec_int_series(df, f"{prefix}_L_mei_supported_reads")
+    split_right = _vec_int_series(df, f"{prefix}_R_mei_supported_reads")
+    discordant_left = _vec_int_series(df, f"{prefix}_discordant_mei_left_supported_reads")
+    discordant_right = _vec_int_series(df, f"{prefix}_discordant_mei_right_supported_reads")
+    return ((split_left >= 1) & (split_right >= 1)) | ((discordant_left >= 1) & (discordant_right >= 1))
+
+
+def _choose_event_orientation_vec(df: pd.DataFrame) -> pd.Series:
+    candidates = [
+        _vec_orientation_series(df, "consensus_insertion_orientation"),
+        _vec_orientation_series(df, "insertion_orientation"),
+        _vec_orientation_series(df, "asm_insertion_orientation"),
+        _vec_orientation_series(df, "disease_insertion_orientation"),
+        _vec_orientation_series(df, "control_insertion_orientation"),
+        _vec_orientation_series(df, "disease_discordant_mei_strand"),
+        _vec_orientation_series(df, "disease_L_mei_strand"),
+        _vec_orientation_series(df, "disease_R_mei_strand"),
+        _vec_orientation_series(df, "control_discordant_mei_strand"),
+        _vec_orientation_series(df, "control_L_mei_strand"),
+        _vec_orientation_series(df, "control_R_mei_strand"),
+    ]
+    conditions = [candidate.isin(["+", "-"]) for candidate in candidates]
+    return pd.Series(np.select(conditions, candidates, default=""), index=df.index)
+
+
+def _choose_consolidated_insertion_orientation_vec(df: pd.DataFrame) -> pd.Series:
+    disease_orient = _vec_orientation_series(df, "disease_insertion_orientation")
+    control_orient = _vec_orientation_series(df, "control_insertion_orientation")
+    disease_bilateral = _vec_sample_has_bilateral_support(df, "disease")
+    control_bilateral = _vec_sample_has_bilateral_support(df, "control")
+    d_valid = disease_orient.isin(["+", "-"])
+    c_valid = control_orient.isin(["+", "-"])
+    conditions = [
+        disease_bilateral & d_valid,
+        control_bilateral & c_valid,
+        d_valid,
+        c_valid,
+    ]
+    choices = [
+        disease_orient,
+        control_orient,
+        disease_orient,
+        control_orient,
+    ]
+    default = _choose_event_orientation_vec(df)
+    return pd.Series(np.select(conditions, choices, default=default), index=df.index)
+
+
 def _choose_consolidated_insertion_orientation(row: pd.Series) -> str:
     disease_orient = str(row.get("disease_insertion_orientation", "") or "").strip()
     control_orient = str(row.get("control_insertion_orientation", "") or "").strip()
@@ -8702,6 +8876,29 @@ def _choose_consolidated_insertion_orientation(row: pd.Series) -> str:
     if control_orient in {"+", "-"}:
         return control_orient
     return _choose_event_orientation(row)
+
+
+def _choose_consolidated_insertion_mei_span_vec(df: pd.DataFrame) -> pd.Series:
+    disease_span = _vec_int_series(df, "disease_insertion_mei_span")
+    control_span = _vec_int_series(df, "control_insertion_mei_span")
+    disease_reads = _vec_int_series(df, "disease_mei_supported_reads")
+    control_reads = _vec_int_series(df, "control_mei_supported_reads")
+    disease_bilateral = _vec_sample_has_bilateral_support(df, "disease")
+    control_bilateral = _vec_sample_has_bilateral_support(df, "control")
+    cond_both_gt_zero = (disease_span > 0) & (control_span > 0)
+    both_choice = pd.Series(np.where(disease_reads >= control_reads, disease_span, control_span), index=df.index)
+    conditions = [
+        disease_bilateral & (disease_span > 0),
+        control_bilateral & (control_span > 0),
+        cond_both_gt_zero,
+    ]
+    choices = [
+        disease_span,
+        control_span,
+        both_choice,
+    ]
+    default = np.maximum(disease_span, control_span)
+    return pd.Series(np.select(conditions, choices, default=default), index=df.index).astype(int)
 
 
 def _choose_consolidated_insertion_mei_span(row: pd.Series) -> int:
@@ -11319,8 +11516,33 @@ def _prioritize_mei_candidates(candidates: pd.DataFrame, *, stage_first: bool = 
 _YYRRRR_MT_ADJ_REPORT_MIN = 0.0  # report motif fields only when MT-adjusted log-odds are positive.
 
 
-def _yyrrrr_mt_adj_value(row: pd.Series) -> float:
-    val = row.get("breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan"))
+def _row_get_attr_or_key(row: object, key: str, default: object = None) -> object:
+    getter = getattr(row, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return getattr(row, key, default)
+
+
+class _RowGetProxy:
+    __slots__ = ("_row",)
+
+    def __init__(self, row: object) -> None:
+        self._row = row
+
+    def get(self, key: str, default: object = None) -> object:
+        return _row_get_attr_or_key(self._row, key, default)
+
+
+def _ensure_row_gettable(row: object) -> object:
+    getter = getattr(row, "get", None)
+    if callable(getter):
+        return row
+    return _RowGetProxy(row)
+
+
+
+def _yyrrrr_mt_adj_value(row: object) -> float:
+    val = _row_get_attr_or_key(row, "breakpoint_yyrrrr_logodds_shift1_mt_adj", float("nan"))
     if pd.isna(val):
         return float("nan")
     try:
@@ -11329,7 +11551,7 @@ def _yyrrrr_mt_adj_value(row: pd.Series) -> float:
         return float("nan")
 
 
-def _yyrrrr_mt_adj_reportable(row: pd.Series) -> bool:
+def _yyrrrr_mt_adj_reportable(row: object) -> bool:
     val = _yyrrrr_mt_adj_value(row)
     return not pd.isna(val) and val > _YYRRRR_MT_ADJ_REPORT_MIN
 
@@ -11354,11 +11576,11 @@ def _apply_breakpoint_motif_report_gating(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _consensus_retrotransposition_class(row: pd.Series) -> str:
+def _consensus_retrotransposition_class(row: object) -> str:
     if not _yyrrrr_mt_adj_reportable(row):
         return ""
-    if bool(row.get("breakpoint_l1_en_motif_like", False)):
-        motif_type = str(row.get("breakpoint_l1_en_motif_type", "") or "").strip()
+    if bool(_row_get_attr_or_key(row, "breakpoint_l1_en_motif_like", False)):
+        motif_type = str(_row_get_attr_or_key(row, "breakpoint_l1_en_motif_type", "") or "").strip()
         if motif_type == "l1_en_canonical":
             return "classical"
         if motif_type in {"l1_en_alternative", "nested_novel_like"}:
@@ -11366,7 +11588,7 @@ def _consensus_retrotransposition_class(row: pd.Series) -> str:
     return "classical"
 
 
-def _consensus_sequence_signature(row: pd.Series, *, retro_class: str = "") -> str:
+def _consensus_sequence_signature(row: object, *, retro_class: str = "") -> str:
     if not retro_class:
         return ""
     for col in (
@@ -11376,7 +11598,7 @@ def _consensus_sequence_signature(row: pd.Series, *, retro_class: str = "") -> s
         "breakpoint_l1_en_best_match_pattern_yy_rrrr",
         "breakpoint_l1_en_best_motif",
     ):
-        pattern = str(row.get(col, "") or "").strip()
+        pattern = str(_row_get_attr_or_key(row, col, "") or "").strip()
         if pattern:
             return pattern
     return ""
@@ -11384,11 +11606,12 @@ def _consensus_sequence_signature(row: pd.Series, *, retro_class: str = "") -> s
 
 def _annotate_consensus_retrotransposition_fields(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    classes = out.apply(_consensus_retrotransposition_class, axis=1)
+    records = list(out.itertuples(index=False))
+    classes = [_consensus_retrotransposition_class(row) for row in records]
     out["consensus_retrotransposition_class"] = classes
     out["consensus_sequence_signature"] = [
         _consensus_sequence_signature(row, retro_class=retro_class)
-        for (_, row), retro_class in zip(out.iterrows(), classes)
+        for row, retro_class in zip(records, classes)
     ]
     return out
 
@@ -12257,7 +12480,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
 
     # Orientation: SR/DPE consolidated call only (never assembly).
     # Footprint stays strictly min-max of mapped SR/DPE coords (no target_len expansion).
-    consolidated_orient = out.apply(_choose_consolidated_insertion_orientation, axis=1)
+    consolidated_orient = _choose_consolidated_insertion_orientation_vec(out)
     read_orient = _series_or_default("insertion_orientation", "").fillna("").astype(str)
     # If insertion_orientation was previously overwritten by assembly, prefer
     # disease/control insertion orientations via the consolidated chooser.
@@ -13094,8 +13317,18 @@ def _run_bedtools_checked(
     *,
     label: str,
 ) -> subprocess.CompletedProcess[str]:
-    """Run bedtools and raise with stderr/stdout if it fails."""
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    """Run bedtools and raise with stderr/stdout if it fails.
+
+    Raises :exc:`RuntimeError` if bedtools does not complete within
+    :data:`_BEDTOOLS_TIMEOUT` seconds, preventing an indefinite hang on
+    unexpectedly large annotation files.
+    """
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_BEDTOOLS_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{label} timed out after {_BEDTOOLS_TIMEOUT}s: {' '.join(cmd)}"
+        ) from exc
     if int(proc.returncode) == 0:
         return proc
     err = (proc.stderr or "").strip()
@@ -13115,22 +13348,36 @@ def _run_bedtools_checked(
 
 
 def _normalize_bed_chrom_style(input_bed: Path, output_bed: Path, target_has_chr_prefix: bool) -> None:
-    with input_bed.open("r", encoding="utf-8") as ih, output_bed.open("w", encoding="utf-8") as oh:
-        for line in ih:
-            if not line.strip():
-                continue
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 3:
-                continue
-            chrom = parts[0]
-            if target_has_chr_prefix:
-                if not chrom.startswith("chr"):
-                    chrom = f"chr{chrom}"
-            else:
-                if chrom.startswith("chr"):
-                    chrom = chrom[3:]
-            parts[0] = chrom
-            oh.write("\t".join(parts) + "\n")
+    non_empty_lines = [line for line in input_bed.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not non_empty_lines:
+        output_bed.write_text("", encoding="utf-8")
+        return
+
+    max_cols = max(len(line.split("\t")) for line in non_empty_lines)
+    df = pd.read_csv(
+        input_bed,
+        sep="\t",
+        header=None,
+        dtype=str,
+        names=list(range(max_cols)),
+        skip_blank_lines=True,
+    )
+    df = df[df[2].notna()].copy()
+    if df.empty:
+        output_bed.write_text("", encoding="utf-8")
+        return
+
+    if target_has_chr_prefix:
+        df[0] = np.where(df[0].str.startswith("chr"), df[0], "chr" + df[0])
+    else:
+        df[0] = df[0].str.replace(r"^chr", "", regex=True)
+
+    last_non_null_col = df.notna().iloc[:, ::-1].idxmax(axis=1)
+    lines = [
+        "\t".join(row.iloc[: int(last_col) + 1].fillna("").tolist())
+        for (_, row), last_col in zip(df.iterrows(), last_non_null_col)
+    ]
+    output_bed.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _g1k_query_interval_for_row(
@@ -13491,6 +13738,17 @@ def _annotate_lr_mei_overlap(
     return out.drop(columns=["row_id"])
 
 
+def _map_mei_family_from_series(series: pd.Series) -> pd.Series:
+    normalized = series.fillna("").astype(str)
+    uniques = pd.unique(normalized)
+    mapping = {
+        u: _infer_mei_family_from_fields(hit_id=u, family_hint=u, extra_hint="")
+        for u in uniques
+    }
+    return normalized.map(mapping)
+
+
+
 def _add_known_mei_polymorphism_consensus(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
     g1k_id = _df_col_series(out, "g1k_melt_id", "").fillna("").astype(str).str.strip()
@@ -13504,12 +13762,8 @@ def _add_known_mei_polymorphism_consensus(candidates: pd.DataFrame) -> pd.DataFr
     out.loc[~has_g1k & has_lr, "known_mei_polymorphism_source"] = "long_read_1kg_ont_vienna"
     out.loc[has_g1k & has_lr, "known_mei_polymorphism_source"] = "melt_1kg,long_read_1kg_ont_vienna"
 
-    g1k_family = _df_col_series(out, "g1k_melt_insertion_subfamily", "").fillna("").astype(str).apply(
-        lambda x: _infer_mei_family_from_fields(hit_id=x, family_hint=x, extra_hint="")
-    )
-    lr_family = _df_col_series(out, "lr_svan_subfamily", "").fillna("").astype(str).apply(
-        lambda x: _infer_mei_family_from_fields(hit_id=x, family_hint=x, extra_hint="")
-    )
+    g1k_family = _map_mei_family_from_series(_df_col_series(out, "g1k_melt_insertion_subfamily", ""))
+    lr_family = _map_mei_family_from_series(_df_col_series(out, "lr_svan_subfamily", ""))
     out["known_mei_polymorphism_family"] = ""
     out.loc[has_g1k & ~has_lr, "known_mei_polymorphism_family"] = g1k_family.loc[has_g1k & ~has_lr]
     out.loc[~has_g1k & has_lr, "known_mei_polymorphism_family"] = lr_family.loc[~has_g1k & has_lr]
@@ -13685,6 +13939,67 @@ def _choose_event_family_and_subfamily(row: pd.Series) -> tuple[str, str]:
 
 def _choose_event_subfamily(row: pd.Series) -> str:
     return _choose_event_family_and_subfamily(row)[1]
+
+
+def _run_named_process_jobs(worker, named_job_kwargs: dict[str, dict[str, object]], max_workers: int) -> dict[str, object]:
+    if max_workers <= 1 or len(named_job_kwargs) <= 1:
+        return {
+            name: worker(**job_kwargs)
+            for name, job_kwargs in named_job_kwargs.items()
+        }
+    results: dict[str, object] = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        future_to_name = {
+            pool.submit(worker, **job_kwargs): name
+            for name, job_kwargs in named_job_kwargs.items()
+        }
+        for future in as_completed(future_to_name):
+            results[future_to_name[future]] = future.result()
+    return results
+
+
+def _sample_has_assigned_rows(*frames: pd.DataFrame | None) -> bool:
+    return any(isinstance(frame, pd.DataFrame) and not frame.empty for frame in frames)
+
+
+
+def _candidate_subset_for_sample(
+    candidates: pd.DataFrame,
+    *assigned_frames: pd.DataFrame | None,
+) -> pd.DataFrame:
+    key_cols = ["chrom", "window_start", "window_end"]
+    if candidates.empty or not _sample_has_assigned_rows(*assigned_frames):
+        return candidates.iloc[0:0].copy()
+    locus_keys: set[tuple[str, int, int]] = set()
+    for frame in assigned_frames:
+        if frame is None or frame.empty:
+            continue
+        if any(col not in frame.columns for col in key_cols):
+            continue
+        locus_keys.update(
+            (str(row.chrom), int(row.window_start), int(row.window_end))
+            for row in frame.loc[:, key_cols].itertuples(index=False)
+        )
+    if not locus_keys:
+        return candidates.iloc[0:0].copy()
+    mask = [
+        (str(row.chrom), int(row.window_start), int(row.window_end)) in locus_keys
+        for row in candidates.loc[:, key_cols].itertuples(index=False)
+    ]
+    return candidates.loc[mask].copy()
+
+
+
+def _empty_mei_remap_result(sample: str) -> dict[str, object]:
+    return {
+        "sample": sample,
+        "split_hits": pd.DataFrame(),
+        "split_summary": ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0),
+        "disc_hits": pd.DataFrame(),
+        "disc_summary": ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0),
+        "disc_mate_summary": ClipAlignmentSummary(sample=f"{sample}_mate", clip_count=0, paf_hits=0),
+    }
+
 
 
 def _choose_event_family(row: pd.Series) -> str:
@@ -13932,6 +14247,51 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
 
 
 
+def _safe_run_read_architecture_plots(
+    gold_review: pd.DataFrame,
+    *,
+    supporting_reads_detail: "pd.DataFrame | Path",
+    out_dir: Path,
+    mei_table: pd.DataFrame,
+    gold_tsv: Path,
+    top_n: int,
+    out_path: Path,
+) -> None:
+    """Call generate_gold_read_architecture_plots, emitting a warning on failure.
+
+    Plot errors must never prevent the candidate TSV/Parquet outputs from being
+    written.  On any exception the function:
+
+    * emits a ``UserWarning`` to stderr that includes the exception class name,
+      the exception message, a condensed 5-frame traceback, the number of gold
+      rows targeted, and the path where the candidate outputs were already
+      written;
+    * returns normally so the caller can continue.
+    """
+    try:
+        generate_gold_read_architecture_plots(
+            gold_review,
+            supporting_reads_detail=supporting_reads_detail,
+            out_dir=out_dir,
+            mei_table=mei_table,
+            gold_tsv=gold_tsv,
+            gold_only=True,
+            top_n=top_n,
+        )
+    except Exception as exc:  # noqa: BLE001 - do not fail annotate on plot errors
+        tb_summary = traceback.format_exc(limit=5)
+        n_gold = len(gold_review)
+        warnings.warn(
+            f"[mei-annotate] read-architecture plot generation failed "
+            f"({type(exc).__name__}: {exc}); "
+            f"{n_gold} gold row(s) targeted; "
+            f"candidate outputs already written to {out_path}. "
+            f"Traceback (last 5 frames):\n{tb_summary}",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
 def annotate_candidate_loci_with_mei(
     evidence_dir: Path,
     candidate_loci_path: Path,
@@ -14057,29 +14417,38 @@ def annotate_candidate_loci_with_mei(
         # Indel collection + MEI remaps: disease∥control (I/O and bwa mem release the GIL).
         click.echo("[mei-annotate] running disease∥control indel + MEI remaps")
         indel_t0 = time.monotonic()
-        indel_jobs: dict[str, object] = {}
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            indel_futs = {}
-            if disease_bam_path is not None:
-                indel_futs[
-                    pool.submit(
-                        _collect_indel_breakpoint_evidence,
-                        disease_bam_path,
-                        candidate,
-                        sample="disease",
-                    )
-                ] = "disease"
-            if control_bam_path is not None:
-                indel_futs[
-                    pool.submit(
-                        _collect_indel_breakpoint_evidence,
-                        control_bam_path,
-                        candidate,
-                        sample="control",
-                    )
-                ] = "control"
-            for fut in as_completed(indel_futs):
-                indel_jobs[indel_futs[fut]] = fut.result()
+        indel_job_kwargs: dict[str, dict[str, object]] = {}
+        disease_indel_candidates = _candidate_subset_for_sample(
+            candidate,
+            split_disease,
+            discordant_disease,
+        )
+        control_indel_candidates = _candidate_subset_for_sample(
+            candidate,
+            split_control,
+            discordant_control,
+        )
+        if disease_bam_path is not None and not disease_indel_candidates.empty:
+            indel_job_kwargs["disease"] = {
+                "bam_path": disease_bam_path,
+                "candidates": disease_indel_candidates,
+                "sample": "disease",
+            }
+        if control_bam_path is not None and not control_indel_candidates.empty:
+            indel_job_kwargs["control"] = {
+                "bam_path": control_bam_path,
+                "candidates": control_indel_candidates,
+                "sample": "control",
+            }
+        indel_jobs = (
+            _run_named_process_jobs(
+                _collect_indel_breakpoint_evidence,
+                indel_job_kwargs,
+                max_workers=2,
+            )
+            if indel_job_kwargs
+            else {}
+        )
         indel_disease = indel_jobs.get("disease", pd.DataFrame())
         indel_control = indel_jobs.get("control", pd.DataFrame())
         click.echo(
@@ -14095,33 +14464,39 @@ def annotate_candidate_loci_with_mei(
             f"[mei-annotate] bwa_threads total={bwa_threads} "
             f"per_sample={per_sample_bwa_threads} (disease∥control)"
         )
-        remap_by_sample = {}
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            remap_futs = {
-                pool.submit(
-                    _remap_one_sample_mei_evidence,
-                    sample="disease",
-                    split_df=split_disease,
-                    discordant_df=discordant_disease,
-                    mei_fasta=mei_fasta,
-                    bam_path=disease_bam_path,
-                    mate_bam_path=disease_mate_bam_path,
-                    bwa_threads=per_sample_bwa_threads,
-                ): "disease",
-                pool.submit(
-                    _remap_one_sample_mei_evidence,
-                    sample="control",
-                    split_df=split_control,
-                    discordant_df=discordant_control,
-                    mei_fasta=mei_fasta,
-                    bam_path=control_bam_path,
-                    mate_bam_path=control_mate_bam_path,
-                    bwa_threads=per_sample_bwa_threads,
-                ): "control",
+        remap_job_kwargs: dict[str, dict[str, object]] = {}
+        remap_by_sample = {
+            "disease": _empty_mei_remap_result("disease"),
+            "control": _empty_mei_remap_result("control"),
+        }
+        if _sample_has_assigned_rows(split_disease, discordant_disease):
+            remap_job_kwargs["disease"] = {
+                "sample": "disease",
+                "split_df": split_disease,
+                "discordant_df": discordant_disease,
+                "mei_fasta": mei_fasta,
+                "bam_path": disease_bam_path,
+                "mate_bam_path": disease_mate_bam_path,
+                "bwa_threads": per_sample_bwa_threads,
             }
-            for fut in as_completed(remap_futs):
-                sample = remap_futs[fut]
-                remap_by_sample[sample] = fut.result()
+        if _sample_has_assigned_rows(split_control, discordant_control):
+            remap_job_kwargs["control"] = {
+                "sample": "control",
+                "split_df": split_control,
+                "discordant_df": discordant_control,
+                "mei_fasta": mei_fasta,
+                "bam_path": control_bam_path,
+                "mate_bam_path": control_mate_bam_path,
+                "bwa_threads": per_sample_bwa_threads,
+            }
+        if remap_job_kwargs:
+            remap_by_sample.update(
+                _run_named_process_jobs(
+                    _remap_one_sample_mei_evidence,
+                    remap_job_kwargs,
+                    max_workers=2,
+                )
+            )
         click.echo(
             f"[mei-annotate] disease∥control MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s"
         )
@@ -14529,19 +14904,14 @@ def annotate_candidate_loci_with_mei(
         output_prefix="insertion_",
     )
     for full_prefix in ("disease_full", "control_full"):
-        full_metrics = candidate.apply(
-            lambda r: _sample_insertion_span_and_orientation(r, full_prefix),
-            axis=1,
-            result_type="expand",
-        )
-        full_metrics.columns = [
-            f"{full_prefix}_insertion_mei_start",
-            f"{full_prefix}_insertion_mei_end",
-            f"{full_prefix}_insertion_mei_span",
-            f"{full_prefix}_insertion_orientation",
+        full_metrics = [
+            _sample_insertion_span_and_orientation(row, full_prefix)
+            for row in candidate.itertuples(index=False)
         ]
-        for col in full_metrics.columns:
-            candidate[col] = full_metrics[col]
+        candidate[f"{full_prefix}_insertion_mei_start"] = [r[0] for r in full_metrics]
+        candidate[f"{full_prefix}_insertion_mei_end"] = [r[1] for r in full_metrics]
+        candidate[f"{full_prefix}_insertion_mei_span"] = [r[2] for r in full_metrics]
+        candidate[f"{full_prefix}_insertion_orientation"] = [r[3] for r in full_metrics]
     candidate = _compute_insertion_model_scores(candidate)
     stage_t0 = time.monotonic()
     candidate = _assign_bronze_silver_stages(candidate)
@@ -14745,18 +15115,15 @@ def annotate_candidate_loci_with_mei(
                 if read_architecture_dir is not None
                 else out_path.with_name(out_path.stem + ".read_architecture")
             )
-            try:
-                generate_gold_read_architecture_plots(
+            _safe_run_read_architecture_plots(
                     gold_review,
                     supporting_reads_detail=detail_source,
                     out_dir=arch_dir,
                     mei_table=candidate,
                     gold_tsv=gold_review_path,
-                    gold_only=True,
                     top_n=read_architecture_top_n,
+                    out_path=out_path,
                 )
-            except Exception as exc:  # noqa: BLE001 - do not fail annotate on plot errors
-                click.echo(f"[mei-annotate] read-architecture plot generation failed: {exc}")
     click.echo(f"[mei-annotate] wrote {len(candidate)} rows to {out_path}")
     click.echo(f"[mei-annotate] total annotate walltime={time.monotonic() - total_t0:.1f}s")
     return out_path

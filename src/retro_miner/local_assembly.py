@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -9,7 +11,9 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Mapping
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import islice
 from pathlib import Path
 
 import click
@@ -26,13 +30,64 @@ _MIN_SIDE_ANCHOR_ALN_LEN = 30
 _MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
 _ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
 
-#: Maximum seconds to wait for a SPAdes assembly run before returning a failure code.
-_SPADES_TIMEOUT: int = 600
-#: Maximum seconds to wait for a minimap2 alignment run before returning failure.
-_MINIMAP2_TIMEOUT: int = 120
+#: Default seconds to wait for a SPAdes assembly run before returning a failure code.
+_SPADES_TIMEOUT: int = 300
+#: Default seconds to wait for a minimap2 alignment run before returning failure.
+_MINIMAP2_TIMEOUT: int = 300
 
 
-def _window_locus_id_from_row(row: pd.Series) -> str:
+def _run_ordered_process_jobs(worker, job_kwargs_list: list[dict[str, object]], max_workers: int):
+    if max_workers <= 1:
+        return [worker(**job_kwargs) for job_kwargs in job_kwargs_list]
+    results: list[object | None] = [None] * len(job_kwargs_list)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(worker, **job_kwargs): idx
+            for idx, job_kwargs in enumerate(job_kwargs_list)
+        }
+        for future in as_completed(future_to_idx):
+            results[future_to_idx[future]] = future.result()
+    return [result for result in results if result is not None]
+
+
+def _primitive_payload_value(value: object) -> object:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, tuple):
+        return tuple(_primitive_payload_value(v) for v in value)
+    if isinstance(value, list):
+        return [_primitive_payload_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _primitive_payload_value(v) for k, v in value.items()}
+    if isinstance(value, set):
+        return {_primitive_payload_value(v) for v in value}
+    return value
+
+
+
+def _build_locus_row_payloads(frame: pd.DataFrame) -> list[dict[str, object]]:
+    columns = list(frame.columns)
+    return [
+        {str(col): _primitive_payload_value(value) for col, value in zip(columns, row)}
+        for row in frame.itertuples(index=False, name=None)
+    ]
+
+
+
+def _window_locus_id_from_row(row: Mapping[str, object]) -> str:
     chrom = str(row.get("chrom", ""))
     window_start = int(row.get("window_start", 1))
     window_end = int(row.get("window_end", window_start))
@@ -41,7 +96,7 @@ def _window_locus_id_from_row(row: pd.Series) -> str:
     return _safe_locus_id(chrom, max(1, window_start), max(1, window_end))
 
 
-def _interval_from_row(row: pd.Series, pad_bp: int) -> tuple[str, int, int]:
+def _interval_from_row(row: Mapping[str, object], pad_bp: int) -> tuple[str, int, int]:
     chrom = str(row.get("chrom", ""))
     window_start = int(row.get("window_start", 1))
     window_end = int(row.get("window_end", window_start))
@@ -121,20 +176,47 @@ def _write_interval_fastq(
 ) -> tuple[int, set[str]]:
     start0 = max(0, int(start_1based) - 1)
     end0 = max(start0 + 1, int(end_1based))
+    max_reads_int = int(max_reads)
     written = 0
     seen_ids: set[str] = set()
     emitted_qnames: set[str] = set()
     preferred_lookup = _preferred_read_lookup(preferred_read_names)
+    preferred_reads: list[pysam.AlignedSegment] = []
+    non_perfect_reads: list[pysam.AlignedSegment] = []
+    backfill_reads: list[pysam.AlignedSegment] = []
     out_fastq_gz.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(out_fastq_gz, "wt", encoding="utf-8") as oh:
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam, gzip.open(out_fastq_gz, "wt", encoding="utf-8") as oh:
+        for read in bam.fetch(chrom, start0, end0):
+            if not _is_primary_interval_read(read):
+                continue
+            if preferred_lookup and _read_matches_preferred(read, preferred_lookup):
+                preferred_reads.append(read)
+                continue
+            if _is_non_perfect_primary_alignment(read):
+                non_perfect_reads.append(read)
+                continue
+            if not non_perfect_only:
+                backfill_reads.append(read)
+
+        buf: list[str] = []
+
+        def _flush_buf() -> None:
+            if buf:
+                oh.write("".join(buf))
+                buf.clear()
+
         def _emit_read(read: pysam.AlignedSegment) -> bool:
             nonlocal written
+            if written >= max_reads_int:
+                return False
             rid = f"{read.query_name}:{'1' if read.is_read1 else '2' if read.is_read2 else '0'}"
             if rid in seen_ids:
                 return False
             seq = str(read.query_sequence)
             qual = read.qual if read.qual is not None else ("I" * len(seq))
-            oh.write(f"@{rid}\n{seq}\n+\n{qual}\n")
+            buf.append(f"@{rid}\n{seq}\n+\n{qual}\n")
+            if len(buf) >= 1000:
+                _flush_buf()
             seen_ids.add(rid)
             qname = str(read.query_name or "")
             if qname:
@@ -142,41 +224,16 @@ def _write_interval_fastq(
             written += 1
             return True
 
-        # Pass 0: force include locus-linked evidence read names first.
-        if preferred_lookup:
-            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-                for read in bam.fetch(chrom, start0, end0):
-                    if not _is_primary_interval_read(read):
-                        continue
-                    if not _read_matches_preferred(read, preferred_lookup):
-                        continue
+        try:
+            for read_group in (preferred_reads, non_perfect_reads, backfill_reads):
+                for read in read_group:
                     _emit_read(read)
-                    if written >= int(max_reads):
+                    if written >= max_reads_int:
                         break
-
-        # Pass 1: prioritize non-perfect/evidence-like reads.
-        if written < int(max_reads):
-            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-                for read in bam.fetch(chrom, start0, end0):
-                    if not _is_primary_interval_read(read):
-                        continue
-                    if not _is_non_perfect_primary_alignment(read):
-                        continue
-                    _emit_read(read)
-                    if written >= int(max_reads):
-                        break
-
-        # Pass 2: if full mode and under cap, backfill with clean/proper reads.
-        if (not non_perfect_only) and written < int(max_reads):
-            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-                for read in bam.fetch(chrom, start0, end0):
-                    if not _is_primary_interval_read(read):
-                        continue
-                    if _is_non_perfect_primary_alignment(read):
-                        continue
-                    _emit_read(read)
-                    if written >= int(max_reads):
-                        break
+                if written >= max_reads_int:
+                    break
+        finally:
+            _flush_buf()
     return written, emitted_qnames
 
 
@@ -186,15 +243,17 @@ def _read_recruited_qnames_from_fastq(path: Path) -> set[str]:
     out: set[str] = set()
     try:
         with gzip.open(path, "rt", encoding="utf-8") as handle:
-            for idx, line in enumerate(handle):
-                if idx % 4 != 0:
-                    continue
-                header = line.strip()
+            for line in islice(handle, 0, None, 4):
+                header = str(line or "").strip()
                 if not header.startswith("@"):
                     continue
-                rid = header[1:].split()[0]
-                qname = rid.rsplit(":", 1)[0]
-                qname = str(qname).strip()
+                parts = header.lstrip("@").split()
+                if not parts:
+                    continue
+                rid = parts[0].strip()
+                if not rid:
+                    continue
+                qname = rid.rsplit(":", 1)[0].strip()
                 if not qname:
                     continue
                 out.add(qname)
@@ -289,6 +348,7 @@ def _run_spades(
     *,
     threads: int,
     memory_gb: int,
+    timeout: float = 300.0,
 ) -> tuple[int, str]:
     outdir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -304,9 +364,10 @@ def _run_spades(
         str(max(1, int(memory_gb))),
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_SPADES_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return 1, f"SPAdes assembly timed out after {_SPADES_TIMEOUT}s."
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=float(timeout))
+    except subprocess.TimeoutExpired as exc:
+        expired_after = float(getattr(exc, "timeout", timeout) or timeout)
+        return 1, f"SPAdes assembly timed out after {expired_after}s."
     stderr_tail = (proc.stderr or "")[-2000:]
     stdout_tail = (proc.stdout or "")[-2000:]
     combined = "\n".join([x for x in [stdout_tail, stderr_tail] if x]).strip()
@@ -358,6 +419,7 @@ def _run_minimap2_paf(
     preset: str = "asm5",
     threads: int = 1,
     minimap2_idx_dir: Path | None = None,
+    timeout: float = 300.0,
 ) -> list[dict[str, object]]:
     if not query_fa.exists() or not target_fa.exists():
         return []
@@ -390,11 +452,12 @@ def _run_minimap2_paf(
                         capture_output=True,
                         text=True,
                         check=False,
-                        timeout=_MINIMAP2_TIMEOUT,
+                        timeout=float(timeout),
                     )
                 except subprocess.TimeoutExpired as exc:
+                    expired_after = float(getattr(exc, "timeout", timeout) or timeout)
                     raise RuntimeError(
-                        f"minimap2 index build timed out after {_MINIMAP2_TIMEOUT}s "
+                        f"minimap2 index build timed out after {expired_after}s "
                         f"for {target_fa}"
                     ) from exc
                 if build.returncode == 0 and idx_path.exists():
@@ -405,47 +468,41 @@ def _run_minimap2_paf(
                 target_arg = str(idx_path)
     cmd = ["minimap2", "-x", preset, "--secondary=no", "-c", "-t", str(max(1, int(threads))), target_arg, str(query_fa)]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=_MINIMAP2_TIMEOUT)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=float(timeout))
     except subprocess.TimeoutExpired as exc:
+        expired_after = float(getattr(exc, "timeout", timeout) or timeout)
         raise RuntimeError(
-            f"minimap2 alignment timed out after {_MINIMAP2_TIMEOUT}s "
+            f"minimap2 alignment timed out after {expired_after}s "
             f"for query={query_fa} target={target_arg}"
         ) from exc
     if proc.returncode != 0:
         return []
-    rows: list[dict[str, object]] = []
-    for line in (proc.stdout or "").splitlines():
-        parts = line.rstrip("\n").split("\t")
-        if len(parts) < 12:
-            continue
-        try:
-            qname = parts[0]
-            qstart = int(parts[2])
-            qend = int(parts[3])
-            strand = parts[4]
-            tname = parts[5]
-            tstart = int(parts[7])
-            tend = int(parts[8])
-            nmatch = int(parts[9])
-            alnlen = int(parts[10])
-            mapq = int(parts[11])
-            rows.append(
-                {
-                    "qname": qname,
-                    "qstart": qstart,
-                    "qend": qend,
-                    "strand": strand,
-                    "tname": tname,
-                    "tstart": tstart,
-                    "tend": tend,
-                    "nmatch": nmatch,
-                    "alnlen": alnlen,
-                    "mapq": mapq,
-                }
-            )
-        except (ValueError, IndexError):
-            continue
-    return rows
+    paf_text = (proc.stdout or "").strip()
+    if not paf_text:
+        return []
+    try:
+        paf = pd.read_csv(
+            io.StringIO(paf_text),
+            sep="\t",
+            header=None,
+            usecols=[0, 2, 3, 4, 5, 7, 8, 9, 10, 11],
+            names=["qname", "qstart", "qend", "strand", "tname", "tstart", "tend", "nmatch", "alnlen", "mapq"],
+            dtype={"qname": "string", "strand": "string", "tname": "string"},
+            engine="python",
+        )
+    except pd.errors.EmptyDataError:
+        return []
+    numeric_cols = ["qstart", "qend", "tstart", "tend", "nmatch", "alnlen", "mapq"]
+    for col in numeric_cols:
+        paf[col] = pd.to_numeric(paf[col], errors="coerce")
+    paf = paf.dropna(subset=numeric_cols)
+    if paf.empty:
+        return []
+    paf[numeric_cols] = paf[numeric_cols].astype(int)
+    paf["qname"] = paf["qname"].fillna("").astype(str)
+    paf["strand"] = paf["strand"].fillna("").astype(str)
+    paf["tname"] = paf["tname"].fillna("").astype(str)
+    return paf[["qname", "qstart", "qend", "strand", "tname", "tstart", "tend", "nmatch", "alnlen", "mapq"]].to_dict("records")
 
 
 def _family_from_target(target: str) -> str:
@@ -1138,7 +1195,9 @@ def _extract_sample_assembly_features(
     }
 
 
+@functools.lru_cache(maxsize=4096)
 def _parse_existing_manifest(manifest_path: Path) -> dict[str, object] | None:
+    manifest_path = Path(manifest_path).resolve()
     if not manifest_path.exists():
         return None
     try:
@@ -1146,6 +1205,11 @@ def _parse_existing_manifest(manifest_path: Path) -> dict[str, object] | None:
         return raw if isinstance(raw, dict) else None
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return None
+
+
+def _clear_manifest_cache() -> None:
+    """Clear cached ``assembly_manifest.json`` parses for test isolation and writes."""
+    _parse_existing_manifest.cache_clear()
 
 
 def _has_assembled_cache(locus_dir: Path, manifest: dict[str, object] | None, *, interval_pad_bp: int) -> bool:
@@ -1206,11 +1270,11 @@ def _process_single_locus(
         version = int(feat.get("coord_logic_version", 0) or 0)
         return version >= int(_ASSEMBLY_FEATURE_SCHEMA_VERSION)
 
-    as_row = pd.Series(row_data)
+    row_view = row_data
     locus_key = (
-        str(as_row.get("chrom", "")),
-        int(as_row.get("window_start", 0)),
-        int(as_row.get("window_end", 0)),
+        str(row_view.get("chrom", "")),
+        int(row_view.get("window_start", 0)),
+        int(row_view.get("window_end", 0)),
     )
     disease_preferred_read_names = (
         disease_preferred_read_names_by_locus.get(locus_key, set()) if disease_preferred_read_names_by_locus else set()
@@ -1218,9 +1282,9 @@ def _process_single_locus(
     control_preferred_read_names = (
         control_preferred_read_names_by_locus.get(locus_key, set()) if control_preferred_read_names_by_locus else set()
     )
-    fallback_bp = int(as_row.get("insertion_breakpoint_pos", 0) or 0)
-    chrom, i_start, i_end = _interval_from_row(as_row, interval_pad_bp)
-    stable_locus_id = _window_locus_id_from_row(as_row)
+    fallback_bp = int(row_view.get("insertion_breakpoint_pos", 0) or 0)
+    chrom, i_start, i_end = _interval_from_row(row_view, interval_pad_bp)
+    stable_locus_id = _window_locus_id_from_row(row_view)
     stable_locus_dir = assembly_cache_dir / stable_locus_id
     legacy_locus_dir = assembly_cache_dir / _safe_locus_id(chrom, i_start, i_end)
     locus_dir = stable_locus_dir
@@ -1259,7 +1323,7 @@ def _process_single_locus(
     if reuse_existing and _has_assembled_cache(locus_dir, manifest, interval_pad_bp=interval_pad_bp):
         cached_pad = int(manifest.get("interval", {}).get("pad_bp", interval_pad_bp))
         chosen_pad = cached_pad
-        chrom, current_start, current_end = _interval_from_row(as_row, cached_pad)
+        chrom, current_start, current_end = _interval_from_row(row_view, cached_pad)
         status = str(manifest.get("status", "assembled"))
         retry_used = bool(manifest.get("retry_used", False))
         d_reads = int(manifest.get("disease_reads_extracted", 0))
@@ -1300,7 +1364,7 @@ def _process_single_locus(
         assembled_from_attempt = False
         for attempt, pad in enumerate([interval_pad_bp, retry_pad_bp], start=1):
             chosen_pad = int(pad)
-            chrom, current_start, current_end = _interval_from_row(as_row, pad)
+            chrom, current_start, current_end = _interval_from_row(row_view, pad)
             phase_specs: list[tuple[str, int, bool]] = [("seed", seed_reads_cap, True)]
             if int(seed_reads_cap) < int(max_reads_per_sample):
                 phase_specs.append(("full", int(max_reads_per_sample), False))
@@ -1560,11 +1624,12 @@ def _process_single_locus(
         "control_recruited_evidence_read_names": sorted(n_recruited_evidence_read_names),
     }
     manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True), encoding="utf-8")
+    _clear_manifest_cache()
 
     result = {
-        "chrom": str(as_row.get("chrom", "")),
-        "window_start": int(as_row.get("window_start", 0)),
-        "window_end": int(as_row.get("window_end", 0)),
+        "chrom": str(row_view.get("chrom", "")),
+        "window_start": int(row_view.get("window_start", 0)),
+        "window_end": int(row_view.get("window_end", 0)),
         "asm_status": status,
         "asm_interval_start": int(current_start),
         "asm_interval_end": int(current_end),
@@ -1784,61 +1849,37 @@ def annotate_silver_with_local_assembly(
         f"minimap2_threads={max(1, int(minimap2_threads))} "
         f"locus_workers={workers}"
     )
-    row_records = silver.to_dict(orient="records")
-    if workers == 1:
-        for idx, row_data in enumerate(row_records, start=1):
-            result, log_line = _process_single_locus(
-                idx=idx,
-                total_loci=total_loci,
-                row_data=row_data,
-                disease_bam_path=disease_bam_path,
-                control_bam_path=control_bam_path,
-                assembly_cache_dir=assembly_cache_dir,
-                mei_fasta=mei_fasta,
-                reference_fasta=reference_fasta,
-                interval_pad_bp=interval_pad_bp,
-                retry_pad_bp=retry_pad_bp,
-                max_reads_per_sample=max_reads_per_sample,
-                spades_threads=spades_threads,
-                spades_memory_gb=spades_memory_gb,
-                minimap2_threads=minimap2_threads,
-                reuse_existing=reuse_existing,
-                reuse_cache_only=reuse_cache_only,
-                spades_exe=spades_exe,
-                disease_preferred_read_names_by_locus=disease_preferred_read_names_by_locus,
-                control_preferred_read_names_by_locus=control_preferred_read_names_by_locus,
-            )
-            rows.append(result)
-            click.echo(log_line)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(
-                    _process_single_locus,
-                    idx=idx,
-                    total_loci=total_loci,
-                    row_data=row_data,
-                    disease_bam_path=disease_bam_path,
-                    control_bam_path=control_bam_path,
-                    assembly_cache_dir=assembly_cache_dir,
-                    mei_fasta=mei_fasta,
-                    reference_fasta=reference_fasta,
-                    interval_pad_bp=interval_pad_bp,
-                    retry_pad_bp=retry_pad_bp,
-                    max_reads_per_sample=max_reads_per_sample,
-                    spades_threads=spades_threads,
-                    spades_memory_gb=spades_memory_gb,
-                    minimap2_threads=minimap2_threads,
-                    reuse_existing=reuse_existing,
-                    reuse_cache_only=reuse_cache_only,
-                    spades_exe=spades_exe,
-                    disease_preferred_read_names_by_locus=disease_preferred_read_names_by_locus,
-                    control_preferred_read_names_by_locus=control_preferred_read_names_by_locus,
-                )
-                for idx, row_data in enumerate(row_records, start=1)
-            ]
-            for fut in as_completed(futures):
-                result, log_line = fut.result()
-                rows.append(result)
-                click.echo(log_line)
+    row_records = _build_locus_row_payloads(silver)
+    job_kwargs_list = [
+        {
+            "idx": idx,
+            "total_loci": total_loci,
+            "row_data": row_data,
+            "disease_bam_path": disease_bam_path,
+            "control_bam_path": control_bam_path,
+            "assembly_cache_dir": assembly_cache_dir,
+            "mei_fasta": mei_fasta,
+            "reference_fasta": reference_fasta,
+            "interval_pad_bp": interval_pad_bp,
+            "retry_pad_bp": retry_pad_bp,
+            "max_reads_per_sample": max_reads_per_sample,
+            "spades_threads": spades_threads,
+            "spades_memory_gb": spades_memory_gb,
+            "minimap2_threads": minimap2_threads,
+            "reuse_existing": reuse_existing,
+            "reuse_cache_only": reuse_cache_only,
+            "spades_exe": spades_exe,
+            "disease_preferred_read_names_by_locus": disease_preferred_read_names_by_locus,
+            "control_preferred_read_names_by_locus": control_preferred_read_names_by_locus,
+        }
+        for idx, row_data in enumerate(row_records, start=1)
+    ]
+    results = _run_ordered_process_jobs(
+        _process_single_locus,
+        job_kwargs_list,
+        max_workers=workers,
+    )
+    for result, log_line in results:
+        rows.append(result)
+        click.echo(log_line)
     return pd.DataFrame(rows)
