@@ -865,7 +865,7 @@ def _infer_orientation(
         # Boolean filter conditions
         # 1. Exclude polya rescue rows
         rescue = df.get("polya_rescue", False).fillna(False).astype(bool)
-    
+
         # 2. Filter by evidence type and MEI hit status
         et = df.get("evidence_type", "").fillna("").astype(str)
         if evidence == "DPE":
@@ -885,23 +885,23 @@ def _infer_orientation(
 
         # Vectorized filtering
         work_sub = df[final_mask].copy()
-        
+
         # Vectorized coordinate conversion and validation
         starts = pd.to_numeric(work_sub.get(start_col, 0), errors="coerce").fillna(0).astype(int)
         ends = pd.to_numeric(work_sub.get(end_col, 0), errors="coerce").fillna(0).astype(int)
-        
+
         valid_coords_mask = (starts > 0) & (ends > 0)
         work_sub = work_sub[valid_coords_mask]
-        
+
         if work_sub.empty:
             return [], []
 
         # Vectorized midpoint calculation
         mids = (starts + ends) / 2.0
-        
+
         # Vectorized junction side classification
         sides = work_sub.apply(lambda r: _junction_side(r, evidence=evidence), axis=1)
-        
+
         # Return lists for visualization
         return mids[sides == "L"].tolist(), mids[sides == "R"].tolist()
 
