@@ -102,6 +102,48 @@ _DETAIL_COLS = (
     "poly_tail_anchor_rescued",
 )
 
+# Low-cardinality string columns that are repeatedly compared/rendered across
+# batch loci. Encoding them as pandas categories cuts per-read memory ~10x on
+# the detail table (hundreds of thousands of rows held open for all plots).
+_DETAIL_CATEGORICAL_COLS = (
+    "sample",
+    "evidence_type",
+    "chrom",
+    "mate_chrom",
+    "anchor_side",
+    "soft_clip_side",
+    "anchor_poly_side",
+    "mei_strand",
+    "mate_mei_strand",
+    "mei_hit_source",
+    "mei_target",
+    "mate_mei_target",
+    "polya_base",
+    "clip_poly_base",
+    "anchor_poly_base",
+)
+
+_GOLD_CATEGORICAL_COLS = (
+    "analysis_stage_tier",
+    "consensus_mei_family",
+    "consensus_mei_subfamily",
+    "sample_status_label",
+)
+
+
+def _as_category_columns(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
+    """Coerce existing ``cols`` in ``df`` to category dtype (in place, no copy)."""
+    if df is None or df.empty or not cols:
+        return df
+    for col in cols:
+        if col not in df.columns:
+            continue
+        try:
+            df[col] = df[col].astype("category")
+        except (TypeError, ValueError):
+            continue
+    return df
+
 
 @dataclass(frozen=True)
 class LocusLayout:
@@ -500,10 +542,6 @@ def _breakpoint_interval(row: pd.Series) -> tuple[int, int, int]:
     return bp_l, bp_r, bp
 
 
-def _plausible_local_mate_pos(mate_pos: int, *, window_start: int, window_end: int, slack: int = 600) -> bool:
-    return window_start - slack <= mate_pos <= window_end + slack
-
-
 def _genomic_insert_size_estimates(
     detail: pd.DataFrame | None,
     *,
@@ -520,16 +558,30 @@ def _genomic_insert_size_estimates(
 
     sizes: list[int] = []
     dpe = detail.loc[detail["evidence_type"].astype(str) == "DPE"]
+    if dpe.empty:
+        return sizes
+
+    gpos_s = (
+        pd.to_numeric(dpe["genomic_pos"], errors="coerce").fillna(0).astype(int)
+        if "genomic_pos" in dpe.columns
+        else pd.Series(0, index=dpe.index)
+    )
+    mate_chrom_s = (
+        dpe["mate_chrom"].fillna("").astype(str)
+        if "mate_chrom" in dpe.columns
+        else pd.Series("", index=dpe.index)
+    )
+    mate_pos_s = (
+        pd.to_numeric(dpe["mate_genomic_pos"], errors="coerce").fillna(0).astype(int)
+        if "mate_genomic_pos" in dpe.columns
+        else pd.Series(0, index=dpe.index)
+    )
+    local = mate_pos_s.between(window_start - 600, window_end + 600)
+    keep = mate_chrom_s.eq(chrom) & mate_pos_s.gt(0) & local & mate_pos_s.ne(gpos_s)
+    dpe = dpe.loc[keep]
     for rec in dpe.itertuples(index=False):
         anchor = int(rec.genomic_pos)
-        mate_chrom = str(getattr(rec, "mate_chrom", "") or "")
-        mate_pos = int(getattr(rec, "mate_genomic_pos", 0) or 0)
-        if mate_chrom != chrom or mate_pos <= 0:
-            continue
-        if not _plausible_local_mate_pos(mate_pos, window_start=window_start, window_end=window_end):
-            continue
-        if mate_pos == anchor:
-            continue
+        mate_pos = int(rec.mate_genomic_pos)
         if anchor <= bp_l and mate_pos >= bp_r:
             sizes.append(mate_pos - anchor)
         elif anchor >= bp_r and mate_pos <= bp_l:
@@ -830,79 +882,81 @@ def _infer_orientation(
     bp_r = int(breakpoint_right) if breakpoint_right is not None else None
     bp = int(breakpoint) if breakpoint is not None else None
 
-    def _junction_side(rec, *, evidence: str) -> str | None:
-        if evidence == "DPE":
-            genomic_pos = int(getattr(rec, "genomic_pos", 0) or 0)
-            if bp_l is not None and bp_r is not None and genomic_pos > 0:
-                side = _flank_side(genomic_pos, bp_l=bp_l, bp_r=bp_r)
-                if side is not None:
-                    return side
-            if bp is not None and genomic_pos > 0:
-                return "L" if genomic_pos <= bp else "R"
-            recorded = str(getattr(rec, "anchor_side", "") or "").upper()
-            return recorded if recorded in {"L", "R"} else None
+    def _col_str(frame: pd.DataFrame, col: str) -> pd.Series:
+        if col in frame.columns:
+            return frame[col].fillna("").astype(str)
+        return pd.Series("", index=frame.index)
 
-        # SR: clip_side is BAM soft-clip side, not the insertion junction.
-        clip = str(
-            getattr(rec, "clip_side", "") or getattr(rec, "anchor_side", "") or ""
-        ).upper()
-        if clip == "L":
-            return "R"
-        if clip == "R":
-            return "L"
-        return None
+    def _col_num(frame: pd.DataFrame, col: str) -> pd.Series:
+        if col in frame.columns:
+            return pd.to_numeric(frame[col], errors="coerce").fillna(0).astype(int)
+        return pd.Series(0, index=frame.index)
 
-    def _collect_vec(df: pd.DataFrame, evidence: str) -> tuple[list[float], list[float]]:
+    def _collect(evidence: str) -> tuple[list[float], list[float]]:
+        """Split MEI-junction coordinates into left/right lists (vectorized).
+
+        Uses boolean masks and ``.str`` accessors instead of a per-row apply.
         """
-        Vectorized alternative to _collect with boolean mask operations.
-    
-        Returns:
-        (left_midpoints, right_midpoints): list of float coordinates
-        """
+        df = work
         if df.empty:
             return [], []
 
-        # Boolean filter conditions
-        # 1. Exclude polya rescue rows
-        rescue = df.get("polya_rescue", False).fillna(False).astype(bool)
+        rescue = pd.Series(False, index=df.index)
+        if "polya_rescue" in df.columns:
+            rescue = df["polya_rescue"].fillna(False).astype(bool)
 
-        # 2. Filter by evidence type and MEI hit status
-        et = df.get("evidence_type", "").fillna("").astype(str)
+        et = _col_str(df, "evidence_type")
         if evidence == "DPE":
-            hit_col = df.get("mate_mei_hit", False).fillna(False).astype(bool)
-            type_mask = (et == "DPE") & hit_col
+            hit = pd.Series(False, index=df.index)
+            if "mate_mei_hit" in df.columns:
+                hit = df["mate_mei_hit"].fillna(False).astype(bool)
+            type_mask = (et == "DPE") & hit
             start_col, end_col = "mate_mei_start", "mate_mei_end"
         else:  # evidence == "SR"
-            hit_col = df.get("mei_hit", False).fillna(False).astype(bool)
-            type_mask = (et == "SR") & hit_col
+            hit = pd.Series(False, index=df.index)
+            if "mei_hit" in df.columns:
+                hit = df["mei_hit"].fillna(False).astype(bool)
+            type_mask = (et == "SR") & hit
             start_col, end_col = "mei_start", "mei_end"
 
-        valid_mask = ~rescue
-        final_mask = valid_mask & type_mask
-
-        if (final_mask.sum() == 0):
+        rows = df.loc[~rescue & type_mask].copy()
+        if rows.empty:
             return [], []
 
-        # Vectorized filtering
-        work_sub = df[final_mask].copy()
-
-        # Vectorized coordinate conversion and validation
-        starts = pd.to_numeric(work_sub.get(start_col, 0), errors="coerce").fillna(0).astype(int)
-        ends = pd.to_numeric(work_sub.get(end_col, 0), errors="coerce").fillna(0).astype(int)
-
-        valid_coords_mask = (starts > 0) & (ends > 0)
-        work_sub = work_sub[valid_coords_mask]
-
-        if work_sub.empty:
+        starts = _col_num(rows, start_col)
+        ends = _col_num(rows, end_col)
+        valid = (starts > 0) & (ends > 0)
+        rows = rows.loc[valid]
+        if rows.empty:
             return [], []
+        mids = (starts.loc[valid] + ends.loc[valid]) / 2.0
 
-        # Vectorized midpoint calculation
-        mids = (starts + ends) / 2.0
+        gpos = _col_num(rows, "genomic_pos")
+        sides = pd.Series("", index=rows.index)
+        valid_g = gpos.gt(0)
 
-        # Vectorized junction side classification
-        sides = work_sub.apply(lambda r: _junction_side(r, evidence=evidence), axis=1)
+        if evidence == "DPE":
+            # DPE: genomic anchor flank is the junction the mate should abut.
+            if bp_l is not None and bp_r is not None:
+                sides.loc[valid_g & gpos.le(bp_l)] = "L"
+                sides.loc[valid_g & gpos.ge(bp_r)] = "R"
+                if bp is not None:
+                    rest = sides.eq("")
+                    sides.loc[valid_g & rest & gpos.le(bp)] = "L"
+                    sides.loc[valid_g & rest & gpos.gt(bp)] = "R"
+            elif bp is not None:
+                sides.loc[valid_g & gpos.le(bp)] = "L"
+                sides.loc[valid_g & gpos.gt(bp)] = "R"
+            recorded = _col_str(rows, "anchor_side").str.upper()
+            recorded = recorded.where(recorded.isin({"L", "R"}), "")
+            sides.loc[sides.eq("")] = recorded.loc[sides.eq("")]
+        else:
+            # SR: clip_side is BAM soft-clip side, not the insertion junction.
+            clip_side = _col_str(rows, "clip_side")
+            anchor_side = _col_str(rows, "anchor_side")
+            clip = clip_side.where(clip_side.ne(""), anchor_side).str.upper()
+            sides = clip.map({"L": "R", "R": "L"}).fillna("")
 
-        # Return lists for visualization
         return mids[sides == "L"].tolist(), mids[sides == "R"].tolist()
 
     def _call(left_mids: list[float], right_mids: list[float]) -> str | None:
@@ -1763,6 +1817,12 @@ class ReadArchitectureCache:
         """Build exact-window and MEI-hit indexes once for batch plotting."""
         if self._indexed:
             return
+        # Encode low-cardinality repeated string columns as categories so the
+        # shared frames consume far less memory across every locus plot.
+        _as_category_columns(self.gold_df, _GOLD_CATEGORICAL_COLS)
+        _as_category_columns(self.detail_df, _DETAIL_CATEGORICAL_COLS)
+        for split in self.split_by_sample.values():
+            _as_category_columns(split, _DETAIL_CATEGORICAL_COLS)
         self._mei_index = _build_mei_index(self.mei_df)
         if self.detail_df.empty:
             self._indexed = True
@@ -1931,31 +1991,30 @@ def _pair_segments(
         "polya_rescue_plotted": 0,
         "vntr_rescue_plotted": 0,
     }
-    for rec in detail.itertuples(index=False):
-        if str(rec.evidence_type) == "SR":
-            pair = _pair_from_sr_row(rec, layout, read_width_bp=read_width_bp)
-            if pair is None:
-                stats["sr_skipped"] += 1
-            else:
-                stats["sr_plotted"] += 1
-                pairs.append(pair)
-                rk = str(pair.get("rescue_kind", "") or "")
-                if rk == "polya":
-                    stats["polya_rescue_plotted"] += 1
-                elif rk == "vntr":
-                    stats["vntr_rescue_plotted"] += 1
+    is_sr = (
+        detail["evidence_type"].fillna("").astype(str).eq("SR").to_numpy()
+        if "evidence_type" in detail.columns
+        else np.zeros(len(detail), dtype=bool)
+    )
+
+    def _track(pair: dict[str, object] | None, skipped_key: str) -> None:
+        """Record stats and append a plotted pair (mutates enclosing dict/list)."""
+        if pair is None:
+            stats[skipped_key] += 1
+            return
+        stats[skipped_key.replace("_skipped", "_plotted")] += 1
+        rk = str(pair.get("rescue_kind", "") or "")
+        if rk == "polya":
+            stats["polya_rescue_plotted"] += 1
+        elif rk == "vntr":
+            stats["vntr_rescue_plotted"] += 1
+        pairs.append(pair)
+
+    for i, rec in enumerate(detail.itertuples(index=False)):
+        if is_sr[i]:
+            _track(_pair_from_sr_row(rec, layout, read_width_bp=read_width_bp), "sr_skipped")
         else:
-            pair = _pair_from_dpe_row(rec, layout)
-            if pair is None:
-                stats["dpe_skipped"] += 1
-            else:
-                stats["dpe_plotted"] += 1
-                rk = str(pair.get("rescue_kind", "") or "")
-                if rk == "polya":
-                    stats["polya_rescue_plotted"] += 1
-                elif rk == "vntr":
-                    stats["vntr_rescue_plotted"] += 1
-                pairs.append(pair)
+            _track(_pair_from_dpe_row(rec, layout), "dpe_skipped")
 
     stats["pairs_before_cap"] = len(pairs)
     cap = max(1, int(max_pairs))
