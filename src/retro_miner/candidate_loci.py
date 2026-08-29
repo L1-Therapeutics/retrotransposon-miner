@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 
 import click
+import numpy as np
 import pandas as pd
 from intervaltree import IntervalTree
 
@@ -107,14 +108,9 @@ def _cluster_sorted_positions(positions: list[int], max_gap_bp: int) -> list[lis
         return []
     if max_gap_bp < 0:
         max_gap_bp = 0
-    clusters: list[list[int]] = [[int(positions[0])]]
-    for pos in positions[1:]:
-        p = int(pos)
-        if p - clusters[-1][-1] <= max_gap_bp:
-            clusters[-1].append(p)
-        else:
-            clusters.append([p])
-    return clusters
+    arr = np.asarray(positions, dtype=np.int64)
+    gaps = np.diff(arr) > max_gap_bp
+    return [seg.tolist() for seg in np.split(arr, np.where(gaps)[0] + 1)]
 
 
 def _split_cluster_positions(
