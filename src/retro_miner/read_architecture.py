@@ -121,6 +121,8 @@ _DETAIL_CATEGORICAL_COLS = (
     "polya_base",
     "clip_poly_base",
     "anchor_poly_base",
+    "family",
+    "strand",
 )
 
 _GOLD_CATEGORICAL_COLS = (
@@ -128,6 +130,9 @@ _GOLD_CATEGORICAL_COLS = (
     "consensus_mei_family",
     "consensus_mei_subfamily",
     "sample_status_label",
+    "sample",
+    "family",
+    "strand",
 )
 
 
@@ -421,6 +426,51 @@ def _mate_polya_width_bp(row: pd.Series) -> int:
     return 0
 
 
+def _mate_polya_widths(frame: pd.DataFrame) -> pd.Series:
+    """Vectorized polyA/T width per mate — same precedence as ``_mate_polya_width_bp``.
+
+    Preference: purity-checked ``mate_seq`` (``.str.upper()`` / ``.str.count()``),
+    then imputed polyA rescue spans, then ``mate_seq_len`` for rescue rows.
+    """
+    idx = frame.index
+    widths = pd.Series(0, index=idx, dtype="int64")
+    if frame.empty:
+        return widths
+
+    seq_s = (
+        frame["mate_seq"].fillna("").astype(str)
+        if "mate_seq" in frame.columns
+        else pd.Series("", index=idx)
+    )
+    seq_len = seq_s.str.len()
+    seq_ok = seq_len.ge(12)
+    if seq_ok.any():
+        upper = seq_s.str.upper()
+        dom = pd.concat([upper.str.count("A"), upper.str.count("T")], axis=1).max(axis=1)
+        seq_ok = seq_ok & (dom / seq_len).ge(0.90)
+        widths = widths.mask(seq_ok, seq_len.clip(upper=_MAX_POLYA_SINGLE_BP))
+
+    rescue = pd.Series(False, index=idx)
+    if "polya_rescue" in frame.columns:
+        rescue = rescue | frame["polya_rescue"].fillna(False).astype(bool)
+    if "mei_hit_source" in frame.columns:
+        source = frame["mei_hit_source"].fillna("").astype(str).str.strip().str.lower()
+        rescue = rescue | source.isin({"polya_rescue", "poly_tail_rescue"})
+    if rescue.any():
+        for start_col, end_col in (("mate_mei_start", "mate_mei_end"), ("mei_start", "mei_end")):
+            if start_col not in frame.columns or end_col not in frame.columns:
+                continue
+            s = pd.to_numeric(frame[start_col], errors="coerce").fillna(0).astype(int)
+            e = pd.to_numeric(frame[end_col], errors="coerce").fillna(0).astype(int)
+            span_ok = rescue & s.gt(0) & e.ge(s) & widths.eq(0)
+            widths = widths.mask(span_ok, (e - s + 1).clip(upper=_MAX_POLYA_SINGLE_BP))
+        if "mate_seq_len" in frame.columns:
+            n = pd.to_numeric(frame["mate_seq_len"], errors="coerce").fillna(0).astype(int)
+            len_ok = rescue & widths.eq(0) & n.ge(12)
+            widths = widths.mask(len_ok, n.clip(upper=_MAX_POLYA_SINGLE_BP))
+    return widths
+
+
 def _max_polya_zone_bp(
     detail: pd.DataFrame | None,
     *,
@@ -449,14 +499,14 @@ def _max_polya_zone_bp(
         if not resc.empty:
             # Use imputed polyA spans / purity-checked mate width — not raw mate_seq_len
             # on non-rescue MEI mates (that inflated zones to ~clip+151).
-            widths.extend(int(v) for v in resc.apply(_mate_polya_width_bp, axis=1).tolist() if int(v) >= 12)
+            widths.extend(int(v) for v in _mate_polya_widths(resc).tolist() if int(v) >= 12)
             _add_span_widths(resc)
     if "mei_hit_source" in detail.columns:
         src = detail["mei_hit_source"].fillna("").astype(str)
         poly_src = detail.loc[src.eq("polya_rescue")]
         if not poly_src.empty:
             widths.extend(
-                int(v) for v in poly_src.apply(_mate_polya_width_bp, axis=1).tolist() if int(v) >= 12
+                int(v) for v in _mate_polya_widths(poly_src).tolist() if int(v) >= 12
             )
             _add_span_widths(poly_src)
     if "polya_base" in detail.columns:
@@ -466,7 +516,7 @@ def _max_polya_zone_bp(
                 cl = pd.to_numeric(poly_base["clip_len"], errors="coerce").fillna(0).astype(int)
                 widths.extend(int(v) for v in cl.tolist() if int(v) >= 12)
             widths.extend(
-                int(v) for v in poly_base.apply(_mate_polya_width_bp, axis=1).tolist() if int(v) >= 12
+                int(v) for v in _mate_polya_widths(poly_base).tolist() if int(v) >= 12
             )
     if "poly_tail_rescued" in detail.columns:
         rescued = detail.loc[detail["poly_tail_rescued"].fillna(False).astype(bool)]
@@ -501,7 +551,7 @@ def _max_polya_zone_bp(
             else pd.Series(0, index=anc.index)
         )
         anchor_w = clip_lens.combine(run_lens, max)
-        mate_w = anc.apply(_mate_polya_width_bp, axis=1)
+        mate_w = _mate_polya_widths(anc)
         for aw, mw in zip(anchor_w.tolist(), mate_w.tolist()):
             if int(aw) >= 8 and int(mw) >= 12:
                 widths.append(int(aw) + int(mw))
@@ -2852,6 +2902,9 @@ def generate_gold_read_architecture_plots(
     if variants.empty:
         click.echo("[read-arch] no variants selected for plots; skipping")
         return pd.DataFrame()
+    # Encode repeated family/strand/sample labels as categories before the
+    # per-locus loop (grouped/read hundreds of times while plots are drawn).
+    _as_category_columns(variants, _GOLD_CATEGORICAL_COLS)
 
     if cache is None:
         if isinstance(supporting_reads_detail, Path):
