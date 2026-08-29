@@ -318,6 +318,7 @@ def _fetch_mate_sequence_from_bam(
     mate_pos_1based: int,
     *,
     fetch_window_bp: int = 500,
+    ref_names: set[str] | None = None,
 ) -> tuple[str, int, int, str, int, str]:
     """Best-effort mate sequence fetch for discordant-pair MEI remapping.
 
@@ -328,7 +329,9 @@ def _fetch_mate_sequence_from_bam(
     empty = ("", 0, 0, "", 0, "")
     if mate_chrom in {"", "*"} or mate_pos_1based <= 0:
         return empty
-    if mate_chrom not in bam.references:
+    if ref_names is None:
+        ref_names = set(bam.references)
+    if mate_chrom not in ref_names:
         return empty
 
     start0 = max(0, int(mate_pos_1based) - 1)
@@ -465,6 +468,7 @@ def extract_discordant_evidence(
         pysam.AlignmentFile(str(mate_bam_resolved), "rb") if fetch_mate_seq else nullcontext(None)
     )
     with pysam.AlignmentFile(str(bam_path), "rb") as bam, mate_bam_ctx as mate_bam:
+        mate_bam_refs = set(mate_bam.references) if mate_bam is not None else set()
         for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
 
@@ -544,6 +548,7 @@ def extract_discordant_evidence(
                     mate_chrom,
                     mate_pos_1based,
                     fetch_window_bp=mate_fetch_window_bp,
+                    ref_names=mate_bam_refs,
                 )
                 if mate_seq:
                     mate_seq_fetched_rows += 1
