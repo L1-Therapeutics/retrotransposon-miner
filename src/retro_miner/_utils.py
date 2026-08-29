@@ -11,6 +11,9 @@ import warnings
 from pathlib import Path
 from typing import IO
 
+_RUN_A_RE = re.compile(r"A+")
+_RUN_T_RE = re.compile(r"T+")
+
 
 def safe_locus_id(chrom: str, start: int, end: int) -> str:
     """Return a filesystem-safe locus identifier string.
@@ -56,16 +59,9 @@ def _poly_at_stats(seq: str) -> tuple[int, float, str]:
         base = "T"
         n_dom = n_t
     frac = float(n_dom) / float(len(s))
-    best = 0
-    cur = 0
-    for ch in s:
-        if ch == base:
-            cur += 1
-            best = max(best, cur)
-        else:
-            cur = 0
-    return (int(best), float(frac), base)
-
+    pattern = _RUN_A_RE if base == "A" else _RUN_T_RE
+    best = max((len(r) for r in pattern.findall(s)), default=0)
+    return (best, float(frac), base)
 
 def _longest_poly_at_span(
     seq: str,
@@ -82,7 +78,7 @@ def _longest_poly_at_span(
     If the span covers essentially the whole read (≥140 bp or within 2 bp of
     read length), that is a full-read polyA/T (few mismatches allowed).
     """
-    s = "".join(ch for ch in (seq or "").upper() if ch in {"A", "C", "G", "T"})
+    s = re.sub(r"[^ACGT]", "", (seq or "").upper())
     n = len(s)
     if n < int(min_len):
         return (0, 0.0, "", "")

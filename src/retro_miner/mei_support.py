@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import itertools
 import json
 import math
 import random
@@ -8863,10 +8864,12 @@ def _revcomp(seq: str) -> str:
     return (seq or "").translate(tr)[::-1]
 
 
-def _hamming(a: str, b: str) -> int:
+def _hamming_distance(a: str, b: str) -> int:
     if len(a) != len(b):
         return max(len(a), len(b))
-    return sum(1 for x, y in zip(a, b) if x != y)
+    if a == b:
+        return 0
+    return sum(x != y for x, y in zip(a, b))
 
 
 # Motif examples from published analyses; these are supportive mechanism hints,
@@ -8893,23 +8896,50 @@ _L1_EN_MOTIF_ALLOWED_MISMATCHES: dict[str, int] = {
     "CCATT": 2,
 }
 
+# Precomputed log-odds contributions for the YYRRRR L1 endonuclease motif
+# model (P(match) = 0.45, P(mismatch) = 0.05, background = 0.25).
+_Y_LOGODDS_MATCH = float(math.log2(0.45 / 0.25))
+_Y_LOGODDS_MISMATCH = float(math.log2(0.05 / 0.25))
+
+# Per-position base-class lookup for the YYRRRR motif: positions 0-1 expect
+# pyrimidines (Y: C/T), positions 2-5 expect purines (R: A/G).  Bases absent
+# from a position's table (N and other IUPAC codes) contribute the mismatch
+# log-odds via the dict.get default.
+_YR_LOGODDS_TABLE: tuple[dict[str, float], ...] = (
+    {"C": _Y_LOGODDS_MATCH, "T": _Y_LOGODDS_MATCH},
+    {"C": _Y_LOGODDS_MATCH, "T": _Y_LOGODDS_MATCH},
+    {"A": _Y_LOGODDS_MATCH, "G": _Y_LOGODDS_MATCH},
+    {"A": _Y_LOGODDS_MATCH, "G": _Y_LOGODDS_MATCH},
+    {"A": _Y_LOGODDS_MATCH, "G": _Y_LOGODDS_MATCH},
+    {"A": _Y_LOGODDS_MATCH, "G": _Y_LOGODDS_MATCH},
+)
+
+
+def _build_l1_motif_distance_table(motif: str) -> dict[str, int]:
+    table: dict[str, int] = {}
+    for combo in itertools.product("ACGT", repeat=len(motif)):
+        window = "".join(combo)
+        table[window] = _hamming_distance(window, motif)
+    return table
+
+
+# Precomputed per-motif Hamming-distance lookups over all ACGT windows, so the
+# per-row motif scan is a dict lookup instead of character-by-character
+# comparison.  Windows containing non-ACGT bases fall back to
+# _hamming_distance at call time.
+_L1_EN_MOTIF_SCAN_TABLE: tuple[tuple[str, str, int, dict[str, int]], ...] = tuple(
+    (motif, mtype, len(motif), _build_l1_motif_distance_table(motif))
+    for motif, mtype in _L1_EN_PAPER_MOTIFS.items()
+)
+
 
 def _yyrrrr_logodds(seq6: str) -> float:
     s = (seq6 or "").upper()
     if len(s) != 6:
         return 0.0
-    favored = [
-        {"C", "T"},
-        {"C", "T"},
-        {"A", "G"},
-        {"A", "G"},
-        {"A", "G"},
-        {"A", "G"},
-    ]
     score = 0.0
     for i, base in enumerate(s):
-        p = 0.45 if base in favored[i] else 0.05
-        score += float(math.log2(p / 0.25))
+        score += _YR_LOGODDS_TABLE[i].get(base, _Y_LOGODDS_MISMATCH)
     return score
 
 
@@ -8970,13 +9000,14 @@ def _match_l1_endonuclease_motif(
     best_anchor6 = anchor6
     best_pattern = ""
 
-    for motif, mtype in _L1_EN_PAPER_MOTIFS.items():
-        mlen = len(motif)
-        windows = [anchor6] if mlen == 6 else [anchor6[:5], anchor6[1:6]]
+    for motif, mtype, mlen, dist_table in _L1_EN_MOTIF_SCAN_TABLE:
+        windows = (anchor6,) if mlen == 6 else (anchor6[:5], anchor6[1:6])
         for w_idx, win in enumerate(windows):
             if len(win) != mlen:
                 continue
-            mm = _hamming(win, motif)
+            mm = dist_table.get(win)
+            if mm is None:
+                mm = _hamming_distance(win, motif)
             if mm < best_mm:
                 best_mm = mm
                 best_motif = motif
