@@ -432,24 +432,14 @@ def _family_from_target(target: str) -> str:
     return ""
 
 
+_POLY_RUN_RE = re.compile(r"A+|T+", re.I)
+
+
 def _poly_at_max_run(seq: str) -> int:
     s = (seq or "").upper()
-    best = 0
-    cur = 0
-    prev = ""
-    for ch in s:
-        if ch not in {"A", "T"}:
-            cur = 0
-            prev = ""
-            continue
-        if ch == prev:
-            cur += 1
-        else:
-            cur = 1
-            prev = ch
-        if cur > best:
-            best = cur
-    return best
+    if not s:
+        return 0
+    return max((len(m.group(0)) for m in _POLY_RUN_RE.finditer(s)), default=0)
 
 
 def _load_fasta_lengths(fasta_path: Path) -> dict[str, int]:
