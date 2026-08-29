@@ -9,6 +9,13 @@ set -euo pipefail
 # This wrapper runs the same commands used in interactive development so the
 # workflow can be reproduced with one command.
 
+# Mirroring the run's pipeline.log to the workdir root is opt-in: it only
+# happens when a caller (e.g. scripts/use_external_workdir.sh or the env)
+# explicitly configured an external workdir, never on the implicit default.
+RTM_WORKDIR_EXPLICIT="0"
+if [[ -n "${RTM_WORKDIR:-}" ]]; then
+  RTM_WORKDIR_EXPLICIT="1"
+fi
 RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
 RTM_PUBLIC_DATA_DIR="${RTM_PUBLIC_DATA_DIR:-${RTM_WORKDIR}/data/public}"
 RTM_RESULTS_DIR="${RTM_RESULTS_DIR:-${RTM_WORKDIR}/results}"
@@ -68,6 +75,19 @@ JUNK_MERGED_BED="${JUNK_MERGED_BED:-}"
 
 now_epoch() {
   date +%s
+}
+
+mirror_pipeline_log() {
+  local run_log="$1"
+  if [[ "${RTM_WORKDIR_EXPLICIT}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${run_log}" ]] || [[ ! -f "${run_log}" ]]; then
+    return 0
+  fi
+  mkdir -p "${RTM_WORKDIR}"
+  cp -f "${run_log}" "${RTM_WORKDIR}/pipeline.log"
+  echo "[candidate-pipeline] mirrored run log -> ${RTM_WORKDIR}/pipeline.log"
 }
 
 normalize_chr_token() {
@@ -738,7 +758,9 @@ fi
 
 if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   REGION="${CHR_LIST[0]}"
-  run_single_pipeline "${REGION}" "${OUTDIR}"
+  mkdir -p "${OUTDIR}"
+  run_single_pipeline "${REGION}" "${OUTDIR}" | tee "${OUTDIR}/pipeline.log"
+  mirror_pipeline_log "${OUTDIR}/pipeline.log"
   echo "[candidate-pipeline] done"
   echo "  ${OUTDIR}/split_evidence.summary.tsv"
   echo "  ${OUTDIR}/candidate_loci.tsv"
@@ -821,3 +843,7 @@ if [[ "${CHR_ALL_MODE}" == "1" ]]; then
   consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${CHR_LIST[@]}"
   echo "  consolidated gold review written to: ${BASE_OUTDIR}/candidate_loci.mei.gold_review.tsv"
 fi
+# Assemble one stable per-run pipeline.log from the finished worker logs, then
+# mirror a copy to the workdir root for automated audit compliance.
+cat "${LOG_DIR}"/*.log > "${BASE_OUTDIR}/pipeline.log" 2>/dev/null || true
+mirror_pipeline_log "${BASE_OUTDIR}/pipeline.log"
