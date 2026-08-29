@@ -280,8 +280,8 @@ def _validate_igv_chrom(chrom: str) -> None:
     ``goto chr22\\nBAD:100-200`` would be split into two separate batch commands, causing
     IGV to receive an unintended command and to navigate to the wrong locus.
     """
-    for ch in _IGV_BATCH_FORBIDDEN:
-        if ch in chrom:
+    for ch in chrom:
+        if ch in _IGV_BATCH_FORBIDDEN:
             raise ValueError(
                 f"IGV batch chromosome contains a forbidden character (0x{ord(ch):02x}): {chrom!r}"
             )
@@ -559,7 +559,13 @@ def _wrap_headless_command(launcher: Path, batch_script: Path) -> list[str]:
 
 def _verify_snapshot_pngs(index_rows: list[dict[str, object]]) -> int:
     paths = [Path(str(row["snapshot_png"])) for row in index_rows if row.get("snapshot_png")]
-    created = sum(1 for path in paths if path.exists() and path.stat().st_size > 0)
+    created = 0
+    for path in paths:
+        try:
+            if path.stat().st_size > 0:
+                created += 1
+        except OSError:
+            continue
     if created == 0 and paths:
         raise RuntimeError(
             f"IGV produced 0/{len(paths)} snapshot PNGs. {_headless_display_help()}"
