@@ -13,9 +13,10 @@ import subprocess
 import tempfile
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Union, cast, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -464,9 +465,9 @@ def _discordant_mate_ok_for_mei_identity(df: pd.DataFrame) -> pd.Series:
         if "mate_chrom" in df.columns
         else pd.Series("", index=df.index)
     )
-    pos = pd.to_numeric(df["pos"] if "pos" in df.columns else 0, errors="coerce").fillna(0).astype(int)
+    pos = pd.to_numeric(df["pos"] if "pos" in df.columns else pd.Series(0, index=df.index), errors="coerce").fillna(0).astype(int)
     mate_pos = pd.to_numeric(
-        df["mate_pos"] if "mate_pos" in df.columns else 0,
+        df["mate_pos"] if "mate_pos" in df.columns else pd.Series(0, index=df.index),
         errors="coerce",
     ).fillna(0).astype(int)
     valid_mate = (mate_chrom != "") & (mate_chrom != "*") & mate_pos.gt(0)
@@ -629,14 +630,14 @@ def _top_family_then_subfamily(
 
     ascending = [True] * len(group_cols) + [False]
     family_top = (
-        work.groupby(group_cols + [family_col], as_index=False)[score_col]
+        work.groupby(group_cols + [family_col], as_index=False)[[score_col]]
         .sum()
         .sort_values(group_cols + [score_col], ascending=ascending)
         .drop_duplicates(group_cols, keep="first")
     )
     within = work.merge(family_top[group_cols + [family_col]], on=group_cols + [family_col], how="inner")
     subfamily_top = (
-        within.groupby(group_cols + [subfamily_col], as_index=False)[score_col]
+        within.groupby(group_cols + [subfamily_col], as_index=False)[[score_col]]
         .sum()
         .sort_values(group_cols + [score_col], ascending=ascending)
         .drop_duplicates(group_cols, keep="first")
@@ -1637,7 +1638,7 @@ def _align_discordant_mates_with_minimap2(
     mate_query["read_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
     mate_query["soft_clip_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
     mate_has_clip = (
-        pd.to_numeric(mate_query.get("mate_soft_clip_len", 0), errors="coerce").fillna(0).astype(int).gt(0)
+        pd.to_numeric(mate_query.get("mate_soft_clip_len", pd.Series(0, index=mate_query.index)), errors="coerce").fillna(0).astype(int).gt(0)
         | mate_query.get("mate_soft_clip_seq", pd.Series("", index=mate_query.index))
         .fillna("")
         .astype(str)
@@ -1745,7 +1746,7 @@ def _hydrate_sample_mei_hits_from_detail(
     split_df: pd.DataFrame,
     discordant_df: pd.DataFrame,
     detail: pd.DataFrame,
-) -> dict[str, object]:
+) -> _RemapOutput:
     """Rebuild per-read MEI hit frames from a prior supporting_reads_detail table.
 
     Skips MEI consensus remap and mate-BAM fetch. Non-hit evidence rows are retained so
@@ -1974,7 +1975,7 @@ def _remap_one_sample_mei_evidence(
     bam_path: Path | None,
     mate_bam_path: Path | None,
     bwa_threads: int = 1,
-) -> dict[str, object]:
+) -> _RemapOutput:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
     t0 = time.monotonic()
     click.echo(f"[mei-annotate] sample={sample} remap start bwa_threads={max(1, int(bwa_threads))}")
@@ -2249,9 +2250,9 @@ def _attach_mei_hits_to_discordant_rows(
     out["target"] = out["target"].fillna("")
     out["family"] = out["family"].fillna("")
     out["target_strand"] = out["target_strand"].fillna("")
-    out["target_start"] = pd.to_numeric(out.get("target_start", 0), errors="coerce").fillna(0).astype(int)
-    out["target_end"] = pd.to_numeric(out.get("target_end", 0), errors="coerce").fillna(0).astype(int)
-    out["mei_score"] = pd.to_numeric(out.get("mei_score", 0.0), errors="coerce").fillna(0.0).astype(float)
+    out["target_start"] = pd.to_numeric(out.get("target_start", pd.Series(0, index=out.index)), errors="coerce").fillna(0).astype(int)
+    out["target_end"] = pd.to_numeric(out.get("target_end", pd.Series(0, index=out.index)), errors="coerce").fillna(0).astype(int)
+    out["mei_score"] = pd.to_numeric(out.get("mei_score", pd.Series(0.0, index=out.index)), errors="coerce").fillna(0.0).astype(float)
     if "mei_hit_source" not in out.columns:
         out["mei_hit_source"] = ""
     out.loc[out["mei_hit"] & (out["mei_hit_source"].fillna("").astype(str).str.len() == 0), "mei_hit_source"] = "consensus"
@@ -2747,8 +2748,8 @@ def _impute_rescue_mei_coords(
             & (out["window_end"].astype(int) == int(we))
         )
         mapped_locus = out.loc[locus & mapped_mask]
-        ends = []
-        starts = []
+        ends: list[int] = []
+        starts: list[int] = []
         for col in end_cols:
             vals = pd.to_numeric(mapped_locus[col], errors="coerce").fillna(0).astype(int)
             ends.extend(int(v) for v in vals.tolist() if int(v) > 0)
@@ -3043,18 +3044,18 @@ def _aggregate_discordant_residual_complex_metrics(df: pd.DataFrame, sample_pref
 
     mei_u = (
         tmp.loc[tmp["_mei_mapped"]]
-        .groupby(["chrom", "window_start", "window_end"], as_index=False)["read_name"]
+        .groupby(["chrom", "window_start", "window_end"], as_index=False)[["read_name"]]
         .nunique()
         .rename(columns={"read_name": f"{sample_prefix}_discordant_mei_mapped_unique_reads"})
     )
     res_u = (
         tmp.loc[~tmp["_mei_related"]]
-        .groupby(["chrom", "window_start", "window_end"], as_index=False)["read_name"]
+        .groupby(["chrom", "window_start", "window_end"], as_index=False)[["read_name"]]
         .nunique()
         .rename(columns={"read_name": f"{sample_prefix}_discordant_residual_unique_reads"})
     )
     all_u = (
-        tmp.groupby(["chrom", "window_start", "window_end"], as_index=False)["read_name"]
+        tmp.groupby(["chrom", "window_start", "window_end"], as_index=False)[["read_name"]]
         .nunique()
         .rename(columns={"read_name": "_total_unique"})
     )
@@ -3190,13 +3191,13 @@ def _split_clip_mei_fields(split_df: pd.DataFrame) -> pd.DataFrame:
         else pd.Series(False, index=split_df.index)
     )
     has_mei = mei_hit | mei_hit_coord
-    clip_len = pd.to_numeric(split_df.get("clip_len", 0), errors="coerce").fillna(0).astype(int)
+    clip_len = pd.to_numeric(split_df.get("clip_len", pd.Series(0, index=split_df.index)), errors="coerce").fillna(0).astype(int)
     if "target_start_coord" in split_df.columns:
         t_start = pd.to_numeric(split_df["target_start_coord"], errors="coerce").fillna(0).astype(int)
         t_end = pd.to_numeric(split_df["target_end_coord"], errors="coerce").fillna(0).astype(int)
         t_strand = split_df.get("target_strand_coord", pd.Series("", index=split_df.index)).fillna("").astype(str)
         t_family = split_df.get("family_coord", pd.Series("", index=split_df.index)).fillna("").astype(str)
-        t_aln = pd.to_numeric(split_df.get("alnlen_coord", 0), errors="coerce").fillna(0).astype(int)
+        t_aln = pd.to_numeric(split_df.get("alnlen_coord", pd.Series(0, index=split_df.index)), errors="coerce").fillna(0).astype(int)
         use_coord = (t_start > 0) | (t_end > 0)
         if "target_start" in split_df.columns:
             t_start = t_start.where(
@@ -3207,16 +3208,16 @@ def _split_clip_mei_fields(split_df: pd.DataFrame) -> pd.DataFrame:
             )
             raw_strand = split_df.get("target_strand", pd.Series("", index=split_df.index)).fillna("").astype(str)
             raw_family = split_df.get("family", pd.Series("", index=split_df.index)).fillna("").astype(str)
-            raw_aln = pd.to_numeric(split_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+            raw_aln = pd.to_numeric(split_df.get("alnlen", pd.Series(0, index=split_df.index)), errors="coerce").fillna(0).astype(int)
             t_strand = t_strand.where(use_coord & t_strand.ne(""), raw_strand)
             t_family = t_family.where(use_coord & t_family.ne(""), raw_family)
             t_aln = t_aln.where(use_coord & t_aln.gt(0), raw_aln)
     else:
-        t_start = pd.to_numeric(split_df.get("target_start", 0), errors="coerce").fillna(0).astype(int)
-        t_end = pd.to_numeric(split_df.get("target_end", 0), errors="coerce").fillna(0).astype(int)
+        t_start = pd.to_numeric(split_df.get("target_start", pd.Series(0, index=split_df.index)), errors="coerce").fillna(0).astype(int)
+        t_end = pd.to_numeric(split_df.get("target_end", pd.Series(0, index=split_df.index)), errors="coerce").fillna(0).astype(int)
         t_strand = split_df.get("target_strand", pd.Series("", index=split_df.index)).fillna("").astype(str)
         t_family = split_df.get("family", pd.Series("", index=split_df.index)).fillna("").astype(str)
-        t_aln = pd.to_numeric(split_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+        t_aln = pd.to_numeric(split_df.get("alnlen", pd.Series(0, index=split_df.index)), errors="coerce").fillna(0).astype(int)
     side = (
         split_df["clip_side"].fillna("").astype(str).str.upper().str[:1]
         if "clip_side" in split_df.columns
@@ -3547,9 +3548,9 @@ def _build_supporting_reads_detail_table(
 
     def _as_int(val: object, default: int = 0) -> int:
         try:
-            if val is None or (isinstance(val, float) and pd.isna(val)):
+            if val is None or (isinstance(val, float) and pd.isna(cast(Any, val))):
                 return default
-            return int(val)
+            return int(cast(Union[int, float, str], val))
         except (TypeError, ValueError):
             return default
 
@@ -3557,7 +3558,7 @@ def _build_supporting_reads_detail_table(
         if val is None:
             return default
         try:
-            if pd.isna(val):
+            if pd.isna(cast(Any, val)):
                 return default
         except (TypeError, ValueError):
             pass
@@ -4439,7 +4440,7 @@ def _clip_overlap_consistency_stats(group: pd.DataFrame) -> tuple[int, float, fl
     # Keep one representative clip per read (highest MEI score first) so one
     # read with multiple alignments does not dominate overlap statistics.
     if "read_name" in work.columns:
-        work["mei_score_effective"] = pd.to_numeric(work.get("mei_score_effective", 0.0), errors="coerce").fillna(0.0)
+        work["mei_score_effective"] = pd.to_numeric(work.get("mei_score_effective", pd.Series(0.0, index=work.index)), errors="coerce").fillna(0.0)
         work = work.sort_values("mei_score_effective", ascending=False).drop_duplicates("read_name", keep="first")
     work = work.head(40).copy()
     side_hint = ""
@@ -4946,7 +4947,7 @@ def _add_candidate_support_info_fields(
         # Unique reads per side, then majority.
         per_side = (
             all_sides.drop_duplicates(key_cols + ["read_name", "poly_side"])
-            .groupby(key_cols + ["poly_side"], as_index=False)["read_name"]
+            .groupby(key_cols + ["poly_side"], as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": "n"})
         )
@@ -4980,7 +4981,7 @@ def _add_candidate_support_info_fields(
             return pd.DataFrame(columns=key_cols + [f"{prefix}_has_mei_support"])
         all_mei = pd.concat(parts, ignore_index=True)
         gate = (
-            all_mei.groupby(key_cols, as_index=False)["read_name"]
+            all_mei.groupby(key_cols, as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": f"{prefix}_mei_unique_reads"})
         )
@@ -5001,7 +5002,7 @@ def _add_candidate_support_info_fields(
             return pd.DataFrame(columns=key_cols + [f"{prefix}_mei_mapped"])
         all_mei = pd.concat(parts, ignore_index=True)
         out_mei = (
-            all_mei.groupby(key_cols, as_index=False)["read_name"]
+            all_mei.groupby(key_cols, as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": f"{prefix}_mei_mapped"})
         )
@@ -5020,7 +5021,7 @@ def _add_candidate_support_info_fields(
         if work.empty:
             return pd.DataFrame(columns=key_cols + [out_col])
         out_r = (
-            work.groupby(key_cols, as_index=False)["read_name"]
+            work.groupby(key_cols, as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": out_col})
         )
@@ -5071,7 +5072,7 @@ def _add_candidate_support_info_fields(
             return pd.DataFrame(columns=key_cols + [out_col])
         all_reads = pd.concat(parts, ignore_index=True)
         out_r = (
-            all_reads.groupby(key_cols, as_index=False)["read_name"]
+            all_reads.groupby(key_cols, as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": out_col})
         )
@@ -5249,7 +5250,7 @@ def _add_candidate_support_info_fields(
         work = work.loc[work["read_name"].str.len() > 0]
         if work.empty:
             return pd.DataFrame(columns=key_cols + [out_col])
-        return work.groupby(key_cols, as_index=False)["read_name"].nunique().rename(columns={"read_name": out_col})
+        return work.groupby(key_cols, as_index=False)[["read_name"]].nunique().rename(columns={"read_name": out_col})
 
     disease_gate = _mei_gate(split_disease_mei, discordant_disease_mei, "disease")
     control_gate = _mei_gate(split_control_mei, discordant_control_mei, "control")
@@ -5765,14 +5766,14 @@ def _aggregate_side_metrics(
         )
     )
     strand_top = (
-        side_df.groupby(["chrom", "window_start", "window_end", "target_strand_effective"], as_index=False)["mei_score_effective"]
+        side_df.groupby(["chrom", "window_start", "window_end", "target_strand_effective"], as_index=False)[["mei_score_effective"]]
         .sum()
         .sort_values(["chrom", "window_start", "window_end", "mei_score_effective"], ascending=[True, True, True, False])
         .drop_duplicates(["chrom", "window_start", "window_end"], keep="first")
         .rename(columns={"target_strand_effective": f"{sample_prefix}_{side}_mei_strand"})
     )
     subfamily_sum = (
-        side_df.groupby(["chrom", "window_start", "window_end"], as_index=False)["mei_score_effective"]
+        side_df.groupby(["chrom", "window_start", "window_end"], as_index=False)[["mei_score_effective"]]
         .sum()
         .rename(columns={"mei_score_effective": "all_subfamily_score_sum"})
     )
@@ -5789,7 +5790,7 @@ def _aggregate_side_metrics(
     ).fillna(0.0)
 
     pos_counts = (
-        side_df.groupby(["chrom", "window_start", "window_end", "pos"], as_index=False)["read_name"]
+        side_df.groupby(["chrom", "window_start", "window_end", "pos"], as_index=False)[["read_name"]]
         .nunique()
         .rename(columns={"read_name": "support_reads"})
     )
@@ -5801,7 +5802,7 @@ def _aggregate_side_metrics(
         columns={"pos": f"{sample_prefix}_{side}_mei_breakpoint_mode", "support_reads": "mode_support_reads"}
     )
     pos_unique = (
-        pos_counts.groupby(["chrom", "window_start", "window_end"], as_index=False)["pos"]
+        pos_counts.groupby(["chrom", "window_start", "window_end"], as_index=False)[["pos"]]
         .nunique()
         .rename(columns={"pos": f"{sample_prefix}_{side}_mei_breakpoint_unique_positions"})
     )
@@ -5980,7 +5981,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     subfamily_top = subfamily_top.rename(columns={"target": f"{sample_prefix}_discordant_mei_subfamily"})
     identity_votes = _identity_vote_maps(identity_df, sample_prefix=sample_prefix)
     strand_top = (
-        mei_df.groupby(["chrom", "window_start", "window_end", "target_strand"], as_index=False)["mei_score"]
+        mei_df.groupby(["chrom", "window_start", "window_end", "target_strand"], as_index=False)[["mei_score"]]
         .sum()
         .sort_values(["chrom", "window_start", "window_end", "mei_score"], ascending=[True, True, True, False])
         .drop_duplicates(["chrom", "window_start", "window_end"], keep="first")
@@ -5989,7 +5990,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     # Purity for the identity-eligible subset (same rows that chose family/subfamily).
     purity_src = identity_df if not identity_df.empty else mei_df.iloc[0:0].copy()
     family_sum = (
-        purity_src.groupby(["chrom", "window_start", "window_end"], as_index=False)["mei_score"]
+        purity_src.groupby(["chrom", "window_start", "window_end"], as_index=False)[["mei_score"]]
         .sum()
         .rename(columns={"mei_score": "all_family_score_sum"})
     )
@@ -6003,7 +6004,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     ).fillna(0.0)
 
     strand_sum = (
-        mei_df.groupby(["chrom", "window_start", "window_end"], as_index=False)["mei_score"]
+        mei_df.groupby(["chrom", "window_start", "window_end"], as_index=False)[["mei_score"]]
         .sum()
         .rename(columns={"mei_score": "all_strand_score_sum"})
     )
@@ -6017,7 +6018,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     ).fillna(0.0)
 
     side_counts = (
-        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)["read_name"]
+        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)[["read_name"]]
         .nunique()
         .rename(columns={"read_name": "side_unique_reads"})
     )
@@ -6046,7 +6047,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     mei_df["target_mid"] = ((mei_df["target_start"].astype(int) + mei_df["target_end"].astype(int)) // 2).astype(int)
     mei_df["target_bin_25bp"] = (mei_df["target_mid"].astype(int) // 25).astype(int)
     side_target_mid = (
-        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)["target_mid"]
+        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)[["target_mid"]]
         .median()
         .rename(columns={"target_mid": "target_mid_median"})
     )
@@ -6132,7 +6133,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
             side_subfamily_src.groupby(
                 ["chrom", "window_start", "window_end", "anchor_side", "target"],
                 as_index=False,
-            )["mei_score"]
+            )[["mei_score"]]
             .sum()
             .sort_values(
                 ["chrom", "window_start", "window_end", "anchor_side", "mei_score"],
@@ -6172,7 +6173,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         out_col: str,
     ) -> pd.DataFrame:
         counts = (
-            data.groupby(["chrom", "window_start", "window_end", "anchor_side", key_col], as_index=False)["read_name"]
+            data.groupby(["chrom", "window_start", "window_end", "anchor_side", key_col], as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": "n_reads"})
         )
@@ -6185,7 +6186,7 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
             .rename(columns={"n_reads": "n_reads_mode"})
         )
         totals = (
-            data.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)["read_name"]
+            data.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": "n_reads_total"})
         )
@@ -7006,7 +7007,7 @@ def _infer_disease_insertion_metrics(
             return pd.DataFrame(columns=out_cols)
 
         pos_support = (
-            work.groupby(key_cols + ["clip_side", "pos"], as_index=False)["read_name"]
+            work.groupby(key_cols + ["clip_side", "pos"], as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": "support_reads"})
             .sort_values(
@@ -7105,7 +7106,7 @@ def _infer_disease_insertion_metrics(
             return pd.DataFrame(columns=out_cols)
 
         pos_support = (
-            work.groupby(key_cols + ["clip_side", "pos"], as_index=False)["read_name"]
+            work.groupby(key_cols + ["clip_side", "pos"], as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": "support_reads"})
             .sort_values(
@@ -7117,7 +7118,7 @@ def _infer_disease_insertion_metrics(
         modes = modes.rename(columns={"pos": "split_breakpoint_mode"})
 
         side_totals = (
-            work.groupby(key_cols + ["clip_side"], as_index=False)["read_name"]
+            work.groupby(key_cols + ["clip_side"], as_index=False)[["read_name"]]
             .nunique()
             .rename(columns={"read_name": "total_reads"})
         )
@@ -7208,9 +7209,9 @@ def _infer_disease_insertion_metrics(
     ) -> tuple[int, int, int, str]:
         def _to_int_safe(value: object, default: int = 0) -> int:
             try:
-                if pd.isna(value):
+                if pd.isna(cast(Any, value)):
                     return int(default)
-                return int(float(value))
+                return int(float(cast(Union[int, float, str], value)))
             except (TypeError, ValueError):
                 return int(default)
 
@@ -7311,9 +7312,9 @@ def _infer_disease_insertion_metrics(
     ) -> tuple[int, int, int, str]:
         def _to_int_safe(value: object, default: int = 0) -> int:
             try:
-                if pd.isna(value):
+                if pd.isna(cast(Any, value)):
                     return int(default)
-                return int(float(value))
+                return int(float(cast(Union[int, float, str], value)))
             except (TypeError, ValueError):
                 return int(default)
 
@@ -7762,9 +7763,9 @@ def _infer_disease_insertion_metrics(
         ) -> tuple[int, int, int, str]:
             def _to_int_safe(value: object, default: int = 0) -> int:
                 try:
-                    if pd.isna(value):
+                    if pd.isna(cast(Any, value)):
                         return int(default)
-                    return int(float(value))
+                    return int(float(cast(Union[int, float, str], value)))
                 except (TypeError, ValueError):
                     return int(default)
 
@@ -11556,7 +11557,7 @@ def _estimate_discordant_gap_intervals(
         if not clipped.empty:
             # Mode of soft-clip junction positions (unique reads per position).
             clip_counts = (
-                clipped.groupby("junction_tip", as_index=False)["read_name"]
+                clipped.groupby("junction_tip", as_index=False)[["read_name"]]
                 .nunique()
                 .sort_values(["read_name", "junction_tip"], ascending=[False, True])
             )
@@ -12933,7 +12934,7 @@ def _extract_float_from_info(value: object, default: float = -1.0) -> float:
         except (ValueError, TypeError):
             return default
     try:
-        return float(value)
+        return float(cast(Union[int, float, str], value))
     except (ValueError, TypeError):
         return default
 
@@ -12950,7 +12951,7 @@ def _extract_int_from_info(value: object, default: int = -1) -> int:
         except (ValueError, TypeError):
             return default
     try:
-        return int(value)
+        return int(cast(Union[int, float, str], value))
     except (ValueError, TypeError):
         return default
 
@@ -13240,13 +13241,34 @@ def _build_mei_variant_index(
     return index
 
 
+class _MeiQueryArrays(TypedDict):
+    """Typed query-window arrays passed to the searchsorted matcher."""
+
+    q_chrom: list[str]
+    q_start0: np.ndarray
+    q_end0: np.ndarray
+    q_rowid: np.ndarray
+    q_family: np.ndarray
+
+
+class _RemapOutput(TypedDict):
+    """Structured per-sample MEI remap/hydration result."""
+
+    sample: str
+    split_hits: pd.DataFrame
+    split_summary: ClipAlignmentSummary
+    disc_hits: pd.DataFrame
+    disc_summary: ClipAlignmentSummary
+    disc_mate_summary: ClipAlignmentSummary
+
+
 def _build_row_query_arrays(
     out: pd.DataFrame,
     split_padding_bp: int,
     dpe_padding_min_bp: int,
     dpe_padding_max_bp: int,
     dpe_padding_tlen_factor: float,
-) -> dict[str, object]:
+) -> _MeiQueryArrays:
     """Compute per-row query windows and event-family codes.
 
     Mirrors the query BED previously written for bedtools: the same
@@ -13290,7 +13312,7 @@ def _annotate_mei_overlap_searchsorted(
     q_end0: np.ndarray,
     q_rowid: np.ndarray,
     q_family: np.ndarray,
-) -> dict[int, dict[str, object]]:
+) -> dict[int, dict[str, Any]]:
     """Match candidate rows to reference variant positions with binary search.
 
     For each chromosome, every query window is reduced to a center coordinate
@@ -13300,17 +13322,17 @@ def _annotate_mei_overlap_searchsorted(
     variant) pairs keep their true interval ``overlap_bp``; the first
     max-overlap hit per row wins, mirroring the old bedtools best-hit logic.
     """
-    best_hits: dict[int, dict[str, object]] = {}
+    best_hits: dict[int, dict[str, Any]] = {}
     active = [c for c in set(q_chrom) & set(ref_index)]
     if not active:
         return best_hits
     q_chrom_arr = np.asarray(q_chrom, dtype=object)
     for chrom in active:
         ref = ref_index[chrom]
-        r_start = ref["start0"]
-        r_end = ref["end0"]
-        r_family = ref["family"]
-        r_meta = ref["meta"]
+        r_start = np.asarray(ref["start0"], dtype=np.int64)
+        r_end = np.asarray(ref["end0"], dtype=np.int64)
+        r_family = np.asarray(ref["family"], dtype=np.int8)
+        r_meta = cast(list[dict[str, Any]], ref["meta"])
         if len(r_start) == 0:
             continue
         row_pos = np.flatnonzero(q_chrom_arr == chrom)
@@ -13360,7 +13382,7 @@ def _annotate_mei_overlap_searchsorted(
         group_max = np.maximum.reduceat(s_ov, group_start)
         group_counts = np.diff(
             np.concatenate((group_start, np.asarray([len(s_ov)], dtype=np.int64)))
-        )
+        ).astype(np.int64)
         is_max = s_ov == np.repeat(group_max, group_counts)
         prev_is_max = np.concatenate((np.asarray([False]), is_max[:-1]))
         at_start = np.zeros(len(s_ov), dtype=bool)
@@ -13862,6 +13884,13 @@ def _write_rmsk_mei_bed(
     ncols = len(df.columns)
 
     # UCSC rmsk table with leading bin, or a BED-like fallback layout.
+    chrom_col: int
+    start_col: int
+    end_col: int
+    strand_col: int
+    name_col: int
+    class_col: int
+    fam_col: int | None
     if ncols >= 13 and str(df.iat[0, 5]).startswith("chr"):
         chrom_col, start_col, end_col = 5, 6, 7
         strand_col, name_col, class_col, fam_col = 9, 10, 11, 12
@@ -14151,6 +14180,8 @@ def annotate_candidate_loci_with_mei(
         f"elapsed={time.monotonic() - assign_t0:.1f}s"
     )
 
+    remap_by_sample: dict[str, _RemapOutput] = {}
+
     if reuse_dir is not None:
         # Re-label path: hydrate MEI hits from a prior annotate detail table.
         # Skips indel BAM scan, mate fetch, and MEI consensus remaps.
@@ -14183,16 +14214,16 @@ def annotate_candidate_loci_with_mei(
         # Re-apply sequence-based rescues (mate_seq is on discordant evidence; prior
         # detail often omitted polyA-only DPE rows, so hydrate alone cannot restore them).
         for sample in ("disease", "control"):
-            disc = remap_by_sample[sample]["disc_hits"]  # type: ignore[index]
+            disc = remap_by_sample[sample]["disc_hits"]
             if isinstance(disc, pd.DataFrame) and not disc.empty:
                 disc = _rescue_vntr_like_discordant_mei_hits(disc)
                 disc = _rescue_polya_like_discordant_mei_hits(disc)
-                remap_by_sample[sample]["disc_hits"] = disc  # type: ignore[index]
+                remap_by_sample[sample]["disc_hits"] = disc
     else:
         # Indel collection + MEI remaps: disease∥control (I/O and bwa mem release the GIL).
         click.echo("[mei-annotate] running disease∥control indel + MEI remaps")
         indel_t0 = time.monotonic()
-        indel_jobs: dict[str, object] = {}
+        indel_jobs: dict[str, pd.DataFrame] = {}
         with ThreadPoolExecutor(max_workers=2) as pool:
             indel_futs = {}
             if disease_bam_path is not None:
@@ -14231,8 +14262,9 @@ def annotate_candidate_loci_with_mei(
             f"per_sample={per_sample_bwa_threads} (disease∥control)"
         )
         remap_by_sample = {}
+
         with ThreadPoolExecutor(max_workers=2) as pool:
-            remap_futs = {
+            remap_futs: dict[Future, str] = {
                 pool.submit(
                     _remap_one_sample_mei_evidence,
                     sample="disease",
@@ -14254,23 +14286,23 @@ def annotate_candidate_loci_with_mei(
                     bwa_threads=per_sample_bwa_threads,
                 ): "control",
             }
-            for fut in as_completed(remap_futs):
-                sample = remap_futs[fut]
-                remap_by_sample[sample] = fut.result()
+            for remap_fut in as_completed(remap_futs):
+                sample = remap_futs[remap_fut]
+                remap_by_sample[sample] = remap_fut.result()
         click.echo(
             f"[mei-annotate] disease∥control MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s"
         )
 
-    disease_hits = remap_by_sample["disease"]["split_hits"]  # type: ignore[assignment]
-    control_hits = remap_by_sample["control"]["split_hits"]  # type: ignore[assignment]
-    disease_summary = remap_by_sample["disease"]["split_summary"]  # type: ignore[assignment]
-    control_summary = remap_by_sample["control"]["split_summary"]  # type: ignore[assignment]
-    disease_disc_hits = remap_by_sample["disease"]["disc_hits"]  # type: ignore[assignment]
-    control_disc_hits = remap_by_sample["control"]["disc_hits"]  # type: ignore[assignment]
-    disease_disc_summary = remap_by_sample["disease"]["disc_summary"]  # type: ignore[assignment]
-    control_disc_summary = remap_by_sample["control"]["disc_summary"]  # type: ignore[assignment]
-    disease_disc_mate_summary = remap_by_sample["disease"]["disc_mate_summary"]  # type: ignore[assignment]
-    control_disc_mate_summary = remap_by_sample["control"]["disc_mate_summary"]  # type: ignore[assignment]
+    disease_hits = remap_by_sample["disease"]["split_hits"]
+    control_hits = remap_by_sample["control"]["split_hits"]
+    disease_summary = remap_by_sample["disease"]["split_summary"]
+    control_summary = remap_by_sample["control"]["split_summary"]
+    disease_disc_hits = remap_by_sample["disease"]["disc_hits"]
+    control_disc_hits = remap_by_sample["control"]["disc_hits"]
+    disease_disc_summary = remap_by_sample["disease"]["disc_summary"]
+    control_disc_summary = remap_by_sample["control"]["disc_summary"]
+    disease_disc_mate_summary = remap_by_sample["disease"]["disc_mate_summary"]
+    control_disc_mate_summary = remap_by_sample["control"]["disc_mate_summary"]
     detail_t0 = time.monotonic()
     # Always rebuild from hit frames so short-MEI rescue / polyA split evidence is included
     # even when MEI hits were hydrated from a prior detail table (reuse mode).
