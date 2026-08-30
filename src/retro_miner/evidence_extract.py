@@ -196,6 +196,41 @@ def _clip_to_poly_at_region(seq: str, *, min_dom_frac: float = 0.90) -> str:
     return span
 
 
+# End-anchored polyA/T patterns for cheap terminal-tail scanning. A terminal
+# poly-tail (3' polyA of the inserted element, or its 5' polyT complement) lies
+# at one of the clip edges, so matching the leading run (``^A+|^T+``) or the
+# trailing run (``A+$|T+$``) avoids scanning the whole clip with a two-pointer
+# window loop.
+_POLY_TAIL_LEADING = re.compile(r"^A+|^T+", re.I)
+_POLY_TAIL_TRAILING = re.compile(r"A+$|T+$", re.I)
+
+
+def _poly_tail_terminal_stats(seq: str) -> tuple[int, float, str]:
+    """Terminal polyA/T run stats ``(run, frac, base)`` via end-anchored regex.
+
+    ``frac`` is the share of the clip that the dominant terminal run covers
+    (``run / effective length``). Returns ``(0, 0.0, "")`` when the clip has no
+    A/T-terminal run.
+    """
+    s = (seq or "").upper()
+    if not s:
+        return (0, 0.0, "")
+    length = len(s)
+
+    candidates: list[tuple[int, float, str]] = []
+    lead = _POLY_TAIL_LEADING.match(s)
+    if lead:
+        base = s[lead.start()]
+        candidates.append((lead.end(), float(lead.end()) / length, base))
+    trail = _POLY_TAIL_TRAILING.search(s)
+    if trail:
+        base = s[trail.start()]
+        candidates.append((length - trail.start(), float(length - trail.start()) / length, base))
+    if not candidates:
+        return (0, 0.0, "")
+    return max(candidates, key=lambda c: (c[0], c[1]))
+
+
 def _poly_at_breakpoint_proximal_stats(
     read_seq: str,
     window_bases: int,
@@ -279,22 +314,24 @@ def extract_split_evidence(
                         clip_seq = query_seq[:clip_len]
                     else:
                         clip_seq = query_seq[-clip_len:]
-                span_len, poly_frac, poly_base, poly_region = _longest_poly_at_span(clip_seq, min_frac=0.90, min_len=8)
-                if span_len <= 0:
-                    poly_run, poly_frac, poly_base = _poly_at_stats(clip_seq)
-                else:
-                    poly_run = span_len
-                    # keep poly_frac/base from span
-                poly_tail_rescued = (
-                    clip_len < min_clip_len
-                    and clip_len >= max(1, int(poly_tail_rescue_min_clip_len))
-                    and poly_run >= max(1, int(poly_tail_rescue_min_run))
-                    and poly_frac >= float(poly_tail_rescue_min_frac)
-                )
                 short_mei_candidate = (
                     clip_len < int(min_clip_len)
                     and clip_len >= max(1, int(short_mei_rescue_min_clip_len))
                 )
+                # Fast-path: only short terminal clips (clip_len < min_clip_len)
+                # are poly-tail rescue candidates. Scan them with the cheap
+                # end-anchored regex (no full-clip two-pointer buffer scan).
+                poly_run, poly_frac, poly_base = 0, 0.0, ""
+                poly_tail_rescued = False
+                if clip_len < min_clip_len:
+                    poly_run, poly_frac, poly_base = _poly_tail_terminal_stats(clip_seq)
+                    poly_tail_rescued = (
+                        clip_len >= max(1, int(poly_tail_rescue_min_clip_len))
+                        and poly_run >= max(1, int(poly_tail_rescue_min_run))
+                        and poly_frac >= float(poly_tail_rescue_min_frac)
+                    )
+                elif clip_seq:
+                    poly_run, poly_frac, poly_base = _poly_tail_terminal_stats(clip_seq)
                 if clip_len < min_clip_len and not poly_tail_rescued and not short_mei_candidate:
                     continue
                 rows.append(
