@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import re
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,55 @@ def _iter_reads_for_regions(bam: pysam.AlignmentFile, regions: list[str]):
         # pysam.fetch(contig, start0, end0) uses 0-based half-open HTSlib coords.
         for read in bam.fetch(contig, start0, end0):
             yield read
+
+
+_SA_TARGET_RE = re.compile(
+    r"^(?P<chrom>[^\s,]+),(?P<pos>-?\d+),(?P<strand>[+-]),(?P<cigar>[^\s,;]+),(?P<mapq>\d+),(?P<nm>\d+)"
+)
+
+
+def _get_tag_fast(read: pysam.AlignedSegment, tag: str, default: Any) -> Any:
+    """Return a SAM tag via the fast-path ``get_tag`` without a prior ``has_tag``.
+
+    ``read.get_tag`` raises ``KeyError`` when the tag is absent, so a single
+    try-except avoids the redundant ``has_tag`` + ``get_tag`` double lookup that
+    the Cython/HTStslib accessor would otherwise perform on every read.
+    """
+    try:
+        return read.get_tag(tag)
+    except (KeyError, ValueError):
+        return default
+
+
+def _parse_sa_targets(sa_raw: str) -> list[tuple[str, int, str, str, int, int]]:
+    """Parse the ``SA`` supplementary-alignment tag into ``(chrom, pos, strand,
+    cigar, mapq, nm)`` tuples.
+
+    The SA tag is ``;``-delimited (max 16) with records of the form
+    ``chr,pos,strand,CIGAR,mapq,NM``.  Uses direct ``split(';')`` plus a compiled
+    record regex for the fixed SAM ``SA`` grammar.
+    """
+    if not sa_raw:
+        return []
+    targets: list[tuple[str, int, str, str, int, int]] = []
+    for field in sa_raw.split(";")[:16]:
+        field = field.strip()
+        if not field:
+            continue
+        m = _SA_TARGET_RE.match(field)
+        if not m:
+            continue
+        targets.append(
+            (
+                m.group("chrom"),
+                int(m.group("pos")),
+                m.group("strand"),
+                m.group("cigar"),
+                int(m.group("mapq")),
+                int(m.group("nm")),
+            )
+        )
+    return targets
 
 
 def _collect_soft_clips(read: pysam.AlignedSegment, min_clip_len: int) -> list[tuple[str, int]]:
@@ -209,9 +259,10 @@ def extract_split_evidence(
             if not clips:
                 continue
 
-            has_sa = read.has_tag("SA")
-            sa_raw = read.get_tag("SA") if has_sa else ""
-            nm = int(read.get_tag("NM")) if read.has_tag("NM") else -1
+            sa_raw = _get_tag_fast(read, "SA", "")
+            sa_targets = _parse_sa_targets(sa_raw)
+            has_sa = bool(sa_targets)
+            nm = int(_get_tag_fast(read, "NM", -1))
             chrom = bam.get_reference_name(read.reference_id)
             for clip_side, clip_len in clips:
                 # Breakpoint coordinate should depend on clipping side:
