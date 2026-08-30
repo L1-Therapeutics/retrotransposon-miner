@@ -8916,6 +8916,21 @@ _YR_LOGODDS_TABLE: tuple[dict[str, float], ...] = (
     {"A": _Y_LOGODDS_MATCH, "G": _Y_LOGODDS_MATCH},
 )
 
+# Pre-computed 6x256 ASCII lookup table mapping each byte ordinal ('A','C','G',
+# 'T','N', and all other IUPAC/printable codes) to its per-position YYRRRR
+# log-odds weight.  Rows 0-1 use the pyrimidine (Y: C/T) match weight, rows 2-5
+# use the purine (R: A/G) match weight; any other byte (including N and lower
+# case) maps to _Y_LOGODDS_MISMATCH, exactly mirroring the per-position dict
+# fallback in _YR_LOGODDS_TABLE.  Built once so per-read scoring is pure array
+# indexing instead of dictionary/character iteration.
+_YR_LOGODDS_ASCII: np.ndarray = np.empty((6, 256), dtype=np.float64)
+for _row, _pos_table in enumerate(_YR_LOGODDS_TABLE):
+    _weights = np.full(256, _Y_LOGODDS_MISMATCH, dtype=np.float64)
+    for _base, _w in _pos_table.items():
+        _weights[ord(_base)] = _w
+    _YR_LOGODDS_ASCII[_row] = _weights
+del _row, _pos_table, _weights, _base, _w
+
 
 def _build_l1_motif_distance_table(motif: str) -> dict[str, int]:
     table: dict[str, int] = {}
@@ -8939,10 +8954,8 @@ def _yyrrrr_logodds(seq6: str) -> float:
     s = (seq6 or "").upper()
     if len(s) != 6:
         return 0.0
-    score = 0.0
-    for i, base in enumerate(s):
-        score += _YR_LOGODDS_TABLE[i].get(base, _Y_LOGODDS_MISMATCH)
-    return score
+    vec = np.frombuffer(s.encode("ascii"), dtype=np.uint8)
+    return float(_YR_LOGODDS_ASCII[np.arange(6), vec].sum())
 
 
 def _yyrrrr_logodds_with_shift_tolerance(oriented_ctx11: str) -> tuple[float, float, int]:
