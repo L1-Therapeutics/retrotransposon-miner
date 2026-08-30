@@ -277,6 +277,56 @@ def _build_loci_from_evidence(
     return out
 
 
+def _merge_overlapping_intervals(
+    intervals: Iterable[tuple[int, int]],
+    *,
+    max_span_bp: int,
+) -> list[tuple[int, int]]:
+    """Collapse overlapping/touching intervals into a sorted union.
+
+    Vectorized single-pass merge: the input is loaded into an ``(N, 2)``
+    ``np.int64`` array sorted by start, non-overlap boundaries are found with
+    ``starts[1:] > np.maximum.accumulate(ends[:-1])``, and merged end
+    coordinates are aggregated with ``np.maximum.accumulate``. Runs whose
+    merged span would exceed ``max_span_bp`` are replayed greedily so long
+    chains are not glued into mega-intervals. Returns ``(start, end)`` tuples.
+    """
+    if not intervals:
+        return []
+    arr = np.asarray(intervals, dtype=np.int64).reshape(-1, 2)
+    order = np.lexsort((arr[:, 1], arr[:, 0]))
+    starts = arr[order, 0]
+    ends = arr[order, 1]
+    max_span = max(1, int(max_span_bp))
+
+    boundaries = np.concatenate(([True], starts[1:] > np.maximum.accumulate(ends[:-1])))
+    group_lo = np.flatnonzero(boundaries)
+    group_hi = np.concatenate((group_lo[1:], [len(starts)]))
+    merged_start = starts[group_lo]
+    merged_end = np.maximum.accumulate(ends)[group_hi - 1]
+
+    merged: list[tuple[int, int]] = []
+    for lo, hi, m_start, m_end in zip(group_lo, group_hi, merged_start, merged_end):
+        if (int(m_end) - int(m_start) + 1) <= max_span:
+            merged.append((int(m_start), int(m_end)))
+            continue
+        # Span cap hit: replay the greedy merge over this component's raw
+        # intervals (rare in practice; keeps the vectorized fast path).
+        cur_start = int(starts[lo])
+        cur_end = int(ends[lo])
+        for j in range(int(lo) + 1, int(hi)):
+            start = int(starts[j])
+            end = int(ends[j])
+            new_end = end if end > cur_end else cur_end
+            if start <= cur_end and (new_end - cur_start + 1) <= max_span:
+                cur_end = new_end
+                continue
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+        merged.append((cur_start, cur_end))
+    return merged
+
+
 def _merge_overlapping_loci(
     loci: pd.DataFrame,
     *,
@@ -301,30 +351,13 @@ def _merge_overlapping_loci(
     merged_rows: list[dict[str, object]] = []
     n_in = len(loci)
     for chrom, grp in loci.groupby("chrom", sort=False):
-        intervals = sorted(
-            (int(r.window_start), int(r.window_end))
-            for r in grp.itertuples(index=False)
-        )
-        if not intervals:
-            continue
-        cur_start, cur_end = intervals[0]
-        for start, end in intervals[1:]:
-            # Merge when intervals overlap OR share exactly one endpoint
-            # (start <= cur_end).  Touching windows are intentionally collapsed
-            # per the docstring; non-overlapping neighbors stay separate.
-            if start <= cur_end:
-                new_end = max(cur_end, end)
-                if (new_end - cur_start + 1) <= max_span:
-                    cur_end = new_end
-                    continue
-                # Would exceed span cap: keep current, start a new interval.
+        intervals = [
+            (int(r.window_start), int(r.window_end)) for r in grp.itertuples(index=False)
+        ]
+        for start, end in _merge_overlapping_intervals(intervals, max_span_bp=max_span):
             merged_rows.append(
-                {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
+                {"chrom": chrom, "window_start": int(start), "window_end": int(end)}
             )
-            cur_start, cur_end = start, end
-        merged_rows.append(
-            {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
-        )
 
     out = pd.DataFrame(merged_rows).drop_duplicates()
     if len(out) < n_in:
