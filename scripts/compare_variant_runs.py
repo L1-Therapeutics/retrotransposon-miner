@@ -3,8 +3,11 @@
 
 Reads two ``candidate_loci.mei.gold_review.tsv`` files (one per run) and performs
 an all-by-all spatial outer join on ``chrom`` + ``consensus_insertion_breakpoint_pos``
-within ``--window-bp`` base pairs. Every candidate row in each TSV is covered (the
-full ranked candidate list, not just top-ranked subsets).
+within ``--window-bp`` base pairs using a fast per-chromosome 1D range search
+(``np.searchsorted`` over sorted breakpoint coordinates). Every candidate row in
+each TSV is covered (the full ranked candidate list, not just top-ranked subsets),
+and every baseline candidate is matched to its nearest perf candidate within the
+window tolerance. Loci entering/leaving the top ``--top-rank`` tier are flagged.
 
 Outputs written under ``--outdir``:
 
@@ -27,6 +30,7 @@ import argparse
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -214,12 +218,18 @@ def load_run(path: Path, label: str) -> Run:
 
 
 def spatial_pairs(base: Run, perf: Run, window_bp: int) -> pd.DataFrame:
-    """All (baseline_row, perf_row) pairs on the same chrom within ``window_bp``."""
+    """All (baseline_row, perf_row) pairs on the same chrom within ``window_bp``.
+
+    Fast 1D range search: per-chromosome ``np.searchsorted`` over the sorted perf
+    breakpoint coordinates (O((n+m) log m) total, no exact-coordinate joins).
+    """
     b_chrom = base.chrom.to_numpy()
     p_chrom = perf.chrom.to_numpy()
     b_bp = base.bp.to_numpy()
     p_bp = perf.bp.to_numpy()
-    rows: list[tuple[int, int, int]] = []
+    b_parts: list[np.ndarray] = []
+    p_parts: list[np.ndarray] = []
+    d_parts: list[np.ndarray] = []
     for chrom_name in np.unique(b_chrom):
         p_idx_all = np.where(p_chrom == chrom_name)[0]
         if p_idx_all.size == 0:
@@ -231,27 +241,53 @@ def spatial_pairs(base: Run, perf: Run, window_bp: int) -> pd.DataFrame:
         b_bp_c = b_bp[b_idx]
         lo = np.searchsorted(p_bp_sorted, b_bp_c - window_bp, side="left")
         hi = np.searchsorted(p_bp_sorted, b_bp_c + window_bp, side="right")
-        for k in range(b_idx.size):
-            for j in range(int(lo[k]), int(hi[k])):
-                j_pos = int(p_idx_sorted[j])
-                rows.append((int(b_idx[k]), j_pos, abs(int(b_bp_c[k]) - int(p_bp[j_pos]))))
-    return pd.DataFrame(rows, columns=["b_row", "p_row", "bp_delta"])
+        counts = hi - lo
+        total = int(counts.sum())
+        if total == 0:
+            continue
+        block_start = np.repeat(lo, counts)
+        block_offsets = np.arange(total) - np.repeat(
+            np.concatenate(([0], np.cumsum(counts)))[:-1], counts
+        )
+        j_rep = block_start + block_offsets
+        b_rep = np.repeat(b_idx, counts)
+        p_rep = p_idx_sorted[j_rep]
+        b_parts.append(b_rep)
+        p_parts.append(p_rep)
+        d_parts.append(np.abs(b_bp[b_rep] - p_bp[p_rep]))
+    if not b_parts:
+        return pd.DataFrame(columns=["b_row", "p_row", "bp_delta"])
+    return pd.DataFrame(
+        {
+            "b_row": np.concatenate(b_parts).astype(np.int64),
+            "p_row": np.concatenate(p_parts).astype(np.int64),
+            "bp_delta": np.concatenate(d_parts).astype(np.int64),
+        }
+    )
+
+
+def _int_key_dict(raw: dict[Any, Any]) -> dict[int, int]:
+    return {int(k): int(v) for k, v in raw.items()}
 
 
 def best_matches(pairs: pd.DataFrame, base: Run, perf: Run) -> tuple[dict[int, int], dict[int, int]]:
-    """Closest perf match per baseline row and closest baseline match per perf row."""
+    """Closest perf match per baseline row and closest baseline match per perf row.
+
+    Every baseline row that has at least one perf candidate within the window is
+    matched to its nearest one (ties broken by lower perf rank).
+    """
     if pairs.empty:
         return {}, {}
     p = pairs.copy()
     p["p_rank"] = perf.rank.to_numpy()[p["p_row"].to_numpy()]
     p["b_rank"] = base.rank.to_numpy()[p["b_row"].to_numpy()]
-    best_b = (
+    best_b = _int_key_dict(
         p.sort_values(["bp_delta", "p_rank"], kind="mergesort")
         .drop_duplicates("b_row")
         .set_index("b_row")["p_row"]
         .to_dict()
     )
-    best_p = (
+    best_p = _int_key_dict(
         p.sort_values(["bp_delta", "b_rank"], kind="mergesort")
         .drop_duplicates("p_row")
         .set_index("p_row")["b_row"]
@@ -260,19 +296,120 @@ def best_matches(pairs: pd.DataFrame, base: Run, perf: Run) -> tuple[dict[int, i
     return best_b, best_p
 
 
-def _status_change(label: str, base_flag: bool, perf_flag: bool) -> list[str]:
-    if base_flag == perf_flag:
-        return []
-    return [f"{'gained' if perf_flag else 'lost'}_{label}"]
+def build_summary(base: Run, perf: Run, pairs: pd.DataFrame, top_rank: int) -> pd.DataFrame:
+    """Vectorized locus-by-locus comparison table.
 
-
-def build_summary(base: Run, perf: Run, pairs: pd.DataFrame) -> pd.DataFrame:
+    Row layout: one row per baseline candidate (in file order), followed by one
+    row per perf candidate that no baseline candidate matched (in file order).
+    """
     best_b, best_p = best_matches(pairs, base, perf)
-    matched_perf_rows = set(best_b.values())
-    n_b_matches = pairs.groupby("b_row").size().to_dict() if not pairs.empty else {}
-    n_p_matches = pairs.groupby("p_row").size().to_dict() if not pairs.empty else {}
+    n_b = len(base)
+    n_p = len(perf)
+    b_to_p = np.full(n_b, -1, dtype=np.int64)
+    for k, v in best_b.items():
+        b_to_p[k] = v
+    matched_perf = set(best_b.values())
+    perf_only = np.array([j for j in range(n_p) if j not in matched_perf], dtype=np.int64)
 
-    metric_names = list(METRIC_FALLBACKS)
+    # Per-output-row source indices (-1 = side absent).
+    out_b_idx = np.concatenate(
+        [np.arange(n_b, dtype=np.int64), np.array([best_p.get(int(j), -1) for j in perf_only], dtype=np.int64)]
+    )
+    out_p_idx = np.concatenate([b_to_p, perf_only])
+    has_b = out_b_idx >= 0
+    has_p = out_p_idx >= 0
+    b_safe = np.where(has_b, out_b_idx, 0)
+    p_safe = np.where(has_p, out_p_idx, 0)
+
+    b_chrom = base.chrom.to_numpy()
+    p_chrom = perf.chrom.to_numpy()
+    b_bp = base.bp.to_numpy().astype("float64")
+    p_bp = perf.bp.to_numpy().astype("float64")
+    b_rank = base.rank.to_numpy().astype("float64")
+    p_rank = perf.rank.to_numpy().astype("float64")
+    b_fam = base.family.to_numpy()
+    p_fam = perf.family.to_numpy()
+
+    b_bp_row = np.where(has_b, b_bp[b_safe], np.nan)
+    p_bp_row = np.where(has_p, p_bp[p_safe], np.nan)
+    b_rank_row = np.where(has_b, b_rank[b_safe], np.nan)
+    p_rank_row = np.where(has_p, p_rank[p_safe], np.nan)
+    top_b_row = np.where(has_b, b_rank[b_safe] <= top_rank, False)
+    top_p_row = np.where(has_p, p_rank[p_safe] <= top_rank, False)
+    both = has_b & has_p
+
+    # All-by-all match counts within the window (per locus, per side).
+    n_bm = np.zeros(n_b, dtype=np.int64)
+    n_pm = np.zeros(n_p, dtype=np.int64)
+    if not pairs.empty:
+        np.add.at(n_bm, pairs["b_row"].to_numpy(), 1)
+        np.add.at(n_pm, pairs["p_row"].to_numpy(), 1)
+
+    data: dict[str, object] = {
+        "match_status": np.select([both, has_b], ["shared", "baseline_only"], default="perf_only"),
+        "chrom": np.where(has_b, b_chrom[b_safe], p_chrom[p_safe]),
+        f"bp_{base.label}": b_bp_row,
+        f"bp_{perf.label}": p_bp_row,
+        "bp_delta_bp": np.where(both, np.abs(b_bp_row - p_bp_row), np.nan),
+        f"rank_{base.label}": b_rank_row,
+        f"rank_{perf.label}": p_rank_row,
+        "rank_shift": np.where(both, p_rank_row - b_rank_row, np.nan),
+        f"top{top_rank}_baseline": top_b_row,
+        f"top{top_rank}_perf": top_p_row,
+        "top_tier_change": np.select(
+            [top_b_row & top_p_row, top_b_row, top_p_row],
+            ["stayed_in_top", "exited_top", "entered_top"],
+            default="outside_top",
+        ),
+        "n_perf_matches_within_window": np.concatenate([n_bm, np.zeros(perf_only.size, dtype=np.int64)]),
+        "n_baseline_matches_within_window": np.concatenate(
+            [np.where(b_to_p >= 0, n_pm[np.where(b_to_p >= 0, b_to_p, 0)], 0), n_pm[perf_only]]
+        ),
+    }
+    for name in METRIC_FALLBACKS:
+        b_m = base.metrics[name].to_numpy().astype("float64")
+        p_m = perf.metrics[name].to_numpy().astype("float64")
+        b_m_row = np.where(has_b, b_m[b_safe], np.nan)
+        p_m_row = np.where(has_p, p_m[p_safe], np.nan)
+        data[f"{name}_{base.label}"] = b_m_row
+        data[f"{name}_{perf.label}"] = p_m_row
+        data[f"delta_{name}"] = np.where(both, p_m_row - b_m_row, np.nan)
+
+    fam_b_row = np.where(has_b, b_fam[b_safe], "")
+    fam_p_row = np.where(has_p, p_fam[p_safe], "")
+    data[f"family_{base.label}"] = fam_b_row
+    data[f"family_{perf.label}"] = fam_p_row
+    data["family_changed"] = both & (fam_b_row != fam_p_row)
+
+    gold_b = np.where(has_b, base.is_gold.to_numpy()[b_safe], False)
+    gold_p = np.where(has_p, perf.is_gold.to_numpy()[p_safe], False)
+    hc_b = np.where(has_b, base.is_high_conf.to_numpy()[b_safe], False)
+    hc_p = np.where(has_p, perf.is_high_conf.to_numpy()[p_safe], False)
+    g1k_b = np.where(has_b, base.is_1000g.to_numpy()[b_safe], False)
+    g1k_p = np.where(has_p, perf.is_1000g.to_numpy()[p_safe], False)
+    data[f"gold_{base.label}"] = gold_b
+    data[f"gold_{perf.label}"] = gold_p
+    data[f"high_conf_{base.label}"] = hc_b
+    data[f"high_conf_{perf.label}"] = hc_p
+    data[f"1000g_{base.label}"] = g1k_b
+    data[f"1000g_{perf.label}"] = g1k_p
+    data["1000g_overlap_change"] = np.select(
+        [g1k_b & g1k_p, g1k_p, g1k_b],
+        ["concordant", "gained_in_perf", "lost_in_perf"],
+        default="neither",
+    )
+    gold_tok = np.select([~gold_b & gold_p, gold_b & ~gold_p], ["gained_gold", "lost_gold"], default="")
+    hc_tok = np.select([~hc_b & hc_p, hc_b & ~hc_p], ["gained_high_conf", "lost_high_conf"], default="")
+    data["status_change"] = np.select(
+        [
+            (gold_tok != "") & (hc_tok != ""),
+            (gold_tok != "") & (hc_tok == ""),
+            (gold_tok == "") & (hc_tok != ""),
+        ],
+        [gold_tok + ";" + hc_tok, gold_tok, hc_tok],
+        default="unchanged",
+    )
+
     columns = [
         "match_status",
         "chrom",
@@ -282,10 +419,13 @@ def build_summary(base: Run, perf: Run, pairs: pd.DataFrame) -> pd.DataFrame:
         f"rank_{base.label}",
         f"rank_{perf.label}",
         "rank_shift",
+        f"top{top_rank}_baseline",
+        f"top{top_rank}_perf",
+        "top_tier_change",
         "n_perf_matches_within_window",
         "n_baseline_matches_within_window",
     ]
-    for name in metric_names:
+    for name in METRIC_FALLBACKS:
         columns += [f"{name}_{base.label}", f"{name}_{perf.label}", f"delta_{name}"]
     columns += [
         f"family_{base.label}",
@@ -300,117 +440,7 @@ def build_summary(base: Run, perf: Run, pairs: pd.DataFrame) -> pd.DataFrame:
         "1000g_overlap_change",
         "status_change",
     ]
-
-    rows: list[dict[str, object]] = []
-    b_arr = {
-        "chrom": base.chrom.to_numpy(),
-        "bp": base.bp.to_numpy(),
-        "rank": base.rank.to_numpy(),
-        "gold": base.is_gold.to_numpy(),
-        "high_conf": base.is_high_conf.to_numpy(),
-        "g1k": base.is_1000g.to_numpy(),
-        "family": base.family.to_numpy(),
-        **{f"m_{m}": base.metrics[m].to_numpy() for m in metric_names},
-    }
-    p_arr = {
-        "chrom": perf.chrom.to_numpy(),
-        "bp": perf.bp.to_numpy(),
-        "rank": perf.rank.to_numpy(),
-        "gold": perf.is_gold.to_numpy(),
-        "high_conf": perf.is_high_conf.to_numpy(),
-        "g1k": perf.is_1000g.to_numpy(),
-        "family": perf.family.to_numpy(),
-        **{f"m_{m}": perf.metrics[m].to_numpy() for m in metric_names},
-    }
-
-    def _row(
-        *,
-        status: str,
-        b: int | None,
-        p: int | None,
-        delta_bp: int | None,
-        n_b: int,
-        n_p: int,
-    ) -> dict[str, object]:
-        b_rec = b_arr if b is not None else None
-        p_rec = p_arr if p is not None else None
-        rec: dict[str, object] = {
-            "match_status": status,
-            "chrom": (b_rec or p_rec)["chrom"][b if b is not None else p],
-            f"bp_{base.label}": b_arr["bp"][b] if b is not None else np.nan,
-            f"bp_{perf.label}": p_arr["bp"][p] if p is not None else np.nan,
-            "bp_delta_bp": delta_bp,
-            f"rank_{base.label}": b_arr["rank"][b] if b is not None else np.nan,
-            f"rank_{perf.label}": p_arr["rank"][p] if p is not None else np.nan,
-            "rank_shift": (p_arr["rank"][p] - b_arr["rank"][b]) if (b is not None and p is not None) else np.nan,
-            "n_perf_matches_within_window": n_b,
-            "n_baseline_matches_within_window": n_p,
-        }
-        for name in metric_names:
-            b_val = float(b_arr[f"m_{name}"][b]) if b is not None else np.nan
-            p_val = float(p_arr[f"m_{name}"][p]) if p is not None else np.nan
-            rec[f"{name}_{base.label}"] = b_val
-            rec[f"{name}_{perf.label}"] = p_val
-            rec[f"delta_{name}"] = (p_val - b_val) if (b is not None and p is not None) else np.nan
-        fam_b = b_arr["family"][b] if b is not None else ""
-        fam_p = p_arr["family"][p] if p is not None else ""
-        rec[f"family_{base.label}"] = fam_b
-        rec[f"family_{perf.label}"] = fam_p
-        rec["family_changed"] = (b is not None and p is not None) and bool(fam_b != fam_p)
-        gold_b = bool(b_arr["gold"][b]) if b is not None else False
-        gold_p = bool(p_arr["gold"][p]) if p is not None else False
-        hc_b = bool(b_arr["high_conf"][b]) if b is not None else False
-        hc_p = bool(p_arr["high_conf"][p]) if p is not None else False
-        g_b = bool(b_arr["g1k"][b]) if b is not None else False
-        g_p = bool(p_arr["g1k"][p]) if p is not None else False
-        rec[f"gold_{base.label}"] = gold_b
-        rec[f"gold_{perf.label}"] = gold_p
-        rec[f"high_conf_{base.label}"] = hc_b
-        rec[f"high_conf_{perf.label}"] = hc_p
-        rec[f"1000g_{base.label}"] = g_b
-        rec[f"1000g_{perf.label}"] = g_p
-        if g_b and g_p:
-            rec["1000g_overlap_change"] = "concordant"
-        elif g_p:
-            rec["1000g_overlap_change"] = "gained_in_perf"
-        elif g_b:
-            rec["1000g_overlap_change"] = "lost_in_perf"
-        else:
-            rec["1000g_overlap_change"] = "neither"
-        changes = _status_change("gold", gold_b, gold_p) + _status_change("high_conf", hc_b, hc_p)
-        rec["status_change"] = ";".join(changes) if changes else "unchanged"
-        return rec
-
-    for i in range(len(base)):
-        j = best_b.get(i)
-        if j is not None:
-            rows.append(
-                _row(
-                    status="shared",
-                    b=i,
-                    p=j,
-                    delta_bp=abs(int(base.bp.iloc[i]) - int(perf.bp.iloc[j])),
-                    n_b=int(n_b_matches.get(i, 1)),
-                    n_p=int(n_p_matches.get(j, 1)),
-                )
-            )
-        else:
-            rows.append(_row(status="baseline_only", b=i, p=None, delta_bp=None, n_b=0, n_p=0))
-    for j in range(len(perf)):
-        if j in matched_perf_rows:
-            continue
-        i = best_p.get(j)
-        rows.append(
-            _row(
-                status="perf_only",
-                b=i,
-                p=j,
-                delta_bp=(abs(int(base.bp.iloc[i]) - int(perf.bp.iloc[j])) if i is not None else None),
-                n_b=0,
-                n_p=int(n_p_matches.get(j, 0)),
-            )
-        )
-    out = pd.DataFrame(rows, columns=columns)
+    out = pd.DataFrame(data, columns=columns)
     return out.sort_values(f"rank_{base.label}", kind="mergesort").reset_index(drop=True)
 
 
@@ -540,7 +570,9 @@ def plot_rank_decay(out_png: Path, runs: list[Run], window: int = ROLLING_WINDOW
     plt.close(fig)
 
 
-def print_summary(summary: pd.DataFrame, venn_counts: dict[str, int], outdir: Path, window_bp: int) -> None:
+def print_summary(
+    summary: pd.DataFrame, venn_counts: dict[str, int], outdir: Path, window_bp: int, top_rank: int
+) -> None:
     shared = summary[summary["match_status"] == "shared"]
     rank_shift = shared["rank_shift"].dropna()
     lines: list[tuple[str, str]] = [
@@ -562,6 +594,9 @@ def print_summary(summary: pd.DataFrame, venn_counts: dict[str, int], outdir: Pa
             ("rank shift median", str(float(rank_shift.median()))),
             ("loci with rank shift", str(int((rank_shift != 0).sum()))),
         ]
+    entered = int(summary["top_tier_change"].eq("entered_top").sum())
+    exited = int(summary["top_tier_change"].eq("exited_top").sum())
+    lines.append((f"top-{top_rank} tier entered/exited", f"{entered}/{exited}"))
     for name in METRIC_FALLBACKS:
         delta = shared[f"delta_{name}"].dropna()
         lines.append((f"delta_{name} != 0", str(int((delta != 0).sum())) + f" (of {len(delta)})"))
@@ -596,16 +631,24 @@ def main() -> None:
         default=50,
         help="Breakpoint coordinate matching tolerance in base pairs (default: 50)",
     )
+    parser.add_argument(
+        "--top-rank",
+        type=int,
+        default=10,
+        help="Top-rank tier size used to flag loci entering/leaving the top ranks (default: 10)",
+    )
     args = parser.parse_args()
     if args.window_bp < 0:
         parser.error("--window-bp must be >= 0")
+    if args.top_rank < 1:
+        parser.error("--top-rank must be >= 1")
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     base = load_run(args.baseline_tsv, "baseline")
     perf = load_run(args.perf_tsv, "perf")
 
     pairs = spatial_pairs(base, perf, args.window_bp)
-    summary = build_summary(base, perf, pairs)
+    summary = build_summary(base, perf, pairs, args.top_rank)
     summary_path = args.outdir / "variant_discordance_summary.csv"
     summary.to_csv(summary_path, index=False)
 
@@ -616,7 +659,7 @@ def main() -> None:
     decay_path = args.outdir / "rank_decay_1000g_density.png"
     plot_rank_decay(decay_path, [base, perf])
 
-    print_summary(summary, venn, args.outdir, args.window_bp)
+    print_summary(summary, venn, args.outdir, args.window_bp, args.top_rank)
     print(f"wrote {summary_path}")
     print(f"wrote {venn_path}")
     print(f"wrote {decay_path}")
