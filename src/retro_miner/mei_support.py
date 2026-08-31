@@ -465,9 +465,9 @@ def _discordant_mate_ok_for_mei_identity(df: pd.DataFrame) -> pd.Series:
         if "mate_chrom" in df.columns
         else pd.Series("", index=df.index)
     )
-    pos = pd.to_numeric(df["pos"] if "pos" in df.columns else pd.Series(0, index=df.index), errors="coerce").fillna(0).astype(int)
+    pos = cast(pd.Series, pd.to_numeric(df["pos"] if "pos" in df.columns else 0, errors="coerce")).fillna(0).astype(int)
     mate_pos = pd.to_numeric(
-        df["mate_pos"] if "mate_pos" in df.columns else pd.Series(0, index=df.index),
+        df["mate_pos"] if "mate_pos" in df.columns else 0,
         errors="coerce",
     ).fillna(0).astype(int)
     valid_mate = (mate_chrom != "") & (mate_chrom != "*") & mate_pos.gt(0)
@@ -5303,24 +5303,22 @@ def _add_candidate_support_info_fields(
         poly_disc_reads = _polyA_discordant_read_table(disc_df)
         mei_split_reads = _mei_read_table(split_mei_df, split_mei_df.iloc[0:0].copy())
         mei_disc_reads = _mei_read_table(disc_mei_df.iloc[0:0].copy(), disc_mei_df)
-        indel_reads = (
+        indel_reads: pd.DataFrame = (
             split_support_df.loc[
-                split_support_df.get("evidence_type", "").fillna("").astype(str) == "indel",
+                split_support_df.get("evidence_type", pd.Series("", index=split_support_df.index)).fillna("").astype(str) == "indel",
                 key_cols + ["read_name"],
             ].drop_duplicates()
             if ("evidence_type" in split_support_df.columns and "read_name" in split_support_df.columns)
             else pd.DataFrame(columns=key_cols + ["read_name"])
         )
-        strict_reads = pd.concat(
-            [
-                poly_split_reads,
-                poly_disc_reads,
-                mei_split_reads,
-                mei_disc_reads,
-                indel_reads,
-            ],
-            ignore_index=True,
-        ).drop_duplicates()
+        strict_reads_frames: list[pd.DataFrame] = [
+            poly_split_reads,
+            poly_disc_reads,
+            mei_split_reads,
+            mei_disc_reads,
+            indel_reads,
+        ]
+        strict_reads = pd.concat(strict_reads_frames, ignore_index=True).drop_duplicates()
 
         # SR = MEI-mapped split clips only (strict ≥20bp or short-seed-rescued).
         # PolyA stays in polyA_MAPPED; CIGAR indels are not SR.
@@ -8714,7 +8712,7 @@ def _df_col_series(df: pd.DataFrame, col: str, default: object) -> pd.Series:
 def _ensure_candidate_schema_defaults(candidates: pd.DataFrame) -> pd.DataFrame:
     """Guarantee optional evidence columns exist with safe defaults."""
     out = candidates.copy()
-    defaults: dict[str, object] = {
+    defaults: dict[str, Any] = {
         "disease_L_mei_supported_reads": 0,
         "disease_R_mei_supported_reads": 0,
         "control_L_mei_supported_reads": 0,

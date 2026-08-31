@@ -12,6 +12,7 @@ from retro_miner.evidence_extract import (
     _clip_to_poly_at_region,
     _longest_poly_at_span,
     _normalize_regions,
+    _parse_sa_targets,
     _poly_at_breakpoint_proximal_stats,
     _poly_at_stats,
     _soft_clip_query_seq,
@@ -187,6 +188,41 @@ def test_clip_to_poly_at_region_returns_span() -> None:
 def test_clip_to_poly_at_region_returns_empty_when_below_threshold() -> None:
     result = _clip_to_poly_at_region("GCGC" * 20)  # no A/T content
     assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# _poly_at_breakpoint_proximal_stats
+# ---------------------------------------------------------------------------
+
+
+def test_parse_sa_targets_empty_returns_empty() -> None:
+    assert _parse_sa_targets("") == []
+    assert _parse_sa_targets(None) == []
+
+
+def test_parse_sa_targets_single_record() -> None:
+    assert _parse_sa_targets("chr1,100,+,50M,60,0") == [("chr1", 100, "+", "50M", 60, 0)]
+
+
+def test_parse_sa_targets_multiple_records() -> None:
+    parsed = _parse_sa_targets("chr1,100,+,50M,60,0;chr2,200,-,20S80M,50,1")
+    assert parsed == [("chr1", 100, "+", "50M", 60, 0), ("chr2", 200, "-", "20S80M", 50, 1)]
+
+
+def test_parse_sa_targets_ignores_trailing_delimiter() -> None:
+    # Trailing ';' produces an empty field that must be skipped.
+    assert _parse_sa_targets("chr1,100,+,50M,60,0;") == [("chr1", 100, "+", "50M", 60, 0)]
+
+
+def test_parse_sa_targets_skips_malformed_record() -> None:
+    # Malformed middle record is skipped; well-formed neighbours survive.
+    parsed = _parse_sa_targets("chr1,100,+,50M,60,0;not-a-valid-record;chr2,5,-,10M,40,2")
+    assert parsed == [("chr1", 100, "+", "50M", 60, 0), ("chr2", 5, "-", "10M", 40, 2)]
+
+
+def test_parse_sa_targets_caps_at_16() -> None:
+    many = ";".join(["chr1,10,+,5M,60,0"] * 20)
+    assert len(_parse_sa_targets(many)) == 16
 
 
 # ---------------------------------------------------------------------------
