@@ -1292,6 +1292,72 @@ def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dic
     }
 
 
+def _python_dependency_available(module_name: str) -> bool:
+    """Return True when a Python module can be imported (via importlib)."""
+    try:
+        import importlib.util
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
+def _extract_mei_fasta_from_ucsc(ucsc_fa: Path, mei_subset_fasta: Path) -> dict[str, Any]:
+    """Fallback: derive a human MEI (Alu/L1/SVA) FASTA from UCSC RepeatBrowser.
+
+    Used when the H5/famdb path is unavailable (missing ``h5py``) or fails, so the
+    pipeline still produces ``dfam_human_mei_l1_alu_sva.fasta`` from the local
+    ``ucsc_repeatbrowser/hg38reps.fa`` reference.
+    """
+    if not ucsc_fa.exists() or ucsc_fa.stat().st_size <= 0:
+        return {"status": "missing_ucsc_fallback", "path": str(ucsc_fa)}
+    kept = 0
+    kept_families = 0
+    mei_subset_fasta.parent.mkdir(parents=True, exist_ok=True)
+    with mei_subset_fasta.open("w", encoding="utf-8") as out_handle:
+        for header, seq in _iter_fasta(ucsc_fa):
+            if not _is_mei_family_name(header):
+                continue
+            body = _trim_mei_consensus_terminal_polya(seq)
+            if not body:
+                continue
+            kept_families += 1
+            if _mei_family_from_header(header) in {"ALU", "LINE1", "SVA"}:
+                kept += 1
+            out_handle.write(f">{header}\n")
+            for i in range(0, len(body), 60):
+                out_handle.write(body[i : i + 60] + "\n")
+    return {
+        "status": "fallback_ucsc",
+        "mei_families": kept,
+        "records_kept": kept_families,
+        "output_path": str(mei_subset_fasta),
+        "bytes": mei_subset_fasta.stat().st_size if mei_subset_fasta.exists() else 0,
+    }
+
+
+def _prepare_dfam_mei_library_ucsc_fallback(
+    outdir: Path,
+    mei_subset_fasta: Path,
+    *,
+    reason: str,
+    detail: str = "",
+) -> dict[str, Any]:
+    """Generate ``dfam_human_mei_l1_alu_sva.fasta`` from UCSC RepeatBrowser when H5 fails."""
+    ucsc_path = outdir / "retrotransposon_db/ucsc_repeatbrowser/hg38reps.fa"
+    result = _extract_mei_fasta_from_ucsc(ucsc_path, mei_subset_fasta)
+    return {
+        "status": "fallback",
+        "path": str(mei_subset_fasta),
+        "bytes": mei_subset_fasta.stat().st_size if mei_subset_fasta.exists() else 0,
+        "fallback_reason": reason,
+        "fallback_detail": detail,
+        **result,
+    }
+
+
 def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_sec: int, force: bool) -> dict[str, Any]:
     # Decoupled from sample BAM download status: extraction runs whenever the
     # Dfam archive is present on disk, regardless of whether the dataset entry is
@@ -1301,25 +1367,51 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
         archive_path = outdir / ds.target_path
     else:
         archive_path = outdir / "retrotransposon_db/dfam/dfam40.0.h5.gz"
+
+    dfam_dir = archive_path.parent
+    mei_subset_fasta = dfam_dir / "dfam_human_mei_l1_alu_sva.fasta"
+
+    # Idempotency: if the final MEI FASTA already exists and is non-empty, we are
+    # done — no need to re-run extraction on a ``skipped_exists`` download.
+    if not force and mei_subset_fasta.exists() and mei_subset_fasta.stat().st_size > 0:
+        with mei_subset_fasta.open("r", encoding="utf-8") as probe:
+            has_seq = any(line.startswith(">") for line in probe)
+        if has_seq:
+            return {
+                "status": "skipped_exists",
+                "path": str(mei_subset_fasta),
+                "bytes": mei_subset_fasta.stat().st_size,
+                "source": "existing_output",
+            }
+
     if not archive_path.exists():
-        return {"status": "skipped_missing_archive", "path": str(archive_path)}
+        # No local Dfam archive; fall back to UCSC RepeatBrowser consensus so the
+        # MEI FASTA can still be produced when only the UCSC source is available.
+        return _prepare_dfam_mei_library_ucsc_fallback(outdir, mei_subset_fasta, reason="missing_archive")
 
-    # MEI subset extraction needs python 'h5py' (used indirectly via famdb.py).
-    # Guard up front so an absent dependency never invalidates already-downloaded files.
-    if shutil.which("git") is None:
-        return {
-            "status": "skipped_missing_dependency",
-            "error": "git_not_found_required_for_famdb_clone",
-            "path": str(archive_path),
-        }
+    # The primary H5 path needs h5py (famdb.py) and git (to clone FamDB tools).
+    h5py_ok = _python_dependency_available("h5py")
+    git_ok = shutil.which("git") is not None
+    if (not h5py_ok) or (not git_ok):
+        missing = []
+        if not h5py_ok:
+            missing.append("h5py")
+        if not git_ok:
+            missing.append("git")
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="missing_h5_dependency",
+            detail=", ".join(missing),
+        )
 
+    # 1) Decompress + stage the H5 DB.
     decompressed_h5 = archive_path.with_suffix("")
     if decompressed_h5.suffix != ".h5":
         decompressed_h5 = archive_path.with_name("dfam40.0.h5")
     if archive_path.suffix == ".gz":
         _decompress_gzip(archive_path, decompressed_h5, force=force)
 
-    dfam_dir = archive_path.parent
     db_dir = dfam_dir / "db"
     db_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1328,14 +1420,33 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
         shutil.copy2(decompressed_h5, db_base_h5)
 
     curated_consensus_h5 = db_dir / "dfam40.curated.consensus.0.h5"
-    _download_file(DFAM_CURATED_CONSENSUS_0_URL, curated_consensus_h5.with_suffix(".h5.gz"), timeout_sec=timeout_sec, force=force)
-    _decompress_gzip(curated_consensus_h5.with_suffix(".h5.gz"), curated_consensus_h5, force=force)
+    try:
+        _download_file(
+            DFAM_CURATED_CONSENSUS_0_URL,
+            curated_consensus_h5.with_suffix(".h5.gz"),
+            timeout_sec=timeout_sec,
+            force=force,
+        )
+        _decompress_gzip(curated_consensus_h5.with_suffix(".h5.gz"), curated_consensus_h5, force=force)
+    except Exception as err:  # noqa: BLE001
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="h5_consensus_download_failed",
+            detail=str(err),
+        )
 
     famdb_tools_dir = dfam_dir / "tools" / "FamDB"
     famdb_py, tool_status = _ensure_famdb_repo(famdb_tools_dir, timeout_sec=timeout_sec)
     if famdb_py is None:
-        return {"status": "skipped_missing_dependency", "error": tool_status, "db_dir": str(db_dir)}
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="famdb_unavailable",
+            detail=tool_status,
+        )
 
+    # 2) Export the curated human FASTAs via famdb.py.
     curated_fasta = dfam_dir / "dfam_human_curated.fasta"
     curated_missing_or_empty = (not curated_fasta.exists()) or (curated_fasta.stat().st_size <= 0)
     if force or curated_missing_or_empty:
@@ -1352,25 +1463,41 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
             "--curated",
             "9606",
         ]
-        with curated_fasta.open("w", encoding="utf-8") as out_handle:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(f"famdb export failed: {' '.join(cmd)}\n{proc.stderr}")
-            out_handle.write(proc.stdout)
+        try:
+            with curated_fasta.open("w", encoding="utf-8") as out_handle:
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    curated_fasta.unlink(missing_ok=True)
+                    raise RuntimeError(f"famdb export failed: {' '.join(cmd)}\n{proc.stderr}")
+                out_handle.write(proc.stdout)
+        except Exception as err:  # noqa: BLE001
+            return _prepare_dfam_mei_library_ucsc_fallback(
+                outdir,
+                mei_subset_fasta,
+                reason="famdb_export_failed",
+                detail=str(err),
+            )
     curated_bytes = curated_fasta.stat().st_size if curated_fasta.exists() else 0
-    if curated_bytes <= 0:
-        raise RuntimeError(
-            f"dfam curated FASTA is empty after export: {curated_fasta}. "
-            "Re-run with --force and verify FamDB export output."
-        )
 
-    mei_subset_fasta = dfam_dir / "dfam_human_mei_l1_alu_sva.fasta"
-    subset_stats = _export_human_mei_subset(curated_fasta, mei_subset_fasta)
-    if int(subset_stats.get("bytes", 0)) <= 0 or int(subset_stats.get("mei_families", 0)) <= 0:
-        raise RuntimeError(
-            "dfam MEI subset FASTA is empty after export "
-            f"(path={mei_subset_fasta}, families={subset_stats.get('mei_families', 0)})."
+    # 3) Export the MEI subset from the curated FASTA.
+    try:
+        subset_stats = _export_human_mei_subset(curated_fasta, mei_subset_fasta)
+    except Exception as err:  # noqa: BLE001
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="mei_subset_export_failed",
+            detail=str(err),
         )
+    if int(subset_stats.get("bytes", 0)) <= 0 or int(subset_stats.get("mei_families", 0)) <= 0:
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="mei_subset_empty",
+            detail=str(subset_stats),
+        )
+    if curated_bytes <= 0:
+        curated_bytes = int(subset_stats.get("bytes", 0))
     return {
         "status": "prepared",
         "famdb_tool": tool_status,
@@ -1410,6 +1537,12 @@ def _mei_family_from_header(header: str) -> str:
     if "LINE/L1" in u or "L1" in u:
         return "LINE1"
     return "OTHER"
+
+
+def _is_mei_family_name(name: str) -> bool:
+    """True for human MEI family names in RepeatMasker/UCSC style (Alu*, L1*, SVA*)."""
+    u = (name or "").upper()
+    return u.startswith("ALU") or u.startswith("L1") or "SVA" in u
 
 
 def _normalize_dfam_subfamily_for_full(header: str) -> str:
