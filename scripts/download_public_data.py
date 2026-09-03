@@ -261,14 +261,53 @@ def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> d
     }
 
 
+def _resolve_cram_reference(outdir: Path) -> Path | None:
+    """Locate a local hg38 reference FASTA for CRAM decoding, if downloaded."""
+    candidates = (
+        outdir / "reference" / "hg38" / "Homo_sapiens_assembly38.fasta",
+        outdir / "reference" / "hg38" / "Homo_sapiens_assembly38.fasta.gz",
+    )
+    for cand in candidates:
+        if cand.exists() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+
+def _cram_view_cmd(
+    url: str,
+    region: str,
+    out_bam: Path,
+    threads: int,
+    ref_fasta: Path | None,
+) -> list[str]:
+    """Build a ``samtools view`` command to slice a region from BAM/CRAM.
+
+    For CRAM sources a local reference is appended via ``-T`` when available,
+    avoiding the remote reference-cache fetch that can time out on S3.
+    """
+    cmd = ["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)]
+    if url.endswith(".cram"):
+        if ref_fasta is not None:
+            cmd.extend(["-T", str(ref_fasta)])
+        else:
+            print(
+                f"[slice:cram] {region}: no local hg38 reference found at "
+                "reference/hg38/Homo_sapiens_assembly38.fasta; falling back to remote "
+                "reference cache (may be slow / retried)",
+                file=sys.stderr,
+            )
+    return cmd
+
+
 def _slice_remote_alignment(
     url: str,
     region: str,
     out_bam: Path,
     threads: int,
     force: bool,
+    ref_fasta: Path | None = None,
     retries: int = 3,
-    retry_backoff_sec: float = 2.0,
+    retry_backoff_sec: float = 5.0,
 ) -> dict[str, Any]:
     out_bam.parent.mkdir(parents=True, exist_ok=True)
     if out_bam.exists() and Path(f"{out_bam}.bai").exists() and not force:
@@ -279,7 +318,8 @@ def _slice_remote_alignment(
     # Direct remote slicing avoids storing full-size BAM locally.
     for attempt in range(1, attempts + 1):
         try:
-            _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)], required=True)
+            cmd = _cram_view_cmd(url=url, region=region, out_bam=out_bam, threads=threads, ref_fasta=ref_fasta)
+            _run_cmd(cmd, required=True)
             _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
             return {
                 "status": "sliced_remote_alignment",
@@ -289,26 +329,21 @@ def _slice_remote_alignment(
             }
         except Exception as err:  # noqa: BLE001
             last_err = err
-            for suffix in (".bai", ".csi"):
-                stale = Path(f"{out_bam}{suffix}")
-                if stale.exists():
+            # Clean up partial / corrupted outputs so the next attempt starts fresh.
+            for stale_path in (out_bam, Path(f"{out_bam}.bai"), Path(f"{out_bam}.csi")):
+                if stale_path.exists():
                     try:
-                        stale.unlink()
+                        stale_path.unlink()
                     except OSError:
                         pass
-            if out_bam.exists():
-                try:
-                    out_bam.unlink()
-                except OSError:
-                    pass
             if attempt >= attempts:
                 raise
-            sleep_s = float(retry_backoff_sec) * (2 ** (attempt - 1))
+            sleep_s = max(0.0, float(retry_backoff_sec))
             print(
                 f"[slice:retry] {region} attempt {attempt}/{attempts} failed: {err}; retrying in {sleep_s:.1f}s",
                 file=sys.stderr,
             )
-            time.sleep(max(0.0, sleep_s))
+            time.sleep(sleep_s)
     if last_err is not None:
         raise last_err
     raise RuntimeError(f"Remote slicing failed unexpectedly for {url} {region}")
@@ -340,8 +375,9 @@ def _slice_remote_alignment_with_mates(
     out_bam: Path,
     threads: int,
     force: bool,
+    ref_fasta: Path | None = None,
     retries: int = 3,
-    retry_backoff_sec: float = 2.0,
+    retry_backoff_sec: float = 5.0,
 ) -> dict[str, Any]:
     """Slice a region, then pull in discordant mates from other chromosomes via the remote BAM."""
     out_bam.parent.mkdir(parents=True, exist_ok=True)
@@ -365,7 +401,7 @@ def _slice_remote_alignment_with_mates(
                 names_tsv = tmp / "mate_qnames.txt"
                 merged_bam = tmp / "merged.bam"
 
-                _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(region_bam)], required=True)
+                _run_cmd(_cram_view_cmd(url=url, region=region, out_bam=region_bam, threads=threads, ref_fasta=ref_fasta), required=True)
                 _run_cmd(["samtools", "index", "-@", str(threads), str(region_bam)], required=True)
                 mate_qnames = _collect_interchrom_mate_qnames(region_bam, region)
                 if mate_qnames:
@@ -401,26 +437,21 @@ def _slice_remote_alignment_with_mates(
             }
         except Exception as err:  # noqa: BLE001
             last_err = err
-            for suffix in (".bai", ".csi"):
-                stale = Path(f"{out_bam}{suffix}")
-                if stale.exists():
+            # Clean up partial / corrupted outputs so the next attempt starts fresh.
+            for stale_path in (out_bam, Path(f"{out_bam}.bai"), Path(f"{out_bam}.csi")):
+                if stale_path.exists():
                     try:
-                        stale.unlink()
+                        stale_path.unlink()
                     except OSError:
                         pass
-            if out_bam.exists():
-                try:
-                    out_bam.unlink()
-                except OSError:
-                    pass
             if attempt >= attempts:
                 raise
-            sleep_s = float(retry_backoff_sec) * (2 ** (attempt - 1))
+            sleep_s = max(0.0, float(retry_backoff_sec))
             print(
                 f"[slice:retry] {region} attempt {attempt}/{attempts} failed with mates: {err}; retrying in {sleep_s:.1f}s",
                 file=sys.stderr,
             )
-            time.sleep(max(0.0, sleep_s))
+            time.sleep(sleep_s)
     if last_err is not None:
         raise last_err
     raise RuntimeError(f"Remote slicing failed unexpectedly for {url} {region}")
@@ -434,6 +465,7 @@ def _download_dataset(
     force: bool,
     retries: int,
     retry_backoff_sec: float,
+    ref_fasta: Path | None = None,
 ) -> dict[str, Any]:
     attempts = max(1, int(retries))
     last_err: Exception | None = None
@@ -443,12 +475,14 @@ def _download_dataset(
                 if ds.include_discordant_mates:
                     result = _slice_remote_alignment_with_mates(
                         ds.url, ds.region, target, threads=threads, force=force,
+                        ref_fasta=ref_fasta,
                         retries=attempts,
                         retry_backoff_sec=float(retry_backoff_sec),
                     )
                 else:
                     result = _slice_remote_alignment(
                         ds.url, ds.region, target, threads=threads, force=force,
+                        ref_fasta=ref_fasta,
                         retries=attempts,
                         retry_backoff_sec=float(retry_backoff_sec),
                     )
@@ -1259,11 +1293,14 @@ def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dic
 
 
 def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_sec: int, force: bool) -> dict[str, Any]:
+    # Decoupled from sample BAM download status: extraction runs whenever the
+    # Dfam archive is present on disk, regardless of whether the dataset entry is
+    # in the active map or whether other (e.g. test BAM/CRAM) downloads succeeded.
     ds = ds_map.get("dfam_human_families_embl")
-    if not ds:
-        return {"status": "skipped_missing_dataset", "reason": "dfam_human_families_embl not in config"}
-
-    archive_path = outdir / ds.target_path
+    if ds is not None:
+        archive_path = outdir / ds.target_path
+    else:
+        archive_path = outdir / "retrotransposon_db/dfam/dfam40.0.h5.gz"
     if not archive_path.exists():
         return {"status": "skipped_missing_archive", "path": str(archive_path)}
 
@@ -1826,10 +1863,13 @@ def _postprocess(
             steps.append(payload)
             return payload
         except Exception as err:  # noqa: BLE001
+            # Record the failure but keep going so independent later steps (e.g.
+            # Dfam MEI FASTA extraction) still run even when an unrelated step
+            # fails (e.g. a sample BAM download that never completed).
             print(f"[postprocess:failed] {step_name} error={err}", file=sys.stderr)
             payload = {"step": step_name, "status": "failed", "error": str(err)}
             steps.append(payload)
-            raise
+            return payload
 
     # 1) Reference FASTA prep: decompress + index files (.fai and .dict).
     for ref_id in ("hg38_reference_fasta", "hg19_reference_fasta", "hs1_t2t_reference_fasta"):
@@ -2444,6 +2484,10 @@ def main() -> int:
         print(f"[preflight] Aborting before downloads: {err}", file=sys.stderr)
         return 1
 
+    # Local hg38 reference FASTA, when present, is passed to CRAM slicing via -T
+    # so remote reference-cache network timeouts are avoided.
+    cram_reference = _resolve_cram_reference(outdir)
+
     manifest: dict[str, Any] = {
         "generated_at_unix": int(time.time()),
         "config": str(config_path),
@@ -2479,6 +2523,7 @@ def main() -> int:
                 force=args.force,
                 retries=args.download_retries,
                 retry_backoff_sec=args.download_retry_backoff_sec,
+                ref_fasta=cram_reference,
             )
             future_to_meta[fut] = (idx, ds, target)
 
