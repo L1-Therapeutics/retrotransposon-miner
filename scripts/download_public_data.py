@@ -261,15 +261,57 @@ def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> d
     }
 
 
-def _slice_remote_alignment(url: str, region: str, out_bam: Path, threads: int, force: bool) -> dict[str, Any]:
+def _slice_remote_alignment(
+    url: str,
+    region: str,
+    out_bam: Path,
+    threads: int,
+    force: bool,
+    retries: int = 3,
+    retry_backoff_sec: float = 2.0,
+) -> dict[str, Any]:
     out_bam.parent.mkdir(parents=True, exist_ok=True)
     if out_bam.exists() and Path(f"{out_bam}.bai").exists() and not force:
         return {"status": "skipped_exists", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
 
+    attempts = max(1, int(retries))
+    last_err: Exception | None = None
     # Direct remote slicing avoids storing full-size BAM locally.
-    _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)], required=True)
-    _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
-    return {"status": "sliced_remote_alignment", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
+    for attempt in range(1, attempts + 1):
+        try:
+            _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)], required=True)
+            _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
+            return {
+                "status": "sliced_remote_alignment",
+                "path": str(out_bam),
+                "bytes": out_bam.stat().st_size,
+                "region": region,
+            }
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            for suffix in (".bai", ".csi"):
+                stale = Path(f"{out_bam}{suffix}")
+                if stale.exists():
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
+            if out_bam.exists():
+                try:
+                    out_bam.unlink()
+                except OSError:
+                    pass
+            if attempt >= attempts:
+                raise
+            sleep_s = float(retry_backoff_sec) * (2 ** (attempt - 1))
+            print(
+                f"[slice:retry] {region} attempt {attempt}/{attempts} failed: {err}; retrying in {sleep_s:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(max(0.0, sleep_s))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Remote slicing failed unexpectedly for {url} {region}")
 
 
 def _collect_interchrom_mate_qnames(region_bam: Path, region: str) -> list[str]:
@@ -298,6 +340,8 @@ def _slice_remote_alignment_with_mates(
     out_bam: Path,
     threads: int,
     force: bool,
+    retries: int = 3,
+    retry_backoff_sec: float = 2.0,
 ) -> dict[str, Any]:
     """Slice a region, then pull in discordant mates from other chromosomes via the remote BAM."""
     out_bam.parent.mkdir(parents=True, exist_ok=True)
@@ -310,47 +354,76 @@ def _slice_remote_alignment_with_mates(
             "include_discordant_mates": True,
         }
 
-    with tempfile.TemporaryDirectory(prefix="rtm_slice_mates_") as tmpdir:
-        tmp = Path(tmpdir)
-        region_bam = tmp / "region.bam"
-        mates_bam = tmp / "mates.bam"
-        names_tsv = tmp / "mate_qnames.txt"
-        merged_bam = tmp / "merged.bam"
+    attempts = max(1, int(retries))
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with tempfile.TemporaryDirectory(prefix="rtm_slice_mates_") as tmpdir:
+                tmp = Path(tmpdir)
+                region_bam = tmp / "region.bam"
+                mates_bam = tmp / "mates.bam"
+                names_tsv = tmp / "mate_qnames.txt"
+                merged_bam = tmp / "merged.bam"
 
-        _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(region_bam)], required=True)
-        _run_cmd(["samtools", "index", "-@", str(threads), str(region_bam)], required=True)
-        mate_qnames = _collect_interchrom_mate_qnames(region_bam, region)
-        if mate_qnames:
-            names_tsv.write_text("\n".join(mate_qnames) + "\n", encoding="utf-8")
-            _run_cmd(
-                [
-                    "samtools",
-                    "view",
-                    "-@", str(threads),
-                    "-b",
-                    "-N",
-                    str(names_tsv),
-                    url,
-                    "-o",
-                    str(mates_bam),
-                ],
-                required=True,
+                _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(region_bam)], required=True)
+                _run_cmd(["samtools", "index", "-@", str(threads), str(region_bam)], required=True)
+                mate_qnames = _collect_interchrom_mate_qnames(region_bam, region)
+                if mate_qnames:
+                    names_tsv.write_text("\n".join(mate_qnames) + "\n", encoding="utf-8")
+                    _run_cmd(
+                        [
+                            "samtools",
+                            "view",
+                            "-@", str(threads),
+                            "-b",
+                            "-N",
+                            str(names_tsv),
+                            url,
+                            "-o",
+                            str(mates_bam),
+                        ],
+                        required=True,
+                    )
+                    _run_cmd(["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)], required=True)
+                    shutil.copy2(merged_bam, out_bam)
+                else:
+                    shutil.copy2(region_bam, out_bam)
+
+                _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
+
+            return {
+                "status": "sliced_remote_alignment_with_mates",
+                "path": str(out_bam),
+                "bytes": out_bam.stat().st_size,
+                "region": region,
+                "include_discordant_mates": True,
+                "mate_qnames": len(mate_qnames),
+            }
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            for suffix in (".bai", ".csi"):
+                stale = Path(f"{out_bam}{suffix}")
+                if stale.exists():
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
+            if out_bam.exists():
+                try:
+                    out_bam.unlink()
+                except OSError:
+                    pass
+            if attempt >= attempts:
+                raise
+            sleep_s = float(retry_backoff_sec) * (2 ** (attempt - 1))
+            print(
+                f"[slice:retry] {region} attempt {attempt}/{attempts} failed with mates: {err}; retrying in {sleep_s:.1f}s",
+                file=sys.stderr,
             )
-            _run_cmd(["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)], required=True)
-            shutil.copy2(merged_bam, out_bam)
-        else:
-            shutil.copy2(region_bam, out_bam)
-
-        _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
-
-    return {
-        "status": "sliced_remote_alignment_with_mates",
-        "path": str(out_bam),
-        "bytes": out_bam.stat().st_size,
-        "region": region,
-        "include_discordant_mates": True,
-        "mate_qnames": len(mate_qnames),
-    }
+            time.sleep(max(0.0, sleep_s))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Remote slicing failed unexpectedly for {url} {region}")
 
 
 def _download_dataset(
@@ -368,9 +441,17 @@ def _download_dataset(
         try:
             if ds.region and (ds.url.endswith(".bam") or ds.url.endswith(".cram")):
                 if ds.include_discordant_mates:
-                    result = _slice_remote_alignment_with_mates(ds.url, ds.region, target, threads=threads, force=force)
+                    result = _slice_remote_alignment_with_mates(
+                        ds.url, ds.region, target, threads=threads, force=force,
+                        retries=attempts,
+                        retry_backoff_sec=float(retry_backoff_sec),
+                    )
                 else:
-                    result = _slice_remote_alignment(ds.url, ds.region, target, threads=threads, force=force)
+                    result = _slice_remote_alignment(
+                        ds.url, ds.region, target, threads=threads, force=force,
+                        retries=attempts,
+                        retry_backoff_sec=float(retry_backoff_sec),
+                    )
             else:
                 result = _download_file(ds.url, target, timeout_sec=timeout_sec, force=force)
             break
@@ -416,9 +497,35 @@ def _run_cmd(cmd: list[str], required: bool = True) -> tuple[bool, str]:
         return (False, msg) if not required else (_raise_runtime(msg))
 
 
+_DOWNLOAD_BINARIES = ("samtools", "bwa", "bgzip", "tabix", "bedtools")
+_POSTPROCESS_BINARIES = ("bigWigToBedGraph", "bigBedToBed", "liftOver")
+_APT_INSTALL_CMD = "sudo apt-get install -y samtools bwa bgzip tabix bedtools"
+_BIOCONDA_INSTALL_CMD = (
+    "conda install -c bioconda -c conda-forge samtools bwa tabix bedtools htslib"
+)
+
+
+def _preflight_check_binaries() -> None:
+    """Verify required system binaries are available before starting downloads."""
+    missing = [name for name in _DOWNLOAD_BINARIES if shutil.which(name) is None]
+    if not missing:
+        return
+    print("[preflight] Missing required binaries: " + ", ".join(missing), file=sys.stderr)
+    print(
+        "[preflight] Install via one of:\n"
+        f"  apt-get: {_APT_INSTALL_CMD}\n"
+        f"  conda:   {_BIOCONDA_INSTALL_CMD}",
+        file=sys.stderr,
+    )
+    raise RuntimeError(
+        f"Missing required binaries: {', '.join(missing)}. "
+        "Install them and re-run. Example (Debian/Ubuntu): "
+        f"'{_APT_INSTALL_CMD}'."
+    )
+
+
 def _ensure_postprocess_binaries() -> None:
-    required_bins = ("bigWigToBedGraph", "bigBedToBed", "liftOver")
-    missing = [name for name in required_bins if shutil.which(name) is None]
+    missing = [name for name in _POSTPROCESS_BINARIES if shutil.which(name) is None]
     if not missing:
         return
     raise RuntimeError(
@@ -1160,6 +1267,15 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
     if not archive_path.exists():
         return {"status": "skipped_missing_archive", "path": str(archive_path)}
 
+    # MEI subset extraction needs python 'h5py' (used indirectly via famdb.py).
+    # Guard up front so an absent dependency never invalidates already-downloaded files.
+    if shutil.which("git") is None:
+        return {
+            "status": "skipped_missing_dependency",
+            "error": "git_not_found_required_for_famdb_clone",
+            "path": str(archive_path),
+        }
+
     decompressed_h5 = archive_path.with_suffix("")
     if decompressed_h5.suffix != ".h5":
         decompressed_h5 = archive_path.with_name("dfam40.0.h5")
@@ -1181,7 +1297,7 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
     famdb_tools_dir = dfam_dir / "tools" / "FamDB"
     famdb_py, tool_status = _ensure_famdb_repo(famdb_tools_dir, timeout_sec=timeout_sec)
     if famdb_py is None:
-        return {"status": "failed", "error": tool_status, "db_dir": str(db_dir)}
+        return {"status": "skipped_missing_dependency", "error": tool_status, "db_dir": str(db_dir)}
 
     curated_fasta = dfam_dir / "dfam_human_curated.fasta"
     curated_missing_or_empty = (not curated_fasta.exists()) or (curated_fasta.stat().st_size <= 0)
@@ -2320,6 +2436,13 @@ def main() -> int:
     ]
 
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-flight: verify required system binaries are present before any I/O.
+    try:
+        _preflight_check_binaries()
+    except Exception as err:  # noqa: BLE001
+        print(f"[preflight] Aborting before downloads: {err}", file=sys.stderr)
+        return 1
 
     manifest: dict[str, Any] = {
         "generated_at_unix": int(time.time()),
