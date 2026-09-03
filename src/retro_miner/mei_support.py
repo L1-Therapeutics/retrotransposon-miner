@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -11,7 +12,7 @@ import subprocess
 import tempfile
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1516,6 +1517,93 @@ def _merge_fetched_mate_sequences(
     return out
 
 
+_MATE_WINDOW_SIZE_BP = 100_000
+
+
+def _group_mate_loci_into_windows(
+    need_fetch: pd.DataFrame,
+    window_size: int = _MATE_WINDOW_SIZE_BP,
+) -> list[tuple[str, int, int, set[str]]]:
+    """Group (mate_chrom, mate_pos, qname) into sorted non-overlapping ``window_size`` windows.
+
+    Each returned tuple is ``(chrom, start0, end0, candidate_qnames)`` so a single
+    BAM ``fetch`` streams all reads in a region instead of one ``fetch`` per row.
+    """
+    if (
+        "read_name" not in need_fetch.columns
+        or "mate_chrom" not in need_fetch.columns
+        or "mate_pos" not in need_fetch.columns
+    ):
+        return []
+    rows = need_fetch[["read_name", "mate_chrom", "mate_pos"]].copy()
+    rows["read_name"] = rows["read_name"].fillna("").astype(str)
+    rows["mate_chrom"] = rows["mate_chrom"].fillna("").astype(str)
+    rows["mate_pos"] = pd.to_numeric(rows["mate_pos"], errors="coerce").fillna(0).astype(int)
+    rows = rows.loc[rows["read_name"].ne("") & rows["mate_chrom"].ne("") & rows["mate_pos"].gt(0)].copy()
+    size = max(1, int(window_size))
+    buckets: dict[tuple[str, int], set[str]] = {}
+    for rec in rows.itertuples(index=False):
+        chrom = str(rec.mate_chrom)
+        pos = int(rec.mate_pos)
+        start0 = max(0, pos - 1)
+        win_start0 = (start0 // size) * size
+        buckets.setdefault((chrom, win_start0), set()).add(str(rec.read_name))
+    windows = [
+        (chrom, win_start0, win_start0 + size, qnames)
+        for (chrom, win_start0), qnames in buckets.items()
+    ]
+    windows.sort(key=lambda w: (w[0], w[1]))
+    return windows
+
+
+def _fetch_mate_sequences_worker(
+    bam_path: str,
+    candidate_qnames: set[str],
+    mate_chrom: str,
+    start0: int,
+    end0: int,
+) -> dict[str, tuple[str, int, int, str, int, str]]:
+    """Stream reads in one window through a process-local ``pysam.AlignmentFile``.
+
+    Returns exactly the same ``(mate_seq, mate_ref_start, mate_ref_end, clip_side,
+    clip_len, clip_seq)`` tuples as the single-read lookup, keyed by query name.
+    """
+    fetched: dict[str, tuple[str, int, int, str, int, str]] = {}
+    if not candidate_qnames:
+        return fetched
+    path = Path(bam_path)
+    if not path.exists():
+        return fetched
+    with pysam.AlignmentFile(str(path), "rb") as bam:
+        try:
+            reads = bam.fetch(mate_chrom, int(start0), int(end0))
+        except (OSError, ValueError, KeyError, RuntimeError):
+            return fetched
+        for mate_read in reads:
+            qname = mate_read.query_name
+            if qname not in candidate_qnames:
+                continue
+            if qname in fetched:
+                continue
+            if mate_read.is_secondary or mate_read.is_supplementary:
+                continue
+            if mate_read.is_unmapped:
+                continue
+            seq = mate_read.query_sequence or ""
+            if not seq:
+                continue
+            clip_side, clip_len, _clip_pos, clip_seq = _longest_soft_clip_from_read(mate_read)
+            fetched[qname] = (
+                seq,
+                int(mate_read.reference_start) + 1 if mate_read.reference_start is not None else 0,
+                int(mate_read.reference_end) if mate_read.reference_end is not None else 0,
+                clip_side,
+                int(clip_len),
+                clip_seq,
+            )
+    return fetched
+
+
 def _fetch_discordant_mate_sequences(
     discordant_df: pd.DataFrame,
     bam_path: Path | None,
@@ -1563,35 +1651,25 @@ def _fetch_discordant_mate_sequences(
         return out
 
     fetched: dict[str, tuple[str, int, int, str, int, str]] = {}
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-        for rec in need_fetch.itertuples(index=False):
-            qname = str(rec.read_name)
-            if qname in fetched:
-                continue
-            mate_chrom = str(rec.mate_chrom)
-            mate_pos = int(rec.mate_pos)
-            start0 = max(0, mate_pos - 1)
-            end0 = start0 + 500
-            for mate_read in bam.fetch(mate_chrom, start0, end0):
-                if mate_read.query_name != qname:
-                    continue
-                if mate_read.is_secondary or mate_read.is_supplementary:
-                    continue
-                if mate_read.is_unmapped:
-                    continue
-                seq = mate_read.query_sequence or ""
-                if not seq:
-                    continue
-                clip_side, clip_len, _clip_pos, clip_seq = _longest_soft_clip_from_read(mate_read)
-                fetched[qname] = (
-                    seq,
-                    int(mate_read.reference_start) + 1 if mate_read.reference_start is not None else 0,
-                    int(mate_read.reference_end) if mate_read.reference_end is not None else 0,
-                    clip_side,
-                    int(clip_len),
-                    clip_seq,
+    windows = _group_mate_loci_into_windows(need_fetch)
+    if windows:
+        max_workers = max(1, min(os.cpu_count() or 1, len(windows)))
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_mate_sequences_worker,
+                    str(bam_path),
+                    qnames,
+                    chrom,
+                    start0,
+                    end0,
                 )
-                break
+                for (chrom, start0, end0, qnames) in windows
+            ]
+            for fut in as_completed(futures):
+                partial = fut.result()
+                for q, t in partial.items():
+                    fetched.setdefault(q, t)
 
     return _merge_fetched_mate_sequences(out, fetched)
 
