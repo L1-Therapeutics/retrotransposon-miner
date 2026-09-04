@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from pathlib import Path
 import subprocess
 import tempfile
+from typing import TypedDict, cast
 
 import click
 import numpy as np
@@ -113,6 +114,74 @@ def _cluster_sorted_positions(positions: list[int], max_gap_bp: int) -> list[lis
     return [seg.tolist() for seg in np.split(arr, np.where(gaps)[0] + 1)]
 
 
+def _cluster_labels(positions: Iterable[int], max_gap_bp: int) -> np.ndarray:
+    """Vectorized re-implementation of ``_cluster_sorted_positions``.
+
+    Returns an array of cluster ids (one per input position) produced by the
+    same gapped-clustering rule: a new cluster starts whenever the gap to the
+    previous element strictly exceeds ``max_gap_bp``.
+    """
+    arr = np.sort(np.asarray([int(p) for p in positions], dtype=np.int64))
+    if arr.size == 0:
+        return np.empty(0, dtype=np.int64)
+    gap = int(max_gap_bp)
+    if gap < 0:
+        gap = 0
+    new_cluster = np.concatenate((np.array([True]), arr[1:] - arr[:-1] > gap))
+    return np.cumsum(new_cluster) - 1
+
+
+def _assign_discordant_to_seeds(
+    seed_starts: Iterable[int],
+    seed_ends: Iterable[int],
+    positions: Iterable[int],
+    radius: int,
+) -> np.ndarray:
+    """Vectorized assignment of discordant positions to the nearest seed.
+
+    Mirrors the original per-position interval-tree loop: a discordant position
+    is assigned to the seed whose closed interval ``[seed_start, seed_end]`` is
+    nearest (distance ``0`` when contained), provided that distance does not
+    exceed ``radius``. Ties are broken by seed start, then seed end, then seed
+    order, matching the tree-iteration ordering of the interval-tree
+    implementation. Returns seed indices (``-1`` for unassigned positions),
+    parallel to ``positions``.
+    """
+    starts = np.asarray([int(s) for s in seed_starts], dtype=np.int64)
+    ends = np.asarray([int(e) for e in seed_ends], dtype=np.int64)
+    pos = np.asarray([int(p) for p in positions], dtype=np.int64)
+    if starts.size == 0:
+        return np.full(pos.shape, -1, dtype=np.int64)
+    radius = int(radius)
+    if radius < 0:
+        radius = 0
+
+    left_dist = starts[:, np.newaxis] - pos[np.newaxis, :]
+    right_dist = pos[np.newaxis, :] - ends[:, np.newaxis]
+    dist = np.where(left_dist > 0, left_dist, np.where(right_dist > 0, right_dist, 0))
+    is_candidate = dist <= radius
+
+    huge = np.iinfo(np.int64).max
+    d_safe = np.where(is_candidate, dist, huge)
+
+    any_candidate = is_candidate.any(axis=0)
+    min_d = d_safe.min(axis=0)
+    tie_d = is_candidate & (dist == min_d[np.newaxis, :])
+
+    s_safe = np.where(tie_d, starts[:, np.newaxis], huge)
+    min_s = s_safe.min(axis=0)
+    tie_s = tie_d & (starts[:, np.newaxis] == min_s[np.newaxis, :])
+
+    e_safe = np.where(tie_s, ends[:, np.newaxis], huge)
+    min_e = e_safe.min(axis=0)
+    tie_e = tie_s & (ends[:, np.newaxis] == min_e[np.newaxis, :])
+
+    idx = np.where(tie_e, np.arange(starts.size)[:, np.newaxis], huge)
+    best = idx.min(axis=0)
+
+    return np.where(any_candidate, best.astype(np.int64), -1)
+
+
 def _split_cluster_positions(
     positions: list[int],
     valley_gap_bp: int,
@@ -147,6 +216,13 @@ def _distance_to_closed_interval(pos: int, start: int, end: int) -> int:
     return 0
 
 
+class _LocusSeed(TypedDict):
+    positions: list[int]
+    min_pos: int
+    max_pos: int
+    seeded_by_split: bool
+
+
 def _build_loci_from_evidence(
     split_disease: pd.DataFrame,
     split_control: pd.DataFrame,
@@ -167,23 +243,32 @@ def _build_loci_from_evidence(
         _progress("no split/discordant evidence found; returning empty loci")
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
-    loci_by_chrom: dict[str, list[dict[str, object]]] = {}
+    loci_by_chrom: dict[str, list[_LocusSeed]] = {}
 
     if not split_all.empty:
         split_pos = split_all.loc[:, ["chrom", "pos"]].copy()
         split_pos["pos"] = split_pos["pos"].astype(int)
         for chrom, chrom_df in split_pos.groupby("chrom", sort=False):
-            positions = sorted(chrom_df["pos"].tolist())
-            for cluster in _cluster_sorted_positions(positions, max_gap_bp=int(split_cluster_bp)):
-                if not cluster:
+            chrom_key = str(chrom)
+            labels = _cluster_labels(chrom_df["pos"].tolist(), max_gap_bp=int(split_cluster_bp))
+            n_clusters = int(labels[-1]) + 1 if labels.size else 0
+            if n_clusters == 0:
+                continue
+            for i in range(n_clusters):
+                cluster = chrom_df["pos"].to_numpy()[labels == i].tolist()
+                seed_positions = [int(lopp) for lopp in cluster]
+                if not seed_positions:
                     continue
-                loci_by_chrom.setdefault(str(chrom), []).append(
-                    {
-                        "positions": list(cluster),
-                        "min_pos": int(cluster[0]),
-                        "max_pos": int(cluster[-1]),
-                        "seeded_by_split": True,
-                    }
+                loci_by_chrom.setdefault(chrom_key, []).append(
+                    cast(
+                        _LocusSeed,
+                        {
+                            "positions": sorted(seed_positions),
+                            "min_pos": int(min(seed_positions)),
+                            "max_pos": int(max(seed_positions)),
+                            "seeded_by_split": True,
+                        },
+                    )
                 )
 
     unassigned_discordant: dict[str, list[int]] = {}
@@ -193,40 +278,23 @@ def _build_loci_from_evidence(
         for chrom, chrom_df in disc_pos.groupby("chrom", sort=False):
             chrom_key = str(chrom)
             seeds = loci_by_chrom.get(chrom_key, [])
-            seed_tree: IntervalTree | None = None
-            if seeds:
-                seed_tree = IntervalTree()
-                radius = int(discordant_cluster_bp)
-                for idx, seed in enumerate(seeds):
-                    seed_start = int(seed["min_pos"])
-                    seed_end = int(seed["max_pos"])
-                    seed_tree.addi(max(1, seed_start - radius), seed_end + radius + 1, idx)
-            for pos in sorted(chrom_df["pos"].tolist()):
-                if not seeds:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
-                    continue
-
-                candidate_seed_idxs = list(seed_tree.at(int(pos))) if seed_tree is not None else []
-                if not candidate_seed_idxs:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
-                    continue
-
-                best_idx = min(
-                    (int(iv.data) for iv in candidate_seed_idxs),
-                    key=lambda idx: _distance_to_closed_interval(
-                        int(pos),
-                        int(seeds[idx]["min_pos"]),
-                        int(seeds[idx]["max_pos"]),
-                    ),
+            if not seeds:
+                unassigned_discordant.setdefault(chrom_key, []).extend(
+                    int(p) for p in sorted(chrom_df["pos"].tolist())
                 )
-                best_dist = _distance_to_closed_interval(
-                    int(pos),
-                    int(seeds[best_idx]["min_pos"]),
-                    int(seeds[best_idx]["max_pos"]),
-                )
-                if best_dist <= int(discordant_cluster_bp):
-                    chosen = seeds[best_idx]
-                    chosen["positions"].append(int(pos))
+                continue
+            seed_starts = [int(seed["min_pos"]) for seed in seeds]
+            seed_ends = [int(seed["max_pos"]) for seed in seeds]
+            pos_list = sorted(chrom_df["pos"].tolist())
+            assigned = _assign_discordant_to_seeds(
+                seed_starts,
+                seed_ends,
+                pos_list,
+                int(discordant_cluster_bp),
+            )
+            for pos, seed_idx in zip(pos_list, assigned.tolist()):
+                if seed_idx >= 0:
+                    seeds[int(seed_idx)]["positions"].append(int(pos))
                 else:
                     unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
 
@@ -235,12 +303,15 @@ def _build_loci_from_evidence(
             if not cluster:
                 continue
             loci_by_chrom.setdefault(chrom, []).append(
-                {
-                    "positions": list(cluster),
-                    "min_pos": int(cluster[0]),
-                    "max_pos": int(cluster[-1]),
-                    "seeded_by_split": False,
-                }
+                cast(
+                    _LocusSeed,
+                    {
+                        "positions": list(cluster),
+                        "min_pos": int(cluster[0]),
+                        "max_pos": int(cluster[-1]),
+                        "seeded_by_split": False,
+                    },
+                )
             )
 
     rows: list[dict[str, int | str]] = []
