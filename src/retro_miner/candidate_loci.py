@@ -131,28 +131,156 @@ def _cluster_labels(positions: Iterable[int], max_gap_bp: int) -> np.ndarray:
     return np.cumsum(new_cluster) - 1
 
 
-def _assign_discordant_to_seeds(starts, pos, *args, **kwargs):
-    starts = np.asarray(starts)
-    pos = np.asarray(pos)
-    if len(starts) == 0 or len(pos) == 0:
-        return np.array([], dtype=int), np.array([], dtype=int)
-    max_dist = kwargs.get("max_dist", 1000)
-    if args and isinstance(args[0], (int, float)):
-        max_dist = args[0]
-    pos_order = np.argsort(pos)
-    sorted_pos = pos[pos_order]
-    left = np.searchsorted(sorted_pos, starts - max_dist, side="left")
-    right = np.searchsorted(sorted_pos, starts + max_dist, side="right")
-    assigned_seeds = []
-    assigned_pos = []
-    for i, (l, r) in enumerate(zip(left, right)):
-        if l < r:
-            count = r - l
-            assigned_seeds.append(np.full(count, i, dtype=int))
-            assigned_pos.append(pos_order[l:r])
-    if assigned_seeds:
-        return np.concatenate(assigned_seeds), np.concatenate(assigned_pos)
-    return np.array([], dtype=int), np.array([], dtype=int)
+def _assign_discordant_to_seeds(
+    seed_starts: Iterable[int],
+    seed_ends: Iterable[int],
+    positions: Iterable[int],
+    radius: int,
+) -> np.ndarray:
+    """Assign discordant positions to the nearest seed interval (memory-safe).
+
+    A discordant position is assigned to the seed whose closed interval
+    ``[seed_start, seed_end]`` is nearest (distance ``0`` when contained),
+    provided that distance does not exceed ``radius``.  Ties are broken by seed
+    start, then seed end, then seed order.
+
+    The earlier "vectorized" implementation built a dense
+    ``n_seeds x n_positions`` int64 matrix (chr22 -> 46615 x 162226 -> ~56 GiB),
+    OOM-killing the process in low-RAM environments.  This version finds the
+    nearest interval with monotonic sweeps and a small active-seed heap --
+    O((n + m) log n) time and O(n + m) memory -- and never materializes the
+    full pairwise matrix.  Returns seed indices (``-1`` for unassigned
+    positions), parallel to ``positions``.
+
+    Original interface restored so callers get a single nearest assignment per
+    position.  (A transient ``(starts, pos)`` point-pair rewrite dropped the
+    ``seed_end`` interval bound and allowed non-nearest multi-matching.)
+    """
+    starts = np.asarray([int(s) for s in seed_starts], dtype=np.int64)
+    ends = np.asarray([int(e) for e in seed_ends], dtype=np.int64)
+    pos = np.asarray([int(p) for p in positions], dtype=np.int64)
+    n = starts.size
+    m = pos.size
+    out = np.full(m, -1, dtype=np.int64)
+    if n == 0:
+        return out
+    radius = int(radius)
+    if radius < 0:
+        radius = 0
+
+    huge = np.iinfo(np.int64).max
+
+    # Left sweep: seeds ending strictly before p; best = max end, tie (start,index).
+    # Positions and seeds both processed in ascending genomic order.
+    left_best = np.full(m, -1, dtype=np.int64)
+    left_order = np.lexsort((np.arange(n), starts, ends))  # by (end,start,index)
+    l_ends = ends[left_order]
+    l_starts = starts[left_order]
+    l_idx = left_order
+    pos_order = np.argsort(pos, kind="stable")  # ascending positions
+    li = 0
+    cur_end = -1
+    cur_start = huge
+    cur_idx = -1
+    for pp in pos_order:
+        p = int(pos[pp])
+        while li < n and int(l_ends[li]) < p:
+            e = int(l_ends[li])
+            s = int(l_starts[li])
+            i = int(l_idx[li])
+            if e > cur_end or (e == cur_end and (s < cur_start or (s == cur_start and i < cur_idx))):
+                cur_end = e
+                cur_start = s
+                cur_idx = i
+            li += 1
+        if cur_idx >= 0:
+            left_best[pp] = cur_idx
+
+    # Right sweep: seeds starting strictly after p; best = min start, tie (end,index).
+    # Positions and seeds both processed in descending genomic order.
+    right_best = np.full(m, -1, dtype=np.int64)
+    right_order = np.lexsort((np.arange(n), ends, starts))[::-1]  # start desc
+    r_starts = starts[right_order]
+    r_ends = ends[right_order]
+    r_idx = right_order
+    pos_order_desc = pos_order[::-1]
+    ri = 0
+    cur_start = huge
+    cur_end = huge
+    cur_idx = -1
+    for pp in pos_order_desc:
+        p = int(pos[pp])
+        while ri < n and int(r_starts[ri]) > p:
+            s = int(r_starts[ri])
+            e = int(r_ends[ri])
+            i = int(r_idx[ri])
+            if s < cur_start or (s == cur_start and (e < cur_end or (e == cur_end and i < cur_idx))):
+                cur_start = s
+                cur_end = e
+                cur_idx = i
+            ri += 1
+        if cur_idx >= 0:
+            right_best[pp] = cur_idx
+
+    # Containing sweep: seeds with start <= p <= end (dist 0); best = min (start,end,index)
+    # among active seeds.  Lazy expiry via a min-heap keyed by (start, end, index).
+    contain_best = np.full(m, -1, dtype=np.int64)
+    by_start = np.lexsort((np.arange(n), ends, starts))  # seeds sorted by (start,end,index)
+    bs_starts = starts[by_start]
+    bs_ends = ends[by_start]
+    bs_idx = by_start
+    import heapq
+    active = []          # heap of (start, end, index)
+    active_end = []      # heap of (end, start, index) for expiry
+    si = 0
+    for pp in pos_order:
+        p = int(pos[pp])
+        while si < n and int(bs_starts[si]) <= p:
+            s = int(bs_starts[si])
+            e = int(bs_ends[si])
+            i = int(bs_idx[si])
+            heapq.heappush(active, (s, e, i))
+            heapq.heappush(active_end, (e, s, i))
+            si += 1
+        while active_end and active_end[0][0] < p:
+            heapq.heappop(active_end)
+        # Remove expired seeds from the query heap.
+        while active and active[0][1] < p:
+            heapq.heappop(active)
+        # Re-insert any seed that was popped from active only when needed is not
+        # required here: active only ever loses expired seeds, and a seed can be
+        # expired by end<p once; it is removed from active at most once (the
+        # matching active_end entry was already popped, so no stale re-add).
+        if active:
+            contain_best[pp] = active[0][2]
+
+    # Combine: pick the candidate (among left/contain/right) with the smallest
+    # (dist, start, end, index) key; enforce radius.
+    for pp in pos_order:
+        p = int(pos[pp])
+        best_key = (huge, huge, huge, huge)
+        best_seed = -1
+        for cand in (left_best[pp], contain_best[pp], right_best[pp]):
+            if cand < 0:
+                continue
+            s = int(starts[cand])
+            e = int(ends[cand])
+            if s <= p <= e:
+                d = 0
+            elif p < s:
+                d = s - p
+            else:
+                d = p - e
+            if d > radius:
+                continue
+            key = (d, s, e, int(cand))
+            if key < best_key:
+                best_key = key
+                best_seed = int(cand)
+        out[pp] = best_seed
+
+    return out
+
 
 def _split_cluster_positions(
     positions: list[int],
@@ -256,19 +384,20 @@ def _build_loci_from_evidence(
                 )
                 continue
             seed_starts = [int(seed["min_pos"]) for seed in seeds]
+            seed_ends = [int(seed["max_pos"]) for seed in seeds]
             pos_list = sorted(chrom_df["pos"].tolist())
-            seed_indices, pos_indices = _assign_discordant_to_seeds(
+            assigned = _assign_discordant_to_seeds(
                 seed_starts,
+                seed_ends,
                 pos_list,
                 int(discordant_cluster_bp),
             )
-            matched_pos: set[int] = set()
-            for seed_idx, pos_idx in zip(seed_indices, pos_indices):
-                matched_pos.add(int(pos_idx))
-                seeds[int(seed_idx)]["positions"].append(int(pos_list[int(pos_idx)]))
             for i, pos in enumerate(pos_list):
-                if i not in matched_pos:
+                seed_idx = int(assigned[i])
+                if seed_idx < 0:
                     unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
+                else:
+                    seeds[seed_idx]["positions"].append(int(pos))
 
     for chrom, positions in unassigned_discordant.items():
         for cluster in _cluster_sorted_positions(sorted(positions), max_gap_bp=int(discordant_cluster_bp)):
