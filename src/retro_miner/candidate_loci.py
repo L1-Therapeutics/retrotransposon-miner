@@ -131,56 +131,28 @@ def _cluster_labels(positions: Iterable[int], max_gap_bp: int) -> np.ndarray:
     return np.cumsum(new_cluster) - 1
 
 
-def _assign_discordant_to_seeds(
-    seed_starts: Iterable[int],
-    seed_ends: Iterable[int],
-    positions: Iterable[int],
-    radius: int,
-) -> np.ndarray:
-    """Vectorized assignment of discordant positions to the nearest seed.
-
-    Mirrors the original per-position interval-tree loop: a discordant position
-    is assigned to the seed whose closed interval ``[seed_start, seed_end]`` is
-    nearest (distance ``0`` when contained), provided that distance does not
-    exceed ``radius``. Ties are broken by seed start, then seed end, then seed
-    order, matching the tree-iteration ordering of the interval-tree
-    implementation. Returns seed indices (``-1`` for unassigned positions),
-    parallel to ``positions``.
-    """
-    starts = np.asarray([int(s) for s in seed_starts], dtype=np.int64)
-    ends = np.asarray([int(e) for e in seed_ends], dtype=np.int64)
-    pos = np.asarray([int(p) for p in positions], dtype=np.int64)
-    if starts.size == 0:
-        return np.full(pos.shape, -1, dtype=np.int64)
-    radius = int(radius)
-    if radius < 0:
-        radius = 0
-
-    left_dist = starts[:, np.newaxis] - pos[np.newaxis, :]
-    right_dist = pos[np.newaxis, :] - ends[:, np.newaxis]
-    dist = np.where(left_dist > 0, left_dist, np.where(right_dist > 0, right_dist, 0))
-    is_candidate = dist <= radius
-
-    huge = np.iinfo(np.int64).max
-    d_safe = np.where(is_candidate, dist, huge)
-
-    any_candidate = is_candidate.any(axis=0)
-    min_d = d_safe.min(axis=0)
-    tie_d = is_candidate & (dist == min_d[np.newaxis, :])
-
-    s_safe = np.where(tie_d, starts[:, np.newaxis], huge)
-    min_s = s_safe.min(axis=0)
-    tie_s = tie_d & (starts[:, np.newaxis] == min_s[np.newaxis, :])
-
-    e_safe = np.where(tie_s, ends[:, np.newaxis], huge)
-    min_e = e_safe.min(axis=0)
-    tie_e = tie_s & (ends[:, np.newaxis] == min_e[np.newaxis, :])
-
-    idx = np.where(tie_e, np.arange(starts.size)[:, np.newaxis], huge)
-    best = idx.min(axis=0)
-
-    return np.where(any_candidate, best.astype(np.int64), -1)
-
+def _assign_discordant_to_seeds(starts, pos, *args, **kwargs):
+    starts = np.asarray(starts)
+    pos = np.asarray(pos)
+    if len(starts) == 0 or len(pos) == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    max_dist = kwargs.get("max_dist", 1000)
+    if args and isinstance(args[0], (int, float)):
+        max_dist = args[0]
+    pos_order = np.argsort(pos)
+    sorted_pos = pos[pos_order]
+    left = np.searchsorted(sorted_pos, starts - max_dist, side="left")
+    right = np.searchsorted(sorted_pos, starts + max_dist, side="right")
+    assigned_seeds = []
+    assigned_pos = []
+    for i, (l, r) in enumerate(zip(left, right)):
+        if l < r:
+            count = r - l
+            assigned_seeds.append(np.full(count, i, dtype=int))
+            assigned_pos.append(pos_order[l:r])
+    if assigned_seeds:
+        return np.concatenate(assigned_seeds), np.concatenate(assigned_pos)
+    return np.array([], dtype=int), np.array([], dtype=int)
 
 def _split_cluster_positions(
     positions: list[int],
@@ -284,18 +256,18 @@ def _build_loci_from_evidence(
                 )
                 continue
             seed_starts = [int(seed["min_pos"]) for seed in seeds]
-            seed_ends = [int(seed["max_pos"]) for seed in seeds]
             pos_list = sorted(chrom_df["pos"].tolist())
-            assigned = _assign_discordant_to_seeds(
+            seed_indices, pos_indices = _assign_discordant_to_seeds(
                 seed_starts,
-                seed_ends,
                 pos_list,
                 int(discordant_cluster_bp),
             )
-            for pos, seed_idx in zip(pos_list, assigned.tolist()):
-                if seed_idx >= 0:
-                    seeds[int(seed_idx)]["positions"].append(int(pos))
-                else:
+            matched_pos: set[int] = set()
+            for seed_idx, pos_idx in zip(seed_indices, pos_indices):
+                matched_pos.add(int(pos_idx))
+                seeds[int(seed_idx)]["positions"].append(int(pos_list[int(pos_idx)]))
+            for i, pos in enumerate(pos_list):
+                if i not in matched_pos:
                     unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
 
     for chrom, positions in unassigned_discordant.items():
