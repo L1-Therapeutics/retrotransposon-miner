@@ -30,8 +30,9 @@ OUTDIR=""
 REGION="chr22"
 CHR_ARG=""
 CHR_CONCURRENCY="6"
-# Disease∥control extract workers. Empty = adaptive: 1 under multi-chrom concurrency,
-# 2 for single-chromosome (or CHR_CONCURRENCY=1) so chrom slots leave enough CPU.
+# Disease∥control extract workers. Empty = extract sequentially (1) so peak
+# resident memory stays low in low-RAM environments. Pass --sample-workers 2 to
+# run disease and control extraction in parallel (times ~2x peak memory).
 SAMPLE_WORKERS=""
 # bwa mem -t for MEI remaps. Empty = auto after chrom list is known:
 #   multi-chrom with CHR_CONCURRENCY>1 → 1
@@ -623,15 +624,12 @@ run_single_pipeline() {
   fi
 
   stage_t0=$(now_epoch)
-  # Under multi-chrom concurrency, keep sample extract serial so each chrom
-  # worker leaves enough cores for other chroms / annotate / minimap2.
+  # Extract disease then control sequentially (--sample-workers 1) by default.
+  # Parallel sample extraction (2) doubles peak resident memory and can be OOM
+  # killed termination in low-RAM environments, so it is opt-in only.
   local sample_workers="${SAMPLE_WORKERS}"
   if [[ -z "${sample_workers}" ]]; then
-    if [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${CHR_CONCURRENCY}" -gt 1 ]]; then
-      sample_workers=1
-    else
-      sample_workers=2
-    fi
+    sample_workers=1
   fi
   # Collect optional --*-mate-bam arguments into a local array so that any
   # path containing spaces is word-split correctly.  Unquoted command
