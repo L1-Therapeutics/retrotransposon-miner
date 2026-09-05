@@ -42,8 +42,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Circle  # noqa: E402
 
 CHROM_COL = "chrom"
-BP_COL = "consensus_insertion_breakpoint_pos"
+#: Accepted names for the insertion breakpoint coordinate (new post-refactor names
+#: first, then legacy pre-refactor names) so baseline and perf gold-review TSVs
+#: with different schemas can be compared.
+BP_COL_FALLBACKS = ("consensus_insertion_breakpoint_pos", "insertion_breakpoint_pos", "breakpoint_pos")
 FAMILY_COL = "consensus_mei_family"
+FAMILY_COL_FALLBACKS = ("consensus_mei_family", "mei_family", "known_mei_polymorphism_family")
 ROLLING_WINDOW = 50
 
 #: Canonical metric name -> accepted column names (first present wins).
@@ -160,7 +164,14 @@ def _gold_mask(df: pd.DataFrame) -> pd.Series:
 
 
 def _high_conf_mask(df: pd.DataFrame, gold: pd.Series) -> pd.Series:
-    tier_col = _first_col(df, ("consensus_breakpoint_confidence_tier", "breakpoint_confidence_tier"))
+    tier_col = _first_col(
+        df,
+        (
+            "consensus_breakpoint_confidence_tier",
+            "breakpoint_confidence_tier",
+            "insertion_breakpoint_confidence_tier",
+        ),
+    )
     if tier_col is not None:
         high = df[tier_col].fillna("").astype(str).str.strip().str.lower().eq("high")
     else:
@@ -183,6 +194,9 @@ def _1000g_mask(df: pd.DataFrame) -> pd.Series:
     src_col = _first_col(df, ("known_mei_polymorphism_source",))
     if src_col is not None:
         hit = hit | df[src_col].fillna("").astype(str).str.contains("melt_1kg", case=False, na=False)
+    bool_col = _first_col(df, ("known_mei_polymorphism", "is_known_mei_polymorphism"))
+    if bool_col is not None:
+        hit = hit | _coerce_bool(df[bool_col])
     return hit
 
 
@@ -190,18 +204,22 @@ def load_run(path: Path, label: str) -> Run:
     if not path.exists():
         raise SystemExit(f"{label} TSV not found: {path}")
     df = pd.read_csv(path, sep="\t", low_memory=False)
-    missing = [c for c in (CHROM_COL, BP_COL) if c not in df.columns]
-    if missing:
-        raise SystemExit(f"{path}: missing required column(s): {', '.join(missing)}")
+    if CHROM_COL not in df.columns:
+        raise SystemExit(f"{path}: missing required column: {CHROM_COL}")
+    bp_col = _first_col(df, BP_COL_FALLBACKS)
+    if bp_col is None:
+        raise SystemExit(
+            f"{path}: missing breakpoint column (tried: {', '.join(BP_COL_FALLBACKS)})"
+        )
 
     chrom = df[CHROM_COL].fillna("").astype(str).str.strip()
-    bp = pd.to_numeric(df[BP_COL], errors="coerce").fillna(0).astype("int64")
+    bp = pd.to_numeric(df[bp_col], errors="coerce").fillna(0).astype("int64")
     gold = _gold_mask(df)
     metrics: dict[str, pd.Series] = {}
     for name in METRIC_FALLBACKS:
         series = _resolve_metric(df, name)
         metrics[name] = series if series is not None else pd.Series(np.nan, index=df.index)
-    fam_col = _first_col(df, (FAMILY_COL, "mei_family"))
+    fam_col = _first_col(df, FAMILY_COL_FALLBACKS)
     family = df[fam_col].fillna("").astype(str).str.strip() if fam_col is not None else pd.Series("", index=df.index)
     return Run(
         label=label,
@@ -227,6 +245,20 @@ def spatial_pairs(base: Run, perf: Run, window_bp: int) -> pd.DataFrame:
     p_chrom = perf.chrom.to_numpy()
     b_bp = base.bp.to_numpy()
     p_bp = perf.bp.to_numpy()
+    b_bp_orig = b_bp
+    p_bp_orig = p_bp
+    # Rows without a resolved breakpoint (placeholder coordinate <= 0) cannot be
+    # matched spatially: they would otherwise explode the window join (every
+    # unresolved row within ``window_bp`` of every other on the same chrom).
+    # Keep original file-order indices so downstream row lookups stay correct.
+    b_keep = np.nonzero(b_bp > 0)[0]
+    p_keep = np.nonzero(p_bp > 0)[0]
+    b_chrom = b_chrom[b_keep]
+    b_bp = b_bp[b_keep]
+    p_chrom = p_chrom[p_keep]
+    p_bp = p_bp[p_keep]
+    if b_chrom.size == 0 or p_chrom.size == 0:
+        return pd.DataFrame(columns=["b_row", "p_row", "bp_delta"])
     b_parts: list[np.ndarray] = []
     p_parts: list[np.ndarray] = []
     d_parts: list[np.ndarray] = []
@@ -236,8 +268,9 @@ def spatial_pairs(base: Run, perf: Run, window_bp: int) -> pd.DataFrame:
             continue
         order = np.argsort(p_bp[p_idx_all], kind="stable")
         p_bp_sorted = p_bp[p_idx_all][order]
-        p_idx_sorted = p_idx_all[order]
+        p_idx_sorted = p_keep[p_idx_all][order]
         b_idx = np.where(b_chrom == chrom_name)[0]
+        b_orig = b_keep[b_idx]
         b_bp_c = b_bp[b_idx]
         lo = np.searchsorted(p_bp_sorted, b_bp_c - window_bp, side="left")
         hi = np.searchsorted(p_bp_sorted, b_bp_c + window_bp, side="right")
@@ -250,11 +283,11 @@ def spatial_pairs(base: Run, perf: Run, window_bp: int) -> pd.DataFrame:
             np.concatenate(([0], np.cumsum(counts)))[:-1], counts
         )
         j_rep = block_start + block_offsets
-        b_rep = np.repeat(b_idx, counts)
+        b_rep = np.repeat(b_orig, counts)
         p_rep = p_idx_sorted[j_rep]
         b_parts.append(b_rep)
         p_parts.append(p_rep)
-        d_parts.append(np.abs(b_bp[b_rep] - p_bp[p_rep]))
+        d_parts.append(np.abs(b_bp_orig[b_rep] - p_bp_orig[p_rep]))
     if not b_parts:
         return pd.DataFrame(columns=["b_row", "p_row", "bp_delta"])
     return pd.DataFrame(
