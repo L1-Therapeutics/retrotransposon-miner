@@ -239,7 +239,7 @@ class TestBruteForceParity:
 
 class TestScalePerformance:
     def test_large_scale_fast_and_memory_safe(self):
-        # 50k seeds, 200k positions — must run < 1.0s and stay under 50 MB of
+        # 50k seeds, 200k positions — must run < 1.0s and stay under 23.8 MB of
         # peak *additional* memory allocation (the old dense O(n*m) matrix was
         # ~50k * 200k * 8 bytes = 80 GB and OOM'd low-RAM hosts).
         rng = np.random.default_rng(2024)
@@ -255,7 +255,7 @@ class TestScalePerformance:
         peak_kb = max(baseline, _peak_rss_kb()) - baseline
 
         assert elapsed < 1.0, f"assignment took {elapsed:.3f}s, expected < 1.0s"
-        assert peak_kb < 50 * 1024, f"peak extra RSS {peak_kb} KiB exceeds 50 MiB"
+        assert peak_kb < 23.8 * 1024, f"peak extra RSS {peak_kb} KiB exceeds 23.8 MiB"
         assert result.size == positions.size
         # Every non-negative assignment must be within radius of its seed.
         s, e = starts, ends
@@ -283,3 +283,101 @@ def _peak_rss_kb() -> int:
         fields = fh.read().split()
     page_size = 4096
     return int(fields[1]) * page_size // 1024
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vectorized implementation edge cases (searchsorted / prefix-max boundaries)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestVectorizedEdgeCases:
+    """Boundary-adjacent inputs that stress the searchsorted/prefix-max logic.
+
+    The vectorized candidate derivation splits the nearest-seed search into
+    three ``np.searchsorted`` joins (strictly-left, containing, strictly-right)
+    plus a ``prefix-max`` lookup for the containing bucket.  These tests pin the
+    closed-interval and tie-break semantics exactly where a boundary position
+    could cross into the wrong column: ``cycle start/end`` containment points,
+    zero-width intervals, unsorted seed inputs, duplicate seeds, and radius
+    gates that excise a whole candidate column.
+    """
+
+    @pytest.mark.parametrize(
+        "starts,ends,positions,radius",
+        [
+            # Point seeds (zero-width intervals): start == end.
+            ([100, 200], [100, 200], [100, 150, 200, 300], 50),
+            # Closed-interval semantics: position == start or == end is contained.
+            ([100, 300], [200, 500], [100, 200, 300, 500], 50),
+            # One past a seed end -> strictly-left candidate (dist = 1).
+            ([100], [200], [201], 50),
+            # One before a seed start -> strictly-right candidate (dist = 1).
+            ([100], [200], [99], 50),
+            # Adjacent seeds touching at a shared boundary (end == next start).
+            ([100, 200, 300], [200, 300, 400], [200, 300], 50),
+            # Duplicate seeds; the tie-break must pick the lowest index.
+            ([100, 100, 200], [200, 200, 300], [100, 150, 200, 250], 60),
+            # Duplicate positions must yield identical assignments.
+            ([100, 500], [200, 600], [150, 150, 150, 900, 900], 100),
+            # Radius 0: only positions contained in a closed interval assign.
+            ([100, 300], [200, 500], [200, 100, 499, 101, 299], 0),
+            # Radius gate removes both side columns, leaving only contained seeds.
+            ([100, 400], [200, 500], [350, 460, 0, 600], 100),
+            # Positions before the first seed and after the last seed.
+            ([400, 800], [500, 900], [399, 401, 899, 901], 10),
+            # Whole-chromosome-sized interval vs a few clustered positions.
+            ([0], [2_000_000_000], [100, 500_000_000, 1_999_999_999], 1),
+            # Equal side distances on both flanks: whichever-start wins the key.
+            ([100, 300], [200, 500], [250], 60),
+        ],
+    )
+    def test_boundary_parity(self, starts, ends, positions, radius):
+        expected = _brute_assign(starts, ends, positions, radius)
+        result = _assign_discordant_to_seeds(starts, ends, positions, radius)
+        assert result.tolist() == expected.tolist()
+
+    def test_unsorted_seeds_match_brute_force(self):
+        # The vectorized path sorts seeds lazily and must not assume pre-sorted input.
+        starts = [900, 100, 500, 300]
+        ends = [1000, 200, 600, 400]
+        positions = [150, 250, 350, 450, 550, 650, 950]
+        expected = _brute_assign(starts, ends, positions, 80)
+        result = _assign_discordant_to_seeds(starts, ends, positions, 80)
+        assert result.tolist() == expected.tolist()
+
+    def test_nested_seeds_prefer_smallest_start(self):
+        # A position inside nested intervals is contained by every ancestor, so
+        # the (start, end, index) tie-break must pick the smallest start.
+        starts = [100, 200, 300]
+        ends = [900, 800, 400]
+        positions = [350, 500, 750]
+        expected = _brute_assign(starts, ends, positions, 0)
+        result = _assign_discordant_to_seeds(starts, ends, positions, 0)
+        assert result.tolist() == expected.tolist() == [0, 0, 0]
+
+    def test_left_right_columns_radius_gate(self):
+        # 250 is 50 bp past seed0's end and 50 bp before seed1's start: equal
+        # distance, smaller start wins.  Radius 40 drops both side columns -> -1.
+        assert _assign_discordant_to_seeds([100, 300], [200, 500], [250], 60).tolist() == [0]
+        assert _assign_discordant_to_seeds([100, 300], [200, 500], [250], 40).tolist() == [-1]
+
+    def test_contain_column_beats_side_columns(self):
+        # seed0 does not contain 1002 (dist 2) but seed1 starts at 1005 (dist 3);
+        # both within radius, so the nearer strictly-left seed wins.
+        result = _assign_discordant_to_seeds([0, 1005], [1000, 2000], [1002], 5)
+        assert result.tolist() == [0]
+
+    def test_randomized_boundary_dense_parity(self):
+        # Dense overlapping seeds in a tight genomic neighborhood put many
+        # positions exactly on interval boundaries, exercising every searchsorted
+        # edge and the prefix-max containing lookup simultaneously.
+        rng = np.random.default_rng(2026)
+        for _ in range(100):
+            n = int(rng.integers(1, 120))
+            starts = np.sort(rng.integers(0, 2000, size=n))
+            ends = starts + rng.integers(0, 400, size=n)
+            positions = rng.integers(-100, 2500, size=int(rng.integers(1, 800)))
+            radius = int(rng.integers(-5, 200))
+            expected = _brute_assign(starts.tolist(), ends.tolist(), positions.tolist(), radius)
+            result = _assign_discordant_to_seeds(starts.tolist(), ends.tolist(), positions.tolist(), radius)
+            assert result.tolist() == expected.tolist()
