@@ -146,11 +146,14 @@ def _assign_discordant_to_seeds(
 
     The earlier "vectorized" implementation built a dense
     ``n_seeds x n_positions`` int64 matrix (chr22 -> 46615 x 162226 -> ~56 GiB),
-    OOM-killing the process in low-RAM environments.  This version finds the
-    nearest interval with monotonic sweeps and a small active-seed heap --
-    O((n + m) log n) time and O(n + m) memory -- and never materializes the
-    full pairwise matrix.  Returns seed indices (``-1`` for unassigned
-    positions), parallel to ``positions``.
+    OOM-killing the process in low-RAM environments.  This version resolves each
+    position against three candidates -- the nearest strictly-left seed, the
+    nearest strictly-right seed, and the best containing seed -- with sorted
+    ``np.searchsorted`` joins and one ``prefix-max`` lookup, never
+    materializing the full pairwise matrix.  All candidate selection and the
+    final (distance, start, end, index) tie-break run vectorized: O(n log n + m
+    log n) time and O(n + m) memory.  Returns seed indices (``-1`` for
+    unassigned positions), parallel to ``positions``.
 
     Original interface restored so callers get a single nearest assignment per
     position.  (A transient ``(starts, pos)`` point-pair rewrite dropped the
@@ -162,7 +165,7 @@ def _assign_discordant_to_seeds(
     n = starts.size
     m = pos.size
     out = np.full(m, -1, dtype=np.int64)
-    if n == 0:
+    if n == 0 or m == 0:
         return out
     radius = int(radius)
     if radius < 0:
@@ -170,114 +173,92 @@ def _assign_discordant_to_seeds(
 
     huge = np.iinfo(np.int64).max
 
-    # Left sweep: seeds ending strictly before p; best = max end, tie (start,index).
-    # Positions and seeds both processed in ascending genomic order.
-    left_best = np.full(m, -1, dtype=np.int64)
-    left_order = np.lexsort((np.arange(n), starts, ends))  # by (end,start,index)
-    l_ends = ends[left_order]
-    l_starts = starts[left_order]
-    l_idx = left_order
-    pos_order = np.argsort(pos, kind="stable")  # ascending positions
-    li = 0
-    cur_end = -1
-    cur_start = huge
-    cur_idx = -1
-    for pp in pos_order:
-        p = int(pos[pp])
-        while li < n and int(l_ends[li]) < p:
-            e = int(l_ends[li])
-            s = int(l_starts[li])
-            i = int(l_idx[li])
-            if e > cur_end or (e == cur_end and (s < cur_start or (s == cur_start and i < cur_idx))):
-                cur_end = e
-                cur_start = s
-                cur_idx = i
-            li += 1
-        if cur_idx >= 0:
-            left_best[pp] = cur_idx
+    # Process positions in ascending order so searchsorted joins stay monotone.
+    p_order = np.argsort(pos, kind="stable")
+    ps = pos[p_order]
 
-    # Right sweep: seeds starting strictly after p; best = min start, tie (end,index).
-    # Positions and seeds both processed in descending genomic order.
-    right_best = np.full(m, -1, dtype=np.int64)
-    right_order = np.lexsort((np.arange(n), ends, starts))[::-1]  # start desc
-    r_starts = starts[right_order]
-    r_ends = ends[right_order]
-    r_idx = right_order
-    pos_order_desc = pos_order[::-1]
-    ri = 0
-    cur_start = huge
-    cur_end = huge
-    cur_idx = -1
-    for pp in pos_order_desc:
-        p = int(pos[pp])
-        while ri < n and int(r_starts[ri]) > p:
-            s = int(r_starts[ri])
-            e = int(r_ends[ri])
-            i = int(r_idx[ri])
-            if s < cur_start or (s == cur_start and (e < cur_end or (e == cur_end and i < cur_idx))):
-                cur_start = s
-                cur_end = e
-                cur_idx = i
-            ri += 1
-        if cur_idx >= 0:
-            right_best[pp] = cur_idx
+    # Candidate 1 - nearest strictly-left seed: max end < p, ties (start, index).
+    # Seed order (end asc, start desc, index desc) puts the preferred seed last
+    # among all seeds ending before p, so a single searchsorted recovers it.
+    left_order = np.lexsort((np.arange(n), -starts, ends))
+    left_ends = ends[left_order]
+    left_pos = np.searchsorted(left_ends, ps, side="left") - 1
+    left_i = np.where(left_pos >= 0, left_order[np.maximum(left_pos, 0)], -1)
 
-    # Containing sweep: seeds with start <= p <= end (dist 0); best = min (start,end,index)
-    # among active seeds.  Lazy expiry via a min-heap keyed by (start, end, index).
-    contain_best = np.full(m, -1, dtype=np.int64)
-    by_start = np.lexsort((np.arange(n), ends, starts))  # seeds sorted by (start,end,index)
-    bs_starts = starts[by_start]
-    bs_ends = ends[by_start]
-    bs_idx = by_start
-    import heapq
-    active = []          # heap of (start, end, index)
-    active_end = []      # heap of (end, start, index) for expiry
-    si = 0
-    for pp in pos_order:
-        p = int(pos[pp])
-        while si < n and int(bs_starts[si]) <= p:
-            s = int(bs_starts[si])
-            e = int(bs_ends[si])
-            i = int(bs_idx[si])
-            heapq.heappush(active, (s, e, i))
-            heapq.heappush(active_end, (e, s, i))
-            si += 1
-        while active_end and active_end[0][0] < p:
-            heapq.heappop(active_end)
-        # Remove expired seeds from the query heap.
-        while active and active[0][1] < p:
-            heapq.heappop(active)
-        # Re-insert any seed that was popped from active only when needed is not
-        # required here: active only ever loses expired seeds, and a seed can be
-        # expired by end<p once; it is removed from active at most once (the
-        # matching active_end entry was already popped, so no stale re-add).
-        if active:
-            contain_best[pp] = active[0][2]
+    # Candidate 2 - best containing seed: min (start, end, index) with
+    # start <= p <= end.  Seeds sorted by (start, end, index); a seed covers p
+    # iff its position in that order is < k(p) = #{start <= p}.  The first seed
+    # (by the same order) whose end >= p is found via prefix-max of ends, which
+    # is monotone non-decreasing -> searchsorted.  It contains p iff below k(p).
+    contain_order = np.lexsort((np.arange(n), ends, starts))
+    c_starts = starts[contain_order]
+    c_ends = ends[contain_order]
+    c_prefix_end = np.maximum.accumulate(c_ends)
+    contain_k = np.searchsorted(c_starts, ps, side="right")
+    contain_j = np.searchsorted(c_prefix_end, ps, side="left")
+    contain_valid = contain_j < contain_k
+    contain_i = np.where(contain_valid, contain_order[np.minimum(contain_j, n - 1)], -1)
 
-    # Combine: pick the candidate (among left/contain/right) with the smallest
-    # (dist, start, end, index) key; enforce radius.
-    for pp in pos_order:
-        p = int(pos[pp])
-        best_key = (huge, huge, huge, huge)
-        best_seed = -1
-        for cand in (left_best[pp], contain_best[pp], right_best[pp]):
-            if cand < 0:
-                continue
-            s = int(starts[cand])
-            e = int(ends[cand])
-            if s <= p <= e:
-                d = 0
-            elif p < s:
-                d = s - p
-            else:
-                d = p - e
-            if d > radius:
-                continue
-            key = (d, s, e, int(cand))
-            if key < best_key:
-                best_key = key
-                best_seed = int(cand)
-        out[pp] = best_seed
+    # Candidate 3 - nearest strictly-right seed: min start > p, ties (end, index).
+    # Seeds sorted by (start, end, index) put the preferred seed first among
+    # seeds starting after p (side="right" keeps start == p in the containing
+    # bucket), so the first searchsorted hit is the unique best.
+    right_order = np.lexsort((np.arange(n), ends, starts))
+    right_starts = starts[right_order]
+    right_pos = np.searchsorted(right_starts, ps, side="right")
+    right_valid = right_pos < n
+    right_i = np.where(right_valid, right_order[np.minimum(right_pos, n - 1)], -1)
+
+    # Materialize (distance, start, end, index) tuples for a candidate column,
+    # masking out-of-radius and missing candidates with int64-max so they never
+    # win the tie-break.
+    def _candidate(cand: np.ndarray) -> tuple[np.ndarray, ...]:
+        valid = cand >= 0
+        safe = np.where(valid, cand, 0)
+        s = starts[safe]
+        e = ends[safe]
+        d = np.where(
+            valid,
+            np.where((s <= ps) & (ps <= e), 0, np.where(ps < s, s - ps, ps - e)),
+            huge,
+        )
+        keep = valid & (d <= radius)
+        return (
+            np.where(keep, cand, huge),
+            np.where(keep, d, huge),
+            np.where(keep, s, huge),
+            np.where(keep, e, huge),
+            keep,
+        )
+
+    def _fold(
+        best: tuple[np.ndarray, ...], cand: tuple[np.ndarray, ...]
+    ) -> tuple[np.ndarray, ...]:
+        b_i, b_d, b_s, b_e = best
+        c_i, c_d, c_s, c_e, _ = cand
+        lt = (b_d < c_d) | (
+            (b_d == c_d)
+            & ((b_s < c_s) | ((b_s == c_s) & ((b_e < c_e) | ((b_e == c_e) & (b_i < c_i)))))
+        )
+        return (
+            np.where(lt, b_i, c_i),
+            np.where(lt, b_d, c_d),
+            np.where(lt, b_s, c_s),
+            np.where(lt, b_e, c_e),
+        )
+
+    any_keep = np.zeros(m, dtype=bool)
+    best: tuple[np.ndarray, ...] | None = None
+    for cand_idx in (left_i, contain_i, right_i):
+        cand = _candidate(cand_idx)
+        any_keep |= cand[4]
+        if best is None:
+            best = cand[:4]
+        else:
+            best = _fold(best, cand)
+    assert best is not None
+    best_i = best[0]
+    out[p_order] = np.where(any_keep, best_i, -1)
 
     return out
 
