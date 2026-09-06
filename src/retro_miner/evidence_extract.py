@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import re
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +85,55 @@ def _iter_reads_for_regions(bam: pysam.AlignmentFile, regions: list[str]):
             yield read
 
 
+_SA_TARGET_RE = re.compile(
+    r"^(?P<chrom>[^\s,]+),(?P<pos>-?\d+),(?P<strand>[+-]),(?P<cigar>[^\s,;]+),(?P<mapq>\d+),(?P<nm>\d+)"
+)
+
+
+def _get_tag_fast(read: pysam.AlignedSegment, tag: str, default: Any) -> Any:
+    """Return a SAM tag via the fast-path ``get_tag`` without a prior ``has_tag``.
+
+    ``read.get_tag`` raises ``KeyError`` when the tag is absent, so a single
+    try-except avoids the redundant ``has_tag`` + ``get_tag`` double lookup that
+    the Cython/HTStslib accessor would otherwise perform on every read.
+    """
+    try:
+        return read.get_tag(tag)
+    except (KeyError, ValueError):
+        return default
+
+
+def _parse_sa_targets(sa_raw: str) -> list[tuple[str, int, str, str, int, int]]:
+    """Parse the ``SA`` supplementary-alignment tag into ``(chrom, pos, strand,
+    cigar, mapq, nm)`` tuples.
+
+    The SA tag is ``;``-delimited (max 16) with records of the form
+    ``chr,pos,strand,CIGAR,mapq,NM``.  Uses direct ``split(';')`` plus a compiled
+    record regex for the fixed SAM ``SA`` grammar.
+    """
+    if not sa_raw:
+        return []
+    targets: list[tuple[str, int, str, str, int, int]] = []
+    for field in sa_raw.split(";")[:16]:
+        field = field.strip()
+        if not field:
+            continue
+        m = _SA_TARGET_RE.match(field)
+        if not m:
+            continue
+        targets.append(
+            (
+                m.group("chrom"),
+                int(m.group("pos")),
+                m.group("strand"),
+                m.group("cigar"),
+                int(m.group("mapq")),
+                int(m.group("nm")),
+            )
+        )
+    return targets
+
+
 def _collect_soft_clips(read: pysam.AlignedSegment, min_clip_len: int) -> list[tuple[str, int]]:
     if read.cigartuples is None:
         return []
@@ -144,6 +194,41 @@ def _clip_to_poly_at_region(seq: str, *, min_dom_frac: float = 0.90) -> str:
     """Return the longest mostly-A or mostly-T substring (empty if none)."""
     _length, _frac, _base, span = _longest_poly_at_span(seq, min_frac=float(min_dom_frac))
     return span
+
+
+# End-anchored polyA/T patterns for cheap terminal-tail scanning. A terminal
+# poly-tail (3' polyA of the inserted element, or its 5' polyT complement) lies
+# at one of the clip edges, so matching the leading run (``^A+|^T+``) or the
+# trailing run (``A+$|T+$``) avoids scanning the whole clip with a two-pointer
+# window loop.
+_POLY_TAIL_LEADING = re.compile(r"^A+|^T+", re.I)
+_POLY_TAIL_TRAILING = re.compile(r"A+$|T+$", re.I)
+
+
+def _poly_tail_terminal_stats(seq: str) -> tuple[int, float, str]:
+    """Terminal polyA/T run stats ``(run, frac, base)`` via end-anchored regex.
+
+    ``frac`` is the share of the clip that the dominant terminal run covers
+    (``run / effective length``). Returns ``(0, 0.0, "")`` when the clip has no
+    A/T-terminal run.
+    """
+    s = (seq or "").upper()
+    if not s:
+        return (0, 0.0, "")
+    length = len(s)
+
+    candidates: list[tuple[int, float, str]] = []
+    lead = _POLY_TAIL_LEADING.match(s)
+    if lead:
+        base = s[lead.start()]
+        candidates.append((lead.end(), float(lead.end()) / length, base))
+    trail = _POLY_TAIL_TRAILING.search(s)
+    if trail:
+        base = s[trail.start()]
+        candidates.append((length - trail.start(), float(length - trail.start()) / length, base))
+    if not candidates:
+        return (0, 0.0, "")
+    return max(candidates, key=lambda c: (c[0], c[1]))
 
 
 def _poly_at_breakpoint_proximal_stats(
@@ -209,9 +294,10 @@ def extract_split_evidence(
             if not clips:
                 continue
 
-            has_sa = read.has_tag("SA")
-            sa_raw = read.get_tag("SA") if has_sa else ""
-            nm = int(read.get_tag("NM")) if read.has_tag("NM") else -1
+            sa_raw = _get_tag_fast(read, "SA", "")
+            sa_targets = _parse_sa_targets(sa_raw)
+            has_sa = bool(sa_targets)
+            nm = int(_get_tag_fast(read, "NM", -1))
             chrom = bam.get_reference_name(read.reference_id)
             for clip_side, clip_len in clips:
                 # Breakpoint coordinate should depend on clipping side:
@@ -228,22 +314,24 @@ def extract_split_evidence(
                         clip_seq = query_seq[:clip_len]
                     else:
                         clip_seq = query_seq[-clip_len:]
-                span_len, poly_frac, poly_base, poly_region = _longest_poly_at_span(clip_seq, min_frac=0.90, min_len=8)
-                if span_len <= 0:
-                    poly_run, poly_frac, poly_base = _poly_at_stats(clip_seq)
-                else:
-                    poly_run = span_len
-                    # keep poly_frac/base from span
-                poly_tail_rescued = (
-                    clip_len < min_clip_len
-                    and clip_len >= max(1, int(poly_tail_rescue_min_clip_len))
-                    and poly_run >= max(1, int(poly_tail_rescue_min_run))
-                    and poly_frac >= float(poly_tail_rescue_min_frac)
-                )
                 short_mei_candidate = (
                     clip_len < int(min_clip_len)
                     and clip_len >= max(1, int(short_mei_rescue_min_clip_len))
                 )
+                # Fast-path: only short terminal clips (clip_len < min_clip_len)
+                # are poly-tail rescue candidates. Scan them with the cheap
+                # end-anchored regex (no full-clip two-pointer buffer scan).
+                poly_run, poly_frac, poly_base = 0, 0.0, ""
+                poly_tail_rescued = False
+                if clip_len < min_clip_len:
+                    poly_run, poly_frac, poly_base = _poly_tail_terminal_stats(clip_seq)
+                    poly_tail_rescued = (
+                        clip_len >= max(1, int(poly_tail_rescue_min_clip_len))
+                        and poly_run >= max(1, int(poly_tail_rescue_min_run))
+                        and poly_frac >= float(poly_tail_rescue_min_frac)
+                    )
+                elif clip_seq:
+                    poly_run, poly_frac, poly_base = _poly_tail_terminal_stats(clip_seq)
                 if clip_len < min_clip_len and not poly_tail_rescued and not short_mei_candidate:
                     continue
                 rows.append(
@@ -318,6 +406,7 @@ def _fetch_mate_sequence_from_bam(
     mate_pos_1based: int,
     *,
     fetch_window_bp: int = 500,
+    ref_names: set[str] | None = None,
 ) -> tuple[str, int, int, str, int, str]:
     """Best-effort mate sequence fetch for discordant-pair MEI remapping.
 
@@ -328,7 +417,9 @@ def _fetch_mate_sequence_from_bam(
     empty = ("", 0, 0, "", 0, "")
     if mate_chrom in {"", "*"} or mate_pos_1based <= 0:
         return empty
-    if mate_chrom not in bam.references:
+    if ref_names is None:
+        ref_names = set(bam.references)
+    if mate_chrom not in ref_names:
         return empty
 
     start0 = max(0, int(mate_pos_1based) - 1)
@@ -465,6 +556,7 @@ def extract_discordant_evidence(
         pysam.AlignmentFile(str(mate_bam_resolved), "rb") if fetch_mate_seq else nullcontext(None)
     )
     with pysam.AlignmentFile(str(bam_path), "rb") as bam, mate_bam_ctx as mate_bam:
+        mate_bam_refs = set(mate_bam.references) if mate_bam is not None else set()
         for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
 
@@ -544,6 +636,7 @@ def extract_discordant_evidence(
                     mate_chrom,
                     mate_pos_1based,
                     fetch_window_bp=mate_fetch_window_bp,
+                    ref_names=mate_bam_refs,
                 )
                 if mate_seq:
                     mate_seq_fetched_rows += 1

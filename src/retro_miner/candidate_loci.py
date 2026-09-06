@@ -5,8 +5,10 @@ from collections.abc import Iterable
 from pathlib import Path
 import subprocess
 import tempfile
+from typing import TypedDict, cast
 
 import click
+import numpy as np
 import pandas as pd
 from intervaltree import IntervalTree
 
@@ -107,14 +109,158 @@ def _cluster_sorted_positions(positions: list[int], max_gap_bp: int) -> list[lis
         return []
     if max_gap_bp < 0:
         max_gap_bp = 0
-    clusters: list[list[int]] = [[int(positions[0])]]
-    for pos in positions[1:]:
-        p = int(pos)
-        if p - clusters[-1][-1] <= max_gap_bp:
-            clusters[-1].append(p)
+    arr = np.asarray(positions, dtype=np.int64)
+    gaps = np.diff(arr) > max_gap_bp
+    return [seg.tolist() for seg in np.split(arr, np.where(gaps)[0] + 1)]
+
+
+def _cluster_labels(positions: Iterable[int], max_gap_bp: int) -> np.ndarray:
+    """Vectorized re-implementation of ``_cluster_sorted_positions``.
+
+    Returns an array of cluster ids (one per input position) produced by the
+    same gapped-clustering rule: a new cluster starts whenever the gap to the
+    previous element strictly exceeds ``max_gap_bp``.
+    """
+    arr = np.sort(np.asarray([int(p) for p in positions], dtype=np.int64))
+    if arr.size == 0:
+        return np.empty(0, dtype=np.int64)
+    gap = int(max_gap_bp)
+    if gap < 0:
+        gap = 0
+    new_cluster = np.concatenate((np.array([True]), arr[1:] - arr[:-1] > gap))
+    return np.cumsum(new_cluster) - 1
+
+
+def _assign_discordant_to_seeds(
+    seed_starts: Iterable[int],
+    seed_ends: Iterable[int],
+    positions: Iterable[int],
+    radius: int,
+) -> np.ndarray:
+    """Assign discordant positions to the nearest seed interval (memory-safe).
+
+    A discordant position is assigned to the seed whose closed interval
+    ``[seed_start, seed_end]`` is nearest (distance ``0`` when contained),
+    provided that distance does not exceed ``radius``.  Ties are broken by seed
+    start, then seed end, then seed order.
+
+    The earlier "vectorized" implementation built a dense
+    ``n_seeds x n_positions`` int64 matrix (chr22 -> 46615 x 162226 -> ~56 GiB),
+    OOM-killing the process in low-RAM environments.  This version resolves each
+    position against three candidates -- the nearest strictly-left seed, the
+    nearest strictly-right seed, and the best containing seed -- with sorted
+    ``np.searchsorted`` joins and one ``prefix-max`` lookup, never
+    materializing the full pairwise matrix.  All candidate selection and the
+    final (distance, start, end, index) tie-break run vectorized: O(n log n + m
+    log n) time and O(n + m) memory.  Returns seed indices (``-1`` for
+    unassigned positions), parallel to ``positions``.
+
+    Original interface restored so callers get a single nearest assignment per
+    position.  (A transient ``(starts, pos)`` point-pair rewrite dropped the
+    ``seed_end`` interval bound and allowed non-nearest multi-matching.)
+    """
+    starts = np.asarray([int(s) for s in seed_starts], dtype=np.int64)
+    ends = np.asarray([int(e) for e in seed_ends], dtype=np.int64)
+    pos = np.asarray([int(p) for p in positions], dtype=np.int64)
+    n = starts.size
+    m = pos.size
+    out = np.full(m, -1, dtype=np.int64)
+    if n == 0 or m == 0:
+        return out
+    radius = int(radius)
+    if radius < 0:
+        radius = 0
+
+    huge = np.iinfo(np.int64).max
+
+    # Process positions in ascending order so searchsorted joins stay monotone.
+    p_order = np.argsort(pos, kind="stable")
+    ps = pos[p_order]
+
+    # Candidate 1 - nearest strictly-left seed: max end < p, ties (start, index).
+    # Seed order (end asc, start desc, index desc) puts the preferred seed last
+    # among all seeds ending before p, so a single searchsorted recovers it.
+    left_order = np.lexsort((np.arange(n), -starts, ends))
+    left_ends = ends[left_order]
+    left_pos = np.searchsorted(left_ends, ps, side="left") - 1
+    left_i = np.where(left_pos >= 0, left_order[np.maximum(left_pos, 0)], -1)
+
+    # Candidate 2 - best containing seed: min (start, end, index) with
+    # start <= p <= end.  Seeds sorted by (start, end, index); a seed covers p
+    # iff its position in that order is < k(p) = #{start <= p}.  The first seed
+    # (by the same order) whose end >= p is found via prefix-max of ends, which
+    # is monotone non-decreasing -> searchsorted.  It contains p iff below k(p).
+    contain_order = np.lexsort((np.arange(n), ends, starts))
+    c_starts = starts[contain_order]
+    c_ends = ends[contain_order]
+    c_prefix_end = np.maximum.accumulate(c_ends)
+    contain_k = np.searchsorted(c_starts, ps, side="right")
+    contain_j = np.searchsorted(c_prefix_end, ps, side="left")
+    contain_valid = contain_j < contain_k
+    contain_i = np.where(contain_valid, contain_order[np.minimum(contain_j, n - 1)], -1)
+
+    # Candidate 3 - nearest strictly-right seed: min start > p, ties (end, index).
+    # Seeds sorted by (start, end, index) put the preferred seed first among
+    # seeds starting after p (side="right" keeps start == p in the containing
+    # bucket), so the first searchsorted hit is the unique best.
+    right_order = np.lexsort((np.arange(n), ends, starts))
+    right_starts = starts[right_order]
+    right_pos = np.searchsorted(right_starts, ps, side="right")
+    right_valid = right_pos < n
+    right_i = np.where(right_valid, right_order[np.minimum(right_pos, n - 1)], -1)
+
+    # Materialize (distance, start, end, index) tuples for a candidate column,
+    # masking out-of-radius and missing candidates with int64-max so they never
+    # win the tie-break.
+    def _candidate(cand: np.ndarray) -> tuple[np.ndarray, ...]:
+        valid = cand >= 0
+        safe = np.where(valid, cand, 0)
+        s = starts[safe]
+        e = ends[safe]
+        d = np.where(
+            valid,
+            np.where((s <= ps) & (ps <= e), 0, np.where(ps < s, s - ps, ps - e)),
+            huge,
+        )
+        keep = valid & (d <= radius)
+        return (
+            np.where(keep, cand, huge),
+            np.where(keep, d, huge),
+            np.where(keep, s, huge),
+            np.where(keep, e, huge),
+            keep,
+        )
+
+    def _fold(
+        best: tuple[np.ndarray, ...], cand: tuple[np.ndarray, ...]
+    ) -> tuple[np.ndarray, ...]:
+        b_i, b_d, b_s, b_e = best
+        c_i, c_d, c_s, c_e, _ = cand
+        lt = (b_d < c_d) | (
+            (b_d == c_d)
+            & ((b_s < c_s) | ((b_s == c_s) & ((b_e < c_e) | ((b_e == c_e) & (b_i < c_i)))))
+        )
+        return (
+            np.where(lt, b_i, c_i),
+            np.where(lt, b_d, c_d),
+            np.where(lt, b_s, c_s),
+            np.where(lt, b_e, c_e),
+        )
+
+    any_keep = np.zeros(m, dtype=bool)
+    best: tuple[np.ndarray, ...] | None = None
+    for cand_idx in (left_i, contain_i, right_i):
+        cand = _candidate(cand_idx)
+        any_keep |= cand[4]
+        if best is None:
+            best = cand[:4]
         else:
-            clusters.append([p])
-    return clusters
+            best = _fold(best, cand)
+    assert best is not None
+    best_i = best[0]
+    out[p_order] = np.where(any_keep, best_i, -1)
+
+    return out
 
 
 def _split_cluster_positions(
@@ -151,6 +297,13 @@ def _distance_to_closed_interval(pos: int, start: int, end: int) -> int:
     return 0
 
 
+class _LocusSeed(TypedDict):
+    positions: list[int]
+    min_pos: int
+    max_pos: int
+    seeded_by_split: bool
+
+
 def _build_loci_from_evidence(
     split_disease: pd.DataFrame,
     split_control: pd.DataFrame,
@@ -171,23 +324,32 @@ def _build_loci_from_evidence(
         _progress("no split/discordant evidence found; returning empty loci")
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
-    loci_by_chrom: dict[str, list[dict[str, object]]] = {}
+    loci_by_chrom: dict[str, list[_LocusSeed]] = {}
 
     if not split_all.empty:
         split_pos = split_all.loc[:, ["chrom", "pos"]].copy()
         split_pos["pos"] = split_pos["pos"].astype(int)
         for chrom, chrom_df in split_pos.groupby("chrom", sort=False):
-            positions = sorted(chrom_df["pos"].tolist())
-            for cluster in _cluster_sorted_positions(positions, max_gap_bp=int(split_cluster_bp)):
-                if not cluster:
+            chrom_key = str(chrom)
+            labels = _cluster_labels(chrom_df["pos"].tolist(), max_gap_bp=int(split_cluster_bp))
+            n_clusters = int(labels[-1]) + 1 if labels.size else 0
+            if n_clusters == 0:
+                continue
+            for i in range(n_clusters):
+                cluster = chrom_df["pos"].to_numpy()[labels == i].tolist()
+                seed_positions = [int(lopp) for lopp in cluster]
+                if not seed_positions:
                     continue
-                loci_by_chrom.setdefault(str(chrom), []).append(
-                    {
-                        "positions": list(cluster),
-                        "min_pos": int(cluster[0]),
-                        "max_pos": int(cluster[-1]),
-                        "seeded_by_split": True,
-                    }
+                loci_by_chrom.setdefault(chrom_key, []).append(
+                    cast(
+                        _LocusSeed,
+                        {
+                            "positions": sorted(seed_positions),
+                            "min_pos": int(min(seed_positions)),
+                            "max_pos": int(max(seed_positions)),
+                            "seeded_by_split": True,
+                        },
+                    )
                 )
 
     unassigned_discordant: dict[str, list[int]] = {}
@@ -197,54 +359,41 @@ def _build_loci_from_evidence(
         for chrom, chrom_df in disc_pos.groupby("chrom", sort=False):
             chrom_key = str(chrom)
             seeds = loci_by_chrom.get(chrom_key, [])
-            seed_tree: IntervalTree | None = None
-            if seeds:
-                seed_tree = IntervalTree()
-                radius = int(discordant_cluster_bp)
-                for idx, seed in enumerate(seeds):
-                    seed_start = int(seed["min_pos"])
-                    seed_end = int(seed["max_pos"])
-                    seed_tree.addi(max(1, seed_start - radius), seed_end + radius + 1, idx)
-            for pos in sorted(chrom_df["pos"].tolist()):
-                if not seeds:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
-                    continue
-
-                candidate_seed_idxs = list(seed_tree.at(int(pos))) if seed_tree is not None else []
-                if not candidate_seed_idxs:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
-                    continue
-
-                best_idx = min(
-                    (int(iv.data) for iv in candidate_seed_idxs),
-                    key=lambda idx: _distance_to_closed_interval(
-                        int(pos),
-                        int(seeds[idx]["min_pos"]),
-                        int(seeds[idx]["max_pos"]),
-                    ),
+            if not seeds:
+                unassigned_discordant.setdefault(chrom_key, []).extend(
+                    int(p) for p in sorted(chrom_df["pos"].tolist())
                 )
-                best_dist = _distance_to_closed_interval(
-                    int(pos),
-                    int(seeds[best_idx]["min_pos"]),
-                    int(seeds[best_idx]["max_pos"]),
-                )
-                if best_dist <= int(discordant_cluster_bp):
-                    chosen = seeds[best_idx]
-                    chosen["positions"].append(int(pos))
+                continue
+            seed_starts = [int(seed["min_pos"]) for seed in seeds]
+            seed_ends = [int(seed["max_pos"]) for seed in seeds]
+            pos_list = sorted(chrom_df["pos"].tolist())
+            assigned = _assign_discordant_to_seeds(
+                seed_starts,
+                seed_ends,
+                pos_list,
+                int(discordant_cluster_bp),
+            )
+            for i, pos in enumerate(pos_list):
+                seed_idx = int(assigned[i])
+                if seed_idx < 0:
+                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
                 else:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
+                    seeds[seed_idx]["positions"].append(int(pos))
 
     for chrom, positions in unassigned_discordant.items():
         for cluster in _cluster_sorted_positions(sorted(positions), max_gap_bp=int(discordant_cluster_bp)):
             if not cluster:
                 continue
             loci_by_chrom.setdefault(chrom, []).append(
-                {
-                    "positions": list(cluster),
-                    "min_pos": int(cluster[0]),
-                    "max_pos": int(cluster[-1]),
-                    "seeded_by_split": False,
-                }
+                cast(
+                    _LocusSeed,
+                    {
+                        "positions": list(cluster),
+                        "min_pos": int(cluster[0]),
+                        "max_pos": int(cluster[-1]),
+                        "seeded_by_split": False,
+                    },
+                )
             )
 
     rows: list[dict[str, int | str]] = []
@@ -281,6 +430,56 @@ def _build_loci_from_evidence(
     return out
 
 
+def _merge_overlapping_intervals(
+    intervals: Iterable[tuple[int, int]],
+    *,
+    max_span_bp: int,
+) -> list[tuple[int, int]]:
+    """Collapse overlapping/touching intervals into a sorted union.
+
+    Vectorized single-pass merge: the input is loaded into an ``(N, 2)``
+    ``np.int64`` array sorted by start, non-overlap boundaries are found with
+    ``starts[1:] > np.maximum.accumulate(ends[:-1])``, and merged end
+    coordinates are aggregated with ``np.maximum.accumulate``. Runs whose
+    merged span would exceed ``max_span_bp`` are replayed greedily so long
+    chains are not glued into mega-intervals. Returns ``(start, end)`` tuples.
+    """
+    if not intervals:
+        return []
+    arr = np.asarray(intervals, dtype=np.int64).reshape(-1, 2)
+    order = np.lexsort((arr[:, 1], arr[:, 0]))
+    starts = arr[order, 0]
+    ends = arr[order, 1]
+    max_span = max(1, int(max_span_bp))
+
+    boundaries = np.concatenate(([True], starts[1:] > np.maximum.accumulate(ends[:-1])))
+    group_lo = np.flatnonzero(boundaries)
+    group_hi = np.concatenate((group_lo[1:], [len(starts)]))
+    merged_start = starts[group_lo]
+    merged_end = np.maximum.accumulate(ends)[group_hi - 1]
+
+    merged: list[tuple[int, int]] = []
+    for lo, hi, m_start, m_end in zip(group_lo, group_hi, merged_start, merged_end):
+        if (int(m_end) - int(m_start) + 1) <= max_span:
+            merged.append((int(m_start), int(m_end)))
+            continue
+        # Span cap hit: replay the greedy merge over this component's raw
+        # intervals (rare in practice; keeps the vectorized fast path).
+        cur_start = int(starts[lo])
+        cur_end = int(ends[lo])
+        for j in range(int(lo) + 1, int(hi)):
+            start = int(starts[j])
+            end = int(ends[j])
+            new_end = end if end > cur_end else cur_end
+            if start <= cur_end and (new_end - cur_start + 1) <= max_span:
+                cur_end = new_end
+                continue
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+        merged.append((cur_start, cur_end))
+    return merged
+
+
 def _merge_overlapping_loci(
     loci: pd.DataFrame,
     *,
@@ -305,30 +504,13 @@ def _merge_overlapping_loci(
     merged_rows: list[dict[str, object]] = []
     n_in = len(loci)
     for chrom, grp in loci.groupby("chrom", sort=False):
-        intervals = sorted(
-            (int(r.window_start), int(r.window_end))
-            for r in grp.itertuples(index=False)
-        )
-        if not intervals:
-            continue
-        cur_start, cur_end = intervals[0]
-        for start, end in intervals[1:]:
-            # Merge when intervals overlap OR share exactly one endpoint
-            # (start <= cur_end).  Touching windows are intentionally collapsed
-            # per the docstring; non-overlapping neighbors stay separate.
-            if start <= cur_end:
-                new_end = max(cur_end, end)
-                if (new_end - cur_start + 1) <= max_span:
-                    cur_end = new_end
-                    continue
-                # Would exceed span cap: keep current, start a new interval.
+        intervals = [
+            (int(r.window_start), int(r.window_end)) for r in grp.itertuples(index=False)
+        ]
+        for start, end in _merge_overlapping_intervals(intervals, max_span_bp=max_span):
             merged_rows.append(
-                {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
+                {"chrom": chrom, "window_start": int(start), "window_end": int(end)}
             )
-            cur_start, cur_end = start, end
-        merged_rows.append(
-            {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
-        )
 
     out = pd.DataFrame(merged_rows).drop_duplicates()
     if len(out) < n_in:

@@ -9,6 +9,13 @@ set -euo pipefail
 # This wrapper runs the same commands used in interactive development so the
 # workflow can be reproduced with one command.
 
+# Mirroring the run's pipeline.log to the workdir root is opt-in: it only
+# happens when a caller (e.g. scripts/use_external_workdir.sh or the env)
+# explicitly configured an external workdir, never on the implicit default.
+RTM_WORKDIR_EXPLICIT="0"
+if [[ -n "${RTM_WORKDIR:-}" ]]; then
+  RTM_WORKDIR_EXPLICIT="1"
+fi
 RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
 RTM_PUBLIC_DATA_DIR="${RTM_PUBLIC_DATA_DIR:-${RTM_WORKDIR}/data/public}"
 RTM_RESULTS_DIR="${RTM_RESULTS_DIR:-${RTM_WORKDIR}/results}"
@@ -30,8 +37,9 @@ OUTDIR=""
 REGION="chr22"
 CHR_ARG=""
 CHR_CONCURRENCY="6"
-# Disease∥control extract workers. Empty = adaptive: 1 under multi-chrom concurrency,
-# 2 for single-chromosome (or CHR_CONCURRENCY=1) so chrom slots leave enough CPU.
+# Disease∥control extract workers. Empty = extract sequentially (1) so peak
+# resident memory stays low in low-RAM environments. Pass --sample-workers 2 to
+# run disease and control extraction in parallel (times ~2x peak memory).
 SAMPLE_WORKERS=""
 # bwa mem -t for MEI remaps. Empty = auto after chrom list is known:
 #   multi-chrom with CHR_CONCURRENCY>1 → 1
@@ -68,6 +76,19 @@ JUNK_MERGED_BED="${JUNK_MERGED_BED:-}"
 
 now_epoch() {
   date +%s
+}
+
+mirror_pipeline_log() {
+  local run_log="$1"
+  if [[ "${RTM_WORKDIR_EXPLICIT}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${run_log}" ]] || [[ ! -f "${run_log}" ]]; then
+    return 0
+  fi
+  mkdir -p "${RTM_WORKDIR}"
+  cp -f "${run_log}" "${RTM_WORKDIR}/pipeline.log"
+  echo "[candidate-pipeline] mirrored run log -> ${RTM_WORKDIR}/pipeline.log"
 }
 
 normalize_chr_token() {
@@ -623,15 +644,12 @@ run_single_pipeline() {
   fi
 
   stage_t0=$(now_epoch)
-  # Under multi-chrom concurrency, keep sample extract serial so each chrom
-  # worker leaves enough cores for other chroms / annotate / minimap2.
+  # Extract disease then control sequentially (--sample-workers 1) by default.
+  # Parallel sample extraction (2) doubles peak resident memory and can be OOM
+  # killed termination in low-RAM environments, so it is opt-in only.
   local sample_workers="${SAMPLE_WORKERS}"
   if [[ -z "${sample_workers}" ]]; then
-    if [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${CHR_CONCURRENCY}" -gt 1 ]]; then
-      sample_workers=1
-    else
-      sample_workers=2
-    fi
+    sample_workers=1
   fi
   # Collect optional --*-mate-bam arguments into a local array so that any
   # path containing spaces is word-split correctly.  Unquoted command
@@ -738,7 +756,9 @@ fi
 
 if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   REGION="${CHR_LIST[0]}"
-  run_single_pipeline "${REGION}" "${OUTDIR}"
+  mkdir -p "${OUTDIR}"
+  run_single_pipeline "${REGION}" "${OUTDIR}" | tee "${OUTDIR}/pipeline.log"
+  mirror_pipeline_log "${OUTDIR}/pipeline.log"
   echo "[candidate-pipeline] done"
   echo "  ${OUTDIR}/split_evidence.summary.tsv"
   echo "  ${OUTDIR}/candidate_loci.tsv"
@@ -821,3 +841,7 @@ if [[ "${CHR_ALL_MODE}" == "1" ]]; then
   consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${CHR_LIST[@]}"
   echo "  consolidated gold review written to: ${BASE_OUTDIR}/candidate_loci.mei.gold_review.tsv"
 fi
+# Assemble one stable per-run pipeline.log from the finished worker logs, then
+# mirror a copy to the workdir root for automated audit compliance.
+cat "${LOG_DIR}"/*.log > "${BASE_OUTDIR}/pipeline.log" 2>/dev/null || true
+mirror_pipeline_log "${BASE_OUTDIR}/pipeline.log"

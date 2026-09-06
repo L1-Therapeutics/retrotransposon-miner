@@ -261,15 +261,92 @@ def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> d
     }
 
 
-def _slice_remote_alignment(url: str, region: str, out_bam: Path, threads: int, force: bool) -> dict[str, Any]:
+def _resolve_cram_reference(outdir: Path) -> Path | None:
+    """Locate a local hg38 reference FASTA for CRAM decoding, if downloaded."""
+    candidates = (
+        outdir / "reference" / "hg38" / "Homo_sapiens_assembly38.fasta",
+        outdir / "reference" / "hg38" / "Homo_sapiens_assembly38.fasta.gz",
+    )
+    for cand in candidates:
+        if cand.exists() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+
+def _cram_view_cmd(
+    url: str,
+    region: str,
+    out_bam: Path,
+    threads: int,
+    ref_fasta: Path | None,
+) -> list[str]:
+    """Build a ``samtools view`` command to slice a region from BAM/CRAM.
+
+    For CRAM sources a local reference is appended via ``-T`` when available,
+    avoiding the remote reference-cache fetch that can time out on S3.
+    """
+    cmd = ["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)]
+    if url.endswith(".cram"):
+        if ref_fasta is not None:
+            cmd.extend(["-T", str(ref_fasta)])
+        else:
+            print(
+                f"[slice:cram] {region}: no local hg38 reference found at "
+                "reference/hg38/Homo_sapiens_assembly38.fasta; falling back to remote "
+                "reference cache (may be slow / retried)",
+                file=sys.stderr,
+            )
+    return cmd
+
+
+def _slice_remote_alignment(
+    url: str,
+    region: str,
+    out_bam: Path,
+    threads: int,
+    force: bool,
+    ref_fasta: Path | None = None,
+    retries: int = 3,
+    retry_backoff_sec: float = 5.0,
+) -> dict[str, Any]:
     out_bam.parent.mkdir(parents=True, exist_ok=True)
     if out_bam.exists() and Path(f"{out_bam}.bai").exists() and not force:
         return {"status": "skipped_exists", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
 
+    attempts = max(1, int(retries))
+    last_err: Exception | None = None
     # Direct remote slicing avoids storing full-size BAM locally.
-    _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)], required=True)
-    _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
-    return {"status": "sliced_remote_alignment", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
+    for attempt in range(1, attempts + 1):
+        try:
+            cmd = _cram_view_cmd(url=url, region=region, out_bam=out_bam, threads=threads, ref_fasta=ref_fasta)
+            _run_cmd(cmd, required=True)
+            _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
+            return {
+                "status": "sliced_remote_alignment",
+                "path": str(out_bam),
+                "bytes": out_bam.stat().st_size,
+                "region": region,
+            }
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            # Clean up partial / corrupted outputs so the next attempt starts fresh.
+            for stale_path in (out_bam, Path(f"{out_bam}.bai"), Path(f"{out_bam}.csi")):
+                if stale_path.exists():
+                    try:
+                        stale_path.unlink()
+                    except OSError:
+                        pass
+            if attempt >= attempts:
+                raise
+            sleep_s = max(0.0, float(retry_backoff_sec))
+            print(
+                f"[slice:retry] {region} attempt {attempt}/{attempts} failed: {err}; retrying in {sleep_s:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_s)
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Remote slicing failed unexpectedly for {url} {region}")
 
 
 def _collect_interchrom_mate_qnames(region_bam: Path, region: str) -> list[str]:
@@ -298,6 +375,9 @@ def _slice_remote_alignment_with_mates(
     out_bam: Path,
     threads: int,
     force: bool,
+    ref_fasta: Path | None = None,
+    retries: int = 3,
+    retry_backoff_sec: float = 5.0,
 ) -> dict[str, Any]:
     """Slice a region, then pull in discordant mates from other chromosomes via the remote BAM."""
     out_bam.parent.mkdir(parents=True, exist_ok=True)
@@ -310,47 +390,71 @@ def _slice_remote_alignment_with_mates(
             "include_discordant_mates": True,
         }
 
-    with tempfile.TemporaryDirectory(prefix="rtm_slice_mates_") as tmpdir:
-        tmp = Path(tmpdir)
-        region_bam = tmp / "region.bam"
-        mates_bam = tmp / "mates.bam"
-        names_tsv = tmp / "mate_qnames.txt"
-        merged_bam = tmp / "merged.bam"
+    attempts = max(1, int(retries))
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with tempfile.TemporaryDirectory(prefix="rtm_slice_mates_") as tmpdir:
+                tmp = Path(tmpdir)
+                region_bam = tmp / "region.bam"
+                mates_bam = tmp / "mates.bam"
+                names_tsv = tmp / "mate_qnames.txt"
+                merged_bam = tmp / "merged.bam"
 
-        _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(region_bam)], required=True)
-        _run_cmd(["samtools", "index", "-@", str(threads), str(region_bam)], required=True)
-        mate_qnames = _collect_interchrom_mate_qnames(region_bam, region)
-        if mate_qnames:
-            names_tsv.write_text("\n".join(mate_qnames) + "\n", encoding="utf-8")
-            _run_cmd(
-                [
-                    "samtools",
-                    "view",
-                    "-@", str(threads),
-                    "-b",
-                    "-N",
-                    str(names_tsv),
-                    url,
-                    "-o",
-                    str(mates_bam),
-                ],
-                required=True,
+                _run_cmd(_cram_view_cmd(url=url, region=region, out_bam=region_bam, threads=threads, ref_fasta=ref_fasta), required=True)
+                _run_cmd(["samtools", "index", "-@", str(threads), str(region_bam)], required=True)
+                mate_qnames = _collect_interchrom_mate_qnames(region_bam, region)
+                if mate_qnames:
+                    names_tsv.write_text("\n".join(mate_qnames) + "\n", encoding="utf-8")
+                    _run_cmd(
+                        [
+                            "samtools",
+                            "view",
+                            "-@", str(threads),
+                            "-b",
+                            "-N",
+                            str(names_tsv),
+                            url,
+                            "-o",
+                            str(mates_bam),
+                        ],
+                        required=True,
+                    )
+                    _run_cmd(["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)], required=True)
+                    shutil.copy2(merged_bam, out_bam)
+                else:
+                    shutil.copy2(region_bam, out_bam)
+
+                _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
+
+            return {
+                "status": "sliced_remote_alignment_with_mates",
+                "path": str(out_bam),
+                "bytes": out_bam.stat().st_size,
+                "region": region,
+                "include_discordant_mates": True,
+                "mate_qnames": len(mate_qnames),
+            }
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            # Clean up partial / corrupted outputs so the next attempt starts fresh.
+            for stale_path in (out_bam, Path(f"{out_bam}.bai"), Path(f"{out_bam}.csi")):
+                if stale_path.exists():
+                    try:
+                        stale_path.unlink()
+                    except OSError:
+                        pass
+            if attempt >= attempts:
+                raise
+            sleep_s = max(0.0, float(retry_backoff_sec))
+            print(
+                f"[slice:retry] {region} attempt {attempt}/{attempts} failed with mates: {err}; retrying in {sleep_s:.1f}s",
+                file=sys.stderr,
             )
-            _run_cmd(["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)], required=True)
-            shutil.copy2(merged_bam, out_bam)
-        else:
-            shutil.copy2(region_bam, out_bam)
-
-        _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
-
-    return {
-        "status": "sliced_remote_alignment_with_mates",
-        "path": str(out_bam),
-        "bytes": out_bam.stat().st_size,
-        "region": region,
-        "include_discordant_mates": True,
-        "mate_qnames": len(mate_qnames),
-    }
+            time.sleep(sleep_s)
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Remote slicing failed unexpectedly for {url} {region}")
 
 
 def _download_dataset(
@@ -361,6 +465,7 @@ def _download_dataset(
     force: bool,
     retries: int,
     retry_backoff_sec: float,
+    ref_fasta: Path | None = None,
 ) -> dict[str, Any]:
     attempts = max(1, int(retries))
     last_err: Exception | None = None
@@ -368,9 +473,19 @@ def _download_dataset(
         try:
             if ds.region and (ds.url.endswith(".bam") or ds.url.endswith(".cram")):
                 if ds.include_discordant_mates:
-                    result = _slice_remote_alignment_with_mates(ds.url, ds.region, target, threads=threads, force=force)
+                    result = _slice_remote_alignment_with_mates(
+                        ds.url, ds.region, target, threads=threads, force=force,
+                        ref_fasta=ref_fasta,
+                        retries=attempts,
+                        retry_backoff_sec=float(retry_backoff_sec),
+                    )
                 else:
-                    result = _slice_remote_alignment(ds.url, ds.region, target, threads=threads, force=force)
+                    result = _slice_remote_alignment(
+                        ds.url, ds.region, target, threads=threads, force=force,
+                        ref_fasta=ref_fasta,
+                        retries=attempts,
+                        retry_backoff_sec=float(retry_backoff_sec),
+                    )
             else:
                 result = _download_file(ds.url, target, timeout_sec=timeout_sec, force=force)
             break
@@ -416,9 +531,35 @@ def _run_cmd(cmd: list[str], required: bool = True) -> tuple[bool, str]:
         return (False, msg) if not required else (_raise_runtime(msg))
 
 
+_DOWNLOAD_BINARIES = ("samtools", "bwa", "bgzip", "tabix", "bedtools")
+_POSTPROCESS_BINARIES = ("bigWigToBedGraph", "bigBedToBed", "liftOver")
+_APT_INSTALL_CMD = "sudo apt-get install -y samtools bwa bgzip tabix bedtools"
+_BIOCONDA_INSTALL_CMD = (
+    "conda install -c bioconda -c conda-forge samtools bwa tabix bedtools htslib"
+)
+
+
+def _preflight_check_binaries() -> None:
+    """Verify required system binaries are available before starting downloads."""
+    missing = [name for name in _DOWNLOAD_BINARIES if shutil.which(name) is None]
+    if not missing:
+        return
+    print("[preflight] Missing required binaries: " + ", ".join(missing), file=sys.stderr)
+    print(
+        "[preflight] Install via one of:\n"
+        f"  apt-get: {_APT_INSTALL_CMD}\n"
+        f"  conda:   {_BIOCONDA_INSTALL_CMD}",
+        file=sys.stderr,
+    )
+    raise RuntimeError(
+        f"Missing required binaries: {', '.join(missing)}. "
+        "Install them and re-run. Example (Debian/Ubuntu): "
+        f"'{_APT_INSTALL_CMD}'."
+    )
+
+
 def _ensure_postprocess_binaries() -> None:
-    required_bins = ("bigWigToBedGraph", "bigBedToBed", "liftOver")
-    missing = [name for name in required_bins if shutil.which(name) is None]
+    missing = [name for name in _POSTPROCESS_BINARIES if shutil.which(name) is None]
     if not missing:
         return
     raise RuntimeError(
@@ -1151,22 +1292,126 @@ def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dic
     }
 
 
+def _python_dependency_available(module_name: str) -> bool:
+    """Return True when a Python module can be imported (via importlib)."""
+    try:
+        import importlib.util
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
+def _extract_mei_fasta_from_ucsc(ucsc_fa: Path, mei_subset_fasta: Path) -> dict[str, Any]:
+    """Fallback: derive a human MEI (Alu/L1/SVA) FASTA from UCSC RepeatBrowser.
+
+    Used when the H5/famdb path is unavailable (missing ``h5py``) or fails, so the
+    pipeline still produces ``dfam_human_mei_l1_alu_sva.fasta`` from the local
+    ``ucsc_repeatbrowser/hg38reps.fa`` reference.
+    """
+    if not ucsc_fa.exists() or ucsc_fa.stat().st_size <= 0:
+        return {"status": "missing_ucsc_fallback", "path": str(ucsc_fa)}
+    kept = 0
+    kept_families = 0
+    mei_subset_fasta.parent.mkdir(parents=True, exist_ok=True)
+    with mei_subset_fasta.open("w", encoding="utf-8") as out_handle:
+        for header, seq in _iter_fasta(ucsc_fa):
+            if not _is_mei_family_name(header):
+                continue
+            body = _trim_mei_consensus_terminal_polya(seq)
+            if not body:
+                continue
+            kept_families += 1
+            if _mei_family_from_header(header) in {"ALU", "LINE1", "SVA"}:
+                kept += 1
+            out_handle.write(f">{header}\n")
+            for i in range(0, len(body), 60):
+                out_handle.write(body[i : i + 60] + "\n")
+    return {
+        "status": "fallback_ucsc",
+        "mei_families": kept,
+        "records_kept": kept_families,
+        "output_path": str(mei_subset_fasta),
+        "bytes": mei_subset_fasta.stat().st_size if mei_subset_fasta.exists() else 0,
+    }
+
+
+def _prepare_dfam_mei_library_ucsc_fallback(
+    outdir: Path,
+    mei_subset_fasta: Path,
+    *,
+    reason: str,
+    detail: str = "",
+) -> dict[str, Any]:
+    """Generate ``dfam_human_mei_l1_alu_sva.fasta`` from UCSC RepeatBrowser when H5 fails."""
+    ucsc_path = outdir / "retrotransposon_db/ucsc_repeatbrowser/hg38reps.fa"
+    result = _extract_mei_fasta_from_ucsc(ucsc_path, mei_subset_fasta)
+    return {
+        "status": "fallback",
+        "path": str(mei_subset_fasta),
+        "bytes": mei_subset_fasta.stat().st_size if mei_subset_fasta.exists() else 0,
+        "fallback_reason": reason,
+        "fallback_detail": detail,
+        **result,
+    }
+
+
 def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_sec: int, force: bool) -> dict[str, Any]:
+    # Decoupled from sample BAM download status: extraction runs whenever the
+    # Dfam archive is present on disk, regardless of whether the dataset entry is
+    # in the active map or whether other (e.g. test BAM/CRAM) downloads succeeded.
     ds = ds_map.get("dfam_human_families_embl")
-    if not ds:
-        return {"status": "skipped_missing_dataset", "reason": "dfam_human_families_embl not in config"}
+    if ds is not None:
+        archive_path = outdir / ds.target_path
+    else:
+        archive_path = outdir / "retrotransposon_db/dfam/dfam40.0.h5.gz"
 
-    archive_path = outdir / ds.target_path
+    dfam_dir = archive_path.parent
+    mei_subset_fasta = dfam_dir / "dfam_human_mei_l1_alu_sva.fasta"
+
+    # Idempotency: if the final MEI FASTA already exists and is non-empty, we are
+    # done — no need to re-run extraction on a ``skipped_exists`` download.
+    if not force and mei_subset_fasta.exists() and mei_subset_fasta.stat().st_size > 0:
+        with mei_subset_fasta.open("r", encoding="utf-8") as probe:
+            has_seq = any(line.startswith(">") for line in probe)
+        if has_seq:
+            return {
+                "status": "skipped_exists",
+                "path": str(mei_subset_fasta),
+                "bytes": mei_subset_fasta.stat().st_size,
+                "source": "existing_output",
+            }
+
     if not archive_path.exists():
-        return {"status": "skipped_missing_archive", "path": str(archive_path)}
+        # No local Dfam archive; fall back to UCSC RepeatBrowser consensus so the
+        # MEI FASTA can still be produced when only the UCSC source is available.
+        return _prepare_dfam_mei_library_ucsc_fallback(outdir, mei_subset_fasta, reason="missing_archive")
 
+    # The primary H5 path needs h5py (famdb.py) and git (to clone FamDB tools).
+    h5py_ok = _python_dependency_available("h5py")
+    git_ok = shutil.which("git") is not None
+    if (not h5py_ok) or (not git_ok):
+        missing = []
+        if not h5py_ok:
+            missing.append("h5py")
+        if not git_ok:
+            missing.append("git")
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="missing_h5_dependency",
+            detail=", ".join(missing),
+        )
+
+    # 1) Decompress + stage the H5 DB.
     decompressed_h5 = archive_path.with_suffix("")
     if decompressed_h5.suffix != ".h5":
         decompressed_h5 = archive_path.with_name("dfam40.0.h5")
     if archive_path.suffix == ".gz":
         _decompress_gzip(archive_path, decompressed_h5, force=force)
 
-    dfam_dir = archive_path.parent
     db_dir = dfam_dir / "db"
     db_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1175,14 +1420,33 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
         shutil.copy2(decompressed_h5, db_base_h5)
 
     curated_consensus_h5 = db_dir / "dfam40.curated.consensus.0.h5"
-    _download_file(DFAM_CURATED_CONSENSUS_0_URL, curated_consensus_h5.with_suffix(".h5.gz"), timeout_sec=timeout_sec, force=force)
-    _decompress_gzip(curated_consensus_h5.with_suffix(".h5.gz"), curated_consensus_h5, force=force)
+    try:
+        _download_file(
+            DFAM_CURATED_CONSENSUS_0_URL,
+            curated_consensus_h5.with_suffix(".h5.gz"),
+            timeout_sec=timeout_sec,
+            force=force,
+        )
+        _decompress_gzip(curated_consensus_h5.with_suffix(".h5.gz"), curated_consensus_h5, force=force)
+    except Exception as err:  # noqa: BLE001
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="h5_consensus_download_failed",
+            detail=str(err),
+        )
 
     famdb_tools_dir = dfam_dir / "tools" / "FamDB"
     famdb_py, tool_status = _ensure_famdb_repo(famdb_tools_dir, timeout_sec=timeout_sec)
     if famdb_py is None:
-        return {"status": "failed", "error": tool_status, "db_dir": str(db_dir)}
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="famdb_unavailable",
+            detail=tool_status,
+        )
 
+    # 2) Export the curated human FASTAs via famdb.py.
     curated_fasta = dfam_dir / "dfam_human_curated.fasta"
     curated_missing_or_empty = (not curated_fasta.exists()) or (curated_fasta.stat().st_size <= 0)
     if force or curated_missing_or_empty:
@@ -1199,25 +1463,41 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
             "--curated",
             "9606",
         ]
-        with curated_fasta.open("w", encoding="utf-8") as out_handle:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(f"famdb export failed: {' '.join(cmd)}\n{proc.stderr}")
-            out_handle.write(proc.stdout)
+        try:
+            with curated_fasta.open("w", encoding="utf-8") as out_handle:
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    curated_fasta.unlink(missing_ok=True)
+                    raise RuntimeError(f"famdb export failed: {' '.join(cmd)}\n{proc.stderr}")
+                out_handle.write(proc.stdout)
+        except Exception as err:  # noqa: BLE001
+            return _prepare_dfam_mei_library_ucsc_fallback(
+                outdir,
+                mei_subset_fasta,
+                reason="famdb_export_failed",
+                detail=str(err),
+            )
     curated_bytes = curated_fasta.stat().st_size if curated_fasta.exists() else 0
-    if curated_bytes <= 0:
-        raise RuntimeError(
-            f"dfam curated FASTA is empty after export: {curated_fasta}. "
-            "Re-run with --force and verify FamDB export output."
-        )
 
-    mei_subset_fasta = dfam_dir / "dfam_human_mei_l1_alu_sva.fasta"
-    subset_stats = _export_human_mei_subset(curated_fasta, mei_subset_fasta)
-    if int(subset_stats.get("bytes", 0)) <= 0 or int(subset_stats.get("mei_families", 0)) <= 0:
-        raise RuntimeError(
-            "dfam MEI subset FASTA is empty after export "
-            f"(path={mei_subset_fasta}, families={subset_stats.get('mei_families', 0)})."
+    # 3) Export the MEI subset from the curated FASTA.
+    try:
+        subset_stats = _export_human_mei_subset(curated_fasta, mei_subset_fasta)
+    except Exception as err:  # noqa: BLE001
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="mei_subset_export_failed",
+            detail=str(err),
         )
+    if int(subset_stats.get("bytes", 0)) <= 0 or int(subset_stats.get("mei_families", 0)) <= 0:
+        return _prepare_dfam_mei_library_ucsc_fallback(
+            outdir,
+            mei_subset_fasta,
+            reason="mei_subset_empty",
+            detail=str(subset_stats),
+        )
+    if curated_bytes <= 0:
+        curated_bytes = int(subset_stats.get("bytes", 0))
     return {
         "status": "prepared",
         "famdb_tool": tool_status,
@@ -1257,6 +1537,12 @@ def _mei_family_from_header(header: str) -> str:
     if "LINE/L1" in u or "L1" in u:
         return "LINE1"
     return "OTHER"
+
+
+def _is_mei_family_name(name: str) -> bool:
+    """True for human MEI family names in RepeatMasker/UCSC style (Alu*, L1*, SVA*)."""
+    u = (name or "").upper()
+    return u.startswith("ALU") or u.startswith("L1") or "SVA" in u
 
 
 def _normalize_dfam_subfamily_for_full(header: str) -> str:
@@ -1710,10 +1996,13 @@ def _postprocess(
             steps.append(payload)
             return payload
         except Exception as err:  # noqa: BLE001
+            # Record the failure but keep going so independent later steps (e.g.
+            # Dfam MEI FASTA extraction) still run even when an unrelated step
+            # fails (e.g. a sample BAM download that never completed).
             print(f"[postprocess:failed] {step_name} error={err}", file=sys.stderr)
             payload = {"step": step_name, "status": "failed", "error": str(err)}
             steps.append(payload)
-            raise
+            return payload
 
     # 1) Reference FASTA prep: decompress + index files (.fai and .dict).
     for ref_id in ("hg38_reference_fasta", "hg19_reference_fasta", "hs1_t2t_reference_fasta"):
@@ -2321,6 +2610,17 @@ def main() -> int:
 
     outdir.mkdir(parents=True, exist_ok=True)
 
+    # Pre-flight: verify required system binaries are present before any I/O.
+    try:
+        _preflight_check_binaries()
+    except Exception as err:  # noqa: BLE001
+        print(f"[preflight] Aborting before downloads: {err}", file=sys.stderr)
+        return 1
+
+    # Local hg38 reference FASTA, when present, is passed to CRAM slicing via -T
+    # so remote reference-cache network timeouts are avoided.
+    cram_reference = _resolve_cram_reference(outdir)
+
     manifest: dict[str, Any] = {
         "generated_at_unix": int(time.time()),
         "config": str(config_path),
@@ -2356,6 +2656,7 @@ def main() -> int:
                 force=args.force,
                 retries=args.download_retries,
                 retry_backoff_sec=args.download_retry_backoff_sec,
+                ref_fasta=cram_reference,
             )
             future_to_meta[fut] = (idx, ds, target)
 
