@@ -21,9 +21,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTANCE_STATE_FILE="${INSTANCE_STATE_FILE:-${REPO_ROOT}/.ec2-instance.env}"
 
 mkdir -p "${HOME}/.ssh"
-KEY_BASENAME="${APP_NAME}-${REGION}"
-KEY_PATH_DEFAULT="${HOME}/.ssh/${KEY_BASENAME}.pem"
+KEY_NAME="${KEY_NAME:-}"
+KEY_OWNER="${KEY_OWNER:-}"
+KEY_BASENAME="${KEY_BASENAME:-}"
 KEY_PATH="${KEY_PATH:-}"
+KEY_PATH_DEFAULT=""
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; }
 
@@ -53,6 +55,8 @@ S3_BUCKET=${S3_BUCKET}
 S3_CACHE_PREFIX=${S3_CACHE_PREFIX}
 IAM_INSTANCE_PROFILE=${IAM_INSTANCE_PROFILE}
 IAM_ROLE_NAME=${IAM_ROLE_NAME}
+KEY_PATH=${KEY_PATH}
+KEY_BASENAME=${KEY_BASENAME}
 EOF
   log "Saved instance binding to ${INSTANCE_STATE_FILE}"
 }
@@ -97,17 +101,107 @@ get_default_subnet() {
     --query 'Subnets[0].SubnetId' --output text
 }
 
+sanitize_key_token() {
+  echo "$1" | tr -c 'A-Za-z0-9+=.@_-' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//'
+}
+
+aws_identity_user() {
+  local arn user
+  if [[ -n "${KEY_OWNER}" ]]; then
+    sanitize_key_token "${KEY_OWNER}"
+    return
+  fi
+  arn="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || true)"
+  if [[ "${arn}" == *":user/"* ]]; then
+    user="${arn##*:user/}"
+  elif [[ "${arn}" == *":assumed-role/"* ]]; then
+    user="$(printf '%s\n' "${arn}" | awk -F/ '{print $2}')"
+  else
+    user="$(id -un 2>/dev/null || echo local)"
+  fi
+  sanitize_key_token "${user}"
+}
+
+resolve_key_basename() {
+  if [[ -n "${KEY_NAME}" ]]; then
+    echo "${KEY_NAME}"
+    return
+  fi
+  if [[ -n "${KEY_BASENAME}" ]]; then
+    echo "${KEY_BASENAME}"
+    return
+  fi
+  echo "${APP_NAME}-${REGION}-$(aws_identity_user)"
+}
+
+first_local_pubkey() {
+  local f
+  for f in "${HOME}/.ssh/id_ed25519.pub" "${HOME}/.ssh/id_rsa.pub"; do
+    [[ -f "${f}" ]] || continue
+    echo "${f}"
+    return 0
+  done
+  return 1
+}
+
+key_pair_exists() {
+  awsq ec2 describe-key-pairs --key-names "$1" >/dev/null 2>&1
+}
+
+import_pubkey_as_key_pair() {
+  local name="$1" pub="$2"
+  if key_pair_exists "${name}"; then
+    log "Reusing EC2 key pair ${name}"
+    return 0
+  fi
+  log "Importing $(basename "${pub}") as EC2 key pair ${name}"
+  awsq ec2 import-key-pair \
+    --key-name "${name}" \
+    --public-key-material "fileb://${pub}" >/dev/null
+}
+
 ensure_key_pair() {
-  local key_path="${KEY_PATH:-${KEY_PATH_DEFAULT}}"
+  KEY_BASENAME="$(resolve_key_basename)"
+  KEY_PATH_DEFAULT="${HOME}/.ssh/${KEY_BASENAME}.pem"
+  export KEY_BASENAME
+  local key_path="${KEY_PATH:-}" pub priv
+
+  if [[ -n "${key_path}" && -f "${key_path}" ]]; then
+    chmod 400 "${key_path}" 2>/dev/null || true
+    if [[ -f "${key_path}.pub" ]]; then
+      import_pubkey_as_key_pair "${KEY_BASENAME}" "${key_path}.pub"
+    fi
+    log "Using existing key file: ${key_path}"
+    return
+  fi
+
+  if pub="$(first_local_pubkey)"; then
+    priv="${pub%.pub}"
+    import_pubkey_as_key_pair "${KEY_BASENAME}" "${pub}"
+    KEY_PATH="${priv}"
+    export KEY_PATH
+    log "Using laptop SSH key: ${KEY_PATH} (key pair ${KEY_BASENAME})"
+    return
+  fi
+
+  key_path="${KEY_PATH_DEFAULT}"
   if [[ -f "${key_path}" ]]; then
+    if ! key_pair_exists "${KEY_BASENAME}"; then
+      log "Local PEM ${key_path} exists but AWS has no key pair ${KEY_BASENAME}."
+      log "Run: ssh-keygen -t ed25519   then rerun bootstrap so your .pub can be imported."
+      exit 1
+    fi
+    KEY_PATH="${key_path}"
+    export KEY_PATH
     chmod 400 "${key_path}"
     log "Using existing key file: ${key_path}"
     return
   fi
 
-  if awsq ec2 describe-key-pairs --key-names "${KEY_BASENAME}" >/dev/null 2>&1; then
-    log "KeyPair '${KEY_BASENAME}' exists in AWS, but local PEM not found."
-    log "Create/import a new key pair manually or delete old key pair and rerun."
+  if key_pair_exists "${KEY_BASENAME}"; then
+    log "Key pair ${KEY_BASENAME} exists in AWS, but this laptop has no matching private key."
+    log "Generate one with: ssh-keygen -t ed25519"
+    log "Then rerun bootstrap (it will import ~/.ssh/id_ed25519.pub as your key pair)."
     exit 1
   fi
 
@@ -116,6 +210,8 @@ ensure_key_pair() {
     --key-name "${KEY_BASENAME}" \
     --query 'KeyMaterial' --output text > "${key_path}"
   chmod 400 "${key_path}"
+  KEY_PATH="${key_path}"
+  export KEY_PATH
 }
 
 ensure_security_group() {
@@ -271,7 +367,7 @@ write_remote_s3_env() {
 attach_instance_profile() {
   local iid assoc cache bucket_name
   [[ -n "${S3_BUCKET}" ]] || {
-    log "Set S3_BUCKET (e.g. S3_BUCKET=s3://l1tx-data) to attach instance S3 access."
+    log "Set S3_BUCKET (e.g. S3_BUCKET=s3://<your-bucket>) to attach instance S3 access."
     exit 1
   }
   bucket_name="$(s3_bucket_name "${S3_BUCKET}")"
@@ -681,7 +777,7 @@ get_public_ip() {
 }
 
 resolve_identity_file() {
-  local key_name="$1" candidate dir
+  local key_name="$1" pub priv
   if [[ -n "${KEY_PATH}" && -f "${KEY_PATH}" ]]; then
     echo "${KEY_PATH}"
     return
@@ -690,19 +786,59 @@ resolve_identity_file() {
     echo "${HOME}/.ssh/${key_name}.pem"
     return
   fi
-  for dir in "${HOME}/Documents/git" "${HOME}/Dropbox/Mac/Documents/git"; do
-    [[ -d "${dir}" ]] || continue
-    candidate="$(find "${dir}" -maxdepth 5 -name "${key_name}.pem" 2>/dev/null | head -1)"
-    if [[ -n "${candidate}" && -f "${candidate}" ]]; then
-      echo "${candidate}"
-      return
-    fi
-  done
-  if [[ "${key_name}" == "${KEY_BASENAME}" && -f "${KEY_PATH_DEFAULT}" ]]; then
+  if [[ -n "${KEY_PATH_DEFAULT}" && -f "${KEY_PATH_DEFAULT}" ]]; then
     echo "${KEY_PATH_DEFAULT}"
     return
   fi
+  if pub="$(first_local_pubkey)"; then
+    priv="${pub%.pub}"
+    if [[ -f "${priv}" ]]; then
+      echo "${priv}"
+      return
+    fi
+  fi
   echo "${HOME}/.ssh/${key_name}.pem"
+}
+
+instance_az() {
+  local iid="$1"
+  awsq ec2 describe-instances \
+    --instance-ids "${iid}" \
+    --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' \
+    --output text
+}
+
+install_my_key() {
+  local iid ssh_user pub priv ip az line
+  require_cmd aws
+  require_cmd ssh
+  iid="$(require_instance_id)"
+  pub="$(first_local_pubkey)" || {
+    log "No ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub on this laptop."
+    log "Create one with: ssh-keygen -t ed25519"
+    exit 1
+  }
+  priv="${pub%.pub}"
+  [[ -f "${priv}" ]] || { log "Found ${pub} but no private key ${priv}"; exit 1; }
+  ssh_user="$(resolve_ssh_user "${iid}")"
+  ip="$(get_public_ip_for "${iid}")" || { log "No public IP for ${iid}. Start it first: $0 up"; exit 1; }
+  az="$(instance_az "${iid}")"
+  ensure_instance_ssh_ingress "${iid}"
+  log "Pushing $(basename "${pub}") via EC2 Instance Connect (${az})"
+  awsq ec2-instance-connect send-ssh-public-key \
+    --instance-id "${iid}" \
+    --availability-zone "${az}" \
+    --instance-os-user "${ssh_user}" \
+    --ssh-public-key "file://${pub}" >/dev/null
+  line="$(tr -d '\n' < "${pub}")"
+  ssh -i "${priv}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=15 \
+    "${ssh_user}@${ip}" \
+    "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '${line}' ~/.ssh/authorized_keys || echo '${line}' >> ~/.ssh/authorized_keys"
+  KEY_PATH="${priv}"
+  export KEY_PATH
+  write_ssh_config
+  log "Installed your public key on ${iid}. Connect with: ssh ${HOST_ALIAS}"
 }
 
 ensure_instance_ssh_ingress() {
@@ -902,13 +1038,18 @@ JupyterLab:
 
 Create a new EC2 for this project:
   bootstrap
-  S3_BUCKET=s3://l1tx-data $0 bootstrap
-  S3_BUCKET=s3://l1tx-data $0 attach-s3
+  S3_BUCKET=s3://<your-bucket> $0 bootstrap
+  S3_BUCKET=s3://<your-bucket> $0 attach-s3
+
+If you can reach the instance via Instance Connect but not SSH:
+  $0 use <instance-id>
+  $0 install-my-key
 
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
+  KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
   INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default 200)
-  S3_BUCKET (e.g. s3://l1tx-data) — grant the instance IAM access to this bucket
+  S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
   S3_CACHE_PREFIX (default: s3://<bucket>/public)
   IAM_INSTANCE_PROFILE, IAM_ROLE_NAME
 EOF
@@ -938,6 +1079,7 @@ case "${1:-help}" in
   stop-jlab) stop_jlab ;;
   start-tunnel) start_tunnel ;;
   attach-s3) attach_instance_profile ;;
+  install-my-key) install_my_key ;;
   status) status ;;
   *)
     usage
