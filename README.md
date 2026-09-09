@@ -432,6 +432,8 @@ Chromosome slices pull a local `.bai` (from S3 or the NCBI sidecar) and use `sam
 
 `--test-bam-mode full` never writes the ~200 GiB BAMs to local disk. Add `--slice-after-full` only when you also want a local `--test-bam-chrom` slice.
 
+The candidate pipeline **does** stage remote (`s3://` or `http(s)://`) disease/control BAMs to `${RTM_WORKDIR}/data/bam_stage` when the run is multiple chromosomes, `--chr all`, or `--chr_concurrency > 1`. It skips the copy when the local file already matches the remote size, and refuses to start if free disk is below BAM size plus headroom. Single-chromosome runs keep streaming. Override the dest with `--bam-stage-dir` / `RTM_BAM_STAGE_DIR`, or disable with `--no-bam-stage` / `RTM_BAM_STAGE=0`.
+
 hs1:
 
 ```bash
