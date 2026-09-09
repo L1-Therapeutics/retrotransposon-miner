@@ -132,9 +132,7 @@ def _have_pysam_and_samtools() -> bool:
     return True
 
 
-def test_index_aware_slice_recovers_discordant_mates(dl, tmp_path: Path) -> None:
-    if not _have_pysam_and_samtools():
-        pytest.skip("pysam and samtools are required for mate-fetch integration")
+def _write_discordant_pair_bam(dl, tmp_path: Path):
     import pysam
 
     raw = tmp_path / "raw.bam"
@@ -168,7 +166,31 @@ def test_index_aware_slice_recovers_discordant_mates(dl, tmp_path: Path) -> None
     assert ok, msg
     ok, msg = dl._run_cmd(["samtools", "index", str(sorted_bam)], required=True)
     assert ok, msg
+    return sorted_bam
 
+
+def _alignment_keys(bam_path: Path) -> list[tuple[str, str, int, int]]:
+    import pysam
+
+    keys: list[tuple[str, str, int, int]] = []
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for read in bam:
+            keys.append(
+                (
+                    str(read.query_name),
+                    str(bam.get_reference_name(read.reference_id)),
+                    int(read.flag),
+                    int(read.reference_start),
+                )
+            )
+    return keys
+
+
+def test_index_aware_slice_recovers_discordant_mates(dl, tmp_path: Path) -> None:
+    if not _have_pysam_and_samtools():
+        pytest.skip("pysam and samtools are required for mate-fetch integration")
+
+    sorted_bam = _write_discordant_pair_bam(dl, tmp_path)
     out = tmp_path / "slice.bam"
     result = dl._slice_remote_alignment_with_mates(
         str(sorted_bam),
@@ -180,11 +202,52 @@ def test_index_aware_slice_recovers_discordant_mates(dl, tmp_path: Path) -> None
     assert result["mate_fetch"] == "index"
     assert result["mate_qnames"] == 1
     assert result["mate_windows"] == 1
-    names: set[str] = set()
-    chroms: set[str] = set()
-    with pysam.AlignmentFile(str(out), "rb") as bam:
-        for read in bam:
-            names.add(read.query_name)
-            chroms.add(bam.get_reference_name(read.reference_id))
+    keys = _alignment_keys(out)
+    names = {q for q, _c, _f, _p in keys}
+    chroms = {c for _q, c, _f, _p in keys}
     assert names == {"disc"}
     assert chroms == {"chrA", "chrB"}
+    assert len(keys) == 2
+    assert len(set(keys)) == len(keys)
+    qname_chrom = {(q, c) for q, c, _f, _p in keys}
+    assert qname_chrom == {("disc", "chrA"), ("disc", "chrB")}
+    assert len(keys) == len(qname_chrom)
+
+
+def test_index_aware_slice_collapses_region_anchor_leaked_in_mate_window(
+    dl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mate-window view that also dumps the region-chrom end must not 2× chrA."""
+    if not _have_pysam_and_samtools():
+        pytest.skip("pysam and samtools are required for mate-fetch integration")
+
+    sorted_bam = _write_discordant_pair_bam(dl, tmp_path)
+    orig = dl._samtools_view_indexed
+
+    def _leak_other_end(url, index_path, region, out_bam, threads):
+        if ":" not in str(region):
+            return orig(url, index_path, region, out_bam, threads)
+        import pysam
+
+        with pysam.AlignmentFile(str(url), "rb") as src, pysam.AlignmentFile(
+            str(out_bam), "wb", template=src
+        ) as dst:
+            for read in src:
+                if read.query_name == "disc":
+                    dst.write(read)
+
+    monkeypatch.setattr(dl, "_samtools_view_indexed", _leak_other_end)
+    out = tmp_path / "slice.bam"
+    result = dl._slice_remote_alignment_with_mates(
+        str(sorted_bam),
+        "chrA",
+        out,
+        threads=1,
+        force=True,
+    )
+    keys = _alignment_keys(out)
+    qname_chrom = [(q, c) for q, c, _f, _p in keys]
+    assert qname_chrom.count(("disc", "chrA")) == 1
+    assert qname_chrom.count(("disc", "chrB")) == 1
+    assert len(keys) == len(set(keys))
+    assert "duplicate_alignments_dropped" in result

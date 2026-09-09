@@ -744,6 +744,17 @@ def _write_index_aware_mates(
             n_win = 0
             with pysam.AlignmentFile(str(raw), "rb") as src, pysam.AlignmentFile(str(filtered), "wb", template=src) as dst:
                 for read in src:
+                    # Window views can leak the other end of the pair (fetch-pairs,
+                    # a too-broad fetch, or a qname dump). Keep only alignments on
+                    # this mate window's chromosome so region-chrom anchors are not
+                    # written into mates.bam and then doubled by samtools merge.
+                    ref = (
+                        src.get_reference_name(read.reference_id)
+                        if read.reference_id is not None and read.reference_id >= 0
+                        else None
+                    )
+                    if ref != chrom:
+                        continue
                     key = (read.query_name, bool(read.is_read1))
                     if read.query_name not in qnames or key in seen:
                         continue
@@ -772,6 +783,38 @@ def _write_index_aware_mates(
             )
 
     return {"mate_reads": written, "mate_windows": len(windows), "mate_fetch": "index"}
+
+
+def _collapse_exact_duplicate_alignments(in_bam: Path, out_bam: Path) -> dict[str, int]:
+    """Drop exact duplicate alignments (same qname, flag, ref, pos).
+
+    ``samtools merge`` of region.bam + mates.bam re-emits a record that appears
+    in both inputs. Streaming collapse keeps BAM order so a coordinate-sorted
+    merge stays indexable.
+    """
+    import pysam
+
+    seen: set[tuple[str, int, int, int]] = set()
+    kept = 0
+    dropped = 0
+    tmp_out = out_bam
+    replace = in_bam.resolve() == out_bam.resolve()
+    if replace:
+        tmp_out = out_bam.with_name(out_bam.name + ".dedup.tmp")
+    with pysam.AlignmentFile(str(in_bam), "rb") as src, pysam.AlignmentFile(str(tmp_out), "wb", template=src) as dst:
+        for read in src:
+            ref_id = int(read.reference_id) if read.reference_id is not None else -1
+            pos = int(read.reference_start) if read.reference_start is not None else -1
+            key = (str(read.query_name), int(read.flag), ref_id, pos)
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+            dst.write(read)
+            kept += 1
+    if replace:
+        tmp_out.replace(out_bam)
+    return {"alignments_kept": kept, "duplicate_alignments_dropped": dropped}
 
 
 def _slice_remote_alignment_with_mates(
@@ -814,9 +857,9 @@ def _slice_remote_alignment_with_mates(
                 ["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)],
                 required=True,
             )
-            shutil.copy2(merged_bam, out_bam)
+            mate_meta.update(_collapse_exact_duplicate_alignments(merged_bam, out_bam))
         else:
-            shutil.copy2(region_bam, out_bam)
+            mate_meta.update(_collapse_exact_duplicate_alignments(region_bam, out_bam))
 
         _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
 

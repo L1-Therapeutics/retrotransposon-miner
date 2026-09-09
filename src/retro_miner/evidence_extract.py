@@ -504,42 +504,9 @@ def extract_discordant_evidence(
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values(["chrom", "pos", "read_name"], kind="mergesort")
+        df = _drop_duplicate_evidence_rows(df, _DISCORDANT_DEDUP_KEYS)
     else:
-        df = pd.DataFrame(
-            columns=[
-                "sample",
-                "chrom",
-                "pos",
-                "ref_end",
-                "soft_clip_side",
-                "soft_clip_len",
-                "soft_clip_pos",
-                "soft_clip_seq",
-                "mate_chrom",
-                "mate_pos",
-                "mate_seq",
-                "mate_ref_start",
-                "mate_ref_end",
-                "mate_soft_clip_side",
-                "mate_soft_clip_len",
-                "mate_soft_clip_seq",
-                "mapq",
-                "template_len",
-                "is_reverse",
-                "mate_is_reverse",
-                "is_proper_pair",
-                "is_read1",
-                "read_name",
-                "discordant_reasons",
-                "nm",
-                "read_seq",
-                "anchor_poly_at_run",
-                "anchor_poly_at_fraction",
-                "anchor_poly_base",
-                "anchor_poly_side",
-                "poly_tail_anchor_rescued",
-            ]
-        )
+        df = pd.DataFrame(columns=_DISCORDANT_COLUMNS)
 
     if not df.empty and mate_seq_missing_interchrom_rows > 0:
         interchrom_total = int(df["discordant_reasons"].fillna("").astype(str).str.contains("interchrom").sum())
@@ -628,6 +595,40 @@ _STRONG_DISCORDANT_REASONS = frozenset(
     {"mate_unmapped", "interchrom", "large_insert", "poly_tail_anchor_rescue"}
 )
 
+# Exact-duplicate collapse for cached slice BAMs that re-emitted the same
+# region-chrom interchrom anchor (same qname/flag/ref/pos). Flag fields are
+# represented by the boolean columns stored on the evidence row.
+_DISCORDANT_DEDUP_KEYS = (
+    "read_name",
+    "chrom",
+    "pos",
+    "is_read1",
+    "mate_chrom",
+    "mate_pos",
+    "is_reverse",
+    "mate_is_reverse",
+    "is_proper_pair",
+)
+_SPLIT_DEDUP_KEYS = (
+    "read_name",
+    "chrom",
+    "pos",
+    "clip_side",
+    "mate_chrom",
+    "mate_pos",
+    "is_reverse",
+)
+
+
+def _drop_duplicate_evidence_rows(df: pd.DataFrame, keys: tuple[str, ...] | list[str]) -> pd.DataFrame:
+    """Keep the first row per exact alignment identity; no-op if keys are absent."""
+    if df.empty:
+        return df
+    present = [k for k in keys if k in df.columns]
+    if not present:
+        return df
+    return df.drop_duplicates(subset=present, keep="first")
+
 
 def _insert_threshold_from_sizes(
     insert_sizes: list[int],
@@ -645,6 +646,7 @@ def _write_split_table(rows: list[dict[str, Any]], outdir: Path, sample_name: st
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values(["chrom", "pos", "read_name", "clip_side"], kind="mergesort")
+        df = _drop_duplicate_evidence_rows(df, _SPLIT_DEDUP_KEYS)
     else:
         df = pd.DataFrame(columns=_SPLIT_COLUMNS)
     df.to_csv(outdir / f"split_evidence.{sample_name}.tsv", sep="\t", index=False)
@@ -656,6 +658,7 @@ def _write_discordant_table(rows: list[dict[str, Any]], outdir: Path, sample_nam
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values(["chrom", "pos", "read_name"], kind="mergesort")
+        df = _drop_duplicate_evidence_rows(df, _DISCORDANT_DEDUP_KEYS)
     else:
         df = pd.DataFrame(columns=_DISCORDANT_COLUMNS)
     df.to_csv(outdir / f"discordant_evidence.{sample_name}.tsv", sep="\t", index=False)
