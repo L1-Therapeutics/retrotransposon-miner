@@ -167,7 +167,19 @@ After the instance is running:
 Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab):
 
 ```bash
-./scripts/ec2_jlab.sh bootstrap
+S3_BUCKET=s3://l1tx-data ./scripts/ec2_jlab.sh bootstrap
+```
+
+That uses your **local** AWS CLI profile only on your laptop, to:
+
+1. Create/reuse an IAM role + instance profile scoped to that bucket.
+2. Attach the profile to the new instance (the VM assumes the role via instance metadata; **do not copy** `~/.aws` keys onto the instance).
+3. Write `RTM_S3_CACHE=s3://l1tx-data/public` on the instance.
+
+For an instance that is already running:
+
+```bash
+S3_BUCKET=s3://l1tx-data ./scripts/ec2_jlab.sh attach-s3
 ```
 
 `start-instance`, `stop-instance`, and `reboot-instance` operate on the **bound** instance only and do not create new instances.
@@ -185,6 +197,7 @@ Use `bootstrap` only when you want the script to provision a new instance (key p
 | `stop-instance` | Stop the bound instance |
 | `reboot-instance` | Reboot the bound instance |
 | `bootstrap` | Create and configure a new EC2 instance |
+| `attach-s3` | Grant the bound instance IAM access to `S3_BUCKET` |
 | `start-jlab` / `stop-jlab` / `start-tunnel` | JupyterLab lifecycle |
 | `help` | Show usage |
 
@@ -196,6 +209,10 @@ Optional environment variables:
 - `SSH_USER` — SSH login user (auto-detected from AMI if unset; e.g. `ec2-user`, `ubuntu`)
 - `KEY_PATH` — path to PEM for the instance key pair
 - `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r6i.4xlarge`)
+- `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)
+- `S3_BUCKET` — bucket the instance may read/write (example: `s3://l1tx-data`); creates/reuses an instance profile, does not copy local keys
+- `S3_CACHE_PREFIX` — object prefix for public-data cache (default: `s3://<bucket>/public`)
+- `IAM_INSTANCE_PROFILE` / `IAM_ROLE_NAME` — override the default `ec2-retrotransposon-s3-profile` / `ec2-retrotransposon-s3-role`
 
 Binding is saved to `.ec2-instance.env` in the repo checkout. Rebind anytime with `use`.
 
@@ -226,8 +243,11 @@ Additional permissions for `bootstrap` (new instance provisioning):
 - `ec2:DescribeAddresses`
 - `ec2:DescribeVpcs`
 - `ec2:DescribeSubnets`
+- `ec2:AssociateIamInstanceProfile` / `ec2:ReplaceIamInstanceProfileAssociation` (when `S3_BUCKET` is set)
 - `ssm:GetParameter` (Amazon Linux AMI lookup)
-- `iam:PassRole` (if attaching an instance profile)
+- `iam:PassRole` (attaching the instance profile)
+- `iam:CreateRole` / `iam:CreateInstanceProfile` / `iam:AddRoleToInstanceProfile` / `iam:PutRolePolicy` / `iam:GetRole` / `iam:GetInstanceProfile` (first-time S3 setup)
+- `s3:CreateBucket` / `s3:HeadBucket` / `s3:ListBucket` (optional; only if the cache bucket does not exist yet)
 
 ### What `scripts/ec2_jlab.sh` Does
 
@@ -237,6 +257,7 @@ Additional permissions for `bootstrap` (new instance provisioning):
 - Writes SSH aliases (`retro-ec2`, `jlab`) into local `~/.ssh/config`.
 - Refreshes SSH security group ingress for your current public IP on connect.
 - Optionally creates a new instance (`bootstrap`), key pair, security group, and Elastic IP.
+- Optionally attaches an IAM instance profile for a user-specified `S3_BUCKET` and caches public data under `s3://<bucket>/public`.
 - Starts JupyterLab remotely and tunnels it locally.
 
 ### Quickstart Runs (chr22)
@@ -379,8 +400,33 @@ GRCh38:
 conda activate rtm-miner || micromamba activate rtm-miner
 python3 scripts/download_public_data.py \
   --references hg38 \
-  --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}"
+  --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}" \
+  --s3-cache-prefix "${RTM_S3_CACHE:-s3://l1tx-data/public}"
 ```
+
+Test BAMs default to a **chr22 slice** (plus discordant mates). To park the entire SEQC2 WGS pair on S3 without filling the instance disk, stream NCBI HTTP through the instance (`curl | aws s3 cp -`) — the object never lands on the local volume:
+
+```bash
+python3 scripts/download_public_data.py \
+  --references hg38 \
+  --dataset-ids seqc2_disease_bam seqc2_control_bam \
+  --test-bam-mode full \
+  --s3-cache-prefix "${RTM_S3_CACHE:-s3://l1tx-data/public}" \
+  --skip-postprocess
+
+# Later chrom slices reuse that S3 object (no NCBI full-BAM scan):
+python3 scripts/download_public_data.py \
+  --references hg38 \
+  --dataset-ids seqc2_disease_bam seqc2_control_bam \
+  --test-bam-mode slice \
+  --test-bam-chrom chr1 \
+  --s3-cache-prefix "${RTM_S3_CACHE:-s3://l1tx-data/public}" \
+  --skip-postprocess
+```
+
+Chromosome slices pull a local `.bai` (from S3 or the NCBI sidecar) and use `samtools view -X` for the region plus discordant-mate windows. They do not stream the whole BAM with `samtools view -N`.
+
+`--test-bam-mode full` never writes the ~200 GiB BAMs to local disk. Add `--slice-after-full` only when you also want a local `--test-bam-chrom` slice.
 
 hs1:
 

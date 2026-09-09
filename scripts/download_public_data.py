@@ -37,6 +37,14 @@ class Dataset:
     required: bool = True
 
 
+@dataclass(frozen=True)
+class MateLocus:
+    qname: str
+    chrom: str
+    start: int
+    end: int
+
+
 BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
 DFAM_CURATED_CONSENSUS_0_URL = "https://www.dfam.org/releases/current/families/FamDB/dfam40.curated.consensus.0.h5.gz"
 UCSC_REPEATBROWSER_HG38REPS_URL = "https://hgdownload.soe.ucsc.edu/hubs/RepeatBrowser2020/hg38reps/hg38reps.fa"
@@ -191,6 +199,253 @@ def _select_dataset_ids_for_references(selected_refs: tuple[str, ...]) -> set[st
     return ids
 
 
+def normalize_s3_prefix(uri: str | None) -> str:
+    """Return canonical s3://bucket/prefix with no trailing slash, or empty."""
+    text = (uri or "").strip()
+    if not text:
+        return ""
+    if not text.startswith("s3://"):
+        text = "s3://" + text.lstrip("/")
+    return text.rstrip("/")
+
+
+def _s3_sync(src: str, dst: str) -> dict[str, Any]:
+    if shutil.which("aws") is None:
+        raise RuntimeError(
+            "aws CLI is required for --s3-cache-prefix / RTM_S3_CACHE. "
+            "On EC2, attach an instance profile (S3_BUCKET=s3://...) instead of copying local AWS keys."
+        )
+    _run_cmd(
+        [
+            "aws",
+            "s3",
+            "sync",
+            src,
+            dst,
+            "--exclude",
+            "test_data/full/*",
+            "--exclude",
+            "*/test_data/full/*",
+        ],
+        required=True,
+    )
+    return {"src": src, "dst": dst, "status": "synced"}
+
+
+def normalize_test_bam_mode(raw: str | None) -> str:
+    value = (raw or "slice").strip().lower()
+    if value in {"slice", "chr22", "region"}:
+        return "slice"
+    if value in {"full", "entire", "whole"}:
+        return "full"
+    raise ValueError(f"Unsupported --test-bam-mode '{raw}'. Use 'slice' (chr22) or 'full'.")
+
+
+def split_s3_uri(uri: str) -> tuple[str, str]:
+    norm = normalize_s3_prefix(uri)
+    if not norm.startswith("s3://"):
+        raise ValueError(f"Not an s3 URI: {uri}")
+    rest = norm[len("s3://") :]
+    bucket, _, key = rest.partition("/")
+    if not bucket or not key:
+        raise ValueError(f"s3 URI must include bucket and key: {uri}")
+    return bucket, key
+
+
+def full_alignment_s3_uri(s3_cache_prefix: str, dataset_id: str, source_url: str) -> str:
+    name = Path(urllib.parse.urlparse(source_url).path).name
+    if not name:
+        raise ValueError(f"Could not derive object name from {source_url}")
+    return f"{normalize_s3_prefix(s3_cache_prefix)}/test_data/full/{dataset_id}/{name}"
+
+
+def _require_aws_cli() -> None:
+    if shutil.which("aws") is None:
+        raise RuntimeError(
+            "aws CLI is required to mirror test BAMs to S3. "
+            "On EC2, attach an instance profile instead of copying local AWS keys."
+        )
+
+
+def _s3_head_size(s3_uri: str) -> int | None:
+    _require_aws_cli()
+    bucket, key = split_s3_uri(s3_uri)
+    ok, out = _run_cmd(
+        [
+            "aws",
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--query",
+            "ContentLength",
+            "--output",
+            "text",
+        ],
+        required=False,
+    )
+    if not ok:
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def _http_content_length(url: str, timeout_sec: int = 60) -> int | None:
+    request = urllib.request.Request(
+        url,
+        method="HEAD",
+        headers={"User-Agent": "retrotransposon-miner/0.1 (+https://github.com/L1-Therapeutics/retrotransposon-miner)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as resp:
+            cl = resp.headers.get("Content-Length")
+            return int(cl) if cl else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _s3_copy(src_uri: str, dst_uri: str) -> dict[str, Any]:
+    _require_aws_cli()
+    started = time.time()
+    _run_cmd(["aws", "s3", "cp", src_uri, dst_uri], required=True)
+    return {
+        "status": "s3_copied",
+        "src": src_uri,
+        "s3": dst_uri,
+        "bytes": _s3_head_size(dst_uri),
+        "seconds": round(time.time() - started, 3),
+    }
+
+
+def _http_stream_to_s3(url: str, s3_uri: str) -> dict[str, Any]:
+    """Pipe HTTP bytes to S3. Uses the instance as a pass-through; does not write the object to disk."""
+    _require_aws_cli()
+    if shutil.which("curl") is None:
+        raise RuntimeError("curl is required to stream HTTP objects directly to S3")
+    expected = _http_content_length(url)
+    aws_cmd = ["aws", "s3", "cp", "-", s3_uri]
+    if expected:
+        aws_cmd.extend(["--expected-size", str(expected)])
+    started = time.time()
+    curl = subprocess.Popen(
+        ["curl", "-fL", "--retry", "5", "--retry-delay", "5", url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert curl.stdout is not None
+    aws = subprocess.Popen(aws_cmd, stdin=curl.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    curl.stdout.close()
+    _aws_out, aws_err = aws.communicate()
+    curl_err = b""
+    if curl.stderr is not None:
+        curl_err = curl.stderr.read()
+    curl.wait()
+    if curl.returncode != 0 or aws.returncode != 0:
+        raise RuntimeError(
+            f"HTTP->S3 stream failed for {url} -> {s3_uri}\n"
+            f"curl_exit={curl.returncode} aws_exit={aws.returncode}\n"
+            f"{curl_err.decode('utf-8', errors='replace')}\n{aws_err}"
+        )
+    return {
+        "status": "streamed_to_s3",
+        "url": url,
+        "s3": s3_uri,
+        "bytes": _s3_head_size(s3_uri),
+        "expected_bytes": expected,
+        "seconds": round(time.time() - started, 3),
+    }
+
+
+def _presign_s3(s3_uri: str, expires_sec: int = 43200) -> str:
+    _require_aws_cli()
+    _ok, url = _run_cmd(["aws", "s3", "presign", s3_uri, "--expires-in", str(expires_sec)], required=True)
+    return url
+
+
+def _sidecar_url(url: str) -> str | None:
+    urls = _http_index_sidecar_urls(url)
+    return urls[0] if urls else None
+
+
+def _http_index_sidecar_urls(url: str) -> list[str]:
+    """Likely remote index URLs. NCBI SEQC2 uses foo.bai; 1000G/samtools use foo.cram.crai."""
+    if url.endswith(".bam"):
+        return [url[:-4] + ".bai", url + ".bai"]
+    if url.endswith(".cram"):
+        return [url + ".crai", url[:-5] + ".crai"]
+    return []
+
+
+def _mirror_full_alignment_to_s3(
+    ds: Dataset,
+    s3_cache_prefix: str,
+    *,
+    force: bool,
+    source_prefix: str = "",
+) -> dict[str, Any]:
+    dest = full_alignment_s3_uri(s3_cache_prefix, ds.dataset_id, ds.url)
+    existing = _s3_head_size(dest)
+    if existing is not None and not force:
+        result = {"status": "skipped_exists", "s3": dest, "bytes": existing, "url": ds.url}
+    else:
+        copied = False
+        src_prefix = normalize_s3_prefix(source_prefix)
+        if src_prefix:
+            name = Path(urllib.parse.urlparse(ds.url).path).name
+            src = f"{src_prefix}/{name}"
+            if _s3_head_size(src) is not None:
+                result = _s3_copy(src, dest)
+                result["url"] = ds.url
+                copied = True
+        if not copied:
+            result = _http_stream_to_s3(ds.url, dest)
+
+    sidecar = _sidecar_url(ds.url)
+    if sidecar:
+        dest_idx = dest + (".bai" if dest.endswith(".bam") else ".crai")
+        idx_existing = _s3_head_size(dest_idx)
+        if idx_existing is not None and not force:
+            result["index_s3"] = dest_idx
+            result["index_status"] = "skipped_exists"
+        else:
+            idx_copied = False
+            src_prefix = normalize_s3_prefix(source_prefix)
+            if src_prefix:
+                idx_name = Path(urllib.parse.urlparse(sidecar).path).name
+                src_idx = f"{src_prefix}/{idx_name}"
+                if _s3_head_size(src_idx) is not None:
+                    idx_res = _s3_copy(src_idx, dest_idx)
+                    result["index_s3"] = dest_idx
+                    result["index_status"] = idx_res["status"]
+                    idx_copied = True
+            if not idx_copied:
+                idx_res = _http_stream_to_s3(sidecar, dest_idx)
+                result["index_s3"] = dest_idx
+                result["index_status"] = idx_res["status"]
+    return result
+
+
+def _local_slice_target(ds: Dataset, chrom: str) -> str:
+    if ds.target_path and "chr22" in ds.target_path:
+        return ds.target_path.replace("chr22", chrom)
+    parent = str(Path(ds.target_path).parent) if ds.target_path else f"test_data/{ds.dataset_id}"
+    name = Path(ds.target_path).name if ds.target_path else f"{ds.dataset_id}.bam"
+    return str(Path(parent).parent / chrom / name)
+
+
+def _alignment_fetch_url(ds: Dataset, s3_cache_prefix: str) -> str:
+    if not s3_cache_prefix:
+        return ds.url
+    dest = full_alignment_s3_uri(s3_cache_prefix, ds.dataset_id, ds.url)
+    if _s3_head_size(dest) is None:
+        return ds.url
+    return _presign_s3(dest)
+
+
 def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -261,23 +516,170 @@ def _download_file(url: str, out_path: Path, timeout_sec: int, force: bool) -> d
     }
 
 
-def _slice_remote_alignment(url: str, region: str, out_bam: Path, threads: int, force: bool) -> dict[str, Any]:
+def merge_interval_windows(
+    loci: list[tuple[str, int, int]],
+    merge_gap: int = 10_000,
+) -> list[tuple[str, int, int]]:
+    """Merge (chrom, start, end) intervals that lie within merge_gap bp on the same chrom."""
+    by_chrom: dict[str, list[tuple[int, int]]] = {}
+    for chrom, start, end in loci:
+        if end < start:
+            start, end = end, start
+        by_chrom.setdefault(chrom, []).append((int(start), int(end)))
+    merged: list[tuple[str, int, int]] = []
+    for chrom, ivs in by_chrom.items():
+        ivs.sort()
+        cur_s, cur_e = ivs[0]
+        for start, end in ivs[1:]:
+            if start <= cur_e + merge_gap:
+                cur_e = max(cur_e, end)
+            else:
+                merged.append((chrom, cur_s, cur_e))
+                cur_s, cur_e = start, end
+        merged.append((chrom, cur_s, cur_e))
+    return merged
+
+
+def samtools_region_1based(chrom: str, start0: int, end0: int) -> str:
+    """Convert a 0-based half-open interval to a samtools region string."""
+    start1 = max(1, int(start0) + 1)
+    end1 = max(start1, int(end0))
+    return f"{chrom}:{start1}-{end1}"
+
+
+def _local_index_candidates(bam_path: Path) -> list[Path]:
+    name = bam_path.name
+    parent = bam_path.parent
+    if name.endswith(".bam"):
+        return [Path(str(bam_path) + ".bai"), parent / f"{name}.bai", parent / f"{name[:-4]}.bai"]
+    if name.endswith(".cram"):
+        return [Path(str(bam_path) + ".crai"), parent / f"{name}.crai", parent / f"{name[:-5]}.crai"]
+    return [Path(str(bam_path) + ".bai")]
+
+
+def _s3_index_candidates(s3_bam: str) -> list[str]:
+    cands = [s3_bam + ".bai", s3_bam + ".crai"]
+    if s3_bam.endswith(".bam"):
+        cands.append(s3_bam[:-4] + ".bai")
+    if s3_bam.endswith(".cram"):
+        cands.append(s3_bam[:-5] + ".crai")
+    # preserve order, drop dups
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _ensure_alignment_index(
+    *,
+    fetch_url: str,
+    ds: Dataset | None,
+    s3_cache_prefix: str,
+    dest_dir: Path,
+) -> Path:
+    """Return a local BAI/CRAI so samtools/pysam can range-fetch without scanning the BAM."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    local_bam = Path(fetch_url)
+    if local_bam.is_file():
+        for cand in _local_index_candidates(local_bam):
+            if cand.is_file():
+                return cand
+        _run_cmd(["samtools", "index", "-@", "2", str(local_bam)], required=True)
+        for cand in _local_index_candidates(local_bam):
+            if cand.is_file():
+                return cand
+        raise RuntimeError(f"Failed to create BAM index next to {local_bam}")
+
+    stem = ds.dataset_id if ds is not None else "remote"
+    local_bai = dest_dir / f"{stem}.remote.bai"
+    if ds is not None and s3_cache_prefix:
+        try:
+            s3_bam = full_alignment_s3_uri(s3_cache_prefix, ds.dataset_id, ds.url)
+            for s3_idx in _s3_index_candidates(s3_bam):
+                if _s3_head_size(s3_idx) is None:
+                    continue
+                dest = dest_dir / Path(s3_idx).name
+                _run_cmd(["aws", "s3", "cp", s3_idx, str(dest)], required=True)
+                return dest
+        except RuntimeError:
+            pass
+    if ds is not None:
+        for sidecar in _http_index_sidecar_urls(ds.url):
+            try:
+                _download_file(sidecar, local_bai, timeout_sec=120, force=True)
+            except Exception:
+                continue
+            if local_bai.is_file() and local_bai.stat().st_size > 0:
+                return local_bai
+    raise RuntimeError(
+        "Index-aware chromosome slicing needs a BAM/CRAM index. "
+        f"Place it beside the S3 object ({stem}.bam.bai) or next to a local BAM. "
+        "A full-file `samtools view -N` scan is not used."
+    )
+
+
+def _samtools_view_indexed(
+    url: str,
+    index_path: Path,
+    region: str,
+    out_bam: Path,
+    threads: int,
+) -> None:
+    out_bam.parent.mkdir(parents=True, exist_ok=True)
+    _run_cmd(
+        [
+            "samtools",
+            "view",
+            "-@",
+            str(threads),
+            "-b",
+            "-X",
+            url,
+            str(index_path),
+            region,
+            "-o",
+            str(out_bam),
+        ],
+        required=True,
+    )
+
+
+def _slice_remote_alignment(
+    url: str,
+    region: str,
+    out_bam: Path,
+    threads: int,
+    force: bool,
+    index_path: Path | None = None,
+) -> dict[str, Any]:
     out_bam.parent.mkdir(parents=True, exist_ok=True)
     if out_bam.exists() and Path(f"{out_bam}.bai").exists() and not force:
         return {"status": "skipped_exists", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
 
-    # Direct remote slicing avoids storing full-size BAM locally.
-    _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(out_bam)], required=True)
+    idx = index_path if index_path is not None and index_path.is_file() else None
+    if idx is None:
+        idx = _ensure_alignment_index(fetch_url=url, ds=None, s3_cache_prefix="", dest_dir=out_bam.parent)
+    _samtools_view_indexed(url, idx, region, out_bam, threads)
     _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
-    return {"status": "sliced_remote_alignment", "path": str(out_bam), "bytes": out_bam.stat().st_size, "region": region}
+    return {
+        "status": "sliced_remote_alignment",
+        "path": str(out_bam),
+        "bytes": out_bam.stat().st_size,
+        "region": region,
+        "index": str(idx),
+    }
 
 
-def _collect_interchrom_mate_qnames(region_bam: Path, region: str) -> list[str]:
-    """Return read names whose mates map outside the sliced region chromosome."""
+def _collect_interchrom_mate_loci(region_bam: Path, region: str, pad_bp: int = 50) -> list[MateLocus]:
+    """Mate loci (chrom/start/end) for reads whose mates map off the sliced chromosome."""
     import pysam
 
     region_chrom = region.split(":", 1)[0]
-    qnames: set[str] = set()
+    loci: list[MateLocus] = []
+    seen: set[tuple[str, str, int]] = set()
     with pysam.AlignmentFile(str(region_bam), "rb") as bam:
         for read in bam.fetch(region=region):
             if not read.is_paired or read.is_unmapped or read.mate_is_unmapped:
@@ -287,9 +689,89 @@ def _collect_interchrom_mate_qnames(region_bam: Path, region: str) -> list[str]:
             if read.next_reference_id < 0:
                 continue
             mate_chrom = bam.get_reference_name(read.next_reference_id)
-            if mate_chrom != region_chrom:
-                qnames.add(read.query_name)
-    return sorted(qnames)
+            if mate_chrom is None or mate_chrom == region_chrom:
+                continue
+            mate_start = int(read.next_reference_start)
+            span = max(int(read.query_length or 0), int(read.infer_query_length() or 0) or 0, 1)
+            mate_end = mate_start + span + int(pad_bp)
+            key = (read.query_name, mate_chrom, mate_start)
+            if key in seen:
+                continue
+            seen.add(key)
+            loci.append(MateLocus(read.query_name, mate_chrom, mate_start, mate_end))
+    return loci
+
+
+def _collect_interchrom_mate_qnames(region_bam: Path, region: str) -> list[str]:
+    """Return read names whose mates map outside the sliced region chromosome."""
+    return sorted({m.qname for m in _collect_interchrom_mate_loci(region_bam, region)})
+
+
+def _write_index_aware_mates(
+    url: str,
+    index_path: Path,
+    loci: list[MateLocus],
+    out_bam: Path,
+    threads: int,
+    merge_gap: int = 10_000,
+) -> dict[str, Any]:
+    """Fetch mates with indexed range queries; never scan the whole BAM by name."""
+    import pysam
+
+    windows = merge_interval_windows([(m.chrom, m.start, m.end) for m in loci], merge_gap=merge_gap)
+    qnames_by_window: dict[tuple[str, int, int], set[str]] = {w: set() for w in windows}
+    for mate in loci:
+        for window in windows:
+            chrom, start, end = window
+            if mate.chrom == chrom and mate.start < end and mate.end > start:
+                qnames_by_window[window].add(mate.qname)
+                break
+
+    written = 0
+    seen: set[tuple[str, bool]] = set()
+    with tempfile.TemporaryDirectory(prefix="rtm_mate_win_") as tmpdir:
+        tmp = Path(tmpdir)
+        window_bams: list[Path] = []
+        header_src: Path | None = None
+        for i, (chrom, start, end) in enumerate(windows):
+            qnames = qnames_by_window[(chrom, start, end)]
+            if not qnames:
+                continue
+            raw = tmp / f"win_{i}.bam"
+            _samtools_view_indexed(url, index_path, samtools_region_1based(chrom, start, end), raw, threads)
+            header_src = raw
+            filtered = tmp / f"win_{i}.filt.bam"
+            n_win = 0
+            with pysam.AlignmentFile(str(raw), "rb") as src, pysam.AlignmentFile(str(filtered), "wb", template=src) as dst:
+                for read in src:
+                    key = (read.query_name, bool(read.is_read1))
+                    if read.query_name not in qnames or key in seen:
+                        continue
+                    dst.write(read)
+                    seen.add(key)
+                    written += 1
+                    n_win += 1
+            if n_win:
+                window_bams.append(filtered)
+        if not window_bams:
+            template_path = header_src
+            if template_path is None:
+                with pysam.AlignmentFile(url, "rb", index_filename=str(index_path)) as src:
+                    with pysam.AlignmentFile(str(out_bam), "wb", template=src):
+                        pass
+            else:
+                with pysam.AlignmentFile(str(template_path), "rb") as src:
+                    with pysam.AlignmentFile(str(out_bam), "wb", template=src):
+                        pass
+        elif len(window_bams) == 1:
+            shutil.copy2(window_bams[0], out_bam)
+        else:
+            _run_cmd(
+                ["samtools", "merge", "-@", str(threads), "-f", str(out_bam), *[str(p) for p in window_bams]],
+                required=True,
+            )
+
+    return {"mate_reads": written, "mate_windows": len(windows), "mate_fetch": "index"}
 
 
 def _slice_remote_alignment_with_mates(
@@ -298,8 +780,9 @@ def _slice_remote_alignment_with_mates(
     out_bam: Path,
     threads: int,
     force: bool,
+    index_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Slice a region, then pull in discordant mates from other chromosomes via the remote BAM."""
+    """Slice a region, then index-fetch discordant mates (no full-BAM name scan)."""
     out_bam.parent.mkdir(parents=True, exist_ok=True)
     if out_bam.exists() and Path(f"{out_bam}.bai").exists() and not force:
         return {
@@ -308,35 +791,29 @@ def _slice_remote_alignment_with_mates(
             "bytes": out_bam.stat().st_size,
             "region": region,
             "include_discordant_mates": True,
+            "mate_fetch": "index",
         }
+
+    idx = index_path if index_path is not None and index_path.is_file() else None
+    if idx is None:
+        idx = _ensure_alignment_index(fetch_url=url, ds=None, s3_cache_prefix="", dest_dir=out_bam.parent)
 
     with tempfile.TemporaryDirectory(prefix="rtm_slice_mates_") as tmpdir:
         tmp = Path(tmpdir)
         region_bam = tmp / "region.bam"
         mates_bam = tmp / "mates.bam"
-        names_tsv = tmp / "mate_qnames.txt"
         merged_bam = tmp / "merged.bam"
 
-        _run_cmd(["samtools", "view", "-@", str(threads), "-b", url, region, "-o", str(region_bam)], required=True)
+        _samtools_view_indexed(url, idx, region, region_bam, threads)
         _run_cmd(["samtools", "index", "-@", str(threads), str(region_bam)], required=True)
-        mate_qnames = _collect_interchrom_mate_qnames(region_bam, region)
-        if mate_qnames:
-            names_tsv.write_text("\n".join(mate_qnames) + "\n", encoding="utf-8")
+        loci = _collect_interchrom_mate_loci(region_bam, region)
+        mate_meta: dict[str, Any] = {"mate_qnames": len({m.qname for m in loci}), "mate_fetch": "index"}
+        if loci:
+            mate_meta.update(_write_index_aware_mates(url, idx, loci, mates_bam, threads))
             _run_cmd(
-                [
-                    "samtools",
-                    "view",
-                    "-@", str(threads),
-                    "-b",
-                    "-N",
-                    str(names_tsv),
-                    url,
-                    "-o",
-                    str(mates_bam),
-                ],
+                ["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)],
                 required=True,
             )
-            _run_cmd(["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)], required=True)
             shutil.copy2(merged_bam, out_bam)
         else:
             shutil.copy2(region_bam, out_bam)
@@ -349,8 +826,33 @@ def _slice_remote_alignment_with_mates(
         "bytes": out_bam.stat().st_size,
         "region": region,
         "include_discordant_mates": True,
-        "mate_qnames": len(mate_qnames),
+        "index": str(idx),
+        **mate_meta,
     }
+
+
+def _slice_dataset_alignment(
+    ds: Dataset,
+    fetch_url: str,
+    chrom: str,
+    target: Path,
+    threads: int,
+    force: bool,
+    s3_cache_prefix: str,
+) -> dict[str, Any]:
+    index_path = _ensure_alignment_index(
+        fetch_url=fetch_url,
+        ds=ds,
+        s3_cache_prefix=s3_cache_prefix,
+        dest_dir=target.parent,
+    )
+    if ds.include_discordant_mates:
+        return _slice_remote_alignment_with_mates(
+            fetch_url, chrom, target, threads=threads, force=force, index_path=index_path
+        )
+    return _slice_remote_alignment(
+        fetch_url, chrom, target, threads=threads, force=force, index_path=index_path
+    )
 
 
 def _download_dataset(
@@ -361,16 +863,43 @@ def _download_dataset(
     force: bool,
     retries: int,
     retry_backoff_sec: float,
+    test_bam_mode: str = "slice",
+    test_bam_chrom: str = "chr22",
+    s3_cache_prefix: str = "",
+    s3_full_bam_source_prefix: str = "",
+    slice_after_full: bool = False,
 ) -> dict[str, Any]:
     attempts = max(1, int(retries))
     last_err: Exception | None = None
+    is_test_alignment = ds.dataset_id in TEST_DATASET_IDS and (ds.url.endswith(".bam") or ds.url.endswith(".cram"))
     for attempt in range(1, attempts + 1):
         try:
-            if ds.region and (ds.url.endswith(".bam") or ds.url.endswith(".cram")):
-                if ds.include_discordant_mates:
-                    result = _slice_remote_alignment_with_mates(ds.url, ds.region, target, threads=threads, force=force)
-                else:
-                    result = _slice_remote_alignment(ds.url, ds.region, target, threads=threads, force=force)
+            if is_test_alignment and test_bam_mode == "full":
+                if not s3_cache_prefix:
+                    raise RuntimeError(
+                        "--test-bam-mode full requires --s3-cache-prefix or RTM_S3_CACHE "
+                        "so the BAM can be stored on S3 instead of the instance volume."
+                    )
+                result = _mirror_full_alignment_to_s3(
+                    ds,
+                    s3_cache_prefix,
+                    force=force,
+                    source_prefix=s3_full_bam_source_prefix,
+                )
+                if slice_after_full:
+                    chrom = test_bam_chrom or ds.region or "chr22"
+                    fetch_url = _alignment_fetch_url(ds, s3_cache_prefix)
+                    result["local_slice"] = _slice_dataset_alignment(
+                        ds, fetch_url, chrom, target, threads, force, s3_cache_prefix
+                    )
+            elif ds.region and (ds.url.endswith(".bam") or ds.url.endswith(".cram")):
+                chrom = (test_bam_chrom if is_test_alignment else None) or ds.region
+                fetch_url = _alignment_fetch_url(ds, s3_cache_prefix) if is_test_alignment else ds.url
+                result = _slice_dataset_alignment(
+                    ds, fetch_url, chrom, target, threads, force, s3_cache_prefix
+                )
+                if fetch_url != ds.url:
+                    result["alignment_source"] = "s3_full_bam"
             else:
                 result = _download_file(ds.url, target, timeout_sec=timeout_sec, force=force)
             break
@@ -2241,6 +2770,12 @@ def main() -> int:
         help="Optional category filter, e.g. reference annotation liftover",
     )
     parser.add_argument(
+        "--dataset-ids",
+        nargs="*",
+        default=None,
+        help="Optional dataset id filter, e.g. seqc2_disease_bam seqc2_control_bam",
+    )
+    parser.add_argument(
         "--references",
         nargs="+",
         default=None,
@@ -2301,6 +2836,41 @@ def main() -> int:
         action="store_true",
         help="Disable prebuilt hg38 BWA index download and always build indexes locally.",
     )
+    parser.add_argument(
+        "--s3-cache-prefix",
+        default=os.environ.get("RTM_S3_CACHE", ""),
+        help=(
+            "Optional s3://bucket/prefix to sync from before downloads and to after. "
+            "Default: RTM_S3_CACHE env (set by ec2_jlab.sh when S3_BUCKET is given)."
+        ),
+    )
+    parser.add_argument(
+        "--test-bam-mode",
+        default="slice",
+        help=(
+            "Test BAM materialization: 'slice'/'chr22' (default) writes a local chromosome "
+            "slice using a BAM index and ranged mate fetches; 'full' streams the entire "
+            "BAM to S3 without filling the instance disk."
+        ),
+    )
+    parser.add_argument(
+        "--test-bam-chrom",
+        default="chr22",
+        help="Chromosome to slice locally in slice mode (default: chr22). Ignored for non-test BAMs.",
+    )
+    parser.add_argument(
+        "--s3-full-bam-source-prefix",
+        default=os.environ.get("RTM_S3_FULL_BAM_SOURCE", ""),
+        help=(
+            "Optional existing s3://bucket/prefix containing the same BAM basenames "
+            "for a server-side copy. Unset (default) streams from NCBI HTTP to S3."
+        ),
+    )
+    parser.add_argument(
+        "--slice-after-full",
+        action="store_true",
+        help="With --test-bam-mode full, also write a local --test-bam-chrom slice from the S3 object.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -2311,33 +2881,60 @@ def main() -> int:
     selected_references = _resolve_selected_references(args.references)
     selected_dataset_ids = _select_dataset_ids_for_references(selected_references)
     categories = set(args.categories) if args.categories else None
+    dataset_ids = set(args.dataset_ids) if args.dataset_ids else None
     active_datasets = [
         d
         for d in datasets
         if d.dataset_id in selected_dataset_ids
         and (categories is None or d.category in categories)
+        and (dataset_ids is None or d.dataset_id in dataset_ids)
         and (d.required or args.include_optional)
     ]
 
     outdir.mkdir(parents=True, exist_ok=True)
 
+    s3_cache = normalize_s3_prefix(args.s3_cache_prefix)
+    test_bam_mode = normalize_test_bam_mode(args.test_bam_mode)
+    test_bam_chrom = (args.test_bam_chrom or "chr22").strip()
+    s3_full_src = normalize_s3_prefix(args.s3_full_bam_source_prefix)
+    if test_bam_mode == "full" and not s3_cache:
+        raise SystemExit("--test-bam-mode full requires --s3-cache-prefix or RTM_S3_CACHE")
     manifest: dict[str, Any] = {
         "generated_at_unix": int(time.time()),
         "config": str(config_path),
         "outdir": str(outdir),
         "selected_references": list(selected_references),
+        "s3_cache_prefix": s3_cache or None,
+        "test_bam_mode": test_bam_mode,
+        "test_bam_chrom": test_bam_chrom,
+        "s3_cache": [],
         "results": [],
         "postprocess": [],
         "summary": {},
     }
 
+    def _push_s3_cache() -> None:
+        if not s3_cache:
+            return
+        print(f"S3 cache push: {outdir} -> {s3_cache}", file=sys.stderr)
+        pushed = _s3_sync(str(outdir), s3_cache)
+        pushed["step"] = "push"
+        manifest["s3_cache"].append(pushed)
+
+    if s3_cache:
+        print(f"S3 cache pull: {s3_cache} -> {outdir}", file=sys.stderr)
+        pulled = _s3_sync(s3_cache, str(outdir))
+        pulled["step"] = "pull"
+        manifest["s3_cache"].append(pulled)
+
     print(
         "Storage note: full-BAM workflows (whole disease+control remap) may require ~300GB free disk. "
-        "This downloader uses chr22 remote slicing for test BAMs to reduce footprint. "
-        "SEQC2 test BAMs also include interchrom discordant mate reads needed for MEI_MAPPED.",
+        "This downloader uses chromosome remote slicing for test BAMs by default. "
+        "Pass --test-bam-mode full to stream entire test BAMs to S3 without storing them locally.",
         file=sys.stderr,
     )
     print(f"Selected references: {', '.join(selected_references)}", file=sys.stderr)
+    print(f"Test BAM mode: {test_bam_mode} (chrom={test_bam_chrom})", file=sys.stderr)
 
     failures = 0
     download_workers = max(1, int(args.download_workers))
@@ -2345,8 +2942,16 @@ def main() -> int:
     future_to_meta: dict[concurrent.futures.Future[dict[str, Any]], tuple[int, Dataset, Path]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=download_workers) as executor:
         for idx, ds in enumerate(active_datasets):
-            target = outdir / ds.target_path
-            print(f"[download] {ds.dataset_id} -> {target}", file=sys.stderr)
+            slice_rel = (
+                _local_slice_target(ds, test_bam_chrom)
+                if ds.dataset_id in TEST_DATASET_IDS
+                else ds.target_path
+            )
+            target = outdir / slice_rel
+            dest_note = target
+            if ds.dataset_id in TEST_DATASET_IDS and test_bam_mode == "full":
+                dest_note = full_alignment_s3_uri(s3_cache, ds.dataset_id, ds.url)
+            print(f"[download] {ds.dataset_id} -> {dest_note}", file=sys.stderr)
             fut = executor.submit(
                 _download_dataset,
                 ds=ds,
@@ -2356,6 +2961,11 @@ def main() -> int:
                 force=args.force,
                 retries=args.download_retries,
                 retry_backoff_sec=args.download_retry_backoff_sec,
+                test_bam_mode=test_bam_mode,
+                test_bam_chrom=test_bam_chrom,
+                s3_cache_prefix=s3_cache,
+                s3_full_bam_source_prefix=s3_full_src,
+                slice_after_full=args.slice_after_full,
             )
             future_to_meta[fut] = (idx, ds, target)
 
@@ -2406,6 +3016,10 @@ def main() -> int:
                 "failed_optional": sum(1 for r in manifest["results"] if r["status"] == "failed" and not r["required"]),
                 "postprocess_failed": 1,
             }
+            try:
+                _push_s3_cache()
+            except Exception as cache_err:  # noqa: BLE001
+                manifest["s3_cache"].append({"step": "push", "status": "failed", "error": str(cache_err)})
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             with manifest_path.open("w", encoding="utf-8") as handle:
                 json.dump(manifest, handle, indent=2)
@@ -2438,6 +3052,13 @@ def main() -> int:
         "failed_optional": failed_optional,
         "postprocess_failed": post_failed,
     }
+
+    try:
+        _push_s3_cache()
+    except Exception as cache_err:  # noqa: BLE001
+        manifest["s3_cache"].append({"step": "push", "status": "failed", "error": str(cache_err)})
+        post_failed += 1
+        manifest["summary"]["postprocess_failed"] = post_failed
 
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with manifest_path.open("w", encoding="utf-8") as handle:
