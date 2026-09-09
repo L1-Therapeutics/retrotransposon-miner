@@ -1516,6 +1516,15 @@ def _merge_fetched_mate_sequences(
     return out
 
 
+# BAI linear-index bin (2^14). Group mates that share a tile; never glue
+# adjacent tiles across a gap (old 65 kb merge chained into multi-Mb fetches).
+# Fetch span is the tight union of per-mate query windows in that tile, not
+# the full 16 kb bin (most occupied tiles are singletons).
+_MATE_FETCH_TILE_BP = 16_384
+# Overlap slop around PNEXT for A-B identity with the per-window path.
+_MATE_FETCH_QUERY_BP = 500
+
+
 def _fetch_discordant_mate_sequences(
     discordant_df: pd.DataFrame,
     bam_path: Path | None,
@@ -1564,6 +1573,10 @@ def _fetch_discordant_mate_sequences(
     if need_fetch.empty:
         return out
 
+    # PNEXT (mate_pos) is the mate's leftmost mapped base, so a 1 bp query at
+    # start0 would hit the alignment. Keep a 500 bp overlap window so the
+    # per-window A-B path and tile-sweep overlap check stay identical. A
+    # singleton tile fetches this 500 bp window, not the full 16 kb bin.
     windows: list[tuple[str, int, int, str]] = []
     seen_qnames: set[str] = set()
     for rec in need_fetch.itertuples(index=False):
@@ -1574,7 +1587,7 @@ def _fetch_discordant_mate_sequences(
         mate_chrom = str(rec.mate_chrom)
         mate_pos = int(rec.mate_pos)
         start0 = max(0, mate_pos - 1)
-        windows.append((mate_chrom, start0, start0 + 500, qname))
+        windows.append((mate_chrom, start0, start0 + _MATE_FETCH_QUERY_BP, qname))
 
     fetch_impl = _fetch_mates_swept if fetch_fn is None else fetch_fn
     with pysam.AlignmentFile(str(bam_path), "rb") as bam:
@@ -1605,25 +1618,29 @@ def _mate_alignment_tuple(
 def _merge_mate_fetch_windows(
     windows: list[tuple[str, int, int, str]],
     *,
-    max_gap_bp: int = 65_536,
+    tile_bp: int = _MATE_FETCH_TILE_BP,
 ) -> list[tuple[str, int, int, list[tuple[str, int, int]]]]:
-    """Merge nearby per-mate 500bp windows so one BAM fetch covers many qnames."""
+    """Group mates by 16 kb tile; fetch the tight union of their query windows.
+
+    Tile membership uses the mate start (``start0`` / PNEXT). Adjacent tiles
+    are never merged: a 50 kb pair stays two fetches. The ``bam.fetch`` span
+    is ``min(start0)..max(end0)`` of the 500 bp windows in that tile, so a
+    singleton is a 500 bp fetch and clustered mates span only the stretch
+    that contains them (at most one tile).
+    """
     if not windows:
         return []
-    ordered = sorted(windows, key=lambda w: (w[0], w[1], w[2], w[3]))
+    tile_size = max(1, int(tile_bp))
+    groups: dict[tuple[str, int], list[tuple[str, int, int]]] = {}
+    for chrom, start0, end0, qname in windows:
+        tile_index = int(start0) // tile_size
+        groups.setdefault((str(chrom), tile_index), []).append((qname, int(start0), int(end0)))
     merged: list[tuple[str, int, int, list[tuple[str, int, int]]]] = []
-    chrom, start0, end0, qname = ordered[0]
-    items = [(qname, start0, end0)]
-    cur_chrom, cur_start, cur_end = chrom, start0, end0
-    for chrom, start0, end0, qname in ordered[1:]:
-        if chrom != cur_chrom or start0 - cur_end > int(max_gap_bp):
-            merged.append((cur_chrom, cur_start, cur_end, items))
-            cur_chrom, cur_start, cur_end = chrom, start0, end0
-            items = [(qname, start0, end0)]
-            continue
-        cur_end = max(cur_end, end0)
-        items.append((qname, start0, end0))
-    merged.append((cur_chrom, cur_start, cur_end, items))
+    for (chrom, _tile_index), items in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        items_sorted = sorted(items, key=lambda it: (it[1], it[2], it[0]))
+        mstart = min(start0 for _qname, start0, _end0 in items_sorted)
+        mend = max(end0 for _qname, _start0, end0 in items_sorted)
+        merged.append((chrom, mstart, mend, items_sorted))
     return merged
 
 
@@ -1653,11 +1670,11 @@ def _fetch_mates_swept(
     bam: pysam.AlignmentFile,
     windows: list[tuple[str, int, int, str]],
     *,
-    max_gap_bp: int = 65_536,
+    tile_bp: int = _MATE_FETCH_TILE_BP,
 ) -> dict[str, tuple[str, int, int, str, int, str]]:
-    """Sort mate windows and fetch merged spans so HTSlib walks forward."""
+    """Fetch mates grouped by tile, using tight per-tile window unions."""
     fetched: dict[str, tuple[str, int, int, str, int, str]] = {}
-    for chrom, mstart, mend, items in _merge_mate_fetch_windows(windows, max_gap_bp=max_gap_bp):
+    for chrom, mstart, mend, items in _merge_mate_fetch_windows(windows, tile_bp=tile_bp):
         if chrom not in bam.references:
             continue
         wanted: dict[str, tuple[int, int]] = {}
