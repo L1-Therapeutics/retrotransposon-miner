@@ -93,6 +93,16 @@ def test_http_index_sidecar_urls(dl) -> None:
     assert dl._sidecar_url(bam) == "https://example.com/foo.bai"
 
 
+def test_s3_copy_uses_shared_high_concurrency_helper(dl, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(dl, "copy_s3_uri", lambda src, dst: calls.append((src, dst)))
+    monkeypatch.setattr(dl, "_s3_head_size", lambda _uri: 123)
+    result = dl._s3_copy("s3://src/a.bam", "s3://dst/a.bam")
+    assert calls == [("s3://src/a.bam", "s3://dst/a.bam")]
+    assert result["status"] == "s3_copied"
+    assert result["bytes"] == 123
+
+
 def test_index_candidates(dl, tmp_path: Path) -> None:
     bam = tmp_path / "sample.bam"
     assert dl._local_index_candidates(bam)[0] == Path(str(bam) + ".bai")

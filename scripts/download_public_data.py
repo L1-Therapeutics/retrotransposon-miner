@@ -23,6 +23,11 @@ from typing import Any
 
 import yaml
 
+_SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+from retro_miner.s3_transfer import copy_s3_uri, download_s3_uri, process_local_aws_config
+
 
 @dataclass
 class Dataset:
@@ -215,20 +220,22 @@ def _s3_sync(src: str, dst: str) -> dict[str, Any]:
             "aws CLI is required for --s3-cache-prefix / RTM_S3_CACHE. "
             "On EC2, attach an instance profile (S3_BUCKET=s3://...) instead of copying local AWS keys."
         )
-    _run_cmd(
-        [
-            "aws",
-            "s3",
-            "sync",
-            src,
-            dst,
-            "--exclude",
-            "test_data/full/*",
-            "--exclude",
-            "*/test_data/full/*",
-        ],
-        required=True,
-    )
+    with process_local_aws_config() as aws_env:
+        _run_cmd(
+            [
+                "aws",
+                "s3",
+                "sync",
+                src,
+                dst,
+                "--exclude",
+                "test_data/full/*",
+                "--exclude",
+                "*/test_data/full/*",
+            ],
+            required=True,
+            env=aws_env,
+        )
     return {"src": src, "dst": dst, "status": "synced"}
 
 
@@ -309,9 +316,8 @@ def _http_content_length(url: str, timeout_sec: int = 60) -> int | None:
 
 
 def _s3_copy(src_uri: str, dst_uri: str) -> dict[str, Any]:
-    _require_aws_cli()
     started = time.time()
-    _run_cmd(["aws", "s3", "cp", src_uri, dst_uri], required=True)
+    copy_s3_uri(src_uri, dst_uri)
     return {
         "status": "s3_copied",
         "src": src_uri,
@@ -337,13 +343,21 @@ def _http_stream_to_s3(url: str, s3_uri: str) -> dict[str, Any]:
         stderr=subprocess.PIPE,
     )
     assert curl.stdout is not None
-    aws = subprocess.Popen(aws_cmd, stdin=curl.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    curl.stdout.close()
-    _aws_out, aws_err = aws.communicate()
-    curl_err = b""
-    if curl.stderr is not None:
-        curl_err = curl.stderr.read()
-    curl.wait()
+    with process_local_aws_config() as aws_env:
+        aws = subprocess.Popen(
+            aws_cmd,
+            stdin=curl.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=aws_env,
+        )
+        curl.stdout.close()
+        _aws_out, aws_err = aws.communicate()
+        curl_err = b""
+        if curl.stderr is not None:
+            curl_err = curl.stderr.read()
+        curl.wait()
     if curl.returncode != 0 or aws.returncode != 0:
         raise RuntimeError(
             f"HTTP->S3 stream failed for {url} -> {s3_uri}\n"
@@ -602,7 +616,7 @@ def _ensure_alignment_index(
                 if _s3_head_size(s3_idx) is None:
                     continue
                 dest = dest_dir / Path(s3_idx).name
-                _run_cmd(["aws", "s3", "cp", s3_idx, str(dest)], required=True)
+                download_s3_uri(s3_idx, dest)
                 return dest
         except RuntimeError:
             pass
@@ -976,9 +990,9 @@ def _download_dataset(
     return result
 
 
-def _run_cmd(cmd: list[str], required: bool = True) -> tuple[bool, str]:
+def _run_cmd(cmd: list[str], required: bool = True, env: dict[str, str] | None = None) -> tuple[bool, str]:
     try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
         return True, proc.stdout.strip()
     except FileNotFoundError as err:
         msg = f"missing executable: {cmd[0]} ({err})"

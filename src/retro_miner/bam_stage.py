@@ -5,6 +5,7 @@ When the pipeline covers multiple chromosomes, ``--chr all``, or
 ``--chr_concurrency > 1``, remote alignments are copied next to their
 BAI/CSI/CRAI so extract/annotate hit local files.
 
+S3 copies use :mod:`retro_miner.s3_transfer` (64 concurrent 64 MiB parts).
 No live object-store calls happen unless ``apply_bam_stage`` / ``--apply``.
 """
 
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
+from retro_miner.s3_transfer import download_s3_uri
 
 HEADROOM_RATIO = 0.10
 MIN_HEADROOM_BYTES = 5 * 1024**3
@@ -292,9 +294,7 @@ def _default_head_size(uri: str) -> int | None:
 def _default_copy(src: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.startswith("s3://"):
-        if shutil.which("aws") is None:
-            raise RuntimeError("aws CLI is required to stage s3:// BAMs")
-        _run_cmd(["aws", "s3", "cp", src, str(dest)])
+        download_s3_uri(src, dest)
         return
     if shutil.which("curl") is None:
         raise RuntimeError("curl is required to stage http(s):// BAMs")

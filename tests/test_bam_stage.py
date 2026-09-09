@@ -20,6 +20,7 @@ from retro_miner.bam_stage import (
     staged_alignment_dest,
     write_env_file,
 )
+from retro_miner.s3_transfer import DEFAULT_S3_MAX_CONCURRENCY
 
 
 def test_is_remote_alignment_uri() -> None:
@@ -211,3 +212,19 @@ def test_write_env_file_quotes_paths(tmp_path: Path) -> None:
     text = env.read_text(encoding="utf-8")
     assert "DISEASE_BAM='/tmp/a.bam'" in text
     assert "CONTROL_BAM='/tmp/b.bam'" in text
+
+
+def test_default_copy_uses_fast_s3_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def _fake_download(uri: str, dest) -> None:
+        seen.append((uri, str(dest)))
+        Path(dest).write_bytes(b"x")
+
+    monkeypatch.setattr("retro_miner.bam_stage.download_s3_uri", _fake_download)
+    from retro_miner.bam_stage import _default_copy
+
+    dest = tmp_path / "x.bam"
+    _default_copy("s3://bucket/x.bam", dest)
+    assert seen == [("s3://bucket/x.bam", str(dest))]
+    assert DEFAULT_S3_MAX_CONCURRENCY == 64
