@@ -5,6 +5,11 @@ APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-r6i.4xlarge}"
+ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
+S3_BUCKET="${S3_BUCKET:-}"
+S3_CACHE_PREFIX="${S3_CACHE_PREFIX:-}"
+IAM_INSTANCE_PROFILE="${IAM_INSTANCE_PROFILE:-ec2-retrotransposon-s3-profile}"
+IAM_ROLE_NAME="${IAM_ROLE_NAME:-ec2-retrotransposon-s3-role}"
 HOST_ALIAS="${HOST_ALIAS:-retro-ec2}"
 JLAB_ALIAS="${JLAB_ALIAS:-jlab}"
 SSH_USER="${SSH_USER:-}"
@@ -44,6 +49,10 @@ REGION=${REGION}
 INSTANCE_ID=${iid}
 INSTANCE_NAME=${name}
 SSH_USER=${user}
+S3_BUCKET=${S3_BUCKET}
+S3_CACHE_PREFIX=${S3_CACHE_PREFIX}
+IAM_INSTANCE_PROFILE=${IAM_INSTANCE_PROFILE}
+IAM_ROLE_NAME=${IAM_ROLE_NAME}
 EOF
   log "Saved instance binding to ${INSTANCE_STATE_FILE}"
 }
@@ -135,6 +144,183 @@ ensure_security_group() {
     >/dev/null 2>&1 || true
 
   echo "${sg_id}"
+}
+
+s3_bucket_name() {
+  local raw="${1:-}"
+  raw="${raw#s3://}"
+  raw="${raw%%/*}"
+  echo "${raw}"
+}
+
+s3_bucket_uri() {
+  local name
+  name="$(s3_bucket_name "$1")"
+  [[ -n "${name}" ]] || return 1
+  echo "s3://${name}"
+}
+
+s3_cache_prefix_for() {
+  if [[ -n "${S3_CACHE_PREFIX}" ]]; then
+    local p="${S3_CACHE_PREFIX}"
+    [[ "${p}" == s3://* ]] || p="s3://${p}"
+    echo "${p%/}"
+    return 0
+  fi
+  local name
+  name="$(s3_bucket_name "$1")"
+  [[ -n "${name}" ]] || return 1
+  echo "s3://${name}/public"
+}
+
+ensure_s3_bucket() {
+  local name="$1"
+  [[ -n "${name}" ]] || return 0
+  if awsq s3api head-bucket --bucket "${name}" >/dev/null 2>&1; then
+    log "Using S3 bucket s3://${name}"
+    return 0
+  fi
+  log "Creating S3 bucket s3://${name} in ${REGION}"
+  if [[ "${REGION}" == "us-east-1" ]]; then
+    awsq s3api create-bucket --bucket "${name}" >/dev/null
+  else
+    awsq s3api create-bucket --bucket "${name}" \
+      --create-bucket-configuration "LocationConstraint=${REGION}" >/dev/null
+  fi
+}
+
+ensure_iam_instance_profile_for_bucket() {
+  local bucket="$1" trust policy_file policy_name has_role created=0
+  [[ -n "${bucket}" ]] || return 0
+
+  trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  if ! aws iam get-role --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1; then
+    log "Creating IAM role ${IAM_ROLE_NAME}"
+    aws iam create-role \
+      --role-name "${IAM_ROLE_NAME}" \
+      --assume-role-policy-document "${trust}" >/dev/null
+    created=1
+  fi
+
+  if ! aws iam get-instance-profile --instance-profile-name "${IAM_INSTANCE_PROFILE}" >/dev/null 2>&1; then
+    log "Creating instance profile ${IAM_INSTANCE_PROFILE}"
+    aws iam create-instance-profile --instance-profile-name "${IAM_INSTANCE_PROFILE}" >/dev/null
+    created=1
+  fi
+
+  has_role="$(aws iam get-instance-profile \
+    --instance-profile-name "${IAM_INSTANCE_PROFILE}" \
+    --query 'InstanceProfile.Roles[0].RoleName' --output text 2>/dev/null || true)"
+  if [[ -z "${has_role}" || "${has_role}" == "None" ]]; then
+    log "Attaching role ${IAM_ROLE_NAME} to profile ${IAM_INSTANCE_PROFILE}"
+    aws iam add-role-to-instance-profile \
+      --instance-profile-name "${IAM_INSTANCE_PROFILE}" \
+      --role-name "${IAM_ROLE_NAME}" >/dev/null
+    created=1
+  fi
+
+  policy_name="s3-bucket-${bucket}"
+  policy_file="$(mktemp)"
+  cat > "${policy_file}" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::${bucket}"
+    },
+    {
+      "Sid": "ObjectRW",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::${bucket}/*"
+    }
+  ]
+}
+EOF
+  log "Granting ${IAM_ROLE_NAME} read/write on s3://${bucket}"
+  aws iam put-role-policy \
+    --role-name "${IAM_ROLE_NAME}" \
+    --policy-name "${policy_name}" \
+    --policy-document "file://${policy_file}" >/dev/null
+  rm -f "${policy_file}"
+
+  if [[ "${created}" == "1" ]]; then
+    log "Waiting for instance profile to propagate"
+    sleep 10
+  fi
+}
+
+write_remote_s3_env() {
+  local bucket_uri cache
+  [[ -n "${S3_BUCKET}" ]] || return 0
+  bucket_uri="$(s3_bucket_uri "${S3_BUCKET}")"
+  cache="$(s3_cache_prefix_for "${S3_BUCKET}")"
+  log "Writing ${cache} onto ${HOST_ALIAS} as RTM_S3_CACHE"
+  ssh "${HOST_ALIAS}" "mkdir -p ~/.config/rtm; printf '%s\n' 'RTM_S3_CACHE=${cache}' 'RTM_S3_BUCKET=${bucket_uri}' > ~/.config/rtm/s3.env; touch ~/.bashrc; grep -q 'config/rtm/s3.env' ~/.bashrc || echo 'set -a; [ -f \"\$HOME/.config/rtm/s3.env\" ] && . \"\$HOME/.config/rtm/s3.env\"; set +a' >> ~/.bashrc"
+}
+
+attach_instance_profile() {
+  local iid assoc cache bucket_name
+  [[ -n "${S3_BUCKET}" ]] || {
+    log "Set S3_BUCKET (e.g. S3_BUCKET=s3://l1tx-data) to attach instance S3 access."
+    exit 1
+  }
+  bucket_name="$(s3_bucket_name "${S3_BUCKET}")"
+  S3_BUCKET="$(s3_bucket_uri "${S3_BUCKET}")"
+  S3_CACHE_PREFIX="$(s3_cache_prefix_for "${S3_BUCKET}")"
+  cache="${S3_CACHE_PREFIX}"
+  export S3_BUCKET S3_CACHE_PREFIX
+
+  ensure_s3_bucket "${bucket_name}"
+  ensure_iam_instance_profile_for_bucket "${bucket_name}"
+  iid="$(require_instance_id)"
+
+  awsq ec2 create-tags --resources "${iid}" \
+    --tags "Key=S3Bucket,Value=${bucket_name}" "Key=S3CachePrefix,Value=${cache}" >/dev/null
+
+  assoc="$(awsq ec2 describe-iam-instance-profile-associations \
+    --filters "Name=instance-id,Values=${iid}" \
+    --query 'IamInstanceProfileAssociations[0].AssociationId' --output text 2>/dev/null || true)"
+  if [[ -z "${assoc}" || "${assoc}" == "None" ]]; then
+    log "Associating instance profile ${IAM_INSTANCE_PROFILE} with ${iid}"
+    awsq ec2 associate-iam-instance-profile \
+      --instance-id "${iid}" \
+      --iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}" >/dev/null
+  else
+    log "Replacing instance profile on ${iid} with ${IAM_INSTANCE_PROFILE}"
+    awsq ec2 replace-iam-instance-profile-association \
+      --association-id "${assoc}" \
+      --iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}" >/dev/null
+  fi
+
+  save_instance_state "${iid}" "$(resolve_instance_name "${iid}")" "$(resolve_ssh_user "${iid}")"
+  write_remote_s3_env || log "Could not write remote S3 env yet (SSH may not be ready)."
+  log "Instance can use ${S3_BUCKET} via IAM role ${IAM_ROLE_NAME} (not your local AWS keys)."
+  log "Public-data cache prefix: ${cache}"
+}
+
+build_s3_user_data() {
+  local cache bucket_uri
+  cache="$(s3_cache_prefix_for "${S3_BUCKET}")"
+  bucket_uri="$(s3_bucket_uri "${S3_BUCKET}")"
+  cat <<EOF
+#!/bin/bash
+set -euo pipefail
+install -d -o ec2-user -g ec2-user /home/ec2-user/.config/rtm
+printf '%s\n' 'RTM_S3_CACHE=${cache}' 'RTM_S3_BUCKET=${bucket_uri}' > /home/ec2-user/.config/rtm/s3.env
+chown ec2-user:ec2-user /home/ec2-user/.config/rtm/s3.env
+touch /home/ec2-user/.bashrc
+grep -q 'config/rtm/s3.env' /home/ec2-user/.bashrc || echo 'set -a; [ -f "\$HOME/.config/rtm/s3.env" ] && . "\$HOME/.config/rtm/s3.env"; set +a' >> /home/ec2-user/.bashrc
+EOF
 }
 
 public_ip_from_ssh_config() {
@@ -345,24 +531,50 @@ bind_instance() {
 }
 
 create_instance() {
-  local instance_id ami subnet sg_id create_name
+  local instance_id ami subnet sg_id create_name bucket_name ud_file="" tags
+  local -a run_args
   ami="$(get_latest_al2023_ami)"
   subnet="$(get_default_subnet)"
   sg_id="$(ensure_security_group)"
   ensure_key_pair
 
   create_name="$(default_create_instance_name)"
-  log "Creating instance ${create_name} (${INSTANCE_TYPE})"
-  instance_id="$(awsq ec2 run-instances \
-    --image-id "${ami}" \
-    --instance-type "${INSTANCE_TYPE}" \
-    --key-name "${KEY_BASENAME}" \
-    --subnet-id "${subnet}" \
-    --security-group-ids "${sg_id}" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}}]" \
-    --count 1 \
-    --query 'Instances[0].InstanceId' --output text)"
+  tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}}]"
+  if [[ -n "${S3_BUCKET}" ]]; then
+    bucket_name="$(s3_bucket_name "${S3_BUCKET}")"
+    S3_BUCKET="$(s3_bucket_uri "${S3_BUCKET}")"
+    S3_CACHE_PREFIX="$(s3_cache_prefix_for "${S3_BUCKET}")"
+    export S3_BUCKET S3_CACHE_PREFIX
+    ensure_s3_bucket "${bucket_name}"
+    ensure_iam_instance_profile_for_bucket "${bucket_name}"
+    ud_file="$(mktemp)"
+    build_s3_user_data > "${ud_file}"
+    tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}},{Key=S3Bucket,Value=${bucket_name}},{Key=S3CachePrefix,Value=${S3_CACHE_PREFIX}}]"
+  fi
 
+  log "Creating instance ${create_name} (${INSTANCE_TYPE})"
+  run_args=(
+    --image-id "${ami}"
+    --instance-type "${INSTANCE_TYPE}"
+    --key-name "${KEY_BASENAME}"
+    --subnet-id "${subnet}"
+    --security-group-ids "${sg_id}"
+    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${ROOT_VOLUME_GB},VolumeType=gp3,DeleteOnTermination=true}"
+    --tag-specifications "ResourceType=instance,Tags=${tags}"
+    --count 1
+    --query "Instances[0].InstanceId"
+    --output text
+  )
+  if [[ -n "${S3_BUCKET}" ]]; then
+    run_args+=(--iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}")
+    run_args+=(--user-data "file://${ud_file}")
+  fi
+  instance_id="$(awsq ec2 run-instances "${run_args[@]}")"
+  [[ -n "${ud_file}" ]] && rm -f "${ud_file}"
+
+  INSTANCE_ID="${instance_id}"
+  INSTANCE_NAME="${create_name}"
+  export INSTANCE_ID INSTANCE_NAME
   save_instance_state "${instance_id}" "${create_name}" "$(resolve_ssh_user "${instance_id}")"
   echo "${instance_id}"
 }
@@ -587,10 +799,26 @@ stop_jlab() {
 }
 
 start_tunnel() {
+  local token i=0
   pkill -f "ssh -N ${JLAB_ALIAS}" >/dev/null 2>&1 || true
   nohup ssh -N "${JLAB_ALIAS}" >/tmp/jlab-tunnel.log 2>&1 &
-  sleep 1
-  log "Tunnel running on http://127.0.0.1:${JLAB_LOCAL_PORT}"
+  while (( i < 30 )); do
+    if lsof -nP -iTCP:"${JLAB_LOCAL_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+      token="$(ssh "${HOST_ALIAS}" "cat ~/.jlab/token 2>/dev/null" || true)"
+      log "Tunnel running on http://127.0.0.1:${JLAB_LOCAL_PORT}"
+      if [[ -n "${token}" ]]; then
+        echo "http://127.0.0.1:${JLAB_LOCAL_PORT}/lab?token=${token}"
+      else
+        log "Jupyter token not found. Run: $0 start-jlab"
+      fi
+      return 0
+    fi
+    sleep 1
+    ((i++))
+  done
+  log "Tunnel failed to start. Check /tmp/jlab-tunnel.log"
+  tail -20 /tmp/jlab-tunnel.log >&2 || true
+  exit 1
 }
 
 status() {
@@ -618,12 +846,25 @@ bootstrap() {
   require_cmd ssh
   require_cmd curl
 
+  if [[ -n "${S3_BUCKET}" ]]; then
+    local bucket_name
+    bucket_name="$(s3_bucket_name "${S3_BUCKET}")"
+    S3_BUCKET="$(s3_bucket_uri "${S3_BUCKET}")"
+    S3_CACHE_PREFIX="$(s3_cache_prefix_for "${S3_BUCKET}")"
+    export S3_BUCKET S3_CACHE_PREFIX
+    ensure_s3_bucket "${bucket_name}"
+    ensure_iam_instance_profile_for_bucket "${bucket_name}"
+  fi
+
   ensure_key_pair
   ensure_security_group >/dev/null
   ensure_instance >/dev/null
   start_instance
   ensure_eip
   write_ssh_config
+  if [[ -n "${S3_BUCKET}" ]]; then
+    attach_instance_profile
+  fi
   status
   start_jlab
   start_tunnel
@@ -633,6 +874,10 @@ bootstrap() {
   echo
   echo "Open JupyterLab:"
   echo "http://127.0.0.1:${JLAB_LOCAL_PORT}/lab?token=${token}"
+  if [[ -n "${S3_CACHE_PREFIX}" ]]; then
+    echo "S3 public-data cache: ${S3_CACHE_PREFIX}"
+    echo "On the instance: python3 scripts/download_public_data.py --references hg38 --s3-cache-prefix ${S3_CACHE_PREFIX}"
+  fi
 }
 
 usage() {
@@ -657,9 +902,15 @@ JupyterLab:
 
 Create a new EC2 for this project:
   bootstrap
+  S3_BUCKET=s3://l1tx-data $0 bootstrap
+  S3_BUCKET=s3://l1tx-data $0 attach-s3
 
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
+  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default 200)
+  S3_BUCKET (e.g. s3://l1tx-data) — grant the instance IAM access to this bucket
+  S3_CACHE_PREFIX (default: s3://<bucket>/public)
+  IAM_INSTANCE_PROFILE, IAM_ROLE_NAME
 EOF
 }
 
@@ -686,6 +937,7 @@ case "${1:-help}" in
   start-jlab) start_jlab ;;
   stop-jlab) stop_jlab ;;
   start-tunnel) start_tunnel ;;
+  attach-s3) attach_instance_profile ;;
   status) status ;;
   *)
     usage
