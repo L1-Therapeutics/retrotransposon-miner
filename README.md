@@ -164,22 +164,22 @@ After the instance is running:
 
 ### Create a New EC2 Instance
 
-Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab):
+Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab). On a shared AWS account, each IAM user gets their own key pair (`retrotransposon-miner-<region>-<iam-user>`). If `~/.ssh/id_ed25519.pub` or `id_rsa.pub` exists, that public key is imported — bootstrap does not reuse another user’s PEM.
 
 ```bash
-S3_BUCKET=s3://l1tx-data ./scripts/ec2_jlab.sh bootstrap
+S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap
 ```
 
 That uses your **local** AWS CLI profile only on your laptop, to:
 
 1. Create/reuse an IAM role + instance profile scoped to that bucket.
 2. Attach the profile to the new instance (the VM assumes the role via instance metadata; **do not copy** `~/.aws` keys onto the instance).
-3. Write `RTM_S3_CACHE=s3://l1tx-data/public` on the instance.
+3. Write `RTM_S3_CACHE=s3://<your-bucket>/public` on the instance.
 
 For an instance that is already running:
 
 ```bash
-S3_BUCKET=s3://l1tx-data ./scripts/ec2_jlab.sh attach-s3
+S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh attach-s3
 ```
 
 `start-instance`, `stop-instance`, and `reboot-instance` operate on the **bound** instance only and do not create new instances.
@@ -198,6 +198,7 @@ S3_BUCKET=s3://l1tx-data ./scripts/ec2_jlab.sh attach-s3
 | `reboot-instance` | Reboot the bound instance |
 | `bootstrap` | Create and configure a new EC2 instance |
 | `attach-s3` | Grant the bound instance IAM access to `S3_BUCKET` |
+| `install-my-key` | Push this laptop’s public key onto the bound instance (Instance Connect) |
 | `start-jlab` / `stop-jlab` / `start-tunnel` | JupyterLab lifecycle |
 | `help` | Show usage |
 
@@ -207,10 +208,11 @@ Optional environment variables:
 - `INSTANCE_ID` / `INSTANCE_NAME` — override bound instance without editing `.ec2-instance.env`
 - `HOST_ALIAS` — SSH config alias (default: `retro-ec2`)
 - `SSH_USER` — SSH login user (auto-detected from AMI if unset; e.g. `ec2-user`, `ubuntu`)
-- `KEY_PATH` — path to PEM for the instance key pair
+- `KEY_PATH` — path to the private key for the instance (PEM or `~/.ssh/id_ed25519`)
+- `KEY_NAME` / `KEY_OWNER` — override the per-user EC2 key pair name (default: `retrotransposon-miner-<region>-<iam-user>`)
 - `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r6i.4xlarge`)
 - `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)
-- `S3_BUCKET` — bucket the instance may read/write (example: `s3://l1tx-data`); creates/reuses an instance profile, does not copy local keys
+- `S3_BUCKET` — bucket the instance may read/write (example: `s3://<your-bucket>`); creates/reuses an instance profile, does not copy local keys
 - `S3_CACHE_PREFIX` — object prefix for public-data cache (default: `s3://<bucket>/public`)
 - `IAM_INSTANCE_PROFILE` / `IAM_ROLE_NAME` — override the default `ec2-retrotransposon-s3-profile` / `ec2-retrotransposon-s3-role`
 
@@ -236,7 +238,8 @@ For bring-your-own-EC2 (`use`, `up`, `connect`, lifecycle commands):
 Additional permissions for `bootstrap` (new instance provisioning):
 - `ec2:RunInstances`
 - `ec2:CreateTags`
-- `ec2:CreateKeyPair`
+- `ec2:CreateKeyPair` / `ec2:ImportKeyPair` (per-IAM-user key; imports `~/.ssh/id_ed25519.pub` when present)
+- `ec2-instance-connect:SendSSHPublicKey` (break-glass: `./scripts/ec2_jlab.sh install-my-key`)
 - `ec2:CreateSecurityGroup`
 - `ec2:AllocateAddress`
 - `ec2:AssociateAddress`
@@ -256,7 +259,8 @@ Additional permissions for `bootstrap` (new instance provisioning):
 - Starts, stops, and reboots the bound instance without creating new ones.
 - Writes SSH aliases (`retro-ec2`, `jlab`) into local `~/.ssh/config`.
 - Refreshes SSH security group ingress for your current public IP on connect.
-- Optionally creates a new instance (`bootstrap`), key pair, security group, and Elastic IP.
+- Optionally creates a new instance (`bootstrap`), a **per-IAM-user** key pair (or imports your laptop `id_ed25519.pub`), security group, and Elastic IP. Does not reuse another user's PEM.
+- `install-my-key` pushes your laptop public key via EC2 Instance Connect and appends it to `authorized_keys`.
 - Optionally attaches an IAM instance profile for a user-specified `S3_BUCKET` and caches public data under `s3://<bucket>/public`.
 - Starts JupyterLab remotely and tunnels it locally.
 
@@ -458,7 +462,8 @@ python3 scripts/download_public_data.py \
 - Designed for headless Linux execution with optional Integrative Genomics Viewer (IGV) snapshot generation.
 - Instance bindings are local (`.ec2-instance.env`); nothing instance-specific is committed to git.
 - If your public IP changes, SSH connect refreshes security group ingress automatically via `ec2_jlab.sh`.
-- Set `KEY_PATH` if your PEM is not in `~/.ssh/` or the default search paths.
+- Set `KEY_PATH` if your private key is not `~/.ssh/id_ed25519` or `~/.ssh/<key-name>.pem`.
+- Locked out of an instance you created? `./scripts/ec2_jlab.sh use <instance-id>` then `./scripts/ec2_jlab.sh install-my-key` (needs `ec2-instance-connect:SendSSHPublicKey`). Do not share another user's PEM.
 - For production use, review security hardening, key lifecycle, and cost controls.
 
 ## License
