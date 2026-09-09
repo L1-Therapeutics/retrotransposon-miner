@@ -195,113 +195,20 @@ def extract_split_evidence(
                 continue
 
             passing_reads += 1
-            mate_chrom = "*"
-            mate_pos_1based = 0
-            if read.is_paired and not read.mate_is_unmapped and read.next_reference_id >= 0:
-                mate_chrom = bam.get_reference_name(read.next_reference_id)
-                mate_pos_1based = read.next_reference_start + 1
-            collect_clip_len = min(
-                int(min_clip_len),
-                max(1, int(poly_tail_rescue_min_clip_len)),
-                max(1, int(short_mei_rescue_min_clip_len)),
+            rows.extend(
+                _split_rows_from_read(
+                    read,
+                    bam=bam,
+                    sample_name=sample_name,
+                    min_clip_len=min_clip_len,
+                    poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+                    poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+                    poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+                    short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
+                )
             )
-            clips = _collect_soft_clips(read, min_clip_len=collect_clip_len)
-            if not clips:
-                continue
 
-            has_sa = read.has_tag("SA")
-            sa_raw = read.get_tag("SA") if has_sa else ""
-            nm = int(read.get_tag("NM")) if read.has_tag("NM") else -1
-            chrom = bam.get_reference_name(read.reference_id)
-            for clip_side, clip_len in clips:
-                # Breakpoint coordinate should depend on clipping side:
-                # - Left clip: mapped segment starts at breakpoint (reference_start + 1)
-                # - Right clip: mapped segment ends at breakpoint (reference_end)
-                if clip_side == "L":
-                    pos_1based = read.reference_start + 1
-                else:
-                    pos_1based = read.reference_end
-                query_seq = read.query_sequence or ""
-                clip_seq = ""
-                if query_seq:
-                    if clip_side == "L":
-                        clip_seq = query_seq[:clip_len]
-                    else:
-                        clip_seq = query_seq[-clip_len:]
-                span_len, poly_frac, poly_base, poly_region = _longest_poly_at_span(clip_seq, min_frac=0.90, min_len=8)
-                if span_len <= 0:
-                    poly_run, poly_frac, poly_base = _poly_at_stats(clip_seq)
-                else:
-                    poly_run = span_len
-                    # keep poly_frac/base from span
-                poly_tail_rescued = (
-                    clip_len < min_clip_len
-                    and clip_len >= max(1, int(poly_tail_rescue_min_clip_len))
-                    and poly_run >= max(1, int(poly_tail_rescue_min_run))
-                    and poly_frac >= float(poly_tail_rescue_min_frac)
-                )
-                short_mei_candidate = (
-                    clip_len < int(min_clip_len)
-                    and clip_len >= max(1, int(short_mei_rescue_min_clip_len))
-                )
-                if clip_len < min_clip_len and not poly_tail_rescued and not short_mei_candidate:
-                    continue
-                rows.append(
-                    {
-                        "sample": sample_name,
-                        "chrom": chrom,
-                        "pos": pos_1based,
-                        "clip_side": clip_side,
-                        "clip_len": int(clip_len),
-                        "mapq": int(read.mapping_quality),
-                        "is_reverse": bool(read.is_reverse),
-                        "read_name": read.query_name,
-                        "mate_chrom": mate_chrom,
-                        "mate_pos": mate_pos_1based,
-                        "has_sa": bool(has_sa),
-                        "sa_raw": sa_raw,
-                        "clip_seq": clip_seq,
-                        "nm": nm,
-                        "short_mei_candidate": bool(short_mei_candidate and not poly_tail_rescued),
-                        "clip_poly_at_run": int(poly_run),
-                        "clip_poly_at_fraction": float(poly_frac),
-                        "clip_poly_base": poly_base,
-                        "poly_tail_rescued": bool(poly_tail_rescued),
-                    }
-                )
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(["chrom", "pos", "read_name", "clip_side"], kind="mergesort")
-    else:
-        df = pd.DataFrame(
-            columns=[
-                "sample",
-                "chrom",
-                "pos",
-                "clip_side",
-                "clip_len",
-                "mapq",
-                "is_reverse",
-                "read_name",
-                "mate_chrom",
-                "mate_pos",
-                "has_sa",
-                "sa_raw",
-                "clip_seq",
-                "nm",
-                "short_mei_candidate",
-                "clip_poly_at_run",
-                "clip_poly_at_fraction",
-                "clip_poly_base",
-                "poly_tail_rescued",
-            ]
-        )
-
-    tsv_path = outdir / f"split_evidence.{sample_name}.tsv"
-    parquet_path = outdir / f"split_evidence.{sample_name}.parquet"
-    df.to_csv(tsv_path, sep="\t", index=False)
-    df.to_parquet(parquet_path, index=False)
+    df = _write_split_table(rows, outdir, sample_name)
 
     return ExtractionSummary(
         sample=sample_name,
@@ -659,3 +566,467 @@ def extract_discordant_evidence(
         mate_seq_fetched_rows=mate_seq_fetched_rows,
         mate_seq_missing_interchrom_rows=mate_seq_missing_interchrom_rows,
     )
+
+
+_SPLIT_COLUMNS = [
+    "sample",
+    "chrom",
+    "pos",
+    "clip_side",
+    "clip_len",
+    "mapq",
+    "is_reverse",
+    "read_name",
+    "mate_chrom",
+    "mate_pos",
+    "has_sa",
+    "sa_raw",
+    "clip_seq",
+    "nm",
+    "short_mei_candidate",
+    "clip_poly_at_run",
+    "clip_poly_at_fraction",
+    "clip_poly_base",
+    "poly_tail_rescued",
+]
+
+_DISCORDANT_COLUMNS = [
+    "sample",
+    "chrom",
+    "pos",
+    "ref_end",
+    "soft_clip_side",
+    "soft_clip_len",
+    "soft_clip_pos",
+    "soft_clip_seq",
+    "mate_chrom",
+    "mate_pos",
+    "mate_seq",
+    "mate_ref_start",
+    "mate_ref_end",
+    "mate_soft_clip_side",
+    "mate_soft_clip_len",
+    "mate_soft_clip_seq",
+    "mapq",
+    "template_len",
+    "is_reverse",
+    "mate_is_reverse",
+    "is_proper_pair",
+    "is_read1",
+    "read_name",
+    "discordant_reasons",
+    "nm",
+    "read_seq",
+    "anchor_poly_at_run",
+    "anchor_poly_at_fraction",
+    "anchor_poly_base",
+    "anchor_poly_side",
+    "poly_tail_anchor_rescued",
+]
+
+_STRONG_DISCORDANT_REASONS = frozenset(
+    {"mate_unmapped", "interchrom", "large_insert", "poly_tail_anchor_rescue"}
+)
+
+
+def _insert_threshold_from_sizes(
+    insert_sizes: list[int],
+    *,
+    quantile: float,
+    fallback_threshold: int,
+) -> int:
+    if not insert_sizes:
+        return int(fallback_threshold)
+    threshold = int(np.quantile(np.asarray(insert_sizes), quantile))
+    return max(threshold, int(fallback_threshold))
+
+
+def _write_split_table(rows: list[dict[str, Any]], outdir: Path, sample_name: str) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["chrom", "pos", "read_name", "clip_side"], kind="mergesort")
+    else:
+        df = pd.DataFrame(columns=_SPLIT_COLUMNS)
+    df.to_csv(outdir / f"split_evidence.{sample_name}.tsv", sep="\t", index=False)
+    df.to_parquet(outdir / f"split_evidence.{sample_name}.parquet", index=False)
+    return df
+
+
+def _write_discordant_table(rows: list[dict[str, Any]], outdir: Path, sample_name: str) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["chrom", "pos", "read_name"], kind="mergesort")
+    else:
+        df = pd.DataFrame(columns=_DISCORDANT_COLUMNS)
+    df.to_csv(outdir / f"discordant_evidence.{sample_name}.tsv", sep="\t", index=False)
+    df.to_parquet(outdir / f"discordant_evidence.{sample_name}.parquet", index=False)
+    return df
+
+
+def _split_rows_from_read(
+    read: pysam.AlignedSegment,
+    *,
+    bam: pysam.AlignmentFile,
+    sample_name: str,
+    min_clip_len: int,
+    poly_tail_rescue_min_clip_len: int,
+    poly_tail_rescue_min_run: int,
+    poly_tail_rescue_min_frac: float,
+    short_mei_rescue_min_clip_len: int,
+) -> list[dict[str, Any]]:
+    mate_chrom = "*"
+    mate_pos_1based = 0
+    if read.is_paired and not read.mate_is_unmapped and read.next_reference_id >= 0:
+        mate_chrom = bam.get_reference_name(read.next_reference_id)
+        mate_pos_1based = read.next_reference_start + 1
+    collect_clip_len = min(
+        int(min_clip_len),
+        max(1, int(poly_tail_rescue_min_clip_len)),
+        max(1, int(short_mei_rescue_min_clip_len)),
+    )
+    clips = _collect_soft_clips(read, min_clip_len=collect_clip_len)
+    if not clips:
+        return []
+
+    has_sa = read.has_tag("SA")
+    sa_raw = read.get_tag("SA") if has_sa else ""
+    nm = int(read.get_tag("NM")) if read.has_tag("NM") else -1
+    chrom = bam.get_reference_name(read.reference_id)
+    rows: list[dict[str, Any]] = []
+    for clip_side, clip_len in clips:
+        if clip_side == "L":
+            pos_1based = read.reference_start + 1
+        else:
+            pos_1based = read.reference_end
+        query_seq = read.query_sequence or ""
+        clip_seq = ""
+        if query_seq:
+            if clip_side == "L":
+                clip_seq = query_seq[:clip_len]
+            else:
+                clip_seq = query_seq[-clip_len:]
+        span_len, poly_frac, poly_base, _poly_region = _longest_poly_at_span(
+            clip_seq, min_frac=0.90, min_len=8
+        )
+        if span_len <= 0:
+            poly_run, poly_frac, poly_base = _poly_at_stats(clip_seq)
+        else:
+            poly_run = span_len
+        poly_tail_rescued = (
+            clip_len < min_clip_len
+            and clip_len >= max(1, int(poly_tail_rescue_min_clip_len))
+            and poly_run >= max(1, int(poly_tail_rescue_min_run))
+            and poly_frac >= float(poly_tail_rescue_min_frac)
+        )
+        short_mei_candidate = clip_len < int(min_clip_len) and clip_len >= max(
+            1, int(short_mei_rescue_min_clip_len)
+        )
+        if clip_len < min_clip_len and not poly_tail_rescued and not short_mei_candidate:
+            continue
+        rows.append(
+            {
+                "sample": sample_name,
+                "chrom": chrom,
+                "pos": pos_1based,
+                "clip_side": clip_side,
+                "clip_len": int(clip_len),
+                "mapq": int(read.mapping_quality),
+                "is_reverse": bool(read.is_reverse),
+                "read_name": read.query_name,
+                "mate_chrom": mate_chrom,
+                "mate_pos": mate_pos_1based,
+                "has_sa": bool(has_sa),
+                "sa_raw": sa_raw,
+                "clip_seq": clip_seq,
+                "nm": nm,
+                "short_mei_candidate": bool(short_mei_candidate and not poly_tail_rescued),
+                "clip_poly_at_run": int(poly_run),
+                "clip_poly_at_fraction": float(poly_frac),
+                "clip_poly_base": poly_base,
+                "poly_tail_rescued": bool(poly_tail_rescued),
+            }
+        )
+    return rows
+
+
+def extract_split_and_discordant_evidence(
+    bam_path: Path,
+    sample_name: str,
+    outdir: Path,
+    regions: list[str] | str,
+    min_mapq: int = 20,
+    min_mapq_discordant: int = 20,
+    min_clip_len: int = 20,
+    poly_tail_rescue_min_clip_len: int = 8,
+    poly_tail_rescue_min_run: int = 8,
+    poly_tail_rescue_min_frac: float = 0.8,
+    short_mei_rescue_min_clip_len: int = 12,
+    insert_quantile: float = 0.995,
+    min_abs_tlen: int = 1000,
+    poly_tail_rescue_window_bases: int = 25,
+    discordant_poly_tail_rescue_min_run: int = 10,
+    discordant_poly_tail_rescue_min_frac: float = 0.8,
+    poly_tail_rescue_min_abs_tlen: int = 500,
+    require_strong_discordant_reason: bool = True,
+    mate_bam_path: Path | None = None,
+    mate_fetch_window_bp: int = 500,
+    fetch_mate_seq: bool = True,
+) -> tuple[ExtractionSummary, ExtractionSummary]:
+    """One BAM walk collecting split and discordant tables.
+
+    Insert-size quantile is computed from the same walk, then large-insert
+    reasons are finalized so the written tables match the historical two-pass
+    extract. Mate sequences (if requested) are filled after that filter.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    region_list = _normalize_regions(regions)
+    mate_bam_resolved = mate_bam_path if mate_bam_path is not None else bam_path
+    if fetch_mate_seq:
+        _validate_mate_fetch_bam(bam_path, mate_bam_path, region_list)
+
+    split_rows: list[dict[str, Any]] = []
+    pending_disc: list[dict[str, Any]] = []
+    insert_sizes: list[int] = []
+    total_reads_scanned = 0
+    split_passing = 0
+    disc_passing = 0
+
+    mate_bam_ctx = (
+        pysam.AlignmentFile(str(mate_bam_resolved), "rb") if fetch_mate_seq else nullcontext(None)
+    )
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam, mate_bam_ctx as mate_bam:
+        for read in _iter_reads_for_regions(bam, region_list):
+            total_reads_scanned += 1
+            qc_skip = bool(
+                read.is_unmapped or read.is_qcfail or read.is_duplicate or read.is_secondary
+            )
+
+            if (
+                read.is_paired
+                and read.is_read1
+                and not read.is_unmapped
+                and not read.mate_is_unmapped
+                and not read.is_qcfail
+                and not read.is_duplicate
+                and not read.is_secondary
+                and read.mapping_quality >= min_mapq_discordant
+                and read.reference_id == read.next_reference_id
+            ):
+                abs_tlen = abs(read.template_length)
+                if abs_tlen > 0:
+                    insert_sizes.append(abs_tlen)
+
+            if not qc_skip and read.mapping_quality >= min_mapq:
+                split_passing += 1
+                split_rows.extend(
+                    _split_rows_from_read(
+                        read,
+                        bam=bam,
+                        sample_name=sample_name,
+                        min_clip_len=min_clip_len,
+                        poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+                        poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+                        poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+                        short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
+                    )
+                )
+
+            if qc_skip or (not read.is_paired) or read.mapping_quality < min_mapq_discordant:
+                continue
+            disc_passing += 1
+
+            mate_chrom = "*"
+            mate_pos_1based = 0
+            if read.next_reference_id >= 0:
+                mate_chrom = bam.get_reference_name(read.next_reference_id)
+                mate_pos_1based = read.next_reference_start + 1
+
+            abs_tlen = abs(read.template_length)
+            reasons: list[str] = []
+            if read.mate_is_unmapped:
+                reasons.append("mate_unmapped")
+            elif read.reference_id != read.next_reference_id:
+                reasons.append("interchrom")
+
+            if read.is_reverse == read.mate_is_reverse:
+                reasons.append("same_strand")
+            if not read.is_proper_pair:
+                reasons.append("improper_pair")
+
+            read_seq = read.query_sequence or ""
+            poly_run, poly_frac, poly_base, poly_side = _poly_at_breakpoint_proximal_stats(
+                read_seq,
+                window_bases=poly_tail_rescue_window_bases,
+            )
+            has_structural_context = (
+                read.mate_is_unmapped
+                or (read.reference_id != read.next_reference_id)
+                or (abs_tlen >= max(1, int(poly_tail_rescue_min_abs_tlen)))
+                or (read.is_reverse == read.mate_is_reverse)
+                or (not read.is_proper_pair)
+            )
+            poly_tail_anchor_rescued = (
+                poly_run >= max(1, int(discordant_poly_tail_rescue_min_run))
+                and poly_frac >= float(discordant_poly_tail_rescue_min_frac)
+                and has_structural_context
+            )
+            if poly_tail_anchor_rescued:
+                reasons.append("poly_tail_anchor_rescue")
+
+            # Keep candidates that already have a reason, or that may gain
+            # large_insert after the insert-size quantile is known (>= floor).
+            if not reasons and abs_tlen < int(min_abs_tlen):
+                continue
+
+            soft_clip_side, soft_clip_len, soft_clip_pos, soft_clip_seq = _longest_soft_clip_from_read(
+                read
+            )
+            pending_disc.append(
+                {
+                    "sample": sample_name,
+                    "chrom": bam.get_reference_name(read.reference_id),
+                    "pos": int(read.reference_start) + 1 if read.reference_start is not None else 0,
+                    "ref_end": int(read.reference_end)
+                    if read.reference_end is not None
+                    else (
+                        int(read.reference_start) + 1 if read.reference_start is not None else 0
+                    ),
+                    "soft_clip_side": soft_clip_side,
+                    "soft_clip_len": int(soft_clip_len),
+                    "soft_clip_pos": int(soft_clip_pos),
+                    "soft_clip_seq": soft_clip_seq,
+                    "mate_chrom": mate_chrom,
+                    "mate_pos": mate_pos_1based,
+                    "mapq": int(read.mapping_quality),
+                    "template_len": int(read.template_length),
+                    "abs_tlen": int(abs_tlen),
+                    "is_reverse": bool(read.is_reverse),
+                    "mate_is_reverse": bool(read.mate_is_reverse),
+                    "is_proper_pair": bool(read.is_proper_pair),
+                    "is_read1": bool(read.is_read1),
+                    "read_name": read.query_name,
+                    "reasons": reasons,
+                    "nm": int(read.get_tag("NM")) if read.has_tag("NM") else -1,
+                    "read_seq": read_seq,
+                    "anchor_poly_at_run": int(poly_run),
+                    "anchor_poly_at_fraction": float(poly_frac),
+                    "anchor_poly_base": poly_base,
+                    "anchor_poly_side": poly_side,
+                    "poly_tail_anchor_rescued": bool(poly_tail_anchor_rescued),
+                }
+            )
+
+        insert_threshold = _insert_threshold_from_sizes(
+            insert_sizes, quantile=insert_quantile, fallback_threshold=min_abs_tlen
+        )
+        disc_rows: list[dict[str, Any]] = []
+        weak_only_filtered_rows = 0
+        mate_seq_fetched_rows = 0
+        mate_seq_missing_interchrom_rows = 0
+        for pending in pending_disc:
+            reasons = list(pending["reasons"])
+            if pending["abs_tlen"] >= insert_threshold and pending["mate_chrom"] != "*":
+                # Match two-pass: large_insert only for same-chrom mapped mates.
+                if "mate_unmapped" not in reasons and "interchrom" not in reasons:
+                    reasons.append("large_insert")
+            if not reasons:
+                continue
+            if require_strong_discordant_reason and not any(
+                r in _STRONG_DISCORDANT_REASONS for r in reasons
+            ):
+                weak_only_filtered_rows += 1
+                continue
+
+            mate_seq = ""
+            mate_ref_start = 0
+            mate_ref_end = 0
+            mate_soft_clip_side = ""
+            mate_soft_clip_len = 0
+            mate_soft_clip_seq = ""
+            if fetch_mate_seq and mate_bam is not None:
+                (
+                    mate_seq,
+                    mate_ref_start,
+                    mate_ref_end,
+                    mate_soft_clip_side,
+                    mate_soft_clip_len,
+                    mate_soft_clip_seq,
+                ) = _fetch_mate_sequence_from_bam(
+                    mate_bam,
+                    str(pending["read_name"]),
+                    str(pending["mate_chrom"]),
+                    int(pending["mate_pos"]),
+                    fetch_window_bp=mate_fetch_window_bp,
+                )
+                if mate_seq:
+                    mate_seq_fetched_rows += 1
+                elif "interchrom" in reasons:
+                    mate_seq_missing_interchrom_rows += 1
+
+            disc_rows.append(
+                {
+                    "sample": pending["sample"],
+                    "chrom": pending["chrom"],
+                    "pos": pending["pos"],
+                    "ref_end": pending["ref_end"],
+                    "soft_clip_side": pending["soft_clip_side"],
+                    "soft_clip_len": pending["soft_clip_len"],
+                    "soft_clip_pos": pending["soft_clip_pos"],
+                    "soft_clip_seq": pending["soft_clip_seq"],
+                    "mate_chrom": pending["mate_chrom"],
+                    "mate_pos": pending["mate_pos"],
+                    "mate_seq": mate_seq,
+                    "mate_ref_start": int(mate_ref_start),
+                    "mate_ref_end": int(mate_ref_end),
+                    "mate_soft_clip_side": mate_soft_clip_side,
+                    "mate_soft_clip_len": int(mate_soft_clip_len),
+                    "mate_soft_clip_seq": mate_soft_clip_seq,
+                    "mapq": pending["mapq"],
+                    "template_len": pending["template_len"],
+                    "is_reverse": pending["is_reverse"],
+                    "mate_is_reverse": pending["mate_is_reverse"],
+                    "is_proper_pair": pending["is_proper_pair"],
+                    "is_read1": pending["is_read1"],
+                    "read_name": pending["read_name"],
+                    "discordant_reasons": ",".join(sorted(set(reasons))),
+                    "nm": pending["nm"],
+                    "read_seq": pending["read_seq"],
+                    "anchor_poly_at_run": pending["anchor_poly_at_run"],
+                    "anchor_poly_at_fraction": pending["anchor_poly_at_fraction"],
+                    "anchor_poly_base": pending["anchor_poly_base"],
+                    "anchor_poly_side": pending["anchor_poly_side"],
+                    "poly_tail_anchor_rescued": pending["poly_tail_anchor_rescued"],
+                }
+            )
+
+    split_df = _write_split_table(split_rows, outdir, sample_name)
+    disc_df = _write_discordant_table(disc_rows, outdir, sample_name)
+    if not disc_df.empty and mate_seq_missing_interchrom_rows > 0:
+        interchrom_total = int(
+            disc_df["discordant_reasons"].fillna("").astype(str).str.contains("interchrom").sum()
+        )
+        missing_frac = mate_seq_missing_interchrom_rows / max(interchrom_total, 1)
+        click.echo(
+            f"[extract-discordant] sample={sample_name} interchrom_rows={interchrom_total} "
+            f"mate_seq_missing={mate_seq_missing_interchrom_rows} ({missing_frac:.1%}); "
+            "MEI_MAPPED discordant support may be undercounted."
+        )
+
+    split_summary = ExtractionSummary(
+        sample=sample_name,
+        total_reads_scanned=total_reads_scanned,
+        passing_reads=split_passing,
+        split_evidence_rows=len(split_df),
+    )
+    disc_summary = ExtractionSummary(
+        sample=sample_name,
+        total_reads_scanned=total_reads_scanned,
+        passing_reads=disc_passing,
+        split_evidence_rows=0,
+        discordant_evidence_rows=len(disc_df),
+        insert_size_threshold=insert_threshold,
+        weak_only_discordant_filtered_rows=weak_only_filtered_rows,
+        mate_seq_fetched_rows=mate_seq_fetched_rows,
+        mate_seq_missing_interchrom_rows=mate_seq_missing_interchrom_rows,
+    )
+    return split_summary, disc_summary
