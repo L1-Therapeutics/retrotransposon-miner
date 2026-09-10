@@ -11,6 +11,7 @@ import pandas as pd
 import pysam
 
 from ._utils import _longest_poly_at_span, _poly_at_stats
+from .bam_io import open_alignment
 
 
 @dataclass
@@ -182,7 +183,7 @@ def extract_split_evidence(
     passing_reads = 0
     region_list = _normalize_regions(regions)
 
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+    with open_alignment(bam_path) as bam:
         # Fetch explicit regions to support targeted chromosome subsets.
         for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
@@ -277,7 +278,7 @@ def _validate_mate_fetch_bam(
 
     scan_chroms = {region.split(":", 1)[0] for region in regions}
     try:
-        with pysam.AlignmentFile(str(scan_bam_path), "rb") as bam:
+        with open_alignment(scan_bam_path) as bam:
             stats = bam.get_index_statistics()
             if not stats:
                 return
@@ -306,7 +307,7 @@ def _estimate_insert_size_threshold(
 ) -> int:
     insert_sizes: list[int] = []
     region_list = _normalize_regions(regions)
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+    with open_alignment(bam_path) as bam:
         for read in _iter_reads_for_regions(bam, region_list):
             if not read.is_paired or not read.is_read1:
                 continue
@@ -369,9 +370,9 @@ def extract_discordant_evidence(
     # Mate BAM is only opened when fetch_mate_seq is enabled. Annotate can re-fetch
     # mates for candidate loci later; skipping here is the main extract speedup.
     mate_bam_ctx = (
-        pysam.AlignmentFile(str(mate_bam_resolved), "rb") if fetch_mate_seq else nullcontext(None)
+        open_alignment(mate_bam_resolved) if fetch_mate_seq else nullcontext(None)
     )
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam, mate_bam_ctx as mate_bam:
+    with open_alignment(bam_path) as bam, mate_bam_ctx as mate_bam:
         for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
 
@@ -795,9 +796,9 @@ def extract_split_and_discordant_evidence(
     disc_passing = 0
 
     mate_bam_ctx = (
-        pysam.AlignmentFile(str(mate_bam_resolved), "rb") if fetch_mate_seq else nullcontext(None)
+        open_alignment(mate_bam_resolved) if fetch_mate_seq else nullcontext(None)
     )
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam, mate_bam_ctx as mate_bam:
+    with open_alignment(bam_path) as bam, mate_bam_ctx as mate_bam:
         for read in _iter_reads_for_regions(bam, region_list):
             total_reads_scanned += 1
             qc_skip = bool(

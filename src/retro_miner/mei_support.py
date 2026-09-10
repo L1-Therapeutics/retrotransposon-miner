@@ -25,6 +25,7 @@ from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
+from retro_miner.bam_io import open_alignment
 from retro_miner.evidence_extract import _longest_soft_clip_from_read, _soft_clip_query_seq
 
 
@@ -1590,7 +1591,7 @@ def _fetch_discordant_mate_sequences(
         windows.append((mate_chrom, start0, start0 + _MATE_FETCH_QUERY_BP, qname))
 
     fetch_impl = _fetch_mates_swept if fetch_fn is None else fetch_fn
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+    with open_alignment(bam_path) as bam:
         fetched = fetch_impl(bam, windows)
 
     return _merge_fetched_mate_sequences(out, fetched)
@@ -3249,7 +3250,7 @@ def _enrich_split_hits_with_mate_positions(
         return out
 
     fetched: dict[str, tuple[str, int]] = {}
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+    with open_alignment(bam_path) as bam:
         for rec in need_fetch.itertuples(index=False):
             qname = str(rec.read_name)
             if qname in fetched:
@@ -4650,7 +4651,7 @@ def _collect_indel_breakpoint_evidence(
             span_by_chrom[chrom] = (min(lo, start), max(hi, end))
 
     rows: list[dict[str, object]] = []
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+    with open_alignment(bam_path) as bam:
         for chrom, tree in trees.items():
             lo, hi = span_by_chrom[chrom]
             fetch_start0 = max(0, int(lo) - 1)
@@ -10433,8 +10434,8 @@ def _annotate_bam_depth_for_consistent_loci(
         f"[mei-annotate] empirical stage: exclusion mask prep elapsed={time.monotonic() - prep_t0:.1f}s"
     )
 
-    with pysam.AlignmentFile(str(disease_bam_path), "rb") as disease_bam, pysam.AlignmentFile(
-        str(control_bam_path), "rb"
+    with open_alignment(disease_bam_path) as disease_bam, open_alignment(
+        control_bam_path
     ) as control_bam:
         total_loci = int(len(idxs))
         loci_progress_every = 100

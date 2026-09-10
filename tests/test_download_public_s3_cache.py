@@ -93,6 +93,52 @@ def test_http_index_sidecar_urls(dl) -> None:
     assert dl._sidecar_url(bam) == "https://example.com/foo.bai"
 
 
+def test_s3_uri_from_url_virtual_host_and_path(dl) -> None:
+    cram = "https://1000genomes.s3.amazonaws.com/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram"
+    assert dl.s3_uri_from_url(cram) == (
+        "s3://1000genomes/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram"
+    )
+    assert dl.s3_uri_from_url(
+        "https://s3.amazonaws.com/1000genomes/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram.crai"
+    ) == "s3://1000genomes/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram.crai"
+    assert dl.s3_uri_from_url(
+        "https://1000genomes.s3.us-east-1.amazonaws.com/foo/bar.cram"
+    ) == "s3://1000genomes/foo/bar.cram"
+    assert dl.s3_uri_from_url("s3://1000genomes/foo/bar.cram") == "s3://1000genomes/foo/bar.cram"
+    assert dl.s3_uri_from_url("https://ftp-trace.ncbi.nlm.nih.gov/foo.bam") is None
+
+
+def test_mirror_prefers_s3_copy_for_s3_hosted_http(dl, monkeypatch: pytest.MonkeyPatch) -> None:
+    copies: list[tuple[str, str]] = []
+    streams: list[str] = []
+    ds = dl.Dataset(
+        dataset_id="hg00100_shortread_highcov_cram",
+        category="test_bam",
+        description="",
+        source="1000 Genomes",
+        url="https://1000genomes.s3.amazonaws.com/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram",
+        target_path="test_data/1kg_hg00100/chr22/hg00100.shortread.chr22.hg38.bam",
+    )
+    monkeypatch.setattr(dl, "_s3_head_size", lambda _uri: None)
+    monkeypatch.setattr(
+        dl,
+        "_s3_copy",
+        lambda src, dst: copies.append((src, dst))
+        or {"status": "s3_copied", "src": src, "s3": dst, "bytes": 1, "seconds": 0.1},
+    )
+    monkeypatch.setattr(
+        dl,
+        "_http_stream_to_s3",
+        lambda url, dest: streams.append(url) or {"status": "streamed_to_s3", "url": url, "s3": dest},
+    )
+    result = dl._mirror_full_alignment_to_s3(ds, "s3://l1tx-data/public", force=False)
+    assert streams == []
+    assert copies[0][0] == (
+        "s3://1000genomes/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram"
+    )
+    assert result["status"] == "s3_copied"
+
+
 def test_s3_copy_uses_shared_high_concurrency_helper(dl, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(dl, "copy_s3_uri", lambda src, dst: calls.append((src, dst)))
