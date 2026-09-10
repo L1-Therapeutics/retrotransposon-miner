@@ -151,6 +151,30 @@ def _distance_to_closed_interval(pos: int, start: int, end: int) -> int:
     return 0
 
 
+def _closed_interval_gap_bp(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
+    """Gap between two closed intervals. 0 if they overlap or touch."""
+    if a_end < b_start:
+        return int(b_start - a_end)
+    if b_end < a_start:
+        return int(a_start - b_end)
+    return 0
+
+
+def _optional_core(row: object, start_attr: str = "core_start", end_attr: str = "core_end") -> tuple[int, int] | None:
+    start = getattr(row, start_attr, 0)
+    end = getattr(row, end_attr, 0)
+    try:
+        start_i = int(start)
+        end_i = int(end)
+    except (TypeError, ValueError):
+        return None
+    if start_i <= 0 or end_i <= 0:
+        return None
+    if end_i < start_i:
+        start_i, end_i = end_i, start_i
+    return (start_i, end_i)
+
+
 def _build_loci_from_evidence(
     split_disease: pd.DataFrame,
     split_control: pd.DataFrame,
@@ -186,6 +210,8 @@ def _build_loci_from_evidence(
                         "positions": list(cluster),
                         "min_pos": int(cluster[0]),
                         "max_pos": int(cluster[-1]),
+                        "core_start": int(cluster[0]),
+                        "core_end": int(cluster[-1]),
                         "seeded_by_split": True,
                     }
                 )
@@ -243,6 +269,8 @@ def _build_loci_from_evidence(
                     "positions": list(cluster),
                     "min_pos": int(cluster[0]),
                     "max_pos": int(cluster[-1]),
+                    "core_start": 0,
+                    "core_end": 0,
                     "seeded_by_split": False,
                 }
             )
@@ -257,16 +285,28 @@ def _build_loci_from_evidence(
                 max_locus_span_bp=int(max_locus_span_bp),
             )
             flank = int(split_cluster_bp) if bool(locus["seeded_by_split"]) else int(discordant_cluster_bp)
+            core_start = int(locus.get("core_start", 0) or 0)
+            core_end = int(locus.get("core_end", 0) or 0)
             for seg in segments:
                 if not seg:
                     continue
                 seg_start = int(min(seg))
                 seg_end = int(max(seg))
+                # Keep the split-only core when this segment still covers it.
+                # DPE-only fragments after a valley split have no split core.
+                has_core = (
+                    bool(locus["seeded_by_split"])
+                    and core_start > 0
+                    and core_end > 0
+                    and _closed_interval_gap_bp(seg_start, seg_end, core_start, core_end) == 0
+                )
                 rows.append(
                     {
                         "chrom": chrom,
                         "window_start": max(1, seg_start - flank),
                         "window_end": seg_end + flank,
+                        "core_start": core_start if has_core else 0,
+                        "core_end": core_end if has_core else 0,
                     }
                 )
 
@@ -275,7 +315,11 @@ def _build_loci_from_evidence(
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
     out = pd.DataFrame(rows).drop_duplicates()
-    out = _merge_overlapping_loci(out, max_locus_span_bp=int(max_locus_span_bp))
+    out = _merge_overlapping_loci(
+        out,
+        max_locus_span_bp=int(max_locus_span_bp),
+        split_cluster_bp=int(split_cluster_bp),
+    )
     out = out.sort_values(["chrom", "window_start", "window_end"], kind="mergesort").reset_index(drop=True)
     _progress(f"built {len(out)} candidate loci from {len(split_all)} split and {len(discordant_all)} discordant rows")
     return out
@@ -285,6 +329,7 @@ def _merge_overlapping_loci(
     loci: pd.DataFrame,
     *,
     max_locus_span_bp: int,
+    split_cluster_bp: int = 100,
 ) -> pd.DataFrame:
     """Collapse overlapping discovery windows on the same chromosome.
 
@@ -294,6 +339,11 @@ def _merge_overlapping_loci(
     endpoint are merged; non-overlapping neighbors stay separate. Merges that
     would exceed ``max_locus_span_bp`` are skipped so long discordant chains
     are not glued into mega-loci.
+
+    When both windows carry split-only cores farther apart than
+    ``split_cluster_bp``, refuse the merge even if DPE-expanded windows
+    overlap and the span is under the cap. Discordant-only windows (no
+    cores) still merge on overlap.
     """
     if loci is None or loci.empty:
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
@@ -302,35 +352,68 @@ def _merge_overlapping_loci(
         return loci.copy()
 
     max_span = max(1, int(max_locus_span_bp))
+    max_core_gap = max(0, int(split_cluster_bp))
+    keep_cores = "core_start" in loci.columns and "core_end" in loci.columns
     merged_rows: list[dict[str, object]] = []
     n_in = len(loci)
+
+    def _flush(chrom: object, start: int, end: int, core: tuple[int, int] | None) -> None:
+        row: dict[str, object] = {
+            "chrom": chrom,
+            "window_start": int(start),
+            "window_end": int(end),
+        }
+        if keep_cores:
+            row["core_start"] = int(core[0]) if core is not None else 0
+            row["core_end"] = int(core[1]) if core is not None else 0
+        merged_rows.append(row)
+
+    def _union_core(
+        left: tuple[int, int] | None,
+        right: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return (min(left[0], right[0]), max(left[1], right[1]))
+
     for chrom, grp in loci.groupby("chrom", sort=False):
         intervals = sorted(
-            (int(r.window_start), int(r.window_end))
+            (
+                int(r.window_start),
+                int(r.window_end),
+                _optional_core(r) if keep_cores else None,
+            )
             for r in grp.itertuples(index=False)
         )
         if not intervals:
             continue
-        cur_start, cur_end = intervals[0]
-        for start, end in intervals[1:]:
+        cur_start, cur_end, cur_core = intervals[0]
+        for start, end, core in intervals[1:]:
             # Merge when intervals overlap OR share exactly one endpoint
             # (start <= cur_end).  Touching windows are intentionally collapsed
             # per the docstring; non-overlapping neighbors stay separate.
             if start <= cur_end:
                 new_end = max(cur_end, end)
-                if (new_end - cur_start + 1) <= max_span:
+                cores_too_far = (
+                    cur_core is not None
+                    and core is not None
+                    and _closed_interval_gap_bp(cur_core[0], cur_core[1], core[0], core[1])
+                    > max_core_gap
+                )
+                if (new_end - cur_start + 1) <= max_span and not cores_too_far:
                     cur_end = new_end
+                    cur_core = _union_core(cur_core, core)
                     continue
-                # Would exceed span cap: keep current, start a new interval.
-            merged_rows.append(
-                {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
-            )
-            cur_start, cur_end = start, end
-        merged_rows.append(
-            {"chrom": chrom, "window_start": int(cur_start), "window_end": int(cur_end)}
-        )
+                # Span cap or distant split cores: keep current, start a new interval.
+            _flush(chrom, cur_start, cur_end, cur_core)
+            cur_start, cur_end, cur_core = start, end, core
+        _flush(chrom, cur_start, cur_end, cur_core)
 
     out = pd.DataFrame(merged_rows).drop_duplicates()
+    if keep_cores and not out.empty:
+        out = out.drop(columns=["core_start", "core_end"])
     if len(out) < n_in:
         _progress(f"merged overlapping loci: {n_in} -> {len(out)}")
     return out
