@@ -6,6 +6,11 @@ INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-r6i.4xlarge}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
+# gp3 throughput/IOPS are independently provisioned, but AWS requires
+# throughput (MB/s) <= 0.25 * IOPS. 1000 MB/s therefore needs >= 4000 IOPS.
+# Default 125 MB/s is the WGS stage bottleneck on r6i.4xlarge (EBS max 1250).
+ROOT_VOLUME_IOPS="${ROOT_VOLUME_IOPS:-4000}"
+ROOT_VOLUME_THROUGHPUT_MB="${ROOT_VOLUME_THROUGHPUT_MB:-1000}"
 S3_BUCKET="${S3_BUCKET:-}"
 S3_CACHE_PREFIX="${S3_CACHE_PREFIX:-}"
 IAM_INSTANCE_PROFILE="${IAM_INSTANCE_PROFILE:-ec2-retrotransposon-s3-profile}"
@@ -655,7 +660,7 @@ create_instance() {
     --key-name "${KEY_BASENAME}"
     --subnet-id "${subnet}"
     --security-group-ids "${sg_id}"
-    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${ROOT_VOLUME_GB},VolumeType=gp3,DeleteOnTermination=true}"
+    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${ROOT_VOLUME_GB},VolumeType=gp3,Iops=${ROOT_VOLUME_IOPS},Throughput=${ROOT_VOLUME_THROUGHPUT_MB},DeleteOnTermination=true}"
     --tag-specifications "ResourceType=instance,Tags=${tags}"
     --count 1
     --query "Instances[0].InstanceId"
@@ -1049,6 +1054,7 @@ Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
   INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default 200)
+  ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
   S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
   S3_CACHE_PREFIX (default: s3://<bucket>/public)
   IAM_INSTANCE_PROFILE, IAM_ROLE_NAME

@@ -6,15 +6,23 @@ string/sequence functions that sit below the BAM-scanning layer.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pandas as pd
 import pytest
 
 from retro_miner.evidence_extract import (
+    _DISCORDANT_DEDUP_KEYS,
+    _SPLIT_DEDUP_KEYS,
     _clip_to_poly_at_region,
+    _drop_duplicate_evidence_rows,
     _longest_poly_at_span,
     _normalize_regions,
     _poly_at_breakpoint_proximal_stats,
     _poly_at_stats,
     _soft_clip_query_seq,
+    _write_discordant_table,
+    _write_split_table,
 )
 
 
@@ -222,3 +230,73 @@ def test_poly_at_bp_proximal_both_windows_equal_left_wins() -> None:
     seq = "A" * 5 + "GCGC" + "A" * 5
     run, frac, base, side = _poly_at_breakpoint_proximal_stats(seq, window_bases=5)
     assert side == "L"  # tie broken by left-first '>=' comparison
+
+
+def test_drop_duplicate_discordant_rows_keeps_first() -> None:
+    row = {
+        "read_name": "q1",
+        "chrom": "chr22",
+        "pos": 100,
+        "is_read1": False,
+        "mate_chrom": "chr1",
+        "mate_pos": 5000,
+        "is_reverse": True,
+        "mate_is_reverse": True,
+        "is_proper_pair": False,
+        "mapq": 60,
+    }
+    df = _drop_duplicate_evidence_rows(pd.DataFrame([row, dict(row), dict(row, mapq=1)]), _DISCORDANT_DEDUP_KEYS)
+    assert len(df) == 1
+    assert int(df.iloc[0]["mapq"]) == 60
+
+
+def test_write_discordant_table_drops_exact_duplicate_rows(tmp_path: Path) -> None:
+    row = {
+        "sample": "s",
+        "chrom": "chr22",
+        "pos": 100,
+        "is_read1": False,
+        "mate_chrom": "chr1",
+        "mate_pos": 5000,
+        "is_reverse": True,
+        "mate_is_reverse": True,
+        "is_proper_pair": False,
+        "read_name": "q1",
+        "discordant_reasons": "interchrom,improper_pair",
+    }
+    df = _write_discordant_table([row, row], tmp_path, "s")
+    assert len(df) == 1
+    written = pd.read_csv(tmp_path / "discordant_evidence.s.tsv", sep="\t")
+    assert len(written) == 1
+
+
+def test_write_split_table_drops_exact_duplicate_rows(tmp_path: Path) -> None:
+    row = {
+        "sample": "s",
+        "chrom": "chr22",
+        "pos": 100,
+        "clip_side": "L",
+        "mate_chrom": "chr1",
+        "mate_pos": 5000,
+        "is_reverse": False,
+        "read_name": "q1",
+        "clip_len": 25,
+    }
+    other = dict(row, clip_side="R")
+    df = _write_split_table([row, row, other], tmp_path, "s")
+    assert len(df) == 2
+    assert set(df["clip_side"]) == {"L", "R"}
+
+
+def test_drop_duplicate_split_rows_keeps_distinct_clip_sides() -> None:
+    left = {
+        "read_name": "q1",
+        "chrom": "chr22",
+        "pos": 100,
+        "clip_side": "L",
+        "mate_chrom": "chr1",
+        "mate_pos": 5000,
+        "is_reverse": False,
+    }
+    df = _drop_duplicate_evidence_rows(pd.DataFrame([left, left, dict(left, clip_side="R")]), _SPLIT_DEDUP_KEYS)
+    assert len(df) == 2

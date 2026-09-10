@@ -212,6 +212,7 @@ Optional environment variables:
 - `KEY_NAME` / `KEY_OWNER` — override the per-user EC2 key pair name (default: `retrotransposon-miner-<region>-<iam-user>`)
 - `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r6i.4xlarge`)
 - `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)
+- `ROOT_VOLUME_IOPS` / `ROOT_VOLUME_THROUGHPUT_MB` — gp3 IOPS and MB/s for `bootstrap` only (default: `4000` / `1000`). AWS requires throughput ≤ 0.25 × IOPS; 1000 MB/s needs at least 4000 IOPS. The gp3 baseline (3000 / 125) is the usual WGS stage bottleneck.
 - `S3_BUCKET` — bucket the instance may read/write (example: `s3://<your-bucket>`); creates/reuses an instance profile, does not copy local keys
 - `S3_CACHE_PREFIX` — object prefix for public-data cache (default: `s3://<bucket>/public`)
 - `IAM_INSTANCE_PROFILE` / `IAM_ROLE_NAME` — override the default `ec2-retrotransposon-s3-profile` / `ec2-retrotransposon-s3-role`
@@ -431,6 +432,10 @@ python3 scripts/download_public_data.py \
 Chromosome slices pull a local `.bai` (from S3 or the NCBI sidecar) and use `samtools view -X` for the region plus discordant-mate windows. They do not stream the whole BAM with `samtools view -N`.
 
 `--test-bam-mode full` never writes the ~200 GiB BAMs to local disk. Add `--slice-after-full` only when you also want a local `--test-bam-chrom` slice.
+
+S3 copies (cache sync, BAM/BAI staging, S3→S3) use 64 concurrent 64 MiB multipart parts instead of the AWS CLI 10×8 MiB default. Turn concurrency down with `RTM_S3_MAX_CONCURRENCY` (process-local AWS config; `~/.aws/config` is not rewritten). Staging a WGS pair to EBS still needs volume throughput: `bootstrap` gp3 defaults to 1000 MB/s (4000 IOPS). The 125 MB/s gp3 baseline will hold a 200 GiB pair at ~25 min even with the fast copier.
+
+The candidate pipeline **does** stage remote (`s3://` or `http(s)://`) disease/control BAMs to `${RTM_WORKDIR}/data/bam_stage` when the run is multiple chromosomes, `--chr all`, or `--chr_concurrency > 1`. It skips the copy when the local file already matches the remote size, and refuses to start if free disk is below BAM size plus headroom. Single-chromosome runs keep streaming. Override the dest with `--bam-stage-dir` / `RTM_BAM_STAGE_DIR`, or disable with `--no-bam-stage` / `RTM_BAM_STAGE=0`.
 
 hs1:
 

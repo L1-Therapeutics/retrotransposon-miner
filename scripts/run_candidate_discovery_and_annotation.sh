@@ -8,6 +8,10 @@ set -euo pipefail
 #
 # This wrapper runs the same commands used in interactive development so the
 # workflow can be reproduced with one command.
+#
+# Remote BAMs (s3:// or http(s)://) are staged locally for multi-chrom /
+# --chr all / --chr_concurrency>1 runs. Single-chrom keeps streaming.
+# --bam-stage-dir / RTM_BAM_STAGE_DIR, --no-bam-stage / RTM_BAM_STAGE=0.
 
 RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
 RTM_PUBLIC_DATA_DIR="${RTM_PUBLIC_DATA_DIR:-${RTM_WORKDIR}/data/public}"
@@ -42,6 +46,11 @@ BWA_THREADS_EXPLICIT="0"
 CHR_ALL_MODE="0"
 # Default resume-safe behavior: skip chromosomes already complete in this outdir.
 SKIP_COMPLETE_EXISTING="1"
+# Multi-chrom / --chr all / chr_concurrency>1 copies remote (s3://, http(s)://)
+# BAMs to local disk. Single-chrom keeps streaming. Disable: --no-bam-stage
+# or RTM_BAM_STAGE=0. Override dest: --bam-stage-dir / RTM_BAM_STAGE_DIR.
+BAM_STAGE_DIR="${RTM_BAM_STAGE_DIR:-}"
+BAM_STAGE_ENABLED="${RTM_BAM_STAGE:-1}"
 WINDOW_SIZE="200"
 G1K_SPLIT_PADDING_BP="200"
 G1K_DPE_PADDING_MIN_BP="200"
@@ -68,6 +77,23 @@ JUNK_MERGED_BED="${JUNK_MERGED_BED:-}"
 
 now_epoch() {
   date +%s
+}
+
+is_remote_alignment() {
+  local p="${1:-}"
+  case "${p}" in
+    s3://*|http://*|https://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+bam_stage_is_enabled() {
+  local raw
+  raw="$(printf '%s' "${BAM_STAGE_ENABLED}" | tr '[:upper:]' '[:lower:]')"
+  case "${raw}" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 normalize_chr_token() {
@@ -335,6 +361,18 @@ while [[ $# -gt 0 ]]; do
       RUN_IN_ENV="1"
       shift 1
       ;;
+    --bam-stage-dir|--bam_stage_dir)
+      BAM_STAGE_DIR="$2"
+      shift 2
+      ;;
+    --no-bam-stage|--no_bam_stage)
+      BAM_STAGE_ENABLED="0"
+      shift 1
+      ;;
+    --bam-stage|--bam_stage)
+      BAM_STAGE_ENABLED="1"
+      shift 1
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -386,7 +424,16 @@ for required in "${DISEASE_BAM}" "${CONTROL_BAM}" "${MEI_FASTA}"; do
   fi
 done
 
-for f in "${DISEASE_BAM}" "${CONTROL_BAM}" "${MEI_FASTA}" "${SEG_DUP_BED}" "${MAPPABILITY_BEDGRAPH}" "${GAP_BED}" "${BLACKLIST_BED}"; do
+for f in "${DISEASE_BAM}" "${CONTROL_BAM}"; do
+  if is_remote_alignment "${f}"; then
+    continue
+  fi
+  if [[ ! -f "${f}" ]]; then
+    echo "ERROR: required file not found: ${f}" >&2
+    exit 1
+  fi
+done
+for f in "${MEI_FASTA}" "${SEG_DUP_BED}" "${MAPPABILITY_BEDGRAPH}" "${GAP_BED}" "${BLACKLIST_BED}"; do
   if [[ ! -f "${f}" ]]; then
     echo "ERROR: required file not found: ${f}" >&2
     exit 1
@@ -444,6 +491,69 @@ run_cli() {
   else
     PYTHONPATH=src "${PYTHON_BIN}" -m retro_miner.cli "${cmd[@]}"
   fi
+}
+
+run_python_module() {
+  local mod="$1"
+  shift
+  if [[ "${RUN_IN_ENV}" == "1" ]]; then
+    micromamba run -n rtm-miner env PYTHONPATH=src "${PYTHON_BIN}" -m "${mod}" "$@"
+  else
+    PYTHONPATH=src "${PYTHON_BIN}" -m "${mod}" "$@"
+  fi
+}
+
+require_alignment_readable() {
+  local label="$1"
+  local f="$2"
+  if [[ -z "${f}" ]]; then
+    return 0
+  fi
+  if is_remote_alignment "${f}"; then
+    echo "[candidate-pipeline] ${label} is remote and unstaged (single-chrom stream): ${f}"
+    return 0
+  fi
+  if [[ ! -f "${f}" ]]; then
+    echo "ERROR: ${label} not found: ${f}" >&2
+    exit 1
+  fi
+}
+
+stage_remote_bams_if_needed() {
+  local envf="${OUTDIR}/.rtm_bam_stage.env"
+  local extra=()
+  if [[ -z "${BAM_STAGE_DIR}" ]]; then
+    BAM_STAGE_DIR="${RTM_WORKDIR}/data/bam_stage"
+  fi
+  mkdir -p "${OUTDIR}"
+  if ! bam_stage_is_enabled; then
+    extra+=(--disabled)
+  fi
+  if [[ "${CHR_ALL_MODE}" == "1" ]]; then
+    extra+=(--chr-all)
+  fi
+  if [[ -n "${DISEASE_MATE_BAM}" ]]; then
+    extra+=(--disease-mate-bam "${DISEASE_MATE_BAM}")
+  fi
+  if [[ -n "${CONTROL_MATE_BAM}" ]]; then
+    extra+=(--control-mate-bam "${CONTROL_MATE_BAM}")
+  fi
+  echo "[candidate-pipeline] bam-stage dir=${BAM_STAGE_DIR} enabled=$(bam_stage_is_enabled && echo 1 || echo 0) chr_count=${ORIG_CHR_COUNT} chr_concurrency=${CHR_CONCURRENCY}"
+  run_python_module retro_miner.bam_stage \
+    --disease-bam "${DISEASE_BAM}" \
+    --control-bam "${CONTROL_BAM}" \
+    --stage-dir "${BAM_STAGE_DIR}" \
+    --chr-count "${ORIG_CHR_COUNT}" \
+    --chr-concurrency "${CHR_CONCURRENCY}" \
+    --out-env "${envf}" \
+    --apply \
+    "${extra[@]}"
+  # shellcheck disable=SC1090
+  source "${envf}"
+  require_alignment_readable "disease BAM" "${DISEASE_BAM}"
+  require_alignment_readable "control BAM" "${CONTROL_BAM}"
+  require_alignment_readable "disease mate BAM" "${DISEASE_MATE_BAM}"
+  require_alignment_readable "control mate BAM" "${CONTROL_MATE_BAM}"
 }
 
 consolidate_all_chrom_outputs() {
@@ -686,6 +796,10 @@ if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
   echo "ERROR: resolved empty chromosome list from --chr '${CHR_ARG}'." >&2
   exit 1
 fi
+ORIG_CHR_COUNT="${#CHR_LIST[@]}"
+if [[ -n "${CHR_ARG}" ]] && [[ "$(printf '%s' "${CHR_ARG}" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
+  CHR_ALL_MODE="1"
+fi
 
 # Resolve bwa threads once chrom plan is known (CLI --bwa-threads overrides auto).
 if [[ "${BWA_THREADS_EXPLICIT}" == "1" ]]; then
@@ -726,15 +840,13 @@ if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; th
   fi
 fi
 
-if [[ -n "${CHR_ARG}" ]] && [[ "$(printf '%s' "${CHR_ARG}" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
-  CHR_ALL_MODE="1"
-fi
-
 if [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${LOCAL_ASSEMBLY}" == "1" ]] && [[ "${CHR_CONCURRENCY}" -gt 1 ]]; then
   echo "ERROR: --chr_concurrency > 1 is not allowed when local assembly is enabled." >&2
   echo "Use --chr_concurrency 1 or add --no-local-assembly." >&2
   exit 1
 fi
+
+stage_remote_bams_if_needed
 
 if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   REGION="${CHR_LIST[0]}"

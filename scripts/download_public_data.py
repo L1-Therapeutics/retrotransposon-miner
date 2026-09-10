@@ -23,6 +23,11 @@ from typing import Any
 
 import yaml
 
+_SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+from retro_miner.s3_transfer import copy_s3_uri, download_s3_uri, process_local_aws_config
+
 
 @dataclass
 class Dataset:
@@ -215,20 +220,22 @@ def _s3_sync(src: str, dst: str) -> dict[str, Any]:
             "aws CLI is required for --s3-cache-prefix / RTM_S3_CACHE. "
             "On EC2, attach an instance profile (S3_BUCKET=s3://...) instead of copying local AWS keys."
         )
-    _run_cmd(
-        [
-            "aws",
-            "s3",
-            "sync",
-            src,
-            dst,
-            "--exclude",
-            "test_data/full/*",
-            "--exclude",
-            "*/test_data/full/*",
-        ],
-        required=True,
-    )
+    with process_local_aws_config() as aws_env:
+        _run_cmd(
+            [
+                "aws",
+                "s3",
+                "sync",
+                src,
+                dst,
+                "--exclude",
+                "test_data/full/*",
+                "--exclude",
+                "*/test_data/full/*",
+            ],
+            required=True,
+            env=aws_env,
+        )
     return {"src": src, "dst": dst, "status": "synced"}
 
 
@@ -309,9 +316,8 @@ def _http_content_length(url: str, timeout_sec: int = 60) -> int | None:
 
 
 def _s3_copy(src_uri: str, dst_uri: str) -> dict[str, Any]:
-    _require_aws_cli()
     started = time.time()
-    _run_cmd(["aws", "s3", "cp", src_uri, dst_uri], required=True)
+    copy_s3_uri(src_uri, dst_uri)
     return {
         "status": "s3_copied",
         "src": src_uri,
@@ -337,13 +343,21 @@ def _http_stream_to_s3(url: str, s3_uri: str) -> dict[str, Any]:
         stderr=subprocess.PIPE,
     )
     assert curl.stdout is not None
-    aws = subprocess.Popen(aws_cmd, stdin=curl.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    curl.stdout.close()
-    _aws_out, aws_err = aws.communicate()
-    curl_err = b""
-    if curl.stderr is not None:
-        curl_err = curl.stderr.read()
-    curl.wait()
+    with process_local_aws_config() as aws_env:
+        aws = subprocess.Popen(
+            aws_cmd,
+            stdin=curl.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=aws_env,
+        )
+        curl.stdout.close()
+        _aws_out, aws_err = aws.communicate()
+        curl_err = b""
+        if curl.stderr is not None:
+            curl_err = curl.stderr.read()
+        curl.wait()
     if curl.returncode != 0 or aws.returncode != 0:
         raise RuntimeError(
             f"HTTP->S3 stream failed for {url} -> {s3_uri}\n"
@@ -602,7 +616,7 @@ def _ensure_alignment_index(
                 if _s3_head_size(s3_idx) is None:
                     continue
                 dest = dest_dir / Path(s3_idx).name
-                _run_cmd(["aws", "s3", "cp", s3_idx, str(dest)], required=True)
+                download_s3_uri(s3_idx, dest)
                 return dest
         except RuntimeError:
             pass
@@ -744,6 +758,17 @@ def _write_index_aware_mates(
             n_win = 0
             with pysam.AlignmentFile(str(raw), "rb") as src, pysam.AlignmentFile(str(filtered), "wb", template=src) as dst:
                 for read in src:
+                    # Window views can leak the other end of the pair (fetch-pairs,
+                    # a too-broad fetch, or a qname dump). Keep only alignments on
+                    # this mate window's chromosome so region-chrom anchors are not
+                    # written into mates.bam and then doubled by samtools merge.
+                    ref = (
+                        src.get_reference_name(read.reference_id)
+                        if read.reference_id is not None and read.reference_id >= 0
+                        else None
+                    )
+                    if ref != chrom:
+                        continue
                     key = (read.query_name, bool(read.is_read1))
                     if read.query_name not in qnames or key in seen:
                         continue
@@ -772,6 +797,38 @@ def _write_index_aware_mates(
             )
 
     return {"mate_reads": written, "mate_windows": len(windows), "mate_fetch": "index"}
+
+
+def _collapse_exact_duplicate_alignments(in_bam: Path, out_bam: Path) -> dict[str, int]:
+    """Drop exact duplicate alignments (same qname, flag, ref, pos).
+
+    ``samtools merge`` of region.bam + mates.bam re-emits a record that appears
+    in both inputs. Streaming collapse keeps BAM order so a coordinate-sorted
+    merge stays indexable.
+    """
+    import pysam
+
+    seen: set[tuple[str, int, int, int]] = set()
+    kept = 0
+    dropped = 0
+    tmp_out = out_bam
+    replace = in_bam.resolve() == out_bam.resolve()
+    if replace:
+        tmp_out = out_bam.with_name(out_bam.name + ".dedup.tmp")
+    with pysam.AlignmentFile(str(in_bam), "rb") as src, pysam.AlignmentFile(str(tmp_out), "wb", template=src) as dst:
+        for read in src:
+            ref_id = int(read.reference_id) if read.reference_id is not None else -1
+            pos = int(read.reference_start) if read.reference_start is not None else -1
+            key = (str(read.query_name), int(read.flag), ref_id, pos)
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+            dst.write(read)
+            kept += 1
+    if replace:
+        tmp_out.replace(out_bam)
+    return {"alignments_kept": kept, "duplicate_alignments_dropped": dropped}
 
 
 def _slice_remote_alignment_with_mates(
@@ -814,9 +871,9 @@ def _slice_remote_alignment_with_mates(
                 ["samtools", "merge", "-@", str(threads), "-f", str(merged_bam), str(region_bam), str(mates_bam)],
                 required=True,
             )
-            shutil.copy2(merged_bam, out_bam)
+            mate_meta.update(_collapse_exact_duplicate_alignments(merged_bam, out_bam))
         else:
-            shutil.copy2(region_bam, out_bam)
+            mate_meta.update(_collapse_exact_duplicate_alignments(region_bam, out_bam))
 
         _run_cmd(["samtools", "index", "-@", str(threads), str(out_bam)], required=True)
 
@@ -933,9 +990,9 @@ def _download_dataset(
     return result
 
 
-def _run_cmd(cmd: list[str], required: bool = True) -> tuple[bool, str]:
+def _run_cmd(cmd: list[str], required: bool = True, env: dict[str, str] | None = None) -> tuple[bool, str]:
     try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
         return True, proc.stdout.strip()
     except FileNotFoundError as err:
         msg = f"missing executable: {cmd[0]} ({err})"

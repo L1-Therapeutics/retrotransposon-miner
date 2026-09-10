@@ -10,7 +10,7 @@ import click
 from retro_miner.candidate_loci import build_candidate_loci
 from retro_miner.evidence_extract import (
     ExtractionSummary,
-    extract_discordant_evidence,
+    extract_split_and_discordant_evidence,
     extract_split_evidence,
 )
 from retro_miner.mei_support import annotate_candidate_loci_with_mei
@@ -70,6 +70,55 @@ def _extract_one_sample(
     """
     sample_t0 = time.monotonic()
     click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
+    if with_discordant:
+        click.echo(f"[extract] sample={sample} one-pass split+discordant")
+        split_summary, discordant_summary = extract_split_and_discordant_evidence(
+            bam_path=bam,
+            sample_name=sample,
+            outdir=outdir,
+            regions=region_list,
+            min_mapq=min_mapq,
+            min_mapq_discordant=min_mapq_discordant,
+            min_clip_len=min_clip_len,
+            poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+            poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+            poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+            short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
+            insert_quantile=discordant_quantile,
+            min_abs_tlen=discordant_min_abs_tlen,
+            poly_tail_rescue_window_bases=discordant_poly_tail_rescue_window_bases,
+            discordant_poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
+            discordant_poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
+            poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
+            require_strong_discordant_reason=require_strong_discordant_reason,
+            mate_bam_path=mate_bam,
+            mate_fetch_window_bp=discordant_mate_fetch_window_bp,
+            fetch_mate_seq=fetch_mate_seq,
+        )
+        one_pass_elapsed = time.monotonic() - sample_t0
+        click.echo(
+            f"[done] sample={sample} scanned={split_summary.total_reads_scanned} "
+            f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows} "
+            f"elapsed={one_pass_elapsed:.1f}s"
+        )
+        click.echo(
+            f"[done-discordant] sample={sample} scanned={discordant_summary.total_reads_scanned} "
+            f"passing={discordant_summary.passing_reads} discordant_rows={discordant_summary.discordant_evidence_rows} "
+            f"insert_threshold={discordant_summary.insert_size_threshold} "
+            f"mate_seq_fetched={discordant_summary.mate_seq_fetched_rows} "
+            f"mate_seq_missing_interchrom={discordant_summary.mate_seq_missing_interchrom_rows} "
+            f"weak_only_filtered={discordant_summary.weak_only_discordant_filtered_rows} "
+            f"elapsed={one_pass_elapsed:.1f}s (one-pass)"
+        )
+        return _SampleExtractResult(
+            sample=sample,
+            split=split_summary,
+            discordant=discordant_summary,
+            split_elapsed_s=one_pass_elapsed,
+            discordant_elapsed_s=0.0,
+            total_elapsed_s=one_pass_elapsed,
+        )
+
     split_t0 = time.monotonic()
     split_summary = extract_split_evidence(
         bam_path=bam,
@@ -89,46 +138,12 @@ def _extract_one_sample(
         f"passing={split_summary.passing_reads} split_rows={split_summary.split_evidence_rows} "
         f"elapsed={split_elapsed:.1f}s"
     )
-
-    discordant_summary: ExtractionSummary | None = None
-    discordant_elapsed = 0.0
-    if with_discordant:
-        disc_t0 = time.monotonic()
-        click.echo(f"[extract-discordant] sample={sample} regions={','.join(region_list)}")
-        discordant_summary = extract_discordant_evidence(
-            bam_path=bam,
-            sample_name=sample,
-            outdir=outdir,
-            regions=region_list,
-            min_mapq=min_mapq_discordant,
-            insert_quantile=discordant_quantile,
-            min_abs_tlen=discordant_min_abs_tlen,
-            poly_tail_rescue_window_bases=discordant_poly_tail_rescue_window_bases,
-            poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
-            poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
-            poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
-            require_strong_discordant_reason=require_strong_discordant_reason,
-            mate_bam_path=mate_bam,
-            mate_fetch_window_bp=discordant_mate_fetch_window_bp,
-            fetch_mate_seq=fetch_mate_seq,
-        )
-        discordant_elapsed = time.monotonic() - disc_t0
-        click.echo(
-            f"[done-discordant] sample={sample} scanned={discordant_summary.total_reads_scanned} "
-            f"passing={discordant_summary.passing_reads} discordant_rows={discordant_summary.discordant_evidence_rows} "
-            f"insert_threshold={discordant_summary.insert_size_threshold} "
-            f"mate_seq_fetched={discordant_summary.mate_seq_fetched_rows} "
-            f"mate_seq_missing_interchrom={discordant_summary.mate_seq_missing_interchrom_rows} "
-            f"weak_only_filtered={discordant_summary.weak_only_discordant_filtered_rows} "
-            f"elapsed={discordant_elapsed:.1f}s"
-        )
-
     return _SampleExtractResult(
         sample=sample,
         split=split_summary,
-        discordant=discordant_summary,
+        discordant=None,
         split_elapsed_s=split_elapsed,
-        discordant_elapsed_s=discordant_elapsed,
+        discordant_elapsed_s=0.0,
         total_elapsed_s=time.monotonic() - sample_t0,
     )
 
@@ -396,16 +411,22 @@ def extract_split_evidence_cmd(
         split_summaries.append(result.split)
         if result.discordant is not None:
             discordant_summaries[sample] = result.discordant
-        click.echo(
-            f"[extract] sample={sample} wall={result.total_elapsed_s:.1f}s "
-            f"(split={result.split_elapsed_s:.1f}s"
-            + (
-                f", discordant={result.discordant_elapsed_s:.1f}s"
-                if result.discordant is not None
-                else ""
+        if result.discordant is not None and result.discordant_elapsed_s <= 0.0:
+            click.echo(
+                f"[extract] sample={sample} wall={result.total_elapsed_s:.1f}s "
+                f"(one-pass split+discordant)"
             )
-            + ")"
-        )
+        else:
+            click.echo(
+                f"[extract] sample={sample} wall={result.total_elapsed_s:.1f}s "
+                f"(split={result.split_elapsed_s:.1f}s"
+                + (
+                    f", discordant={result.discordant_elapsed_s:.1f}s"
+                    if result.discordant is not None
+                    else ""
+                )
+                + ")"
+            )
 
     summary_path = outdir / "split_evidence.summary.tsv"
     with summary_path.open("w", encoding="utf-8") as handle:
