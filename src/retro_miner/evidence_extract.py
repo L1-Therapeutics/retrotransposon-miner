@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,41 @@ class ExtractionSummary:
     weak_only_discordant_filtered_rows: int = 0
     mate_seq_fetched_rows: int = 0
     mate_seq_missing_interchrom_rows: int = 0
+
+
+def same_alignment_path(left: Path | None, right: Path | None) -> bool:
+    """True when both paths exist and resolve to the same alignment file."""
+    if left is None or right is None:
+        return False
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return os.path.normpath(os.path.abspath(left)) == os.path.normpath(os.path.abspath(right))
+
+
+def clone_sample_evidence_tables(outdir: Path, *, src_sample: str, dst_sample: str) -> list[str]:
+    """Copy extract tables from one sample name to another, rewriting ``sample``."""
+    written: list[str] = []
+    for prefix in ("split_evidence", "discordant_evidence"):
+        for suffix in (".tsv", ".parquet"):
+            src = outdir / f"{prefix}.{src_sample}{suffix}"
+            dst = outdir / f"{prefix}.{dst_sample}{suffix}"
+            if not src.exists():
+                continue
+            df = pd.read_parquet(src) if suffix == ".parquet" else pd.read_csv(src, sep="\t")
+            if "sample" in df.columns:
+                df = df.copy()
+                df["sample"] = dst_sample
+            if suffix == ".parquet":
+                df.to_parquet(dst, index=False)
+            else:
+                df.to_csv(dst, sep="\t", index=False)
+            written.append(str(dst))
+    return written
+
+
+def clone_extraction_summary(summary: ExtractionSummary, dst_sample: str) -> ExtractionSummary:
+    return replace(summary, sample=dst_sample)
 
 
 def _normalize_regions(regions: list[str] | str) -> list[str]:

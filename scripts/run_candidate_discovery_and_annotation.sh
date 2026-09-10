@@ -752,6 +752,9 @@ run_single_pipeline() {
   local _mate_bam_args=()
   [[ -n "${DISEASE_MATE_BAM}" ]] && _mate_bam_args+=(--disease-mate-bam "${DISEASE_MATE_BAM}")
   [[ -n "${CONTROL_MATE_BAM}" ]] && _mate_bam_args+=(--control-mate-bam "${CONTROL_MATE_BAM}")
+  if [[ "$(realpath "${DISEASE_BAM}" 2>/dev/null || echo "${DISEASE_BAM}")" == "$(realpath "${CONTROL_BAM}" 2>/dev/null || echo "${CONTROL_BAM}")" ]]; then
+    echo "[candidate-pipeline] germline single-pass: disease and control BAM are the same file"
+  fi
   echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir} (sample_workers=${sample_workers}; no-fetch-mate-seq)"
   run_cli extract-split-evidence \
     --disease-bam "${DISEASE_BAM}" \
