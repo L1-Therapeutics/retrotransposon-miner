@@ -192,22 +192,26 @@ def extract_split_evidence(
                 continue
             if read.is_qcfail or read.is_duplicate or read.is_secondary:
                 continue
+
+            clip_rows = _split_rows_from_read(
+                read,
+                bam=bam,
+                sample_name=sample_name,
+                min_clip_len=min_clip_len,
+                poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+                poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+                poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+                short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
+            )
             if read.mapping_quality < min_mapq:
+                # Keep polyA/T and other qualifying terminal clips; drop MAPQ-0 150M.
+                if not clip_rows:
+                    continue
+                rows.extend(_mark_low_mapq_clip_rescued(clip_rows, rescued=True))
                 continue
 
             passing_reads += 1
-            rows.extend(
-                _split_rows_from_read(
-                    read,
-                    bam=bam,
-                    sample_name=sample_name,
-                    min_clip_len=min_clip_len,
-                    poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
-                    poly_tail_rescue_min_run=poly_tail_rescue_min_run,
-                    poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
-                    short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
-                )
-            )
+            rows.extend(_mark_low_mapq_clip_rescued(clip_rows, rescued=False))
 
     df = _write_split_table(rows, outdir, sample_name)
 
@@ -556,6 +560,7 @@ _SPLIT_COLUMNS = [
     "clip_poly_at_fraction",
     "clip_poly_base",
     "poly_tail_rescued",
+    "low_mapq_clip_rescued",
 ]
 
 _DISCORDANT_COLUMNS = [
@@ -748,8 +753,15 @@ def _split_rows_from_read(
                 "clip_poly_at_fraction": float(poly_frac),
                 "clip_poly_base": poly_base,
                 "poly_tail_rescued": bool(poly_tail_rescued),
+                "low_mapq_clip_rescued": False,
             }
         )
+    return rows
+
+
+def _mark_low_mapq_clip_rescued(rows: list[dict[str, Any]], *, rescued: bool) -> list[dict[str, Any]]:
+    for row in rows:
+        row["low_mapq_clip_rescued"] = bool(rescued)
     return rows
 
 
@@ -820,20 +832,22 @@ def extract_split_and_discordant_evidence(
                 if abs_tlen > 0:
                     insert_sizes.append(abs_tlen)
 
-            if not qc_skip and read.mapping_quality >= min_mapq:
-                split_passing += 1
-                split_rows.extend(
-                    _split_rows_from_read(
-                        read,
-                        bam=bam,
-                        sample_name=sample_name,
-                        min_clip_len=min_clip_len,
-                        poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
-                        poly_tail_rescue_min_run=poly_tail_rescue_min_run,
-                        poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
-                        short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
-                    )
+            if not qc_skip:
+                clip_rows = _split_rows_from_read(
+                    read,
+                    bam=bam,
+                    sample_name=sample_name,
+                    min_clip_len=min_clip_len,
+                    poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+                    poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+                    poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+                    short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
                 )
+                if read.mapping_quality >= min_mapq:
+                    split_passing += 1
+                    split_rows.extend(_mark_low_mapq_clip_rescued(clip_rows, rescued=False))
+                elif clip_rows:
+                    split_rows.extend(_mark_low_mapq_clip_rescued(clip_rows, rescued=True))
 
             if qc_skip or (not read.is_paired) or read.mapping_quality < min_mapq_discordant:
                 continue

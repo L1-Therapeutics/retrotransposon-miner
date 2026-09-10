@@ -17,6 +17,7 @@ from retro_miner.evidence_extract import (
     _clip_to_poly_at_region,
     _drop_duplicate_evidence_rows,
     _longest_poly_at_span,
+    _mark_low_mapq_clip_rescued,
     _normalize_regions,
     _poly_at_breakpoint_proximal_stats,
     _poly_at_stats,
@@ -286,6 +287,27 @@ def test_write_split_table_drops_exact_duplicate_rows(tmp_path: Path) -> None:
     df = _write_split_table([row, row, other], tmp_path, "s")
     assert len(df) == 2
     assert set(df["clip_side"]) == {"L", "R"}
+
+
+def test_mark_low_mapq_clip_rescued_flags_rows() -> None:
+    rows = [{"pos": 1, "low_mapq_clip_rescued": False}, {"pos": 2}]
+    out = _mark_low_mapq_clip_rescued(rows, rescued=True)
+    assert all(r["low_mapq_clip_rescued"] is True for r in out)
+
+
+def test_write_split_table_keeps_low_mapq_flag(tmp_path: Path) -> None:
+    row = {
+        "sample": "s",
+        "chrom": "chr22",
+        "pos": 49879732,
+        "clip_side": "R",
+        "clip_len": 13,
+        "read_name": "q1",
+        "poly_tail_rescued": True,
+        "low_mapq_clip_rescued": True,
+    }
+    df = _write_split_table([row], tmp_path, "s")
+    assert bool(df.iloc[0]["low_mapq_clip_rescued"])
 
 
 def test_drop_duplicate_split_rows_keeps_distinct_clip_sides() -> None:
