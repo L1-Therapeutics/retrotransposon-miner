@@ -315,6 +315,51 @@ def _http_content_length(url: str, timeout_sec: int = 60) -> int | None:
         return None
 
 
+_S3_VIRTUAL_HOST_RE = re.compile(
+    r"^(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])"
+    r"\.s3(?:[.-](?P<region>[a-z0-9-]+))?\.amazonaws\.com$",
+    re.IGNORECASE,
+)
+_S3_PATH_HOST_RE = re.compile(
+    r"^s3(?:[.-](?P<region>[a-z0-9-]+))?\.amazonaws\.com$",
+    re.IGNORECASE,
+)
+
+
+def s3_uri_from_url(url: str) -> str | None:
+    """Map s3:// or Amazon S3 HTTPS object URLs to s3://bucket/key.
+
+    Public 1000 Genomes CRAMs are published as
+    ``https://1000genomes.s3.amazonaws.com/...``; copying that as ``s3://``
+    stays in-region and skips the HTTP hairpin through the instance.
+    """
+    text = (url or "").strip()
+    if not text:
+        return None
+    if text.startswith("s3://"):
+        try:
+            split_s3_uri(text)
+        except ValueError:
+            return None
+        return text
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    host = parsed.netloc.split("@")[-1].split(":")[0]
+    key = urllib.parse.unquote(parsed.path.lstrip("/"))
+    virt = _S3_VIRTUAL_HOST_RE.match(host)
+    if virt:
+        if not key:
+            return None
+        return f"s3://{virt.group('bucket')}/{key}"
+    if _S3_PATH_HOST_RE.match(host):
+        bucket, _, rest = key.partition("/")
+        if not bucket or not rest:
+            return None
+        return f"s3://{bucket}/{rest}"
+    return None
+
+
 def _s3_copy(src_uri: str, dst_uri: str) -> dict[str, Any]:
     started = time.time()
     copy_s3_uri(src_uri, dst_uri)
@@ -416,6 +461,19 @@ def _mirror_full_alignment_to_s3(
                 result["url"] = ds.url
                 copied = True
         if not copied:
+            src_s3 = s3_uri_from_url(ds.url)
+            if src_s3:
+                try:
+                    result = _s3_copy(src_s3, dest)
+                    result["url"] = ds.url
+                    copied = True
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[download] S3 copy failed for {src_s3} -> {dest} ({exc}); "
+                        "falling back to HTTP stream",
+                        file=sys.stderr,
+                    )
+        if not copied:
             result = _http_stream_to_s3(ds.url, dest)
 
     sidecar = _sidecar_url(ds.url)
@@ -436,6 +494,20 @@ def _mirror_full_alignment_to_s3(
                     result["index_s3"] = dest_idx
                     result["index_status"] = idx_res["status"]
                     idx_copied = True
+            if not idx_copied:
+                idx_s3 = s3_uri_from_url(sidecar)
+                if idx_s3:
+                    try:
+                        idx_res = _s3_copy(idx_s3, dest_idx)
+                        result["index_s3"] = dest_idx
+                        result["index_status"] = idx_res["status"]
+                        idx_copied = True
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            f"[download] S3 copy failed for {idx_s3} -> {dest_idx} ({exc}); "
+                            "falling back to HTTP stream",
+                            file=sys.stderr,
+                        )
             if not idx_copied:
                 idx_res = _http_stream_to_s3(sidecar, dest_idx)
                 result["index_s3"] = dest_idx

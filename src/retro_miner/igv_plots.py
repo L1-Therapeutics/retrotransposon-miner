@@ -18,6 +18,7 @@ import pandas as pd
 import pysam
 
 from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
+from .bam_io import open_alignment
 
 _XVFB_PROC: subprocess.Popen[bytes] | None = None
 
@@ -184,6 +185,8 @@ def _resolve_bam_index(bam_path: Path) -> Path | None:
         bam_path.with_suffix(".bai"),
         Path(f"{bam_path}.csi"),
         bam_path.with_suffix(".csi"),
+        Path(f"{bam_path}.crai"),
+        bam_path.with_suffix(".crai"),
     ):
         if candidate.exists():
             return candidate
@@ -224,7 +227,7 @@ def _count_reads_in_window(bam_path: Path, chrom: str, start: int, end: int) -> 
     if end <= start:
         return 0
     try:
-        with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        with open_alignment(bam_path) as bam:
             if chrom not in bam.references and not chrom.startswith("chr"):
                 alt = f"chr{chrom}"
                 if alt in bam.references:

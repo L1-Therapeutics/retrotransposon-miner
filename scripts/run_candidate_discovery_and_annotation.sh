@@ -381,6 +381,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 set_reference_build_defaults
+if [[ -n "${REFERENCE_FASTA}" ]]; then
+  export RTM_ALIGNMENT_REFERENCE="${REFERENCE_FASTA}"
+fi
 if [[ -z "${OUTDIR}" ]]; then
   OUTDIR="${RTM_RESULTS_DIR}/mei_step1_${REFERENCE_BUILD}_chr22"
 fi

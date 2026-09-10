@@ -17,6 +17,7 @@ import pandas as pd
 import pysam
 
 from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
+from .bam_io import open_alignment
 
 _MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
 _MINIMAP2_INDEX_LOCK = threading.Lock()
@@ -139,7 +140,7 @@ def _write_interval_fastq(
 
         # Pass 0: force include locus-linked evidence read names first.
         if preferred_lookup:
-            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+            with open_alignment(bam_path) as bam:
                 for read in bam.fetch(chrom, start0, end0):
                     if not _is_primary_interval_read(read):
                         continue
@@ -151,7 +152,7 @@ def _write_interval_fastq(
 
         # Pass 1: prioritize non-perfect/evidence-like reads.
         if written < int(max_reads):
-            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+            with open_alignment(bam_path) as bam:
                 for read in bam.fetch(chrom, start0, end0):
                     if not _is_primary_interval_read(read):
                         continue
@@ -163,7 +164,7 @@ def _write_interval_fastq(
 
         # Pass 2: if full mode and under cap, backfill with clean/proper reads.
         if (not non_perfect_only) and written < int(max_reads):
-            with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+            with open_alignment(bam_path) as bam:
                 for read in bam.fetch(chrom, start0, end0):
                     if not _is_primary_interval_read(read):
                         continue
