@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from retro_miner.evidence_extract import (
+    ExtractionSummary,
     _DISCORDANT_DEDUP_KEYS,
     _SPLIT_DEDUP_KEYS,
     _clip_to_poly_at_region,
@@ -23,6 +24,9 @@ from retro_miner.evidence_extract import (
     _soft_clip_query_seq,
     _write_discordant_table,
     _write_split_table,
+    clone_extraction_summary,
+    clone_sample_evidence_tables,
+    same_alignment_path,
 )
 
 
@@ -300,3 +304,29 @@ def test_drop_duplicate_split_rows_keeps_distinct_clip_sides() -> None:
     }
     df = _drop_duplicate_evidence_rows(pd.DataFrame([left, left, dict(left, clip_side="R")]), _SPLIT_DEDUP_KEYS)
     assert len(df) == 2
+
+
+def test_same_alignment_path_resolves_duplicates(tmp_path: Path) -> None:
+    bam = tmp_path / "sample.cram"
+    bam.write_bytes(b"cram")
+    assert same_alignment_path(bam, tmp_path / "sample.cram")
+    assert not same_alignment_path(bam, tmp_path / "other.cram")
+    assert not same_alignment_path(bam, None)
+
+
+def test_clone_sample_evidence_tables_rewrites_sample(tmp_path: Path) -> None:
+    src = pd.DataFrame({"read_name": ["r1"], "sample": ["control"], "chrom": ["chr21"]})
+    src.to_csv(tmp_path / "split_evidence.control.tsv", sep="\t", index=False)
+    src.to_parquet(tmp_path / "split_evidence.control.parquet", index=False)
+    written = clone_sample_evidence_tables(tmp_path, src_sample="control", dst_sample="disease")
+    assert any(path.endswith("split_evidence.disease.tsv") for path in written)
+    cloned = pd.read_csv(tmp_path / "split_evidence.disease.tsv", sep="\t")
+    assert list(cloned["sample"]) == ["disease"]
+    assert list(cloned["read_name"]) == ["r1"]
+
+
+def test_clone_extraction_summary_renames_sample() -> None:
+    src = ExtractionSummary(sample="control", total_reads_scanned=10, passing_reads=8, split_evidence_rows=2)
+    dst = clone_extraction_summary(src, "disease")
+    assert dst.sample == "disease"
+    assert dst.total_reads_scanned == 10
