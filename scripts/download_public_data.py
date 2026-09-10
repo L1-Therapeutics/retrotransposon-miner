@@ -72,6 +72,12 @@ REFERENCE_DATASET_IDS_BY_BUILD: dict[str, set[str]] = {
         "gnomad_v41_sv_non_neuro_bb",
         "melt_1kg_mei_nstd144_vcf",
         "melt_1kg_mei_nstd144_vcf_tbi",
+        "melt_1kg_phase3_sv_genotypes_vcf",
+        "melt_1kg_phase3_sv_genotypes_vcf_tbi",
+        "lr_1kg_ont_vienna_svim_asm_hg38_bcf",
+        "lr_1kg_ont_vienna_svim_asm_hg38_bcf_csi",
+        "lr_1kg_ont_vienna_svim_asm_hg38_svan_bcf",
+        "lr_1kg_ont_vienna_svim_asm_hg38_svan_bcf_csi",
     },
     "hg19": {
         "hg19_reference_fasta",

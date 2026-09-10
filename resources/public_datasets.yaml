@@ -185,6 +185,22 @@ datasets:
     target_path: polymorphism/hg38/1kg/README_1kGP_phased_panel_110722.pdf
     required: true
 
+  - id: melt_1kg_phase3_sv_genotypes_vcf
+    category: mei_polymorphism
+    description: 1000G Phase 3 integrated SV genotype VCF (GRCh38), including MELT ALU/LINE1/SVA
+    source: 1000 Genomes
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/phase3/integrated_sv_map/supporting/GRCh38_positions/ALL.wgs.mergedSV.v8.20130502.svs.genotypes.GRCh38.vcf.gz
+    target_path: polymorphism/hg38/1kg/ALL.wgs.mergedSV.v8.20130502.svs.genotypes.GRCh38.vcf.gz
+    required: true
+
+  - id: melt_1kg_phase3_sv_genotypes_vcf_tbi
+    category: mei_polymorphism
+    description: Index for 1000G Phase 3 integrated SV genotype VCF (GRCh38)
+    source: 1000 Genomes
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/phase3/integrated_sv_map/supporting/GRCh38_positions/ALL.wgs.mergedSV.v8.20130502.svs.genotypes.GRCh38.vcf.gz.tbi
+    target_path: polymorphism/hg38/1kg/ALL.wgs.mergedSV.v8.20130502.svs.genotypes.GRCh38.vcf.gz.tbi
+    required: true
+
   - id: melt_1kg_mei_nstd144_vcf
     category: mei_polymorphism
     description: MELT-based 1000G MEI callset (dbVar nstd144, GRCh38)
@@ -215,6 +231,38 @@ datasets:
     source: NCBI dbVar
     url: https://ftp.ncbi.nlm.nih.gov/pub/dbVar/data/Homo_sapiens/by_study/vcf/nstd144.GRCh37.variant_call.vcf.gz.tbi
     target_path: polymorphism/hg19/melt/nstd144.GRCh37.variant_call.vcf.gz.tbi
+    required: true
+
+  - id: lr_1kg_ont_vienna_svim_asm_hg38_bcf
+    category: mei_polymorphism
+    description: 1000G ONT Vienna SVIM-asm multi-sample genotypes on GRCh38 (v1.1)
+    source: 1000 Genomes ONT Vienna
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/release/v1.1/svim-asm-hg38/svim.asm.hg38.bcf
+    target_path: polymorphism/hg38/long_read_1kg_ont_vienna/svim.asm.hg38.bcf
+    required: true
+
+  - id: lr_1kg_ont_vienna_svim_asm_hg38_bcf_csi
+    category: mei_polymorphism
+    description: Index for 1000G ONT Vienna SVIM-asm GRCh38 genotypes (v1.1)
+    source: 1000 Genomes ONT Vienna
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/release/v1.1/svim-asm-hg38/svim.asm.hg38.bcf.csi
+    target_path: polymorphism/hg38/long_read_1kg_ont_vienna/svim.asm.hg38.bcf.csi
+    required: true
+
+  - id: lr_1kg_ont_vienna_svim_asm_hg38_svan_bcf
+    category: mei_polymorphism
+    description: 1000G ONT Vienna SVIM-asm SVAN MEI annotation on GRCh38, sites-only (v1.1)
+    source: 1000 Genomes ONT Vienna
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/release/v1.1/svim-asm-hg38/svim.asm.hg38.noGt.SVAN_1.3.bcf
+    target_path: polymorphism/hg38/long_read_1kg_ont_vienna/svim.asm.hg38.noGt.SVAN_1.3.bcf
+    required: true
+
+  - id: lr_1kg_ont_vienna_svim_asm_hg38_svan_bcf_csi
+    category: mei_polymorphism
+    description: Index for 1000G ONT Vienna SVIM-asm SVAN GRCh38 annotation (v1.1)
+    source: 1000 Genomes ONT Vienna
+    url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1KG_ONT_VIENNA/release/v1.1/svim-asm-hg38/svim.asm.hg38.noGt.SVAN_1.3.bcf.csi
+    target_path: polymorphism/hg38/long_read_1kg_ont_vienna/svim.asm.hg38.noGt.SVAN_1.3.bcf.csi
     required: true
 
   - id: lr_1kg_ont_vienna_svan_mei_vcf

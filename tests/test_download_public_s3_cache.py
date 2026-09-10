@@ -307,3 +307,26 @@ def test_index_aware_slice_collapses_region_anchor_leaked_in_mate_window(
     assert qname_chrom.count(("disc", "chrB")) == 1
     assert len(keys) == len(set(keys))
     assert "duplicate_alignments_dropped" in result
+
+
+HG38_MEI_GENOTYPE_IDS = {
+    "melt_1kg_phase3_sv_genotypes_vcf",
+    "melt_1kg_phase3_sv_genotypes_vcf_tbi",
+    "lr_1kg_ont_vienna_svim_asm_hg38_bcf",
+    "lr_1kg_ont_vienna_svim_asm_hg38_bcf_csi",
+    "lr_1kg_ont_vienna_svim_asm_hg38_svan_bcf",
+    "lr_1kg_ont_vienna_svim_asm_hg38_svan_bcf_csi",
+}
+
+
+def test_hg38_download_includes_1kg_mei_genotype_callsets(dl) -> None:
+    selected = dl._select_dataset_ids_for_references(("hg38",))
+    missing = sorted(HG38_MEI_GENOTYPE_IDS - selected)
+    assert missing == []
+
+    cfg = Path(__file__).resolve().parents[1] / "resources" / "public_datasets.yaml"
+    catalog = {ds.dataset_id: ds for ds in dl._load_config(cfg)}
+    for ds_id in HG38_MEI_GENOTYPE_IDS:
+        assert ds_id in catalog, ds_id
+        assert catalog[ds_id].category == "mei_polymorphism"
+        assert catalog[ds_id].required is True
