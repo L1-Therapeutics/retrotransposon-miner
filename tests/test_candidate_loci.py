@@ -15,6 +15,8 @@ import pytest
 from retro_miner.candidate_loci import (
     _DISCORDANT_EVIDENCE_REQUIRED_COLS,
     _SPLIT_EVIDENCE_REQUIRED_COLS,
+    _build_loci_from_evidence,
+    _closed_interval_gap_bp,
     _cluster_sorted_positions,
     _distance_to_closed_interval,
     _merge_overlapping_loci,
@@ -214,6 +216,130 @@ class TestMergeOverlappingLoci:
         assert len(result) == 1
         assert result.iloc[0]["window_start"] == 100
         assert result.iloc[0]["window_end"] == 350
+
+    def test_distant_split_cores_refuse_merge_even_when_windows_overlap(self):
+        df = pd.DataFrame(
+            [
+                {"chrom": "chr22", "window_start": 49878612, "window_end": 49879519, "core_start": 49879012, "core_end": 49879281},
+                {"chrom": "chr22", "window_start": 49879332, "window_end": 49880399, "core_start": 49879732, "core_end": 49879732},
+            ]
+        )
+        result = _merge_overlapping_loci(df, max_locus_span_bp=2000, split_cluster_bp=100)
+        assert len(result) == 2
+        starts = set(result["window_start"].astype(int))
+        assert 49878612 in starts
+        assert 49879332 in starts
+
+    def test_close_split_cores_still_merge(self):
+        # SVA-like TSD: cores ~30 bp apart, overlapping windows.
+        df = pd.DataFrame(
+            [
+                {"chrom": "chr1", "window_start": 1000, "window_end": 1300, "core_start": 1100, "core_end": 1110},
+                {"chrom": "chr1", "window_start": 1080, "window_end": 1400, "core_start": 1130, "core_end": 1140},
+            ]
+        )
+        result = _merge_overlapping_loci(df, max_locus_span_bp=2000, split_cluster_bp=100)
+        assert len(result) == 1
+        assert int(result.iloc[0]["window_start"]) == 1000
+        assert int(result.iloc[0]["window_end"]) == 1400
+
+
+class TestClosedIntervalGap:
+    def test_overlap_is_zero(self):
+        assert _closed_interval_gap_bp(100, 200, 150, 250) == 0
+
+    def test_touching_is_zero(self):
+        assert _closed_interval_gap_bp(100, 200, 200, 300) == 0
+
+    def test_gap_is_start_minus_end(self):
+        assert _closed_interval_gap_bp(100, 200, 251, 300) == 51
+
+
+def _split_row(chrom: str, pos: int, name: str) -> dict[str, object]:
+    return {
+        "chrom": chrom,
+        "pos": pos,
+        "read_name": name,
+        "mapq": 30,
+        "clip_len": 25,
+        "has_sa": False,
+    }
+
+
+def _disc_row(chrom: str, pos: int, name: str) -> dict[str, object]:
+    return {
+        "chrom": chrom,
+        "pos": pos,
+        "read_name": name,
+        "mapq": 30,
+        "discordant_reasons": "mate_mei",
+        "template_len": 800,
+    }
+
+
+class TestBuildLociSplitCores:
+    def test_dpe_bridge_does_not_merge_450bp_split_cores(self):
+        split = pd.DataFrame(
+            [
+                _split_row("chr22", 49879145, "left1"),
+                _split_row("chr22", 49879145, "left2"),
+                _split_row("chr22", 49879732, "right1"),
+                _split_row("chr22", 49879732, "right2"),
+            ]
+        )
+        empty_split = split.iloc[0:0].copy()
+        disc = pd.DataFrame(
+            [
+                _disc_row("chr22", 49879300, "dpe1"),
+                _disc_row("chr22", 49879500, "dpe2"),
+                _disc_row("chr22", 49879650, "dpe3"),
+            ]
+        )
+        empty_disc = disc.iloc[0:0].copy()
+        result = _build_loci_from_evidence(
+            split_disease=split,
+            split_control=empty_split,
+            discordant_disease=disc,
+            discordant_control=empty_disc,
+            split_cluster_bp=100,
+            discordant_cluster_bp=400,
+            max_locus_span_bp=2000,
+        )
+        assert len(result) == 2
+        covers_left = (
+            (result["window_start"] <= 49879145) & (result["window_end"] >= 49879145)
+        ).any()
+        covers_right = (
+            (result["window_start"] <= 49879732) & (result["window_end"] >= 49879732)
+        ).any()
+        assert covers_left
+        assert covers_right
+        # Must not be one ~1.8 kb window covering both.
+        both = (
+            (result["window_start"] <= 49879145) & (result["window_end"] >= 49879732)
+        )
+        assert not both.any()
+
+    def test_close_sva_cores_still_one_locus(self):
+        split = pd.DataFrame(
+            [
+                _split_row("chr1", 5000, "l1"),
+                _split_row("chr1", 5030, "r1"),
+            ]
+        )
+        empty = split.iloc[0:0].copy()
+        result = _build_loci_from_evidence(
+            split_disease=split,
+            split_control=empty,
+            discordant_disease=empty.assign(discordant_reasons="", template_len=0),
+            discordant_control=empty.assign(discordant_reasons="", template_len=0),
+            split_cluster_bp=100,
+            discordant_cluster_bp=400,
+            max_locus_span_bp=2000,
+        )
+        assert len(result) == 1
+        assert int(result.iloc[0]["window_start"]) <= 5000
+        assert int(result.iloc[0]["window_end"]) >= 5030
 
 
 # ─────────────────────────────────────────────────────────────────────────────
