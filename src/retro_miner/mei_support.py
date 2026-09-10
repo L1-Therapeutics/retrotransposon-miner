@@ -26,7 +26,11 @@ from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.bam_io import open_alignment
-from retro_miner.evidence_extract import _longest_soft_clip_from_read, _soft_clip_query_seq
+from retro_miner.evidence_extract import (
+    _longest_soft_clip_from_read,
+    _soft_clip_query_seq,
+    same_alignment_path,
+)
 
 
 @dataclass
@@ -13899,6 +13903,25 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
 
 
 
+def _relabel_frame_sample(df: pd.DataFrame, dst_sample: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    out = df.copy()
+    if "sample" in out.columns:
+        out["sample"] = dst_sample
+    return out
+
+
+def _clone_remap_to_sample(remap: dict, dst_sample: str) -> dict:
+    cloned: dict = {}
+    for key, val in remap.items():
+        if isinstance(val, pd.DataFrame):
+            cloned[key] = _relabel_frame_sample(val, dst_sample)
+        else:
+            cloned[key] = val
+    return cloned
+
+
 def annotate_candidate_loci_with_mei(
     evidence_dir: Path,
     candidate_loci_path: Path,
@@ -14021,77 +14044,110 @@ def annotate_candidate_loci_with_mei(
                 disc = _rescue_polya_like_discordant_mei_hits(disc)
                 remap_by_sample[sample]["disc_hits"] = disc  # type: ignore[index]
     else:
-        # Indel collection + MEI remaps: disease∥control (I/O and bwa mem release the GIL).
-        click.echo("[mei-annotate] running disease∥control indel + MEI remaps")
+        germline_same_bam = same_alignment_path(disease_bam_path, control_bam_path)
+        if germline_same_bam:
+            click.echo("[mei-annotate] germline single-pass indel + MEI remaps (same BAM)")
+        else:
+            click.echo("[mei-annotate] running disease∥control indel + MEI remaps")
         indel_t0 = time.monotonic()
         indel_jobs: dict[str, object] = {}
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            indel_futs = {}
-            if disease_bam_path is not None:
-                indel_futs[
-                    pool.submit(
-                        _collect_indel_breakpoint_evidence,
-                        disease_bam_path,
-                        candidate,
-                        sample="disease",
-                    )
-                ] = "disease"
-            if control_bam_path is not None:
-                indel_futs[
-                    pool.submit(
-                        _collect_indel_breakpoint_evidence,
-                        control_bam_path,
-                        candidate,
-                        sample="control",
-                    )
-                ] = "control"
-            for fut in as_completed(indel_futs):
-                indel_jobs[indel_futs[fut]] = fut.result()
-        indel_disease = indel_jobs.get("disease", pd.DataFrame())
-        indel_control = indel_jobs.get("control", pd.DataFrame())
+        if germline_same_bam:
+            src_bam = control_bam_path or disease_bam_path
+            if src_bam is not None:
+                indel_jobs["control"] = _collect_indel_breakpoint_evidence(
+                    src_bam, candidate, sample="control"
+                )
+            indel_control = indel_jobs.get("control", pd.DataFrame())
+            indel_disease = _relabel_frame_sample(indel_control, "disease")
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                indel_futs = {}
+                if disease_bam_path is not None:
+                    indel_futs[
+                        pool.submit(
+                            _collect_indel_breakpoint_evidence,
+                            disease_bam_path,
+                            candidate,
+                            sample="disease",
+                        )
+                    ] = "disease"
+                if control_bam_path is not None:
+                    indel_futs[
+                        pool.submit(
+                            _collect_indel_breakpoint_evidence,
+                            control_bam_path,
+                            candidate,
+                            sample="control",
+                        )
+                    ] = "control"
+                for fut in as_completed(indel_futs):
+                    indel_jobs[indel_futs[fut]] = fut.result()
+            indel_disease = indel_jobs.get("disease", pd.DataFrame())
+            indel_control = indel_jobs.get("control", pd.DataFrame())
         click.echo(
             f"[mei-annotate] indel collection disease={len(indel_disease)} "
             f"control={len(indel_control)} elapsed={time.monotonic() - indel_t0:.1f}s"
         )
 
         remap_t0 = time.monotonic()
-        # disease∥control remaps can run together; split bwa threads across them
-        # when the caller asked for more than one thread.
-        per_sample_bwa_threads = max(1, bwa_threads // 2) if bwa_threads > 1 else 1
-        click.echo(
-            f"[mei-annotate] bwa_threads total={bwa_threads} "
-            f"per_sample={per_sample_bwa_threads} (disease∥control)"
+        per_sample_bwa_threads = (
+            max(1, int(bwa_threads))
+            if germline_same_bam
+            else (max(1, bwa_threads // 2) if bwa_threads > 1 else 1)
         )
-        remap_by_sample = {}
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            remap_futs = {
-                pool.submit(
-                    _remap_one_sample_mei_evidence,
-                    sample="disease",
-                    split_df=split_disease,
-                    discordant_df=discordant_disease,
-                    mei_fasta=mei_fasta,
-                    bam_path=disease_bam_path,
-                    mate_bam_path=disease_mate_bam_path,
-                    bwa_threads=per_sample_bwa_threads,
-                ): "disease",
-                pool.submit(
-                    _remap_one_sample_mei_evidence,
-                    sample="control",
-                    split_df=split_control,
-                    discordant_df=discordant_control,
-                    mei_fasta=mei_fasta,
-                    bam_path=control_bam_path,
-                    mate_bam_path=control_mate_bam_path,
-                    bwa_threads=per_sample_bwa_threads,
-                ): "control",
+        if germline_same_bam:
+            click.echo(f"[mei-annotate] bwa_threads total={bwa_threads} (germline single-pass)")
+            remap_control = _remap_one_sample_mei_evidence(
+                sample="control",
+                split_df=split_control,
+                discordant_df=discordant_control,
+                mei_fasta=mei_fasta,
+                bam_path=control_bam_path,
+                mate_bam_path=control_mate_bam_path or disease_mate_bam_path,
+                bwa_threads=per_sample_bwa_threads,
+            )
+            remap_by_sample = {
+                "control": remap_control,
+                "disease": _clone_remap_to_sample(remap_control, "disease"),
             }
-            for fut in as_completed(remap_futs):
-                sample = remap_futs[fut]
-                remap_by_sample[sample] = fut.result()
-        click.echo(
-            f"[mei-annotate] disease∥control MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s"
-        )
+            click.echo(
+                f"[mei-annotate] germline MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s"
+            )
+        else:
+            click.echo(
+                f"[mei-annotate] bwa_threads total={bwa_threads} "
+                f"per_sample={per_sample_bwa_threads} (disease∥control)"
+            )
+            remap_by_sample = {}
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                remap_futs = {
+                    pool.submit(
+                        _remap_one_sample_mei_evidence,
+                        sample="disease",
+                        split_df=split_disease,
+                        discordant_df=discordant_disease,
+                        mei_fasta=mei_fasta,
+                        bam_path=disease_bam_path,
+                        mate_bam_path=disease_mate_bam_path,
+                        bwa_threads=per_sample_bwa_threads,
+                    ): "disease",
+                    pool.submit(
+                        _remap_one_sample_mei_evidence,
+                        sample="control",
+                        split_df=split_control,
+                        discordant_df=discordant_control,
+                        mei_fasta=mei_fasta,
+                        bam_path=control_bam_path,
+                        mate_bam_path=control_mate_bam_path,
+                        bwa_threads=per_sample_bwa_threads,
+                    ): "control",
+                }
+                for fut in as_completed(remap_futs):
+                    sample = remap_futs[fut]
+                    remap_by_sample[sample] = fut.result()
+            click.echo(
+                f"[mei-annotate] disease∥control MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s"
+            )
 
     disease_hits = remap_by_sample["disease"]["split_hits"]  # type: ignore[assignment]
     control_hits = remap_by_sample["control"]["split_hits"]  # type: ignore[assignment]
