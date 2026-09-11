@@ -294,6 +294,17 @@ ensure_iam_instance_profile_for_bucket() {
   local bucket="$1" trust policy_file policy_name has_role created=0
   [[ -n "${bucket}" ]] || return 0
 
+  if aws iam get-role --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1 \
+    && aws iam get-instance-profile --instance-profile-name "${IAM_INSTANCE_PROFILE}" >/dev/null 2>&1; then
+    has_role="$(aws iam get-instance-profile \
+      --instance-profile-name "${IAM_INSTANCE_PROFILE}" \
+      --query 'InstanceProfile.Roles[0].RoleName' --output text 2>/dev/null || true)"
+    if [[ -n "${has_role}" && "${has_role}" != "None" ]]; then
+      log "Reusing instance role ${IAM_ROLE_NAME} / profile ${IAM_INSTANCE_PROFILE} (no IAM policy updates)"
+      return 0
+    fi
+  fi
+
   trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   if ! aws iam get-role --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1; then
     log "Creating IAM role ${IAM_ROLE_NAME}"
