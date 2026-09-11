@@ -249,8 +249,8 @@ Additional permissions for `bootstrap` (new instance provisioning):
 - `ec2:DescribeSubnets`
 - `ec2:AssociateIamInstanceProfile` / `ec2:ReplaceIamInstanceProfileAssociation` (when `S3_BUCKET` is set)
 - `ssm:GetParameter` (Amazon Linux AMI lookup)
-- `iam:PassRole` (attaching the instance profile)
-- `iam:CreateRole` / `iam:CreateInstanceProfile` / `iam:AddRoleToInstanceProfile` / `iam:PutRolePolicy` / `iam:GetRole` / `iam:GetInstanceProfile` (first-time S3 setup)
+- `iam:PassRole` / `iam:GetRole` / `iam:GetInstanceProfile` (reuse the existing instance role; do not copy laptop keys onto the VM)
+- `iam:CreateRole` / `iam:CreateInstanceProfile` / `iam:AddRoleToInstanceProfile` / `iam:PutRolePolicy` (first-time admin setup only; skipped when the role already exists)
 - `s3:CreateBucket` / `s3:HeadBucket` / `s3:ListBucket` (optional; only if the cache bucket does not exist yet)
 
 ### What `scripts/ec2_jlab.sh` Does
