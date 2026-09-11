@@ -704,13 +704,85 @@ ensure_instance() {
   create_instance
 }
 
+instance_missing_diagnostic() {
+  local iid="$1"
+  log "Selected instance no longer exists: ${iid}"
+  log "  $0 list-instances"
+  log "  $0 use <instance-id-or-name>"
+  log "  Stale binding kept at ${INSTANCE_STATE_FILE}; rebind to a live instance (use) or create a new one (bootstrap)."
+}
+
+# probe_instance reports whether instance ${iid} exists, without mislabeling
+# other API failures (auth/network/throttle) as "missing".
+#   returns 0 = describe-instances succeeded (instance exists)
+#   returns 2 = InvalidInstanceID.NotFound (instance definitively gone)
+#   returns 1 = describe-instances failed for another reason
+probe_instance() {
+  local iid="$1"
+  PROBE_ERR="$(awsq ec2 describe-instances --instance-ids "${iid}" 2>&1 >/dev/null || true)"
+  if [[ -z "${PROBE_ERR}" ]]; then
+    return 0
+  fi
+  if grep -q "InvalidInstanceID.NotFound" <<<"${PROBE_ERR}"; then
+    return 2
+  fi
+  return 1
+}
+
+handle_missing_or_probe_failure() {
+  local iid="$1" rc="$2"
+  if [[ "${rc}" -eq 2 ]]; then
+    instance_missing_diagnostic "${iid}"
+  else
+    log "Unable to query instance ${iid}."
+    sed 's/^/  /' <<< "${PROBE_ERR}" >&2 || true
+    log "Check AWS credentials and connectivity, then re-run: $0 status"
+  fi
+  exit 1
+}
+
 start_instance() {
-  local iid
+  local iid rc err
+
+  require_cmd aws
+
   iid="$(require_instance_id)"
+
+  # The bound instance may have been terminated since the state file was written;
+  # fail fast rather than letting a hung wait look like a successful start.
+  rc=0
+  probe_instance "${iid}" || rc=$?
+  [[ "${rc}" -eq 0 ]] || handle_missing_or_probe_failure "${iid}" "${rc}"
+
   log "Starting instance ${iid}"
-  awsq ec2 start-instances --instance-ids "${iid}" >/dev/null 2>&1 || true
-  awsq ec2 wait instance-running --instance-ids "${iid}"
-  awsq ec2 wait instance-status-ok --instance-ids "${iid}"
+  if ! err="$(awsq ec2 start-instances --instance-ids "${iid}" 2>&1 >/dev/null)"; then
+    log "Failed to start instance ${iid}:"
+    sed 's/^/  /' <<< "${err}" >&2 || true
+    exit 1
+  fi
+
+  if ! awsq ec2 wait instance-running --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} did not reach the running state."
+      log "Check current state with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
+  if ! awsq ec2 wait instance-status-ok --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} is running but not status-ok yet."
+      log "Check status with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
   log "Instance is running and healthy."
 }
 
