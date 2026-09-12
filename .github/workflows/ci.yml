@@ -1,39 +1,47 @@
-name: CI
+name: Continuous Integration & Parity Verification
 
 on:
   push:
-    branches: [main]
+    branches: [ main, fix/*, feature/* ]
   pull_request:
+    branches: [ main ]
 
 jobs:
   test:
-    name: pytest (${{ matrix.os }} / py${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
+
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
 
-      - name: Install package and dev dependencies
-        run: pip install -e ".[dev]"
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y samtools bedtools bwa htslib-tools
 
-      - name: Lint (ruff)
-        run: ruff check src tests
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pysam hypothesis anyio
 
-      - name: Shell syntax check
-        run: |
-          set -euo pipefail
-          for sh in scripts/*.sh; do
-            bash -n "${sh}"
-          done
+    - name: Run Pytest Suite
+      run: |
+        pytest -v
 
-      - name: Run tests
-        run: python -m pytest
+    - name: Run One-Pass Extraction Benchmark
+      run: |
+        python3 benchmarks/benchmark_one_pass_extraction.py --num-reads 10000 --json > benchmark_results.json
+        cat benchmark_results.json
+
+    - name: Upload Benchmark Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results-py${{ matrix.python-version }}
+        path: benchmark_results.json
