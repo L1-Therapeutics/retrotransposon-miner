@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
+AMI_ID="${AMI_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-r6i.4xlarge}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
 # gp3 throughput/IOPS are independently provisioned, but AWS requires
@@ -86,10 +87,141 @@ imds_get() {
     -H "X-aws-ec2-metadata-token: ${token}" 2>/dev/null
 }
 
+# --- AMI selection --------------------------------------------------------
+# Resolution order used by bootstrap (and the internal test hook below):
+#   1. AMI_ID override: validated via describe-images, never queries SSM.
+#   2. Public SSM parameter (AL2023 kernel-default x86_64); the returned value
+#      is syntax-checked rather than trusted blindly.
+#   3. ec2 describe-images fallback: Amazon-owned, AL2023 kernel 6.1, x86_64,
+#      EBS-backed, available; newest by CreationDate; then fully validated.
+# Only the resolved AMI id is ever printed to stdout; diagnostics go to stderr.
+AL2023_SSM_PARAM="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+AL2023_IMAGE_NAME_PATTERN="al2023-ami-2023.*-kernel-6.1-x86_64"
+
+ami_valid_syntax() {
+  [[ "$1" =~ ^ami-[0-9a-f]+$ ]]
+}
+
 get_latest_al2023_ami() {
-  awsq ssm get-parameter \
-    --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-    --query 'Parameter.Value' --output text
+  local out rc
+  out="$(awsq ssm get-parameter --name "${AL2023_SSM_PARAM}" --query 'Parameter.Value' --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -eq 0 && "${out}" =~ ^ami-[0-9a-f]+$ ]]; then
+    echo "${out}"
+    return 0
+  fi
+  if [[ "${rc}" -eq 0 ]]; then
+    if [[ -z "${out}" || "${out}" == "None" ]]; then
+      log "  ssm get-parameter returned no value."
+    else
+      log "  ssm get-parameter returned a malformed value: ${out}"
+    fi
+  else
+    log "  ssm get-parameter exited ${rc}:"
+    sed 's/^/    /' <<< "${out}" >&2 || true
+  fi
+  return 1
+}
+
+validate_selected_ami() {
+  local ami="$1" out rc img state arch rootdev
+  if ! ami_valid_syntax "${ami}"; then
+    log "Invalid AMI id ${ami}; expected an id like ami-0<hex>."
+    return 1
+  fi
+  out="$(awsq ec2 describe-images \
+    --owners amazon \
+    --image-ids "${ami}" \
+    --query 'Images[0].[ImageId,State,Architecture,RootDeviceType]' \
+    --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ "${out}" == *InvalidAMIID.NotFound* ]]; then
+      log "AMI ${ami} does not exist."
+    else
+      log "Unable to validate AMI ${ami}:"
+      sed 's/^/  /' <<< "${out}" >&2 || true
+    fi
+    return 1
+  fi
+  if [[ -z "${out}" || "${out}" == "None" ]]; then
+    log "AMI ${ami} does not exist or is not Amazon-owned."
+    return 1
+  fi
+  IFS=$'\t' read -r img state arch rootdev <<< "${out}"
+  [[ "${img}" == "${ami}" ]] || {
+    log "AMI validation mismatch for ${ami}."
+    return 1
+  }
+  [[ "${state}" == "available" ]] || {
+    log "AMI ${ami} is not available (state=${state})."
+    return 1
+  }
+  [[ "${arch}" == "x86_64" ]] || {
+    log "AMI ${ami} is not x86_64 (architecture=${arch})."
+    return 1
+  }
+  [[ "${rootdev}" == "ebs" ]] || {
+    log "AMI ${ami} is not EBS-backed (root-device-type=${rootdev})."
+    return 1
+  }
+  echo "${ami}"
+  return 0
+}
+
+ami_fallback_ec2() {
+  local out rc
+  out="$(awsq ec2 describe-images \
+    --owners amazon \
+    --filters \
+      "Name=name,Values=${AL2023_IMAGE_NAME_PATTERN}" \
+      "Name=architecture,Values=x86_64" \
+      "Name=root-device-type,Values=ebs" \
+      "Name=state,Values=available" \
+    --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+    --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    log "  ec2 describe-images exited ${rc}:"
+    sed 's/^/    /' <<< "${out}" >&2 || true
+    return 1
+  fi
+  if [[ -z "${out}" || "${out}" == "None" ]]; then
+    log "  No Amazon Linux 2023 image matches the fallback filters."
+    return 1
+  fi
+  if ! ami_valid_syntax "${out}"; then
+    log "  ec2 describe-images returned a malformed AMI id: ${out}"
+    return 1
+  fi
+  echo "${out}"
+  return 0
+}
+
+resolve_ami() {
+  local ami validated sel
+
+  if [[ -n "${AMI_ID}" ]]; then
+    validated="$(validate_selected_ami "${AMI_ID}")" || return 1
+    echo "${validated}"
+    return 0
+  fi
+
+  if ami="$(get_latest_al2023_ami)"; then
+    echo "${ami}"
+    return 0
+  fi
+
+  log "ssm get-parameter did not yield a usable AMI; using ec2 describe-images fallback."
+  if sel="$(ami_fallback_ec2)"; then
+    validated="$(validate_selected_ami "${sel}")" && {
+      echo "${validated}"
+      return 0
+    }
+    log "  ec2 describe-images selected an invalid AMI: ${sel}"
+  fi
+
+  log "Could not determine an Amazon Linux 2023 x86_64 AMI id."
+  log "Set AMI_ID to an approved Amazon Linux 2023 x86_64 AMI id (Amazon-owned, x86_64, EBS-backed) and re-run:"
+  log "  AMI_ID=ami-<id> $0 bootstrap"
+  return 1
 }
 
 get_default_vpc() {
@@ -645,7 +777,11 @@ bind_instance() {
 create_instance() {
   local instance_id ami subnet sg_id create_name bucket_name ud_file="" tags
   local -a run_args
-  ami="$(get_latest_al2023_ami)"
+  ami="$(resolve_ami)" || exit 1
+  [[ "${ami}" =~ ^ami-[0-9a-f]+$ ]] || {
+    log "No usable AMI id; aborting before run-instances."
+    exit 1
+  }
   subnet="$(get_default_subnet)"
   sg_id="$(ensure_security_group)"
   ensure_key_pair
@@ -1136,6 +1272,7 @@ If you can reach the instance via Instance Connect but not SSH:
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
+  AMI_ID (AL2023 x86_64 AMI id for bootstrap; default: SSM, then describe-images)
   INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default 200)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
   S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
@@ -1143,6 +1280,18 @@ Optional env vars:
   IAM_INSTANCE_PROFILE, IAM_ROLE_NAME
 EOF
 }
+
+# Internal test hook: lets the test suite exercise `resolve_ami` directly
+# without adding a public subcommand. Whitelisted; unused in normal operation.
+if [[ -n "${EC2_JLAB_TEST_FN:-}" ]]; then
+  case "${EC2_JLAB_TEST_FN}" in
+    resolve_ami) resolve_ami ;;
+    *) log "Unknown EC2_JLAB_TEST_FN: ${EC2_JLAB_TEST_FN}"
+       exit 1
+       ;;
+  esac
+  exit $?
+fi
 
 case "${1:-help}" in
   help|-h|--help) usage ;;

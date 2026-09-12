@@ -45,6 +45,16 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]]; then
   fi
 fi
 
+report_version() {
+  local label="$1"
+  shift
+  local out
+  out="$("$@" 2>&1)" || true
+  if [[ -n "${out}" ]]; then
+    printf '%s: %s\n' "${label}" "${out}" | awk 'NR==1'
+  fi
+}
+
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "ERROR: ${PYTHON_BIN} not found in PATH." >&2
@@ -76,14 +86,14 @@ print("Python modules OK")
 PY
 
 echo "All required tools detected."
-samtools --version | awk 'NR==1 {print "samtools:", $0}'
-bedtools --version | awk '{print "bedtools:", $0}'
-minimap2 --version | awk '{print "minimap2:", $0}'
-bwa 2>&1 | awk 'NR==1 {print "bwa:", $0}' || true
-bwa-mem2 version 2>&1 | awk 'NR==1 {print "bwa-mem2:", $0}'
-bcftools --version | awk 'NR==1 {print "bcftools:", $0}'
+report_version "samtools" samtools --version
+report_version "bedtools" bedtools --version
+report_version "minimap2" minimap2 --version
+report_version "bwa" bwa
+report_version "bwa-mem2" bwa-mem2 version
+report_version "bcftools" bcftools --version
 if command -v liftOver >/dev/null 2>&1; then
-  liftOver 2>&1 | awk 'NR==1 {print "liftOver:", $0}'
+  report_version "liftOver" liftOver
 fi
 
 echo "Environment validation complete."
