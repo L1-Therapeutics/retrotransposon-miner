@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
+import sys
 import time
 import tracemalloc
 import tempfile
 import json
 import argparse
 from pathlib import Path
+
+# Resolve repository root directory for standalone execution
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from scripts.generate_synthetic_bam import generate_synthetic_bam
 
 """
@@ -16,16 +23,15 @@ against synthetic BAM datasets.
 def profile_extraction(bam_path: Path):
     tracemalloc.start()
     start_time = time.perf_counter()
-    
-    # Simulate single-pass extraction sweep
+
     import pysam
     with pysam.AlignmentFile(bam_path, "rb") as samfile:
         reads = [r for r in samfile.fetch(until_eof=True) if not r.is_unmapped]
-        
+
     elapsed = time.perf_counter() - start_time
     current, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    
+
     return {
         "read_count": len(reads),
         "runtime_seconds": round(elapsed, 5),
@@ -41,9 +47,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         bam_path = Path(tmpdir) / "benchmark_input.bam"
         generate_synthetic_bam(bam_path, num_reads=args.num_reads)
-        
+
         metrics = profile_extraction(bam_path)
-        
+
         if args.json:
             print(json.dumps(metrics, indent=2))
         else:
