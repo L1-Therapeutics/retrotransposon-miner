@@ -1,7 +1,7 @@
-import pytest
-import pysam
 import tempfile
 from pathlib import Path
+
+import pysam
 
 """
 Tests one-pass extraction and mate-sweep parity across edge cases:

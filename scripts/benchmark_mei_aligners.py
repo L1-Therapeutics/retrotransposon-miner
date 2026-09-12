@@ -25,9 +25,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import defaultdict
 from pathlib import Path
-
 
 FAMILIES = ("ALU", "LINE1", "SVA")
 DEFAULT_LENGTHS = (20, 22, 25, 30, 40, 60, 100)

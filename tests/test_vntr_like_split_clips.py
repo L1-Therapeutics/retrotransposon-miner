@@ -6,8 +6,8 @@ import pandas as pd
 
 from retro_miner.mei_support import (
     _annotate_vntr_like_split_clips,
-    _sva_vntr_like_score,
     _split_mei_support_eligible_mask,
+    _sva_vntr_like_score,
 )
 
 

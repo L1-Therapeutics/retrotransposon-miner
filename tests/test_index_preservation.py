@@ -1,7 +1,7 @@
-import pytest
-import pysam
 import tempfile
 from pathlib import Path
+
+import pysam
 
 """
 Regression tests for PR #30 index-alignment fix and PR #32 one-pass extraction.

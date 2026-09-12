@@ -4,27 +4,37 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# Repo-root sys.path resolution for standalone execution
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from retro_miner.evidence_extract import extract_split_and_discordant_evidence
 
 
 def _load(path: Path) -> pd.DataFrame:
+    """Load and sort an evidence TSV for comparison."""
     df = pd.read_csv(path, sep="\t")
     return df.sort_values(list(df.columns), kind="mergesort").reset_index(drop=True)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--bam", type=Path, required=True)
-    p.add_argument("--sample", default="disease")
-    p.add_argument("--region", default="chr22")
-    p.add_argument("--baseline-dir", type=Path, required=True)
-    p.add_argument("--outdir", type=Path, required=True)
-    args = p.parse_args()
+    """Compare 1-pass extraction output against a 2-pass baseline directory."""
+    parser = argparse.ArgumentParser(description="Compare one-pass vs two-pass extract tables.")
+    parser.add_argument("--bam", type=Path, required=True, help="Input BAM path")
+    parser.add_argument("--sample", default="disease", help="Sample name")
+    parser.add_argument("--region", default="chr22", help="Region string")
+    parser.add_argument("--baseline-dir", type=Path, required=True, help="2-pass baseline output dir")
+    parser.add_argument("--outdir", type=Path, required=True, help="1-pass output dir")
+    args = parser.parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.monotonic()

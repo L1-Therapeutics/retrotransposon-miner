@@ -32,13 +32,15 @@ rtm = "retro_miner.cli:cli"
 [tool.ruff]
 target-version = "py311"
 line-length    = 120
-exclude        = ["scripts"]   # standalone scripts, not part of the installable package
+exclude        = ["scripts"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "BLE"]
+select = ["E", "F", "I", "UP", "B"]
 ignore = [
   "E501",   # long lines are common in generated/table-heavy modules
   "E731",   # lambda aliases (s = lambda ...) are intentional shorthand in large pipeline functions
+  "E402",   # module-level imports after sys.path manipulation are intentional in standalone scripts
+  "BLE001", # blind Exception catches are intentional in data-download / retry utilities
 ]
 
 [tool.pytest.ini_options]

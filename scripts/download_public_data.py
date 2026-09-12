@@ -18,7 +18,6 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from socket import timeout as SocketTimeoutError
 from typing import Any
 
 import yaml
@@ -1038,13 +1037,7 @@ def _download_dataset(
             else:
                 result = _download_file(ds.url, target, timeout_sec=timeout_sec, force=force)
             break
-        except (
-            urllib.error.URLError,
-            urllib.error.HTTPError,
-            TimeoutError,
-            SocketTimeoutError,
-            ConnectionError,
-        ) as err:
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ConnectionError) as err:
             last_err = err
             if attempt >= attempts:
                 raise

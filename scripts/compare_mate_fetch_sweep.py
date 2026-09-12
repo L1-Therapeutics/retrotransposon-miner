@@ -4,10 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Repo-root sys.path resolution for standalone execution
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from retro_miner.mei_support import (
     _discordant_mate_mei_query_seq,
@@ -31,6 +40,7 @@ _NEXT_STEP_COLS = [
 
 
 def _with_mei_query(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the ``mei_query_seq`` column to a discordant evidence DataFrame."""
     out = df.copy()
     out["mei_query_seq"] = [
         _discordant_mate_mei_query_seq(row) for row in out.itertuples(index=False)
@@ -39,23 +49,25 @@ def _with_mei_query(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _next_step_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Select the columns required by annotate's next-step table."""
     cols = [c for c in _NEXT_STEP_COLS if c in df.columns]
     return df.loc[:, cols].reset_index(drop=True)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--bam", type=Path, required=True)
-    p.add_argument("--discordant-tsv", type=Path, required=True)
-    p.add_argument(
+    """Compare swept vs per-window mate fetch results."""
+    parser = argparse.ArgumentParser(description="Compare swept vs per-window mate fetch.")
+    parser.add_argument("--bam", type=Path, required=True, help="BAM path")
+    parser.add_argument("--discordant-tsv", type=Path, required=True, help="Discordant evidence TSV")
+    parser.add_argument(
         "--nrows",
         type=int,
         default=5000,
         help="Discordant rows to read. 0 = entire table.",
     )
-    args = p.parse_args()
+    args = parser.parse_args()
 
-    read_kw: dict = {"sep": "\t"}
+    read_kw: dict[str, Any] = {"sep": "\t"}
     if args.nrows > 0:
         read_kw["nrows"] = args.nrows
     df = pd.read_csv(args.discordant_tsv, **read_kw)
@@ -79,7 +91,7 @@ def main() -> None:
     if len(per_next) != len(sweep_next):
         raise SystemExit(f"ROWCOUNT_MISMATCH {len(per_next)} vs {len(sweep_next)}")
 
-    mismatches = []
+    mismatches: list[str] = []
     for col in per_next.columns:
         left = per_next[col]
         right = sweep_next[col]

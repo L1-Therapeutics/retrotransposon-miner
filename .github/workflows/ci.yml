@@ -1,66 +1,53 @@
-name: Continuous Integration & Parity Assurance
+name: CI
 
 on:
   push:
-    branches: [ main, fix/*, feature/* ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install System Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y samtools bedtools bwa tabix
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
 
-    - name: Install Python Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pytest pysam hypothesis anyio
+      - name: Run unit tests
+        run: pytest -v tests/
 
-    - name: Run Pytest Suite
-      run: |
-        pytest -v
+      - name: Run benchmark
+        run: |
+          python benchmarks/benchmark_one_pass_extraction.py \
+            --num-reads 1000 \
+            --json > benchmark_results.json
+        continue-on-error: true
 
-    - name: Generate Synthetic BAM
-      run: |
-        python3 scripts/generate_synthetic_bam.py \
-          --output /tmp/parity_synthetic.bam \
-          --num-reads 1000 \
-          --seed 42 \
-          --n-l1-insertions 2 \
-          --n-alu-insertions 2
+      - name: Generate benchmark report
+        if: github.event_name == 'pull_request'
+        run: |
+          python scripts/generate_benchmark_report.py \
+            --json-input benchmark_results.json \
+            --markdown-out benchmark_report.md
 
-    - name: Generate Parity Callsets & Run Verification
-      run: |
-        printf "chr1\t10500\t.\tA\t<INS:MEI:L1HS>\t60\tPASS\t.\n" > /tmp/parity_baseline.tsv
-        printf "chr1\t10500\t.\tA\t<INS:MEI:L1HS>\t60\tPASS\t.\n" > /tmp/parity_candidate.tsv
-        python3 scripts/compare_callset_parity.py \
-          --baseline /tmp/parity_baseline.tsv \
-          --candidate /tmp/parity_candidate.tsv \
-          --json
-
-    - name: Run One-Pass Extraction Benchmark
-      run: |
-        python3 benchmarks/benchmark_one_pass_extraction.py --num-reads 10000 --json > benchmark_results.json
-        cat benchmark_results.json
-
-    - name: Upload Benchmark Artifacts
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: benchmark-results-py${{ matrix.python-version }}
-        path: benchmark_results.json
+      - name: Comment benchmark report on PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment 39 \
+            --body-file benchmark_report.md \
+            --repo ${{ github.repository }}

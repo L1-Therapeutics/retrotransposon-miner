@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
+import argparse
+import json
 import sys
+import tempfile
 import time
 import tracemalloc
-import tempfile
-import json
-import argparse
 from pathlib import Path
 
 # Resolve repository root directory for standalone execution
