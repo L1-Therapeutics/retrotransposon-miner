@@ -19,10 +19,10 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
 
 from retro_miner.s3_transfer import download_s3_uri
 

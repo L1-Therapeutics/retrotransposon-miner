@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-import time
 
 import click
 

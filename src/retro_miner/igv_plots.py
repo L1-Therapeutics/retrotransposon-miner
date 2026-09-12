@@ -15,9 +15,9 @@ from pathlib import Path
 
 import click
 import pandas as pd
-import pysam
 
-from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
+from ._utils import _iter_fasta_records
+from ._utils import safe_locus_id as _safe_locus_id
 from .bam_io import open_alignment
 
 _XVFB_PROC: subprocess.Popen[bytes] | None = None
@@ -51,7 +51,7 @@ def _igv_singleton_lock(
     while owner_fd is None:
         try:
             owner_fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(owner_fd, f"{os.getpid()}\t{int(time.time())}\n".encode("utf-8"))
+            os.write(owner_fd, f"{os.getpid()}\t{int(time.time())}\n".encode())
             break
         except FileExistsError:
             stale = False

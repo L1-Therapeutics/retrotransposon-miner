@@ -16,7 +16,8 @@ import click
 import pandas as pd
 import pysam
 
-from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
+from ._utils import _iter_fasta_records
+from ._utils import safe_locus_id as _safe_locus_id
 from .bam_io import open_alignment
 
 _MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
@@ -462,7 +463,7 @@ def _load_fasta_lengths(fasta_path: Path) -> dict[str, int]:
     lengths: dict[str, int] = {}
     try:
         with pysam.FastaFile(str(fasta_path)) as fa:
-            for name, length in zip(fa.references, fa.lengths):
+            for name, length in zip(fa.references, fa.lengths, strict=False):
                 lengths[str(name)] = int(length)
     except (OSError, ValueError, RuntimeError):
         lengths = {}

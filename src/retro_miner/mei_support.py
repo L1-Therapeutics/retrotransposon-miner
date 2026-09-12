@@ -15,18 +15,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-import pandas as pd
 import click
+import pandas as pd
 import pysam
 from intervaltree import IntervalTree
 
-from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
-
-from retro_miner.igv_plots import generate_gold_review_igv_plots
-from retro_miner.read_architecture import generate_gold_read_architecture_plots
-from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.bam_io import open_alignment
 from retro_miner.evidence_extract import _longest_soft_clip_from_read, _soft_clip_query_seq
+from retro_miner.igv_plots import generate_gold_review_igv_plots
+from retro_miner.local_assembly import annotate_silver_with_local_assembly
+from retro_miner.read_architecture import generate_gold_read_architecture_plots
+
+from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 
 
 @dataclass
@@ -1250,7 +1250,7 @@ def _align_clips_with_minimap2(
     out["clip_id"] = [f"{sample}_{i}" for i in range(len(out))]
     out["clip_seq_coord"] = [
         _trim_poly_at_from_clip(str(seq), str(side))
-        for seq, side in zip(out["clip_seq"].fillna(""), out["clip_side"].fillna(""))
+        for seq, side in zip(out["clip_seq"].fillna(""), out["clip_side"].fillna(""), strict=False)
     ]
     out["mei_query_seq"] = out["clip_seq_coord"].fillna("").astype(str)
     for col, default in (
@@ -1393,7 +1393,7 @@ def _align_discordant_reads_with_minimap2(
         else pd.Series("", index=reads.index)
     )
     reads["mei_query_seq"] = [
-        _trim_poly_at_from_clip(seq, side) for seq, side in zip(raw_query, clip_side)
+        _trim_poly_at_from_clip(seq, side) for seq, side in zip(raw_query, clip_side, strict=False)
     ]
     reads = reads.loc[
         reads["mei_query_seq"].str.len() >= max(_DPE_MEI_REMAP_MIN_CLIP_BP, _MEI_ALIGN_MIN_TRIMMED_BP)
@@ -2695,7 +2695,7 @@ def _annotate_vntr_like_split_clips(
         at_sva_locus = pd.Series(
             [
                 (str(c), int(ws), int(we)) in sva_loci
-                for c, ws, we in zip(out["chrom"], out["window_start"], out["window_end"])
+                for c, ws, we in zip(out["chrom"], out["window_start"], out["window_end"], strict=False)
             ],
             index=out.index,
         )
@@ -4534,7 +4534,7 @@ def _pair_clip_similarity(a: str, b: str) -> float:
         return 0.0
     aa = a[:n]
     bb = b[:n]
-    matches = sum(1 for x, y in zip(aa, bb) if x == y)
+    matches = sum(1 for x, y in zip(aa, bb, strict=False) if x == y)
     return float(matches) / float(n)
 
 
@@ -5025,7 +5025,7 @@ def _add_candidate_support_info_fields(
                         zip(
                             tmp.loc[need_bp, "chrom"].tolist(),
                             tmp.loc[need_bp, "window_start"].tolist(),
-                            tmp.loc[need_bp, "window_end"].tolist(),
+                            tmp.loc[need_bp, "window_end"].tolist(), strict=False,
                         )
                     )
                     bp = pd.Series(
@@ -5240,7 +5240,7 @@ def _add_candidate_support_info_fields(
                     mate_lens.tolist(),
                     anchor_clip.tolist(),
                     run.tolist(),
-                    rescued.tolist(),
+                    rescued.tolist(), strict=False,
                 )
             ]
             polya_rescue = (
@@ -5255,7 +5255,7 @@ def _add_candidate_support_info_fields(
                     max(int(d), int(rl))
                     for d, rl in zip(
                         pd.Series(dpe_len, index=work.index).loc[keep_mask].tolist(),
-                        read_lens.loc[keep_mask].tolist(),
+                        read_lens.loc[keep_mask].tolist(), strict=False,
                     )
                 ]
                 tmp = tmp.loc[pd.to_numeric(tmp[out_col], errors="coerce").fillna(0).astype(int) > 0]
@@ -5584,7 +5584,7 @@ def _add_candidate_support_info_fields(
                 polya_mapped_total.tolist(),
                 vntr_mapped_total.tolist(),
                 is_sva.tolist(),
-                polya_side_vals.tolist(),
+                polya_side_vals.tolist(), strict=False,
             )
         ]
         if f"{prefix}_supporting_reads" in out.columns:
@@ -7609,8 +7609,8 @@ def _infer_disease_insertion_metrics(
                 if not chrom:
                     continue
                 try:
-                    ws = int(getattr(row, "window_start"))
-                    we = int(getattr(row, "window_end"))
+                    ws = int(row.window_start)
+                    we = int(row.window_end)
                 except (TypeError, ValueError):
                     continue
                 side = str(getattr(row, "clip_side", "") or "").strip().upper()
@@ -7678,7 +7678,7 @@ def _infer_disease_insertion_metrics(
             for i in range(0, len(window_seq) - m + 1):
                 mm = 0
                 w = window_seq[i : i + m]
-                for a, b in zip(w, motif):
+                for a, b in zip(w, motif, strict=False):
                     if a != b:
                         mm += 1
                         if mm > int(max_mismatch):
@@ -8501,7 +8501,7 @@ def _add_post_assembly_support_info_fields(
         dpe_r = pd.to_numeric(merged.get(f"{prefix}_dpe_r_post_asm", 0), errors="coerce").fillna(0).astype(int)
         merged[f"{prefix}_supporting_reads_post_assembly"] = [
             f"SR_L={sl},SR_R={srx},DPE_L={dl},DPE_R={dr}"
-            for sl, srx, dl, dr in zip(sr_l.tolist(), sr_r.tolist(), dpe_l.tolist(), dpe_r.tolist())
+            for sl, srx, dl, dr in zip(sr_l.tolist(), sr_r.tolist(), dpe_l.tolist(), dpe_r.tolist(), strict=False)
         ]
         if f"{prefix}_supporting_reads_post_assembly" in out.columns:
             out = out.drop(columns=[f"{prefix}_supporting_reads_post_assembly"])
@@ -8975,7 +8975,7 @@ def _revcomp(seq: str) -> str:
 def _hamming(a: str, b: str) -> int:
     if len(a) != len(b):
         return max(len(a), len(b))
-    return sum(1 for x, y in zip(a, b) if x != y)
+    return sum(1 for x, y in zip(a, b, strict=False) if x != y)
 
 
 # Motif examples from published analyses; these are supportive mechanism hints,
@@ -9128,33 +9128,33 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         out[col] = out[col].fillna("").astype(str)
 
     out["disease_family_agreement"] = [
-        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_family"], out["disease_R_mei_family"])
+        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_family"], out["disease_R_mei_family"], strict=False)
     ]
     out["disease_subfamily_agreement"] = [
-        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_subfamily"], out["disease_R_mei_subfamily"])
+        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_subfamily"], out["disease_R_mei_subfamily"], strict=False)
     ]
     out["disease_strand_agreement"] = [
-        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_strand"], out["disease_R_mei_strand"])
+        _agreement_flag(a, b) for a, b in zip(out["disease_L_mei_strand"], out["disease_R_mei_strand"], strict=False)
     ]
     out["control_family_agreement"] = [
         _agreement_flag(a, b)
         for a, b in zip(
             s("control_L_mei_family", "").fillna("").astype(str),
-            s("control_R_mei_family", "").fillna("").astype(str),
+            s("control_R_mei_family", "").fillna("").astype(str), strict=False,
         )
     ]
     out["control_subfamily_agreement"] = [
         _agreement_flag(a, b)
         for a, b in zip(
             s("control_L_mei_subfamily", "").fillna("").astype(str),
-            s("control_R_mei_subfamily", "").fillna("").astype(str),
+            s("control_R_mei_subfamily", "").fillna("").astype(str), strict=False,
         )
     ]
     out["control_strand_agreement"] = [
         _agreement_flag(a, b)
         for a, b in zip(
             s("control_L_mei_strand", "").fillna("").astype(str),
-            s("control_R_mei_strand", "").fillna("").astype(str),
+            s("control_R_mei_strand", "").fillna("").astype(str), strict=False,
         )
     ]
 
@@ -9730,7 +9730,7 @@ def _depth_stats_for_interval(
     span = end0 - start0
     if span <= 0:
         return (0.0, 0.0)
-    depths = [a + c + g + t for a, c, g, t in zip(cov[0], cov[1], cov[2], cov[3])]
+    depths = [a + c + g + t for a, c, g, t in zip(cov[0], cov[1], cov[2], cov[3], strict=False)]
     if not depths:
         return (0.0, 0.0)
     total_depth = float(sum(depths))
@@ -10095,7 +10095,7 @@ def _sample_random_windows(
         tree = excluded_trees.setdefault(chrom, IntervalTree())
         tree.addi(int(row.window_start), int(row.window_end) + 1, 1)
 
-    reference_lengths = {str(chrom): int(length) for chrom, length in zip(bam.references, bam.lengths)}
+    reference_lengths = {str(chrom): int(length) for chrom, length in zip(bam.references, bam.lengths, strict=False)}
     target_chroms = [str(c) for c in candidates["chrom"].astype(str).unique().tolist() if str(c) in reference_lengths]
     if not target_chroms:
         target_chroms = [str(c) for c in bam.references if str(c) in reference_lengths]
@@ -11355,7 +11355,7 @@ def _annotate_consensus_retrotransposition_fields(df: pd.DataFrame) -> pd.DataFr
     out["consensus_retrotransposition_class"] = classes
     out["consensus_sequence_signature"] = [
         _consensus_sequence_signature(row, retro_class=retro_class)
-        for (_, row), retro_class in zip(out.iterrows(), classes)
+        for (_, row), retro_class in zip(out.iterrows(), classes, strict=False)
     ]
     return out
 
@@ -12663,7 +12663,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
                     dpe_l.tolist(),
                     dpe_r.tolist(),
                     mei_mapped.tolist(),
-                    is_sva.tolist(),
+                    is_sva.tolist(), strict=False,
                 )
             ],
             index=out.index,
@@ -13811,7 +13811,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
         with cand_bed.open("w", encoding="utf-8") as hout:
             for i, row in enumerate(out.itertuples(index=False)):
                 as_row = pd.Series(row._asdict())
-                chrom = str(getattr(row, "chrom"))
+                chrom = str(row.chrom)
                 pos_1based = int(getattr(row, "insertion_breakpoint_pos", 0) or 0)
                 if pos_1based <= 0:
                     pos_1based = int(

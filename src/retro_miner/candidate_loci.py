@@ -1,17 +1,16 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import time
 from collections.abc import Iterable
 from pathlib import Path
-import subprocess
-import tempfile
 
 import click
 import pandas as pd
 from intervaltree import IntervalTree
 
 from ._utils import _open_textmaybe_gz
-
 
 _RUN_T0: float | None = None
 
@@ -92,7 +91,7 @@ def _read_passing_counts(summary_path: Path) -> dict[str, int]:
             "['sample', 'passing_reads'].  "
             "Run 'rtm extract-split-evidence' to regenerate it."
         ) from exc
-    return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int)))
+    return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int), strict=False))
 
 
 def _windowize(df: pd.DataFrame, window_size: int) -> pd.DataFrame:
