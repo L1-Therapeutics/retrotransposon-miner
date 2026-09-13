@@ -56,12 +56,6 @@ where = ["src"]
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
-[tool.ruff]
-target-version = "py311"
-line-length = 100
-select = ["E", "F", "I", "UP", "B"]
-ignore = ["E501"]
-
 [tool.black]
 line-length = 100
 target-version = ['py311', 'py312', 'py313']
