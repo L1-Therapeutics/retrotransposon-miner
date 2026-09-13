@@ -71,15 +71,26 @@ def _alt_label(family: str) -> str:
 
 
 def _extract_genotype_fields(rec: dict[str, Any]) -> tuple[str, float, float]:
-    """Return ``(genotype, vaf, genotype_quality)`` from a typed or flat record."""
+    """Return ``(genotype, vaf, genotype_quality)`` from a typed or flat record.
+
+    In the flat fallback, a present-but-``None`` key (as produced by pandas
+    ``DataFrame.to_dict("records")`` on empty cells) is treated as absent and
+    falls back to the default.  Explicit zeros (``vaf=0.0``, ``gq=0.0``) are
+    preserved via an ``is None`` check rather than falsiness.
+    """
     call = rec.get("genotype_call")
     if isinstance(call, GenotypeCall):
         return call.genotype, float(call.vaf), float(call.genotype_quality)
-    return (
-        str(rec.get("genotype", "0/1")),
-        float(rec.get("vaf", 0.50)),
-        float(rec.get("genotype_quality", 30.0)),
-    )
+    genotype = rec.get("genotype", "0/1")
+    vaf = rec.get("vaf", 0.50)
+    gq = rec.get("genotype_quality", 30.0)
+    if genotype is None:
+        genotype = "0/1"
+    if vaf is None:
+        vaf = 0.50
+    if gq is None:
+        gq = 30.0
+    return str(genotype), float(vaf), float(gq)
 
 
 def _extract_subfamily_fields(rec: dict[str, Any]) -> tuple[str, float]:
@@ -87,7 +98,13 @@ def _extract_subfamily_fields(rec: dict[str, Any]) -> tuple[str, float]:
     call = rec.get("subfamily_call")
     if isinstance(call, SubfamilyCall):
         return call.top_subfamily, float(call.log_likelihood_ratio)
-    return str(rec.get("subfamily", "L1HS")), float(rec.get("mei_llr", 3.0))
+    subfamily = rec.get("subfamily", "L1HS")
+    llr = rec.get("mei_llr", 3.0)
+    if subfamily is None:
+        subfamily = "L1HS"
+    if llr is None:
+        llr = 3.0
+    return str(subfamily), float(llr)
 
 
 def _extract_tsd_fields(rec: dict[str, Any]) -> tuple[str, int, int]:
@@ -98,9 +115,18 @@ def _extract_tsd_fields(rec: dict[str, Any]) -> tuple[str, int, int]:
         tsd_len = int(result.tsd_length)
         poly_a = 1 if result.polyA_tail_detected else 0
     else:
-        tsd_seq = str(rec.get("tsd_seq", ""))
-        tsd_len = int(rec.get("tsd_len", len(tsd_seq)))
-        poly_a = 1 if rec.get("poly_a_detected", False) else 0
+        tsd_seq = rec.get("tsd_seq", "")
+        tsd_len = rec.get("tsd_len", len(tsd_seq) if tsd_seq else 0)
+        poly_a_raw = rec.get("poly_a_detected")
+        if tsd_seq is None:
+            tsd_seq = ""
+        if tsd_len is None:
+            tsd_len = len(tsd_seq)
+        if poly_a_raw is None:
+            poly_a_raw = False
+        tsd_seq = str(tsd_seq)
+        tsd_len = int(tsd_len)
+        poly_a = 1 if bool(poly_a_raw) else 0
     return tsd_seq, tsd_len, poly_a
 
 
@@ -116,7 +142,13 @@ def _extract_support(rec: dict[str, Any]) -> int:
 
 def _extract_depth(rec: dict[str, Any]) -> tuple[int, int]:
     """Return ``(k_ref, k_alt)`` allele depths used to populate AD."""
-    return int(rec.get("k_ref", 10)), int(rec.get("k_alt", 10))
+    k_ref = rec.get("k_ref", 10)
+    k_alt = rec.get("k_alt", 10)
+    if k_ref is None:
+        k_ref = 10
+    if k_alt is None:
+        k_alt = 10
+    return int(k_ref), int(k_alt)
 
 
 def _build_header_lines(records: list[dict[str, Any]], sample_name: str) -> list[str]:
@@ -174,7 +206,10 @@ def write_mei_vcf(
         chrom = str(rec.get("chrom", "chr1"))
         pos = int(rec.get("pos", 10000))
         mei_id = f"MEI_{chrom}_{pos}"
-        ref_base = str(rec.get("ref_base", "N"))[0].upper()
+        ref_base = rec.get("ref_base", "N")
+        if ref_base is None:
+            ref_base = "N"
+        ref_base = str(ref_base)[0].upper()
         family = str(rec.get("family", "L1"))
 
         subfamily, llr = _extract_subfamily_fields(rec)

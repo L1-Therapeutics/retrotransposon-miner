@@ -209,6 +209,89 @@ def test_alt_definitions_match_used_families():
         assert "##ALT=<ID=INS:MEI:SVA" not in content
 
 
+def test_none_optional_fields_flat_record_exports_with_defaults():
+    record = {
+        "chrom": "chr1",
+        "pos": 15000,
+        "ref_base": None,
+        "family": "L1",
+        "subfamily": None,
+        "genotype": None,
+        "genotype_quality": None,
+        "vaf": None,
+        "k_ref": None,
+        "k_alt": None,
+        "tsd_seq": None,
+        "tsd_len": None,
+        "poly_a_detected": None,
+        "mei_llr": None,
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vcf_file = Path(tmpdir) / "none_flat.vcf"
+        write_mei_vcf([record], vcf_file)
+
+        content = vcf_file.read_text()
+        assert "chr1\t15000\tMEI_chr1_15000\tN\t<INS:MEI:L1HS>" in content
+        assert "0/1:30.0:0.50:10,10" in content
+        assert "MEI_LLR=3.00" in content
+        assert "SUBFAM=L1HS" in content
+        assert "TSDLEN=0" in content
+        assert "POLYA=0" in content
+
+        with pysam.VariantFile(str(vcf_file)) as reader:
+            parsed = next(iter(reader))
+            assert parsed.info["SUBFAM"] == "L1HS"
+            assert parsed.info["MEI_LLR"] == pytest.approx(3.0)
+            assert parsed.info["SUPPORT"] == 0
+            sample = parsed.samples["SAMPLE"]
+            assert sample["GT"] == (0, 1)
+            assert sample["GQ"] == pytest.approx(30.0)
+            assert sample["VAF"] == pytest.approx(0.50)
+            assert sample["AD"] == (10, 10)
+
+
+def test_explicit_zero_flat_fields_preserved():
+    record = {
+        "chrom": "chr8",
+        "pos": 80000,
+        "ref_base": "C",
+        "family": "L1",
+        "subfamily": "L1HS",
+        "genotype": "0/1",
+        "genotype_quality": 0.0,
+        "vaf": 0.0,
+        "k_ref": 0,
+        "k_alt": 3,
+        "tsd_seq": "GG",
+        "tsd_len": 0,
+        "poly_a_detected": False,
+        "mei_llr": 0.0,
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vcf_file = Path(tmpdir) / "zero_flat.vcf"
+        write_mei_vcf([record], vcf_file)
+
+        content = vcf_file.read_text()
+        assert "chr8\t80000\tMEI_chr8_80000\tC\t<INS:MEI:L1HS>" in content
+        assert ".\tLowQual\t" in content
+        assert "TSDLEN=0" in content
+        assert "POLYA=0" in content
+        assert "MEI_LLR=0.00" in content
+        assert "0/1:0.0:0.00:0,3" in content
+
+        with pysam.VariantFile(str(vcf_file)) as reader:
+            parsed = next(iter(reader))
+            assert parsed.info["MEI_LLR"] == pytest.approx(0.0)
+            assert parsed.info["POLYA"] == 0
+            assert parsed.info["SUPPORT"] == 3
+            sample = parsed.samples["SAMPLE"]
+            assert sample["GQ"] == pytest.approx(0.0)
+            assert sample["VAF"] == pytest.approx(0.0)
+            assert sample["AD"] == (0, 3)
+
+
 def test_record_lines_conform_to_vcf_syntax():
     records = [
         _typed_record(),
