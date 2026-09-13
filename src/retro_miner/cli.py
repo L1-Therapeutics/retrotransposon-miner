@@ -464,7 +464,13 @@ def extract_split_evidence_cmd(
     "--disease-bam",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Optional disease BAM for spanning reference depth and genotyping.",
+    help="Optional disease BAM for spanning reference depth, genotyping and TSD refinement.",
+)
+@click.option(
+    "--reference-fasta",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional reference genome FASTA (.fai indexed) for TSD boundary refinement.",
 )
 @click.option("--window-size", type=click.IntRange(min=1), default=200, show_default=True, help="Window size in bp for locus binning.")
 @click.option(
@@ -559,6 +565,7 @@ def build_candidate_loci_cmd(
     evidence_dir: Path,
     outdir: Path | None,
     disease_bam: Path | None,
+    reference_fasta: Path | None,
     window_size: int,
     split_cluster_bp: int,
     discordant_cluster_bp: int,
@@ -597,6 +604,8 @@ def build_candidate_loci_cmd(
         encode_blacklist_bed=encode_blacklist_bed,
         encode_blacklist_min_fraction=encode_blacklist_min_fraction,
         bam_path=disease_bam,
+        reference_fasta=reference_fasta,
+        tsd_refine_flank_bp=60,
     )
     click.echo(f"[candidate-loci] {tsv_path} elapsed={time.monotonic() - t0:.1f}s")
 

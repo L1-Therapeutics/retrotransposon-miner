@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import subprocess
 import tempfile
 import time
@@ -822,6 +821,114 @@ def _annotate_junk_flags(
     return out
 
 
+def _locus_median_breakpoints(
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+) -> dict[tuple[str, int, int], int]:
+    """Median evidence breakpoint per locus, keyed by (chrom, window_start, window_end)."""
+    parts = [d for d in (split_disease, split_control) if d is not None and not d.empty]
+    if not parts or any("pos" not in p.columns for p in parts):
+        return {}
+    merged_pos = pd.concat(parts, ignore_index=True)
+    keys = merged_pos.groupby(["chrom", "window_start", "window_end"])["pos"].median()
+    return {
+        (str(chrom), int(ws), int(we)): int(round(float(v)))
+        for (chrom, ws, we), v in keys.items()
+    }
+
+
+def _annotate_tsd_refinement(
+    loci: pd.DataFrame,
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+    bam_path: Path | None,
+    reference_fasta: Path | None,
+    tsd_refine_flank_bp: int,
+) -> pd.DataFrame:
+    """Annotate per-locus TSD fields from soft-clipped reads and the reference.
+
+    Adds ``tsd_seq``, ``tsd_length``, ``tsd_confidence_score`` and
+    ``polyA_tail_detected`` to *loci*.  When no BAM or reference FASTA is
+    supplied the columns are backfilled with neutral defaults so the output
+    schema stays stable regardless of inputs.
+    """
+    out = loci.copy().reset_index(drop=True)
+    if out.empty:
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    if bam_path is None or not bam_path.exists():
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    if reference_fasta is None or not reference_fasta.exists():
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    if (split_disease is None or split_disease.empty) and (
+        split_control is None or split_control.empty
+    ):
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+
+    from .tsd_refiner import refine_tsd_boundaries  # lazy: pysam-backed module
+
+    breakpoints = _locus_median_breakpoints(split_disease, split_control)
+    flank = max(10, int(tsd_refine_flank_bp))
+    rows: list[dict[str, object]] = []
+    with open_alignment(bam_path) as bam, pysam.FastaFile(str(reference_fasta)) as ref:
+        for row in out.itertuples(index=False):
+            chrom = str(row.chrom)
+            ws, we = int(row.window_start), int(row.window_end)
+            pos = breakpoints.get((chrom, ws, we), (ws + we) // 2)
+            pos0 = max(0, int(pos) - 1)
+            reads: list[pysam.AlignedSegment] = []
+            try:
+                reads = [
+                    r
+                    for r in bam.fetch(chrom, max(0, pos0 - flank), pos0 + flank + 1)
+                    if r is not None
+                    and r.cigartuples is not None
+                    and any(op == 4 for op, _ in r.cigartuples)
+                ]
+            except (ValueError, KeyError):
+                reads = []
+            res = refine_tsd_boundaries(
+                chrom,
+                pos,
+                reads,
+                ref,
+                min_tsd_len=4,
+                max_tsd_len=40,
+                flank_window_bp=max(flank, 80),
+            )
+            rows.append(
+                {
+                    "tsd_seq": res.tsd_seq,
+                    "tsd_length": res.tsd_length,
+                    "tsd_confidence_score": res.tsd_confidence_score,
+                    "polyA_tail_detected": res.polyA_tail_detected,
+                }
+            )
+    tsd_df = pd.DataFrame(rows)
+    if tsd_df.empty:
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    return pd.concat([out.reset_index(drop=True), tsd_df.reset_index(drop=True)], axis=1)
+
+
 def build_candidate_loci(
     evidence_dir: Path,
     outdir: Path,
@@ -841,6 +948,8 @@ def build_candidate_loci(
     encode_blacklist_bed: Path | None = None,
     encode_blacklist_min_fraction: float = 0.1,
     bam_path: Path | None = None,
+    reference_fasta: Path | None = None,
+    tsd_refine_flank_bp: int = 60,
 ) -> Path:
     global _RUN_T0
     _RUN_T0 = time.monotonic()
@@ -972,6 +1081,16 @@ def build_candidate_loci(
 
         genotype_df = pd.DataFrame(genotype_calls)
         merged = pd.concat([merged.reset_index(drop=True), genotype_df.reset_index(drop=True)], axis=1)
+
+        _progress("annotating TSD refinement per locus")
+        merged = _annotate_tsd_refinement(
+            loci=merged,
+            split_disease=split_disease,
+            split_control=split_control,
+            bam_path=bam_path,
+            reference_fasta=reference_fasta,
+            tsd_refine_flank_bp=tsd_refine_flank_bp,
+        )
 
         _progress("sorting final candidate loci")
         merged = merged.sort_values(["enrichment_ratio", "disease_total_rows"], ascending=[False, False], kind="mergesort")
