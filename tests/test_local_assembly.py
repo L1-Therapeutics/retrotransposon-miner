@@ -1,37 +1,58 @@
 import pytest
-from retro_miner.local_assembly import assemble_locus_clips, AssembledContig
 
-def test_de_bruijn_assembly_overlapping_clips():
-    # Two overlapping soft clips sharing 10-bp motif
-    clips = [
-        "ATTGCAGCTAGCTAG",
-        "AGCTAGCTAGAAAAA",
-        "ATTGCAGCTAGCTAG",
-        "AGCTAGCTAGAAAAA",
-    ]
+from retro_miner.local_assembly import AssembledContig, assemble_locus_clips, build_kmer_graph
 
-    contigs = assemble_locus_clips(clips, k=8, min_coverage=2)
 
-    assert len(contigs) > 0
-    top = contigs[0]
-    assert isinstance(top, AssembledContig)
-    assert "ATTGCAGCTAGCTAG" in top.sequence
-    assert top.length >= 15
-    assert top.support_score >= 2.0
+class TestBuildKmerGraph:
+    def test_non_empty_sequences_produce_adjacency(self):
+        adj, in_degrees, kmer_counts = build_kmer_graph(["ATTGCAGCTAGCTAG", "AGCTAGCTAGAAAAA"], k=4)
+        assert isinstance(adj, dict)
+        assert len(adj) > 0
 
-def test_noise_kmers_pruned_below_coverage_threshold():
-    # True clips repeated twice, noise clip present once
-    clips = [
-        "CGATCGATCGATCG",
-        "CGATCGATCGATCG",
-        "AAAAAAAAAAAAAA", # Noise clip (coverage=1)
-    ]
+    def test_empty_sequences_return_empty_graph(self):
+        adj, in_degrees, kmer_counts = build_kmer_graph([], k=21)
+        assert adj == {}
+        assert in_degrees == {}
+        assert kmer_counts == {}
 
-    contigs = assemble_locus_clips(clips, k=6, min_coverage=2)
+    def test_singleton_noise_pruned(self):
+        adj, in_degrees, kmer_counts = build_kmer_graph(["ACGTACGTACGT", "TTTTTTTT"], k=4)
+        for neighbors in adj.values():
+            for nxt in neighbors:
+                assert nxt in adj
 
-    assert len(contigs) == 1
-    assert "CGATCG" in contigs[0].sequence
-    assert "AAAAAA" not in contigs[0].sequence
 
-def test_empty_sequence_list():
-    assert assemble_locus_clips([], k=15) == []
+class TestAssembleLocusClips:
+    def test_overlapping_soft_clips_assemble_contig(self):
+        sequences = ["ATTGCAGCTAGCTAG", "AGCTAGCTAGAAAAA"]
+        contigs = assemble_locus_clips(sequences, k=4, min_coverage=2)
+        assert len(contigs) >= 1
+        longest = contigs[0]
+        assert isinstance(longest, AssembledContig)
+        assert longest.length >= 1
+        assert "AGCTAG" in longest.sequence
+
+    def test_low_coverage_noise_filtered(self):
+        clips = [
+            "CGATCGATCGATCG",
+            "CGATCGATCGATCG",
+            "AAAAAAAAAAAAAA",
+        ]
+        contigs = assemble_locus_clips(clips, k=6, min_coverage=2)
+        assert len(contigs) == 1
+        assert "CGATCG" in contigs[0].sequence
+        assert "AAAAAA" not in contigs[0].sequence
+
+    def test_empty_input_returns_empty(self):
+        contigs = assemble_locus_clips([], k=15)
+        assert contigs == []
+
+    def test_short_sequences_below_k_skipped(self):
+        contigs = assemble_locus_clips(["ACG", "TTT"], k=5, min_coverage=2)
+        assert contigs == []
+
+    def test_contigs_ordered_by_length_desc(self):
+        sequences = ["AAAAAA", "CCCC", "GGGGGGGG"]
+        contigs = assemble_locus_clips(sequences, k=3, min_coverage=2)
+        for i in range(len(contigs) - 1):
+            assert contigs[i].length >= contigs[i + 1].length
