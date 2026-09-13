@@ -29,7 +29,7 @@ jobs:
     - name: Install Python Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pytest pysam hypothesis anyio
+        pip install -e . pytest pysam hypothesis anyio pandas
 
     - name: Run Pytest Suite
       run: |
