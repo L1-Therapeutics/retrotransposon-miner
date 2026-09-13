@@ -966,7 +966,7 @@ def build_candidate_loci(
                 {
                     "vaf": call.vaf,
                     "gt": call.genotype,
-                    "gq": call.quality_score,
+                    "gq": call.genotype_quality,
                 }
             )
 
