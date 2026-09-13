@@ -22,6 +22,9 @@ class GenotypeCall:
     posterior_probs: dict[str, float]
 
 
+_MIN_TOTAL_READS = 3
+
+
 def log_binomial_pmf(k: int, n: int, p: float) -> float:
     """Calculate log2 binomial probability log2 Binomial(k; n, p)."""
     if n == 0:
@@ -55,7 +58,7 @@ def calculate_mei_genotype(
         GenotypeCall containing call string ("0/0", "0/1", "1/1", or "./."), VAF, GQ.
     """
     n = k_alt + k_ref
-    if n == 0:
+    if n < _MIN_TOTAL_READS:
         return GenotypeCall(
             genotype="./.",
             vaf=0.0,
