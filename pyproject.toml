@@ -18,6 +18,7 @@ dependencies = [
   "pandas>=2.2",
   "pyarrow>=16",        # implicit pandas Parquet engine
   "numpy>=1.26",
+  "scipy>=1.11",         # Fisher exact test in somatic_filter.py
   "matplotlib>=3.9",   # read_architecture.py plots
   "biopython>=1.84",
   "pyfaidx>=0.8",
