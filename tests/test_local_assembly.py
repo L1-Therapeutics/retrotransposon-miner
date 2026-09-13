@@ -1,6 +1,10 @@
-import pytest
+from pathlib import Path
 
-from retro_miner.local_assembly import AssembledContig, assemble_locus_clips, build_kmer_graph
+from retro_miner.local_assembly import (
+    AssembledContig,
+    assemble_locus_clips,
+    build_kmer_graph,
+)
 
 
 class TestBuildKmerGraph:
@@ -56,3 +60,52 @@ class TestAssembleLocusClips:
         contigs = assemble_locus_clips(sequences, k=3, min_coverage=2)
         for i in range(len(contigs) - 1):
             assert contigs[i].length >= contigs[i + 1].length
+
+
+class TestAnnotateSilverContract:
+    def test_adapter_exported_and_empty_frame_has_schema(self):
+        import pandas as pd
+
+        from retro_miner.local_assembly import annotate_silver_with_local_assembly
+
+        out = annotate_silver_with_local_assembly(
+            pd.DataFrame(),
+            disease_bam_path=Path("/nonexistent/disease.bam"),
+            control_bam_path=Path("/nonexistent/control.bam"),
+            assembly_cache_dir=Path("/nonexistent/cache"),
+            mei_fasta=Path("/nonexistent/mei.fa"),
+        )
+        assert out.empty
+        for col in (
+            "chrom",
+            "window_start",
+            "window_end",
+            "asm_consensus_breakpoint_pos",
+            "asm_breakpoint_source",
+            "asm_tsd_seq",
+            "asm_tsd_len",
+            "asm_polyA_max_run",
+        ):
+            assert col in out.columns
+
+    def test_adapter_skips_non_silver_loci(self):
+        import pandas as pd
+
+        from retro_miner.local_assembly import annotate_silver_with_local_assembly
+
+        candidates = pd.DataFrame(
+            {
+                "chrom": ["chr1"],
+                "window_start": [1000],
+                "window_end": [2000],
+                "silver_stage_pass": [False],
+            }
+        )
+        out = annotate_silver_with_local_assembly(
+            candidates,
+            disease_bam_path=Path("/nonexistent/disease.bam"),
+            control_bam_path=Path("/nonexistent/control.bam"),
+            assembly_cache_dir=Path("/nonexistent/cache"),
+            mei_fasta=Path("/nonexistent/mei.fa"),
+        )
+        assert out.empty
