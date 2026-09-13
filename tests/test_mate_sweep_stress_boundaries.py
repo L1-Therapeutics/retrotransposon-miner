@@ -14,7 +14,7 @@ def test_missing_quality_scores_handled_gracefully():
     with tempfile.TemporaryDirectory() as tmpdir:
         bam_path = Path(tmpdir) / "missing_qual.bam"
         header = {'HD': {'VN': '1.0'}, 'SQ': [{'LN': 1000000, 'SN': 'chr1'}]}
-        
+
         with pysam.AlignmentFile(bam_path, "wb", header=header) as out:
             a = pysam.AlignedSegment()
             a.query_name = "no_qual_read_01"
@@ -30,8 +30,7 @@ def test_missing_quality_scores_handled_gracefully():
             out.write(a)
 
         pysam.index(str(bam_path))
-        
-        # Verify single-pass extraction parses read without throwing TypeError
+
         with pysam.AlignmentFile(bam_path, "rb") as samfile:
             reads = [r for r in samfile.fetch(until_eof=True) if not r.is_unmapped]
             assert len(reads) == 1
@@ -47,7 +46,7 @@ def test_unplaced_decoy_contig_mate_tracking():
                 {'LN': 100000, 'SN': 'chr1_KI270706v1_random'}
             ]
         }
-        
+
         with pysam.AlignmentFile(bam_path, "wb", header=header) as out:
             r1 = pysam.AlignedSegment()
             r1.query_name = "translocation_decoy_pair"
@@ -57,7 +56,7 @@ def test_unplaced_decoy_contig_mate_tracking():
             r1.reference_start = 5000
             r1.mapping_quality = 60
             r1.cigar = ((0, 100),)
-            r1.mrnm = 1  # Mate on decoy contig
+            r1.mrnm = 1
             r1.mpos = 1000
             out.write(r1)
 
