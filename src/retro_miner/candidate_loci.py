@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import subprocess
 import tempfile
 import time
@@ -8,9 +9,12 @@ from pathlib import Path
 
 import click
 import pandas as pd
+import pysam
 from intervaltree import IntervalTree
 
 from ._utils import _open_textmaybe_gz
+from .bam_io import open_alignment
+from .genotyper import calculate_mei_genotype
 
 _RUN_T0: float | None = None
 
@@ -20,6 +24,45 @@ def _progress(msg: str) -> None:
         click.echo(f"[candidate-loci] {msg}")
     else:
         click.echo(f"[candidate-loci] +{(time.monotonic() - _RUN_T0):.1f}s {msg}")
+
+
+def _count_spanning_ref_reads_in_open_bam(
+    bam: pysam.AlignmentFile,
+    pos: int,
+    window: int = 50,
+    min_mapq: int = 20,
+) -> int:
+    start = max(0, pos - window)
+    end = pos + window
+    count = 0
+    for read in bam.fetch(bam.references[0], start, end):
+        if read.is_unmapped or read.mate_is_unmapped:
+            continue
+        if read.mapping_quality < min_mapq:
+            continue
+        if not read.is_paired or not read.is_proper_pair:
+            continue
+        if read.cigartuples is None:
+            continue
+        if any(op == 4 for op, _ in read.cigartuples):
+            continue
+        if any(op == 5 for op, _ in read.cigartuples):
+            continue
+        ref_start = int(read.reference_start) if read.reference_start is not None else 0
+        ref_end = int(read.reference_end) if read.reference_end is not None else 0
+        if ref_start <= end and ref_end >= start:
+            count += 1
+    return count
+
+
+def count_spanning_ref_reads(
+    bam_path: Path,
+    pos: int,
+    window: int = 50,
+    min_mapq: int = 20,
+) -> int:
+    with open_alignment(bam_path) as bam:
+        return _count_spanning_ref_reads_in_open_bam(bam, pos, window, min_mapq)
 
 
 def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
@@ -797,6 +840,7 @@ def build_candidate_loci(
     gap_min_fraction: float = 0.1,
     encode_blacklist_bed: Path | None = None,
     encode_blacklist_min_fraction: float = 0.1,
+    bam_path: Path | None = None,
 ) -> Path:
     global _RUN_T0
     _RUN_T0 = time.monotonic()
@@ -897,6 +941,37 @@ def build_candidate_loci(
         encode_blacklist_bed=encode_blacklist_bed,
         encode_blacklist_min_fraction=encode_blacklist_min_fraction,
     )
+
+        _progress("computing spanning reference depth and genotyping")
+        ref_counts: list[int] = []
+        if bam_path is not None and bam_path.exists():
+            with open_alignment(bam_path) as bam:
+                for row in merged.itertuples(index=False):
+                    center = (int(row.window_start) + int(row.window_end)) // 2
+                    ref_counts.append(
+                        _count_spanning_ref_reads_in_open_bam(bam, center)
+                    )
+        else:
+            ref_counts = [0] * len(merged)
+
+        merged["ref_read_count"] = ref_counts
+        merged["alt_read_count"] = merged["disease_total_rows"]
+
+        genotype_calls = []
+        for _, row in merged.iterrows():
+            k_alt = int(row["alt_read_count"])
+            k_ref = int(row["ref_read_count"])
+            call = calculate_mei_genotype(k_alt, k_ref)
+            genotype_calls.append(
+                {
+                    "vaf": call.vaf,
+                    "gt": call.genotype,
+                    "gq": call.quality_score,
+                }
+            )
+
+        genotype_df = pd.DataFrame(genotype_calls)
+        merged = pd.concat([merged.reset_index(drop=True), genotype_df.reset_index(drop=True)], axis=1)
 
         _progress("sorting final candidate loci")
         merged = merged.sort_values(["enrichment_ratio", "disease_total_rows"], ascending=[False, False], kind="mergesort")
