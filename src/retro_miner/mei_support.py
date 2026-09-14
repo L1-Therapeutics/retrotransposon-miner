@@ -21,10 +21,13 @@ import pysam
 from intervaltree import IntervalTree
 
 from retro_miner.bam_io import open_alignment
+from retro_miner.cleavage_motif import score_cleavage_motif
 from retro_miner.evidence_extract import _longest_soft_clip_from_read, _soft_clip_query_seq
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
+from retro_miner.subfamily_voter import classify_mei_subfamily
+from retro_miner.transduction_detector import detect_3prime_transduction
 
 from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 
@@ -13898,6 +13901,97 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
     return out
 
 
+def _enrich_candidates_with_scientific_modules(
+    candidate: pd.DataFrame,
+    *,
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+    discordant_disease: pd.DataFrame,
+    discordant_control: pd.DataFrame,
+    asm_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Enrich candidate loci with scientific module annotations.
+
+    Applies subfamily voting, De Bruijn micro-assembly, 3' transduction
+    detection, and TPRT cleavage motif scoring to each candidate locus.
+    """
+    if candidate.empty:
+        return candidate
+
+    out = candidate.copy().reset_index(drop=True)
+
+    seq_cols = ["soft_clip_seq", "mate_seq", "read_seq", "clip_seq"]
+    seq_dfs = [df for df in [split_disease, split_control, discordant_disease, discordant_control] if not df.empty]
+    if seq_dfs:
+        seq_df = pd.concat(seq_dfs, ignore_index=True)
+    else:
+        seq_df = pd.DataFrame()
+
+    subfamily_rows: list[dict[str, object]] = []
+    transduction_rows: list[dict[str, object]] = []
+    motif_rows: list[dict[str, object]] = []
+
+    for row in out.itertuples(index=False):
+        chrom = str(getattr(row, "chrom", ""))
+        ws = int(getattr(row, "window_start", 0))
+        we = int(getattr(row, "window_end", 0))
+
+        locus_seqs: list[str] = []
+        if not seq_df.empty:
+            mask = (seq_df.get("chrom", pd.Series("")) == chrom) & (
+                (seq_df.get("window_start", pd.Series(0)) == ws)
+                & (seq_df.get("window_end", pd.Series(0)) == we)
+            )
+            subset = seq_df.loc[mask]
+            for col in seq_cols:
+                if col in subset.columns:
+                    locus_seqs.extend(subset[col].fillna("").astype(str).tolist())
+
+        sub_call = classify_mei_subfamily([s for s in locus_seqs if s], family_hint="L1")
+        subfamily_rows.append(
+            {
+                "subfamily": sub_call.top_subfamily,
+                "mei_llr": float(sub_call.log_likelihood_ratio),
+            }
+        )
+
+        contig_seqs = [s for s in locus_seqs if s and len(s) >= 15]
+        if contig_seqs:
+            from retro_miner.local_assembly import assemble_locus_clips
+            unitigs = assemble_locus_clips(contig_seqs, k=min(15, max(4, min(len(s) for s in contig_seqs))), min_coverage=2)
+            best_contig = unitigs[0].sequence if unitigs else ""
+            if best_contig:
+                tr = detect_3prime_transduction(best_contig, min_transduction_len=20)
+                transduction_rows.append(
+                    {
+                        "transduction_type": tr.transduction_type if tr.has_transduction else "NONE",
+                        "transduction_seq": tr.transduction_seq,
+                        "transduction_length": int(tr.transduction_length),
+                    }
+                )
+                motif_rows.append(
+                    {
+                        "tprt_motif_score": float(score_cleavage_motif(best_contig).pwm_score),
+                    }
+                )
+            else:
+                transduction_rows.append(
+                    {"transduction_type": "NONE", "transduction_seq": "", "transduction_length": 0}
+                )
+                motif_rows.append({"tprt_motif_score": 0.0})
+        else:
+            transduction_rows.append(
+                {"transduction_type": "NONE", "transduction_seq": "", "transduction_length": 0}
+            )
+            motif_rows.append({"tprt_motif_score": 0.0})
+
+    sub_df = pd.DataFrame(subfamily_rows)
+    tr_df = pd.DataFrame(transduction_rows)
+    motif_df = pd.DataFrame(motif_rows)
+
+    out = pd.concat([out.reset_index(drop=True), sub_df.reset_index(drop=True), tr_df.reset_index(drop=True), motif_df.reset_index(drop=True)], axis=1)
+    return out
+
 
 def annotate_candidate_loci_with_mei(
     evidence_dir: Path,
@@ -14562,6 +14656,20 @@ def annotate_candidate_loci_with_mei(
         discordant_disease=discordant_disease,
         discordant_control=discordant_control,
     )
+
+    science_t0 = time.monotonic()
+    candidate = _enrich_candidates_with_scientific_modules(
+        candidate,
+        split_disease=split_disease,
+        split_control=split_control,
+        discordant_disease=discordant_disease,
+        discordant_control=discordant_control,
+        asm_df=asm_df if local_assembly else pd.DataFrame(),
+    )
+    click.echo(
+        f"[mei-annotate] scientific module enrichment elapsed={time.monotonic() - science_t0:.1f}s"
+    )
+
     if g1k_mei_vcf is not None:
         g1k_t0 = time.monotonic()
         candidate = _annotate_g1k_mei_overlap(

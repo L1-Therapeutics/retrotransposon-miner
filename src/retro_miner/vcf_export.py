@@ -42,6 +42,10 @@ INFO_HEADER_LINES: list[str] = [
     '##INFO=<ID=MEI_LLR,Number=1,Type=Float,Description="Log-likelihood ratio for subfamily call">',
     '##INFO=<ID=SUBFAM,Number=1,Type=String,Description="Classified mobile element subfamily">',
     '##INFO=<ID=SUPPORT,Number=1,Type=Integer,Description="Number of supporting non-reference reads">',
+    '##INFO=<ID=TRANSDUCTION_TYPE,Number=1,Type=String,Description="3\' transduction classification (3_PRIME_PARTNERED, 3_PRIME_ORPHAN, NONE)">',
+    '##INFO=<ID=TRANSDUCTION_SEQ,Number=1,Type=String,Description="Transduced genomic sequence barcode">',
+    '##INFO=<ID=TRANSDUCTION_LENGTH,Number=1,Type=Integer,Description="Length of transduced sequence in bp">',
+    '##INFO=<ID=TPRT_MOTIF_SCORE,Number=1,Type=Float,Description="TPRT endonuclease cleavage motif confidence score">',
 ]
 
 FILTER_HEADER_LINES: list[str] = [
@@ -128,6 +132,20 @@ def _extract_tsd_fields(rec: dict[str, Any]) -> tuple[str, int, int]:
         tsd_len = int(tsd_len)
         poly_a = 1 if bool(poly_a_raw) else 0
     return tsd_seq, tsd_len, poly_a
+
+
+def _extract_transduction_fields(rec: dict[str, Any]) -> tuple[str, str, int]:
+    """Return ``(transduction_type, transduction_seq, transduction_length)``."""
+    return (
+        str(rec.get("transduction_type", "NONE")),
+        str(rec.get("transduction_seq", "")),
+        int(rec.get("transduction_length", 0)),
+    )
+
+
+def _extract_tprt_motif_score(rec: dict[str, Any]) -> float:
+    """Return TPRT cleavage motif score."""
+    return float(rec.get("tprt_motif_score", 0.0))
 
 
 def _extract_support(rec: dict[str, Any]) -> int:
@@ -217,6 +235,8 @@ def write_mei_vcf(
         tsd_seq, tsd_len, poly_a = _extract_tsd_fields(rec)
         support = _extract_support(rec)
         k_ref, k_alt = _extract_depth(rec)
+        tr_type, tr_seq, tr_len = _extract_transduction_fields(rec)
+        tprt_score = _extract_tprt_motif_score(rec)
 
         alt_symbol = f"<INS:MEI:{_alt_label(family)}>"
         qual_str = f"{gq:.1f}" if gq > 0 else "."
@@ -231,6 +251,10 @@ def write_mei_vcf(
             f"MEI_LLR={llr:.2f}",
             f"SUBFAM={subfamily}",
             f"SUPPORT={support}",
+            f"TRANSDUCTION_TYPE={tr_type}",
+            f"TRANSDUCTION_SEQ={tr_seq if tr_seq else 'NONE'}",
+            f"TRANSDUCTION_LENGTH={tr_len}",
+            f"TPRT_MOTIF_SCORE={tprt_score:.2f}",
         ]
         info_str = ";".join(info_fields)
 
