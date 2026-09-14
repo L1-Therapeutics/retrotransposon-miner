@@ -72,7 +72,7 @@ def process_candidate_locus(
         "k_alt": k_alt,
         "tsd_seq": tsd_res.tsd_seq,
         "tsd_len": tsd_res.tsd_length,
-        "poly_a_detected": tsd_res.poly_a_detected,
+        "poly_a_detected": tsd_res.polyA_tail_detected,
         "mei_llr": subfam_call.log_likelihood_ratio,
         "assembled_contig": top_contig,
     }
