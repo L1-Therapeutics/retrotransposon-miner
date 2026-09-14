@@ -243,7 +243,116 @@ def _resolve_overlap(
     return overlap, micro_seq, "", False
 
 
+def _concat_clip_inputs(clips: str | Sequence[str] | Sequence[pysam.AlignedSegment]) -> str:
+    """Fold a clip argument into one uppercased sequence string.
+
+    Accepts either a bare clip string, a list of clip strings, or a list of
+    :class:`pysam.AlignedSegment` records.  Sequences are concatenated in
+    order before the Shannon entropy and common-substring analyses.
+    """
+    if clips is None:
+        return ""
+    if isinstance(clips, str):
+        return clips.upper()
+    parts: list[str] = []
+    for clip in clips:
+        if clip is None:
+            continue
+        if isinstance(clip, str):
+            seq = clip
+        elif isinstance(clip, pysam.AlignedSegment):
+            seq = clip.query_sequence or ""
+        else:
+            seq = str(clip)
+        if seq:
+            parts.append(seq)
+    return "".join(parts).upper()
+
+
+def _junction_tsd_candidate(left: str, right: str, min_tsd_len: int, max_tsd_len: int) -> str:
+    """Extract the junction-flush duplicated block shared by *left* and *right*.
+
+    Prefers the maximal exact flush match straddling the insertion junction
+    (``left[-k:] == right[:k]``); falls back to the longest common substring
+    when no flush block is within the TSD length band.
+    """
+    flush_len = _max_flush_match(left, right)
+    if min_tsd_len <= flush_len <= max_tsd_len:
+        return left[-flush_len:]
+    common = find_longest_common_substring(left, right)
+    if min_tsd_len <= len(common) <= max_tsd_len:
+        return common
+    if flush_len:
+        return left[-flush_len:]
+    return ""
+
+
 def refine_tsd_boundaries(
+    chrom_or_left: str,
+    pos_or_right: int | str | Sequence[str] | Sequence[pysam.AlignedSegment],
+    soft_clips_or_fasta: (
+        Sequence[pysam.AlignedSegment] | str | Path | pysam.FastaFile | None
+    ) = None,
+    ref_genome_fasta: str | Path | pysam.FastaFile | None = None,
+    min_tsd_len: int = MIN_TSD_LEN,
+    max_tsd_len: int = MAX_TSD_LEN,
+    clip_min_len: int = MIN_CLIP_LEN,
+    flank_window_bp: int = 80,
+) -> TSDResult:
+    """Refine the TSD boundaries for one insertion locus.
+
+    Supports two calling conventions:
+
+    * Legacy record form ``(chrom, pos, soft_clips, ref_genome_fasta)`` -
+      reads are partitioned from their clip-to-junction geometry against the
+      reference (see :func:`_refine_tsd_boundaries_reads`).
+    * Clip-string form ``(left_clip_seq, right_clip_seq[, ref_genome_fasta])`` -
+      the sequences are concatenated (when lists are passed) and analysed via
+      Shannon entropy plus junction common-substring matching; a reference
+      genome is optional and unused in this mode.
+
+    Args:
+        chrom_or_left: Reference chromosome, or the 5' clip sequences.
+        pos_or_right: 1-based insertion breakpoint, or the 3' clip sequences.
+        soft_clips_or_fasta: Supporting soft-clipped reads (legacy form) or an
+            optional reference FASTA / :class:`pysam.FastaFile` (clip form).
+        ref_genome_fasta: Reference FASTA for the legacy record form.  An open
+            :class:`pysam.FastaFile` will not be closed here.
+        min_tsd_len: Smallest biological TSD length considered real.
+        max_tsd_len: Largest TSD length considered a single block.
+        clip_min_len: Minimum soft-clip length used as evidence.
+        flank_window_bp: Reference window flanking each junction used for the
+            exact k-mer resolution.
+
+    Returns:
+        :class:`TSDResult` with resolved TSD, confidence, and tail status.
+    """
+    if not isinstance(pos_or_right, int):
+        return _refine_tsd_boundaries_clips(
+            chrom_or_left,
+            pos_or_right,
+            min_tsd_len,
+            max_tsd_len,
+            clip_min_len,
+        )
+    if ref_genome_fasta is None:
+        raise TypeError(
+            "refine_tsd_boundaries() requires 'ref_genome_fasta' when called as "
+            "(chrom, pos, soft_clips, ref_genome_fasta)"
+        )
+    return _refine_tsd_boundaries_reads(
+        chrom_or_left,
+        pos_or_right,
+        soft_clips_or_fasta,
+        ref_genome_fasta,
+        min_tsd_len,
+        max_tsd_len,
+        clip_min_len,
+        flank_window_bp,
+    )
+
+
+def _refine_tsd_boundaries_reads(
     chrom: str,
     pos: int,
     soft_clips: Sequence[pysam.AlignedSegment],
@@ -253,7 +362,7 @@ def refine_tsd_boundaries(
     clip_min_len: int = MIN_CLIP_LEN,
     flank_window_bp: int = 80,
 ) -> TSDResult:
-    """Refine the TSD boundaries for one insertion locus.
+    """Refine TSD boundaries from raw soft-clipped read records.
 
     Args:
         chrom: Reference chromosome/contig name.
@@ -449,4 +558,98 @@ def refine_tsd_boundaries(
         right_breakpoint=right_bp_val,
         n_left_anchored=len(left_anchors),
         n_right_anchored=len(right_anchors),
+    )
+
+
+def _refine_tsd_boundaries_clips(
+    left_clip_seq: str | Sequence[str] | Sequence[pysam.AlignedSegment],
+    right_clip_seq: str | Sequence[str] | Sequence[pysam.AlignedSegment],
+    min_tsd_len: int = MIN_TSD_LEN,
+    max_tsd_len: int = MAX_TSD_LEN,
+    clip_min_len: int = MIN_CLIP_LEN,
+) -> TSDResult:
+    """Refine TSD boundaries directly from clip sequences.
+
+    Concatenates the left/right clip sequences, runs Shannon entropy
+    discrimination over the insert-facing homopolymer run to detect the 3'
+    poly(A)/poly(T) tail, and resolves the duplicated target site block by
+    junction-flush common-substring matching between the two arms.
+
+    Args:
+        left_clip_seq: 5' clip string or list of 5' clip strings/reads.
+        right_clip_seq: 3' clip string or list of 3' clip strings/reads.
+        min_tsd_len: Smallest biological TSD length considered real.
+        max_tsd_len: Largest TSD length considered a single block.
+        clip_min_len: Minimum clip length used as evidence.
+
+    Returns:
+        :class:`TSDResult` with resolved TSD, confidence, and tail status.
+    """
+    if min_tsd_len < 1:
+        min_tsd_len = 1
+    if max_tsd_len < min_tsd_len:
+        max_tsd_len = min_tsd_len
+    if clip_min_len < 1:
+        clip_min_len = 1
+
+    left = _concat_clip_inputs(left_clip_seq)
+    right = _concat_clip_inputs(right_clip_seq)
+
+    clip_seqs = [c for c in (left, right) if c and len(c) >= clip_min_len]
+    if not clip_seqs:
+        return TSDResult(
+            chrom="",
+            pos=0,
+            tsd_seq="",
+            tsd_length=0,
+            tsd_confidence_score=CONFIDENCE_NONE,
+            polyA_tail_detected=False,
+            entropy=0.0,
+            method="no_soft_clips",
+        )
+
+    poly_tail_base, poly_tail_length = _detect_poly_tail(clip_seqs)
+    polyA_tail_detected = poly_tail_base != ""
+    avg_entropy = round(
+        sum(calculate_sequence_entropy(c) for c in clip_seqs) / len(clip_seqs),
+        4,
+    )
+
+    tsd_seq = _junction_tsd_candidate(left, right, min_tsd_len, max_tsd_len)
+    microhomology_seq = ""
+    method = "none"
+    confidence = CONFIDENCE_NONE
+
+    if tsd_seq:
+        tsd_seq, microhomology_seq, micro_method, resolved = _resolve_overlap(
+            tsd_seq, poly_tail_base, min_tsd_len
+        )
+        if resolved:
+            method = micro_method
+            confidence = CONFIDENCE_MICROHOMOLOGY
+        elif is_poly_a_or_t(tsd_seq):
+            tsd_seq = ""
+            method = "polyA_artifact"
+            confidence = CONFIDENCE_NONE
+        elif len(tsd_seq) < min_tsd_len:
+            method = "short_overlap"
+            confidence = CONFIDENCE_SHORT_OVERLAP
+        else:
+            method = "tsd_flush_match"
+            confidence = CONFIDENCE_TSD_POLYA if polyA_tail_detected else CONFIDENCE_TSD
+
+    return TSDResult(
+        chrom="",
+        pos=0,
+        tsd_seq=tsd_seq,
+        tsd_length=len(tsd_seq),
+        tsd_confidence_score=confidence,
+        polyA_tail_detected=polyA_tail_detected,
+        entropy=avg_entropy,
+        method=method,
+        microhomology_seq=microhomology_seq,
+        poly_tail_base=poly_tail_base,
+        poly_tail_length=poly_tail_length,
+        n_left_anchored=len(left) if left else 0,
+        n_right_anchored=len(right) if right else 0,
     )
