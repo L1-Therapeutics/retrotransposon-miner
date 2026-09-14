@@ -14,6 +14,7 @@ from retro_miner.evidence_extract import (
     extract_split_evidence,
 )
 from retro_miner.mei_support import annotate_candidate_loci_with_mei
+from retro_miner.summary_report import generate_scientific_summary_report
 
 
 @click.group()
@@ -1078,6 +1079,32 @@ def annotate_mei_support_cmd(
         bwa_threads=bwa_threads,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
+
+
+@cli.command("generate-summary-report")
+@click.option(
+    "--vcf",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to annotated MEI VCF v4.3 file.",
+)
+@click.option(
+    "--output-md",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to write the Markdown summary report.",
+)
+def generate_summary_report_cmd(vcf: Path, output_md: Path) -> None:
+    """Generate a scientific summary report from an annotated MEI VCF."""
+    t0 = time.monotonic()
+    summary = generate_scientific_summary_report(vcf, output_md)
+    json_path = output_md.with_suffix(".json")
+    click.echo(f"[summary] wrote Markdown report to {output_md}")
+    click.echo(f"[summary] wrote JSON summary to {json_path}")
+    click.echo(
+        f"[summary] total_candidates={summary.total_candidates} "
+        f"mean_vaf={summary.mean_vaf:.4f} elapsed={time.monotonic() - t0:.1f}s"
+    )
 
 
 if __name__ == "__main__":
