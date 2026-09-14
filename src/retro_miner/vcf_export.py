@@ -47,6 +47,8 @@ INFO_HEADER_LINES: list[str] = [
     '##INFO=<ID=TRANSDUCTION_SEQ,Number=1,Type=String,Description="Transduced genomic sequence barcode">',
     '##INFO=<ID=TRANSDUCTION_LENGTH,Number=1,Type=Integer,Description="Length of transduced sequence in bp">',
     '##INFO=<ID=TPRT_MOTIF_SCORE,Number=1,Type=Float,Description="TPRT endonuclease cleavage motif confidence score">',
+    '##INFO=<ID=EN_INDEPENDENT,Number=1,Type=Integer,Description="Insertion classified as EN-independent (DSB-repair) retrotransposition: no TSD, no canonical 5\' TTTT/AA-3\' motif, and target-site deletion > 0 bp (Morrish et al. 2002)">',
+    '##INFO=<ID=TARGET_DEL_BP,Number=1,Type=Integer,Description="Target-site genomic deletion size at the insertion locus in bp">',
     '##INFO=<ID=SOMATIC,Number=1,Type=Integer,Description="Subclonal somatic MEI flagged by 3-component EM mixture model (1=somatic, 0=not)">',
     '##INFO=<ID=SOMATIC_POST,Number=1,Type=Float,Description="Somatic component posterior probability P(Somatic | k_alt, n)">',
     '##INFO=<ID=SUBCLONE_VAF,Number=1,Type=Float,Description="Inferred subclonal variant allele fraction theta_som">',
@@ -150,6 +152,17 @@ def _extract_transduction_fields(rec: dict[str, Any]) -> tuple[str, str, int]:
 def _extract_tprt_motif_score(rec: dict[str, Any]) -> float:
     """Return TPRT cleavage motif score."""
     return float(rec.get("tprt_motif_score", 0.0))
+
+
+def _extract_en_independent_fields(rec: dict[str, Any]) -> tuple[int, int]:
+    """Return ``(en_independent_flag, target_deletion_bp)`` from a record."""
+    is_en_independent = rec.get("is_en_independent", False)
+    target_del_bp = rec.get("target_del_bp", 0)
+    if is_en_independent is None:
+        is_en_independent = False
+    if target_del_bp is None:
+        target_del_bp = 0
+    return int(bool(is_en_independent)), int(target_del_bp)
 
 
 def _extract_support(rec: dict[str, Any]) -> int:
@@ -266,6 +279,7 @@ def write_mei_vcf(
         k_ref, k_alt = _extract_depth(rec)
         tr_type, tr_seq, tr_len = _extract_transduction_fields(rec)
         tprt_score = _extract_tprt_motif_score(rec)
+        en_flag, target_del_bp = _extract_en_independent_fields(rec)
         somatic_fields = _extract_somatic_fields(rec)
 
         alt_symbol = f"<INS:MEI:{_alt_label(family)}>"
@@ -285,6 +299,8 @@ def write_mei_vcf(
             f"TRANSDUCTION_SEQ={tr_seq if tr_seq else 'NONE'}",
             f"TRANSDUCTION_LENGTH={tr_len}",
             f"TPRT_MOTIF_SCORE={tprt_score:.2f}",
+            f"EN_INDEPENDENT={en_flag}",
+            f"TARGET_DEL_BP={target_del_bp}",
         ]
         if somatic_fields is not None:
             som_flag, som_post, subclone_vaf = somatic_fields
