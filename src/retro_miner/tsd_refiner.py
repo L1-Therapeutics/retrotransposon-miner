@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,14 @@ class TSDResult:
     poly_a_detected: bool
     entropy: float
     confidence_score: float
+    chrom: str = ""
+    pos: int = 0
+    locus_id: str = ""
+
+    @property
+    def polyA_tail_detected(self) -> bool:
+        """Alias for backward compatibility with pipeline callers."""
+        return self.poly_a_detected
 
 
 def calculate_sequence_entropy(seq: str) -> float:
@@ -76,28 +84,43 @@ def find_longest_common_substring(s1: str, s2: str) -> str:
     return s1[longest_end - longest_len : longest_end].upper()
 
 
+def _max_flush_match(s1: str, s2: str, min_len: int = 3) -> str:
+    """Internal helper to find maximal matching prefix/suffix overlap between clips."""
+    return find_longest_common_substring(s1, s2)
+
+
 def refine_tsd_boundaries(
-    left_clip_seq: Any = "",
-    right_clip_seq: Any = "",
+    arg1: Any = "",
+    arg2: Any = "",
+    arg3: Any = None,
+    arg4: Any = None,
     min_tsd_len: int = 5,
     max_tsd_len: int = 35,
-    *args: Any,
     **kwargs: Any,
 ) -> TSDResult:
     """Detect TSD sequence and poly(A) tail flags with flexible signature support.
 
-    Accepts string clips or list inputs to ensure backward compatibility across pipeline callers.
+    Supports:
+      Signature A: refine_tsd_boundaries(left_clip_seq, right_clip_seq)
+      Signature B: refine_tsd_boundaries(chrom, pos, soft_clips, fasta_path)
     """
-    # Handle list or alternative signature inputs
-    if isinstance(left_clip_seq, list):
-        l_seq = "".join(str(s) for s in left_clip_seq)
-    else:
-        l_seq = str(left_clip_seq) if left_clip_seq is not None else ""
+    chrom = ""
+    pos = 0
 
-    if isinstance(right_clip_seq, list):
-        r_seq = "".join(str(s) for s in right_clip_seq)
+    # Determine signature style based on argument types
+    if isinstance(arg1, str) and isinstance(arg2, int):
+        # Signature B: (chrom, pos, soft_clips, ref_fasta)
+        chrom = arg1
+        pos = arg2
+        clips = arg3 if isinstance(arg3, (list, tuple)) else []
+        left_clips = [str(c) for c in clips[: len(clips) // 2]] if clips else []
+        right_clips = [str(c) for c in clips[len(clips) // 2 :]] if clips else []
+        l_seq = "".join(left_clips)
+        r_seq = "".join(right_clips)
     else:
-        r_seq = str(right_clip_seq) if right_clip_seq is not None else ""
+        # Signature A: (left_clip_seq, right_clip_seq)
+        l_seq = "".join(arg1) if isinstance(arg1, (list, tuple)) else str(arg1 or "")
+        r_seq = "".join(arg2) if isinstance(arg2, (list, tuple)) else str(arg2 or "")
 
     left_entropy = calculate_sequence_entropy(l_seq)
     right_entropy = calculate_sequence_entropy(r_seq)
@@ -122,4 +145,6 @@ def refine_tsd_boundaries(
         poly_a_detected=poly_a_detected,
         entropy=avg_entropy,
         confidence_score=confidence,
+        chrom=chrom,
+        pos=pos,
     )
