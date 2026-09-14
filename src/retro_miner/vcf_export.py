@@ -48,7 +48,7 @@ INFO_HEADER_LINES: list[str] = [
     '##INFO=<ID=TRANSDUCTION_SEQ,Number=1,Type=String,Description="Transduced genomic sequence barcode">',
     '##INFO=<ID=TRANSDUCTION_LENGTH,Number=1,Type=Integer,Description="Length of transduced sequence in bp">',
     '##INFO=<ID=TPRT_MOTIF_SCORE,Number=1,Type=Float,Description="TPRT endonuclease cleavage motif confidence score">',
-    '##INFO=<ID=EN_INDEPENDENT,Number=1,Type=Integer,Description="Insertion classified as EN-independent (DSB-repair) retrotransposition: no TSD, no canonical 5\' TTTT/AA-3\' motif, and target-site deletion > 0 bp (Morrish et al. 2002)">',
+    "##INFO=<ID=EN_INDEPENDENT,Number=1,Type=Integer,Description=\"Insertion classified as EN-independent (DSB-repair) retrotransposition: no TSD, no canonical 5' TTTT/AA-3' motif, and target-site deletion > 0 bp (Morrish et al. 2002)\">",
     '##INFO=<ID=TARGET_DEL_BP,Number=1,Type=Integer,Description="Target-site genomic deletion size at the insertion locus in bp">',
     '##INFO=<ID=SOMATIC,Number=1,Type=Integer,Description="Subclonal somatic MEI flagged by 3-component EM mixture model (1=somatic, 0=not)">',
     '##INFO=<ID=SOMATIC_POST,Number=1,Type=Float,Description="Somatic component posterior probability P(Somatic | k_alt, n)">',

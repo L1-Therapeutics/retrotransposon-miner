@@ -12,7 +12,7 @@ from retro_miner.vcf_export import write_mei_vcf
 
 VCF_LINE_RE = re.compile(
     r"^(\S+)\t(\d+)\t(MEI_\S+)\t([A-ZN.])\t(<INS:MEI:[^>]+>)\t([.\d]+)\t"
-    r"(PASS|LowQual)\t([^\t]+)\t(GT:GQ:VAF:AD)\t(\S+)$"
+    r"(PASS|LowQual)\t([^\t]+)\t(GT:GQ:VAF:AD:HP:PQ)\t(\S+)$"
 )
 
 
@@ -34,10 +34,9 @@ def _typed_record() -> dict:
             pos=15000,
             tsd_seq="ATTGCAG",
             tsd_length=7,
-            tsd_confidence_score=0.85,
-            polyA_tail_detected=True,
+            confidence_score=0.85,
+            poly_a_detected=True,
             entropy=1.4,
-            method="tsd_flush_match",
         ),
         "subfamily_call": SubfamilyCall(
             family="L1",
@@ -184,10 +183,9 @@ def test_no_poly_a_tail_exported_as_zero():
         pos=15000,
         tsd_seq="GGCC",
         tsd_length=4,
-        tsd_confidence_score=0.60,
-        polyA_tail_detected=False,
+        confidence_score=0.60,
+        poly_a_detected=False,
         entropy=2.0,
-        method="blunt",
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:

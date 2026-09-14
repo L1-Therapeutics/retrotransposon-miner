@@ -261,4 +261,3 @@ def run_scientific_mei_pipeline(
         _tag_somatic_fields(rec, call)
 
     return write_mei_vcf(refined_records, output_vcf_path, sample_name=sample_name)
-
