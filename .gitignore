@@ -1,35 +1,11 @@
-# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
-dist/
 build/
+dist/
 *.egg-info/
-
-# Environments
-.venv/
-venv/
-.env
-.ec2-instance.env
-
-# Data and temporary outputs
-data/
-results/
-workdir-results
-workdir-results/
-tmp/
-*.bam
-*.bai
-*.cram
-*.crai
-*.sam
-*.fastq
-*.fq
-*.vcf
-*.vcf.gz
-*.tbi
 .aider*
