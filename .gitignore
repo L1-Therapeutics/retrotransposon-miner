@@ -32,3 +32,4 @@ tmp/
 *.vcf
 *.vcf.gz
 *.tbi
+.aider*

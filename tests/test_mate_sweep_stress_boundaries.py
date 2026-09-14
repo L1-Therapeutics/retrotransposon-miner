@@ -1,13 +1,14 @@
-import pytest
-import pysam
 import tempfile
 from pathlib import Path
 
+import pysam
+
 """
-Stress tests for PR #32 streaming one-pass extraction engine:
+Stress tests for streaming record boundaries (PR #32 one-pass extraction engine):
 1. Missing query qualities (wildcard '*')
 2. Unplaced decoy scaffolds (chrUn_*, *_random)
-3. High-density query name collisions across read groups
+
+Records are validated directly through the streaming pysam.AlignmentFile API.
 """
 
 def test_missing_quality_scores_handled_gracefully():
