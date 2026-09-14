@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from retro_miner.genotyper import GenotypeCall
+from retro_miner.somatic_em import SomaticCall
 from retro_miner.subfamily_voter import SubfamilyCall
 from retro_miner.tsd_refiner import TSDResult
 
@@ -46,6 +47,9 @@ INFO_HEADER_LINES: list[str] = [
     '##INFO=<ID=TRANSDUCTION_SEQ,Number=1,Type=String,Description="Transduced genomic sequence barcode">',
     '##INFO=<ID=TRANSDUCTION_LENGTH,Number=1,Type=Integer,Description="Length of transduced sequence in bp">',
     '##INFO=<ID=TPRT_MOTIF_SCORE,Number=1,Type=Float,Description="TPRT endonuclease cleavage motif confidence score">',
+    '##INFO=<ID=SOMATIC,Number=1,Type=Integer,Description="Subclonal somatic MEI flagged by 3-component EM mixture model (1=somatic, 0=not)">',
+    '##INFO=<ID=SOMATIC_POST,Number=1,Type=Float,Description="Somatic component posterior probability P(Somatic | k_alt, n)">',
+    '##INFO=<ID=SUBCLONE_VAF,Number=1,Type=Float,Description="Inferred subclonal variant allele fraction theta_som">',
 ]
 
 FILTER_HEADER_LINES: list[str] = [
@@ -117,7 +121,7 @@ def _extract_tsd_fields(rec: dict[str, Any]) -> tuple[str, int, int]:
     if isinstance(result, TSDResult):
         tsd_seq = result.tsd_seq
         tsd_len = int(result.tsd_length)
-        poly_a = 1 if result.polyA_tail_detected else 0
+        poly_a = 1 if getattr(result, "polyA_tail_detected", getattr(result, "poly_a_detected", False)) else 0
     else:
         tsd_seq = rec.get("tsd_seq", "")
         tsd_len = rec.get("tsd_len", len(tsd_seq) if tsd_seq else 0)
@@ -156,6 +160,31 @@ def _extract_support(rec: dict[str, Any]) -> int:
     if value is None:
         value = 0
     return int(value)
+
+
+def _extract_somatic_fields(rec: dict[str, Any]) -> tuple[int, float, float] | None:
+    """Return ``(somatic_flag, somatic_posterior, subclone_vaf)`` when tag present.
+
+    Supports the typed ``SomaticCall`` object (preferred) or the flat keys
+    emitted by the pipeline engine.  Returns ``None`` for untagged records.
+    """
+    call = rec.get("somatic_call")
+    if isinstance(call, SomaticCall):
+        return (
+            int(call.is_somatic),
+            float(call.somatic_posterior),
+            float(call.subclone_vaf),
+        )
+    is_somatic = rec.get("is_somatic")
+    if is_somatic is not None:
+        posterior = rec.get("somatic_posterior", 0.0)
+        subclone_vaf = rec.get("subclone_vaf", 0.0)
+        if posterior is None:
+            posterior = 0.0
+        if subclone_vaf is None:
+            subclone_vaf = 0.0
+        return int(bool(is_somatic)), float(posterior), float(subclone_vaf)
+    return None
 
 
 def _extract_depth(rec: dict[str, Any]) -> tuple[int, int]:
@@ -237,6 +266,7 @@ def write_mei_vcf(
         k_ref, k_alt = _extract_depth(rec)
         tr_type, tr_seq, tr_len = _extract_transduction_fields(rec)
         tprt_score = _extract_tprt_motif_score(rec)
+        somatic_fields = _extract_somatic_fields(rec)
 
         alt_symbol = f"<INS:MEI:{_alt_label(family)}>"
         qual_str = f"{gq:.1f}" if gq > 0 else "."
@@ -256,6 +286,11 @@ def write_mei_vcf(
             f"TRANSDUCTION_LENGTH={tr_len}",
             f"TPRT_MOTIF_SCORE={tprt_score:.2f}",
         ]
+        if somatic_fields is not None:
+            som_flag, som_post, subclone_vaf = somatic_fields
+            info_fields.append(f"SOMATIC={som_flag}")
+            info_fields.append(f"SOMATIC_POST={som_post:.2f}")
+            info_fields.append(f"SUBCLONE_VAF={subclone_vaf:.2f}")
         info_str = ";".join(info_fields)
 
         sample_vals = f"{gt}:{gq:.1f}:{vaf:.2f}:{k_ref},{k_alt}"
