@@ -8,7 +8,8 @@ Supports optional spatial-index-guided O(log N) locus fetching when a BAM
 index (``.bai`` / ``.csi``) is present, falling back to sequential streaming
 for unindexed alignments.
 
-Literature Anchors: Gardner et al. (2017) / Layer et al. (2014) / Cameron et al. (2017) / Li et al. (2009) / Li et al. (2011).
+Supports optional read-spanning haplotype phasing against heterozygous SNPs
+to assign MEI loci to H1/H2 phase blocks.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import Any
 
 from retro_miner.enb_independent import classify_en_independent_event
 from retro_miner.genotyper import calculate_mei_genotype
+from retro_miner.haplotype_phaser import PhaseLinkageResult, phase_mei_locus
 from retro_miner.indexed_stream import LocusEvidence, fetch_locus_spanning_pairs, has_bam_index
 from retro_miner.local_assembly import assemble_locus_clips
 from retro_miner.somatic_em import SomaticCall, SomaticEMClassifier
@@ -61,6 +63,8 @@ def process_candidate_locus(
     somatic_classifier: SomaticEMClassifier | None = None,
     en_score: float | None = None,
     target_del_bp: int = 0,
+    het_snps: list[tuple[int, str, str]] | None = None,
+    phase_window_bp: int = 1000,
 ) -> dict[str, Any]:
     """Perform full scientific refinement and genotyping for a single candidate locus.
 
@@ -72,6 +76,9 @@ def process_candidate_locus(
     batch by :func:`run_scientific_mei_pipeline`), the locus is additionally
     tagged with EM subclonal-somatic mixture fields, including the somatic
     posterior and inferred subclone VAF.
+
+    When *het_snps* is provided, the locus is phased against nearby
+    heterozygous SNPs to assign H1/H2 haplotype block membership.
 
     Args:
         chrom: Reference chromosome.
@@ -88,6 +95,9 @@ def process_candidate_locus(
         en_score: Optional normalized EN cleavage motif PWM score in
             ``[0.0, 1.0]`` (default 0.0 = no canonical motif evidenced).
         target_del_bp: Target-site genomic deletion size at the locus in bp.
+        het_snps: Optional list of ``(snp_pos, ref_allele, alt_allele)`` for
+            heterozygous SNPs used for phasing.
+        phase_window_bp: Half-width of the phasing window in bp.
 
     Returns:
         Enriched locus dictionary ready for VCF v4.3 export.
@@ -164,7 +174,39 @@ def process_candidate_locus(
         somatic_call = somatic_classifier.predict(k_alt=k_alt, n=n_total)
         _tag_somatic_fields(record, somatic_call)
 
+    # 7. Haplotype Phasing against heterozygous SNPs
+    phase_result = _phase_if_requested(
+        bam_path=bam_path,
+        chrom=chrom,
+        pos=pos,
+        het_snps=het_snps,
+        window_bp=phase_window_bp,
+    )
+    record["phase_linkage"] = phase_result
+
     return record
+
+
+def _phase_if_requested(
+    bam_path: Path | None,
+    chrom: str,
+    pos: int,
+    het_snps: list[tuple[int, str, str]] | None,
+    window_bp: int,
+) -> PhaseLinkageResult | None:
+    """Run phasing when a BAM and heterozygous SNPs are available."""
+    if bam_path is None or not het_snps:
+        return None
+    try:
+        return phase_mei_locus(
+            bam_path=bam_path,
+            chrom=chrom,
+            pos=pos,
+            het_snps=het_snps,
+            window_bp=window_bp,
+        )
+    except Exception:
+        return None
 
 
 def run_scientific_mei_pipeline(
@@ -174,6 +216,11 @@ def run_scientific_mei_pipeline(
     bam_path: Path | None = None,
 ) -> Path:
     """Execute end-to-end candidate locus refinement and export to VCF v4.3.
+
+    Each candidate locus may carry ``het_snps`` (list of
+    ``(snp_pos, ref_allele, alt_allele)``) and an optional ``phase_window_bp``
+    override; when present the locus is phased against the heterozygous SNPs
+    and the resulting ``PHASE_BLOCK`` / ``HAPLOTYPE`` fields are exported.
 
     Args:
         raw_candidate_loci: List of unrefined candidate dictionary loci.
@@ -199,6 +246,8 @@ def run_scientific_mei_pipeline(
             locus_end=int(loc.get("locus_end", loc.get("pos", 10000) + 200)),
             en_score=loc.get("en_score"),
             target_del_bp=int(loc.get("target_del_bp") or 0),
+            het_snps=loc.get("het_snps"),
+            phase_window_bp=int(loc.get("phase_window_bp", 1000)),
         )
         refined_records.append(refined)
 

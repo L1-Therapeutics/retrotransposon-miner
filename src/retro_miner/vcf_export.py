@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from retro_miner.genotyper import GenotypeCall
+from retro_miner.haplotype_phaser import PhaseLinkageResult
 from retro_miner.somatic_em import SomaticCall
 from retro_miner.subfamily_voter import SubfamilyCall
 from retro_miner.tsd_refiner import TSDResult
@@ -52,6 +53,8 @@ INFO_HEADER_LINES: list[str] = [
     '##INFO=<ID=SOMATIC,Number=1,Type=Integer,Description="Subclonal somatic MEI flagged by 3-component EM mixture model (1=somatic, 0=not)">',
     '##INFO=<ID=SOMATIC_POST,Number=1,Type=Float,Description="Somatic component posterior probability P(Somatic | k_alt, n)">',
     '##INFO=<ID=SUBCLONE_VAF,Number=1,Type=Float,Description="Inferred subclonal variant allele fraction theta_som">',
+    '##INFO=<ID=PHASE_BLOCK,Number=1,Type=String,Description="Resolved phase block interval (chrom:start-end) for haplotype-phased MEI">',
+    '##INFO=<ID=HAPLOTYPE,Number=1,Type=String,Description="Haplotype assignment (H1, H2, or UNPHASED) for MEI locus">',
 ]
 
 FILTER_HEADER_LINES: list[str] = [
@@ -64,6 +67,8 @@ FORMAT_HEADER_LINES: list[str] = [
     '##FORMAT=<ID=GQ,Number=1,Type=Float,Description="Genotype Quality">',
     '##FORMAT=<ID=VAF,Number=1,Type=Float,Description="Variant Allele Frequency">',
     '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths for reference and alternate alleles">',
+    '##FORMAT=<ID=HP,Number=1,Type=String,Description="Haplotype Identifier">',
+    '##FORMAT=<ID=PQ,Number=1,Type=Float,Description="Phred-scaled Phase Quality">',
 ]
 
 MIN_PASS_GQ = 20.0
@@ -200,6 +205,23 @@ def _extract_somatic_fields(rec: dict[str, Any]) -> tuple[int, float, float] | N
     return None
 
 
+def _extract_phase_fields(rec: dict[str, Any]) -> tuple[str, str, float] | None:
+    """Return ``(hap, phase_block_id, pq)`` when a phase linkage result is present."""
+    phase = rec.get("phase_linkage")
+    if isinstance(phase, PhaseLinkageResult):
+        return phase.haplotype_assigned, phase.phase_block_id, float(phase.phase_confidence)
+    hap = rec.get("haplotype_assigned", "UNPHASED")
+    block = rec.get("phase_block_id", "")
+    pq = rec.get("phase_confidence", 0.0)
+    if hap is None:
+        hap = "UNPHASED"
+    if block is None:
+        block = ""
+    if pq is None:
+        pq = 0.0
+    return str(hap), str(block), float(pq)
+
+
 def _extract_depth(rec: dict[str, Any]) -> tuple[int, int]:
     """Return ``(k_ref, k_alt)`` allele depths used to populate AD."""
     k_ref = rec.get("k_ref", 10)
@@ -281,6 +303,7 @@ def write_mei_vcf(
         tprt_score = _extract_tprt_motif_score(rec)
         en_flag, target_del_bp = _extract_en_independent_fields(rec)
         somatic_fields = _extract_somatic_fields(rec)
+        hap, phase_block, pq = _extract_phase_fields(rec)
 
         alt_symbol = f"<INS:MEI:{_alt_label(family)}>"
         qual_str = f"{gq:.1f}" if gq > 0 else "."
@@ -307,12 +330,14 @@ def write_mei_vcf(
             info_fields.append(f"SOMATIC={som_flag}")
             info_fields.append(f"SOMATIC_POST={som_post:.2f}")
             info_fields.append(f"SUBCLONE_VAF={subclone_vaf:.2f}")
+        info_fields.append(f"HAPLOTYPE={hap}")
+        info_fields.append(f"PHASE_BLOCK={phase_block if phase_block else 'NONE'}")
         info_str = ";".join(info_fields)
 
-        sample_vals = f"{gt}:{gq:.1f}:{vaf:.2f}:{k_ref},{k_alt}"
+        sample_vals = f"{gt}:{gq:.1f}:{vaf:.2f}:{k_ref},{k_alt}:{hap}:{pq:.2f}"
         line = (
             f"{chrom}\t{pos}\t{mei_id}\t{ref_base}\t{alt_symbol}\t{qual_str}\t"
-            f"{filter_str}\t{info_str}\tGT:GQ:VAF:AD\t{sample_vals}"
+            f"{filter_str}\t{info_str}\tGT:GQ:VAF:AD:HP:PQ\t{sample_vals}"
         )
         lines.append(line)
 
