@@ -17,7 +17,6 @@ from retro_miner.mei_support import (
     trim_mei_consensus_terminal_polya,
 )
 
-
 # ---------------------------------------------------------------------------
 # _cigar_alignment_spans  →  (query_aligned_bp, ref_span_bp, alnlen)
 #

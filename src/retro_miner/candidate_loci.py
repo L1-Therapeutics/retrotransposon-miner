@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import time
 from collections.abc import Iterable
 from pathlib import Path
-import subprocess
-import tempfile
 
 import click
 import pandas as pd
+import pysam
 from intervaltree import IntervalTree
 
 from ._utils import _open_textmaybe_gz
-
+from .bam_io import open_alignment
+from .genotyper import calculate_mei_genotype
 
 _RUN_T0: float | None = None
 
@@ -21,6 +23,45 @@ def _progress(msg: str) -> None:
         click.echo(f"[candidate-loci] {msg}")
     else:
         click.echo(f"[candidate-loci] +{(time.monotonic() - _RUN_T0):.1f}s {msg}")
+
+
+def _count_spanning_ref_reads_in_open_bam(
+    bam: pysam.AlignmentFile,
+    pos: int,
+    window: int = 50,
+    min_mapq: int = 20,
+) -> int:
+    start = max(0, pos - window)
+    end = pos + window
+    count = 0
+    for read in bam.fetch(bam.references[0], start, end):
+        if read.is_unmapped or read.mate_is_unmapped:
+            continue
+        if read.mapping_quality < min_mapq:
+            continue
+        if not read.is_paired or not read.is_proper_pair:
+            continue
+        if read.cigartuples is None:
+            continue
+        if any(op == 4 for op, _ in read.cigartuples):
+            continue
+        if any(op == 5 for op, _ in read.cigartuples):
+            continue
+        ref_start = int(read.reference_start) if read.reference_start is not None else 0
+        ref_end = int(read.reference_end) if read.reference_end is not None else 0
+        if ref_start <= end and ref_end >= start:
+            count += 1
+    return count
+
+
+def count_spanning_ref_reads(
+    bam_path: Path,
+    pos: int,
+    window: int = 50,
+    min_mapq: int = 20,
+) -> int:
+    with open_alignment(bam_path) as bam:
+        return _count_spanning_ref_reads_in_open_bam(bam, pos, window, min_mapq)
 
 
 def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
@@ -92,7 +133,7 @@ def _read_passing_counts(summary_path: Path) -> dict[str, int]:
             "['sample', 'passing_reads'].  "
             "Run 'rtm extract-split-evidence' to regenerate it."
         ) from exc
-    return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int)))
+    return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int), strict=False))
 
 
 def _windowize(df: pd.DataFrame, window_size: int) -> pd.DataFrame:
@@ -780,6 +821,114 @@ def _annotate_junk_flags(
     return out
 
 
+def _locus_median_breakpoints(
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+) -> dict[tuple[str, int, int], int]:
+    """Median evidence breakpoint per locus, keyed by (chrom, window_start, window_end)."""
+    parts = [d for d in (split_disease, split_control) if d is not None and not d.empty]
+    if not parts or any("pos" not in p.columns for p in parts):
+        return {}
+    merged_pos = pd.concat(parts, ignore_index=True)
+    keys = merged_pos.groupby(["chrom", "window_start", "window_end"])["pos"].median()
+    return {
+        (str(chrom), int(ws), int(we)): int(round(float(v)))
+        for (chrom, ws, we), v in keys.items()
+    }
+
+
+def _annotate_tsd_refinement(
+    loci: pd.DataFrame,
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+    bam_path: Path | None,
+    reference_fasta: Path | None,
+    tsd_refine_flank_bp: int,
+) -> pd.DataFrame:
+    """Annotate per-locus TSD fields from soft-clipped reads and the reference.
+
+    Adds ``tsd_seq``, ``tsd_length``, ``tsd_confidence_score`` and
+    ``polyA_tail_detected`` to *loci*.  When no BAM or reference FASTA is
+    supplied the columns are backfilled with neutral defaults so the output
+    schema stays stable regardless of inputs.
+    """
+    out = loci.copy().reset_index(drop=True)
+    if out.empty:
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    if bam_path is None or not bam_path.exists():
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    if reference_fasta is None or not reference_fasta.exists():
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    if (split_disease is None or split_disease.empty) and (
+        split_control is None or split_control.empty
+    ):
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+
+    from .tsd_refiner import refine_tsd_boundaries  # lazy: pysam-backed module
+
+    breakpoints = _locus_median_breakpoints(split_disease, split_control)
+    flank = max(10, int(tsd_refine_flank_bp))
+    rows: list[dict[str, object]] = []
+    with open_alignment(bam_path) as bam, pysam.FastaFile(str(reference_fasta)) as ref:
+        for row in out.itertuples(index=False):
+            chrom = str(row.chrom)
+            ws, we = int(row.window_start), int(row.window_end)
+            pos = breakpoints.get((chrom, ws, we), (ws + we) // 2)
+            pos0 = max(0, int(pos) - 1)
+            reads: list[pysam.AlignedSegment] = []
+            try:
+                reads = [
+                    r
+                    for r in bam.fetch(chrom, max(0, pos0 - flank), pos0 + flank + 1)
+                    if r is not None
+                    and r.cigartuples is not None
+                    and any(op == 4 for op, _ in r.cigartuples)
+                ]
+            except (ValueError, KeyError):
+                reads = []
+            res = refine_tsd_boundaries(
+                chrom,
+                pos,
+                reads,
+                ref,
+                min_tsd_len=4,
+                max_tsd_len=40,
+                flank_window_bp=max(flank, 80),
+            )
+            rows.append(
+                {
+                    "tsd_seq": res.tsd_seq,
+                    "tsd_length": res.tsd_length,
+                    "tsd_confidence_score": res.tsd_confidence_score,
+                    "polyA_tail_detected": res.polyA_tail_detected,
+                }
+            )
+    tsd_df = pd.DataFrame(rows)
+    if tsd_df.empty:
+        out["tsd_seq"] = ""
+        out["tsd_length"] = 0
+        out["tsd_confidence_score"] = 0.0
+        out["polyA_tail_detected"] = False
+        return out
+    return pd.concat([out.reset_index(drop=True), tsd_df.reset_index(drop=True)], axis=1)
+
+
 def build_candidate_loci(
     evidence_dir: Path,
     outdir: Path,
@@ -798,6 +947,9 @@ def build_candidate_loci(
     gap_min_fraction: float = 0.1,
     encode_blacklist_bed: Path | None = None,
     encode_blacklist_min_fraction: float = 0.1,
+    bam_path: Path | None = None,
+    reference_fasta: Path | None = None,
+    tsd_refine_flank_bp: int = 60,
 ) -> Path:
     global _RUN_T0
     _RUN_T0 = time.monotonic()
@@ -898,6 +1050,47 @@ def build_candidate_loci(
         encode_blacklist_bed=encode_blacklist_bed,
         encode_blacklist_min_fraction=encode_blacklist_min_fraction,
     )
+
+        _progress("computing spanning reference depth and genotyping")
+        ref_counts: list[int] = []
+        if bam_path is not None and bam_path.exists():
+            with open_alignment(bam_path) as bam:
+                for row in merged.itertuples(index=False):
+                    center = (int(row.window_start) + int(row.window_end)) // 2
+                    ref_counts.append(
+                        _count_spanning_ref_reads_in_open_bam(bam, center)
+                    )
+        else:
+            ref_counts = [0] * len(merged)
+
+        merged["ref_read_count"] = ref_counts
+        merged["alt_read_count"] = merged["disease_total_rows"]
+
+        genotype_calls = []
+        for _, row in merged.iterrows():
+            k_alt = int(row["alt_read_count"])
+            k_ref = int(row["ref_read_count"])
+            call = calculate_mei_genotype(k_alt, k_ref)
+            genotype_calls.append(
+                {
+                    "vaf": call.vaf,
+                    "gt": call.genotype,
+                    "gq": call.genotype_quality,
+                }
+            )
+
+        genotype_df = pd.DataFrame(genotype_calls)
+        merged = pd.concat([merged.reset_index(drop=True), genotype_df.reset_index(drop=True)], axis=1)
+
+        _progress("annotating TSD refinement per locus")
+        merged = _annotate_tsd_refinement(
+            loci=merged,
+            split_disease=split_disease,
+            split_control=split_control,
+            bam_path=bam_path,
+            reference_fasta=reference_fasta,
+            tsd_refine_flank_bp=tsd_refine_flank_bp,
+        )
 
         _progress("sorting final candidate loci")
         merged = merged.sort_values(["enrichment_ratio", "disease_total_rows"], ascending=[False, False], kind="mergesort")

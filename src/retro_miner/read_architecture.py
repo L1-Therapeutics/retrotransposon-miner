@@ -326,7 +326,7 @@ def _mei_coords_from_detail(
             hits = hits.loc[tfam.eq(fam)]
         starts = pd.to_numeric(hits[start_col], errors="coerce").fillna(0).astype(int)
         ends = pd.to_numeric(hits[end_col], errors="coerce").fillna(0).astype(int)
-        for start, end in zip(starts.tolist(), ends.tolist()):
+        for start, end in zip(starts.tolist(), ends.tolist(), strict=False):
             if start > 0:
                 coords.append(start)
             if end > 0:
@@ -399,7 +399,7 @@ def _max_polya_zone_bp(
             s = pd.to_numeric(frame[start_col], errors="coerce").fillna(0).astype(int)
             e = pd.to_numeric(frame[end_col], errors="coerce").fillna(0).astype(int)
             widths.extend(
-                int(ee - ss + 1) for ss, ee in zip(s.tolist(), e.tolist()) if ss > 0 and ee >= ss
+                int(ee - ss + 1) for ss, ee in zip(s.tolist(), e.tolist(), strict=False) if ss > 0 and ee >= ss
             )
 
     if "polya_rescue" in detail.columns:
@@ -460,7 +460,7 @@ def _max_polya_zone_bp(
         )
         anchor_w = clip_lens.combine(run_lens, max)
         mate_w = anc.apply(_mate_polya_width_bp, axis=1)
-        for aw, mw in zip(anchor_w.tolist(), mate_w.tolist()):
+        for aw, mw in zip(anchor_w.tolist(), mate_w.tolist(), strict=False):
             if int(aw) >= 8 and int(mw) >= 12:
                 widths.append(int(aw) + int(mw))
     if not widths:
@@ -1778,7 +1778,7 @@ class ReadArchitectureCache:
                 change[1:] = (hit_sample[1:] != hit_sample[:-1]) | (hit_chrom[1:] != hit_chrom[:-1])
                 starts = np.flatnonzero(change)
                 ends = np.append(starts[1:], len(hit_idx))
-                for start, end in zip(starts.tolist(), ends.tolist()):
+                for start, end in zip(starts.tolist(), ends.tolist(), strict=False):
                     key = (str(hit_sample[start]), str(hit_chrom[start]))
                     hit_gpos[key] = hit_pos[start:end]
                     hit_rows[key] = hit_idx[start:end]
@@ -1825,7 +1825,7 @@ class ReadArchitectureCache:
         supporting_reads_detail: Path | None = None,
         mei_tsv: Path | None = None,
         load_split_evidence: bool = True,
-    ) -> "ReadArchitectureCache":
+    ) -> ReadArchitectureCache:
         gold_df = _read_tsv(gold_tsv)
         detail_path = supporting_reads_detail or _default_supporting_reads_detail(gold_tsv)
         if detail_path is None or not detail_path.exists():
@@ -1865,7 +1865,7 @@ class ReadArchitectureCache:
         mei_df: pd.DataFrame | None = None,
         split_by_sample: dict[str, pd.DataFrame] | None = None,
         gold_tsv: Path | None = None,
-    ) -> "ReadArchitectureCache":
+    ) -> ReadArchitectureCache:
         cache = cls(
             gold_df=gold_df,
             detail_df=detail_df,

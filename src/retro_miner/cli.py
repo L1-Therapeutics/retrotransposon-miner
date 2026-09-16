@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-import time
 
 import click
 
@@ -14,6 +14,7 @@ from retro_miner.evidence_extract import (
     extract_split_evidence,
 )
 from retro_miner.mei_support import annotate_candidate_loci_with_mei
+from retro_miner.summary_report import generate_scientific_summary_report
 
 
 @click.group()
@@ -460,6 +461,18 @@ def extract_split_evidence_cmd(
     default=None,
     help="Output directory for candidate loci table (defaults to evidence-dir).",
 )
+@click.option(
+    "--disease-bam",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional disease BAM for spanning reference depth, genotyping and TSD refinement.",
+)
+@click.option(
+    "--reference-fasta",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional reference genome FASTA (.fai indexed) for TSD boundary refinement.",
+)
 @click.option("--window-size", type=click.IntRange(min=1), default=200, show_default=True, help="Window size in bp for locus binning.")
 @click.option(
     "--split-cluster-bp",
@@ -552,6 +565,8 @@ def extract_split_evidence_cmd(
 def build_candidate_loci_cmd(
     evidence_dir: Path,
     outdir: Path | None,
+    disease_bam: Path | None,
+    reference_fasta: Path | None,
     window_size: int,
     split_cluster_bp: int,
     discordant_cluster_bp: int,
@@ -589,6 +604,9 @@ def build_candidate_loci_cmd(
         gap_min_fraction=gap_min_fraction,
         encode_blacklist_bed=encode_blacklist_bed,
         encode_blacklist_min_fraction=encode_blacklist_min_fraction,
+        bam_path=disease_bam,
+        reference_fasta=reference_fasta,
+        tsd_refine_flank_bp=60,
     )
     click.echo(f"[candidate-loci] {tsv_path} elapsed={time.monotonic() - t0:.1f}s")
 
@@ -1061,6 +1079,32 @@ def annotate_mei_support_cmd(
         bwa_threads=bwa_threads,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
+
+
+@cli.command("generate-summary-report")
+@click.option(
+    "--vcf",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to annotated MEI VCF v4.3 file.",
+)
+@click.option(
+    "--output-md",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to write the Markdown summary report.",
+)
+def generate_summary_report_cmd(vcf: Path, output_md: Path) -> None:
+    """Generate a scientific summary report from an annotated MEI VCF."""
+    t0 = time.monotonic()
+    summary = generate_scientific_summary_report(vcf, output_md)
+    json_path = output_md.with_suffix(".json")
+    click.echo(f"[summary] wrote Markdown report to {output_md}")
+    click.echo(f"[summary] wrote JSON summary to {json_path}")
+    click.echo(
+        f"[summary] total_candidates={summary.total_candidates} "
+        f"mean_vaf={summary.mean_vaf:.4f} elapsed={time.monotonic() - t0:.1f}s"
+    )
 
 
 if __name__ == "__main__":
