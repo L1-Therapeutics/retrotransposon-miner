@@ -1,5 +1,5 @@
-import pytest
-from retro_miner.subfamily_voter import classify_mei_subfamily, SubfamilyCall
+from retro_miner.subfamily_voter import SubfamilyCall, classify_mei_subfamily
+
 
 def test_l1hs_active_motif_classification():
     # Reads containing L1HS 3' UTR diagnostic ACA/GAG sequence

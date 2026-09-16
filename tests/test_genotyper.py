@@ -1,6 +1,6 @@
 import pytest
 
-from retro_miner.genotyper import calculate_mei_genotype, GenotypeCall
+from retro_miner.genotyper import GenotypeCall, calculate_mei_genotype
 
 
 class TestCalculateMeiGenotype:

@@ -1,5 +1,5 @@
-import pytest
 from benchmarks.benchmark_giab_truthset import evaluate_benchmark_parity
+
 
 def test_perfect_parity_benchmark():
     truth = [("chr1", 1000, "L1HS"), ("chr1", 5000, "ALU")]

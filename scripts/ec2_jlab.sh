@@ -763,10 +763,13 @@ bind_instance() {
 
   iid="$(resolve_instance_selector "${sel}")" || exit 1
 
-  awsq ec2 describe-instances --instance-ids "${iid}" >/dev/null 2>&1 || {
+  rc=0
+  probe_instance "${iid}" || rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
     log "Instance not found in ${REGION}: ${iid}"
     exit 1
-  }
+  fi
+  [[ "${rc}" -eq 0 ]] || handle_missing_or_probe_failure "${iid}" "${rc}"
 
   INSTANCE_ID="${iid}"
   export INSTANCE_ID
@@ -877,6 +880,16 @@ handle_missing_or_probe_failure() {
   exit 1
 }
 
+# preflight_or_exit probes the bound instance before a lifecycle operation so
+# a since-terminated instance fails fast instead of hanging a wait or silently
+# acting on a stale binding.  Exits via handle_missing_or_probe_failure when
+# the instance is gone or describe-instances fails for another reason.
+preflight_or_exit() {
+  local iid="$1" rc=0
+  probe_instance "${iid}" || rc=$?
+  [[ "${rc}" -eq 0 ]] || handle_missing_or_probe_failure "${iid}" "${rc}"
+}
+
 start_instance() {
   local iid rc err
 
@@ -937,30 +950,66 @@ connect() {
 }
 
 stop_instance() {
-  local iid
+  local iid rc err
+
+  require_cmd aws
   iid="$(require_instance_id)"
+  preflight_or_exit "${iid}"
+
   log "Stopping ${iid}"
-  if ! awsq ec2 stop-instances --instance-ids "${iid}" >/dev/null 2>&1; then
-    log "Unable to stop via EC2 API with current credentials."
+  if ! err="$(awsq ec2 stop-instances --instance-ids "${iid}" 2>&1 >/dev/null)"; then
+    log "Failed to stop instance ${iid}:"
+    sed 's/^/  /' <<< "${err}" >&2 || true
     log "If you're currently on this EC2 host, use: sudo shutdown -h now"
     exit 1
   fi
-  awsq ec2 wait instance-stopped --instance-ids "${iid}"
+
+  if ! awsq ec2 wait instance-stopped --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} did not reach the stopped state."
+      log "Check current state with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
   log "Instance stopped."
 }
 
 reboot_instance() {
-  local iid
+  local iid rc err
+
+  require_cmd aws
   iid="$(require_instance_id)"
+  preflight_or_exit "${iid}"
+
   log "Rebooting ${iid}"
-  awsq ec2 reboot-instances --instance-ids "${iid}"
-  awsq ec2 wait instance-status-ok --instance-ids "${iid}"
+  if ! err="$(awsq ec2 reboot-instances --instance-ids "${iid}" 2>&1 >/dev/null)"; then
+    log "Failed to reboot instance ${iid}:"
+    sed 's/^/  /' <<< "${err}" >&2 || true
+    exit 1
+  fi
+
+  if ! awsq ec2 wait instance-status-ok --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} did not become status-ok after reboot."
+      log "Check status with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
   log "Instance healthy after reboot."
 }
 
 ensure_eip() {
-  local iid alloc_id assoc_id
+  local iid alloc_id assoc_id created=0 rc out_err
   iid="$(require_instance_id)"
+  preflight_or_exit "${iid}"
 
   local eip_tag="${APP_NAME}-${iid}-eip"
   alloc_id="$(awsq ec2 describe-addresses \
@@ -975,12 +1024,29 @@ ensure_eip() {
 
   if [[ -z "${alloc_id}" || "${alloc_id}" == "None" ]]; then
     log "Allocating Elastic IP"
-    alloc_id="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text)"
+    out_err="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text 2>&1)" && rc=0 || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      log "Failed to allocate an Elastic IP."
+      sed 's/^/  /' <<< "${out_err}" >&2 || true
+      exit 1
+    fi
+    alloc_id="${out_err}"
+    created=1
     awsq ec2 create-tags --resources "${alloc_id}" --tags "Key=Name,Value=${eip_tag}" "Key=App,Value=${APP_NAME}" >/dev/null
   fi
 
   log "Associating EIP ${alloc_id} to ${iid}"
-  assoc_id="$(awsq ec2 associate-address --instance-id "${iid}" --allocation-id "${alloc_id}" --allow-reassociation --query 'AssociationId' --output text)"
+  out_err="$(awsq ec2 associate-address --instance-id "${iid}" --allocation-id "${alloc_id}" --allow-reassociation --query 'AssociationId' --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    log "Failed to associate EIP ${alloc_id} to ${iid}:"
+    sed 's/^/  /' <<< "${out_err}" >&2 || true
+    if [[ "${created}" == "1" ]]; then
+      awsq ec2 release-address --allocation-id "${alloc_id}" >/dev/null 2>&1 || true
+      log "Released freshly allocated EIP ${alloc_id}"
+    fi
+    exit 1
+  fi
+  assoc_id="${out_err}"
   log "EIP association: ${assoc_id}"
 }
 
@@ -997,6 +1063,7 @@ get_public_ip_for() {
 get_public_ip() {
   local iid
   iid="$(get_instance_id)" || return 1
+  preflight_or_exit "${iid}"
   get_public_ip_for "${iid}"
 }
 
@@ -1188,6 +1255,7 @@ status() {
     instance_not_bound_help
     exit 0
   fi
+  preflight_or_exit "${iid}"
   awsq ec2 describe-instances \
     --instance-ids "${iid}" \
     --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress,Type:InstanceType,Name:Tags[?Key==`Name`]|[0].Value}' \

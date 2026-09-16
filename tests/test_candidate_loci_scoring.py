@@ -1,5 +1,4 @@
 import pandas as pd
-import pytest
 
 """
 Unit tests for candidate locus grouping and quality thresholds.

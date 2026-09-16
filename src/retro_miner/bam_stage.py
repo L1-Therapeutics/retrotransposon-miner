@@ -241,7 +241,7 @@ def plan_bam_stage(
 
 
 def _run_cmd(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{err}")
@@ -268,8 +268,7 @@ def _default_head_size(uri: str) -> int | None:
                 "text",
             ],
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
         if proc.returncode != 0:

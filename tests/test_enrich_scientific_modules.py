@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
 from retro_miner.mei_support import _enrich_candidates_with_scientific_modules
 

@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -46,7 +45,7 @@ def _parse_format(format_str: str, sample_str: str) -> dict[str, str]:
     fields = format_str.split(":")
     values = sample_str.split(":")
     out: dict[str, str] = {}
-    for f, v in zip(fields, values):
+    for f, v in zip(fields, values, strict=False):
         out[f] = v
     return out
 

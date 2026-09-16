@@ -71,7 +71,7 @@ def _igv_singleton_lock(
                 raise RuntimeError(
                     f"Timed out waiting for IGV singleton lock: {lock_file}. "
                     "Another IGV batch run may still be active."
-                )
+                ) from None
             time.sleep(max(0.1, float(poll_sec)))
     try:
         yield

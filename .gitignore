@@ -9,3 +9,10 @@ build/
 dist/
 *.egg-info/
 .aider*
+
+*.env
+*.bam
+.ec2-*
+
+!tests/data/
+!tests/data/*.bam

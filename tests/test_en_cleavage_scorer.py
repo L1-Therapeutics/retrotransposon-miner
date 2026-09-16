@@ -1,5 +1,5 @@
-import pytest
-from retro_miner.en_cleavage_scorer import score_en_cleavage_site, ElemCleavageScore
+from retro_miner.en_cleavage_scorer import ElemCleavageScore, score_en_cleavage_site
+
 
 def test_canonical_en_motif_scoring():
     res = score_en_cleavage_site("CGATTTTTAAGCTA")

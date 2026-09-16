@@ -48,7 +48,7 @@ def score_en_cleavage_site(ref_sequence_context: str) -> ElemCleavageScore:
     for canon in CANONICAL_MOTIFS:
         for i in range(len(seq) - len(canon) + 1):
             sub = seq[i : i + len(canon)]
-            matches = sum(1 for a, b in zip(sub, canon) if a == b)
+            matches = sum(1 for a, b in zip(sub, canon, strict=False) if a == b)
             score = round(matches / len(canon), 4)
             if score > best_score:
                 best_score = score

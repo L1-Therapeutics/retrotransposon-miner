@@ -189,8 +189,7 @@ def _run_aws_cli(args: list[str], *, env: Mapping[str, str] | None = None) -> No
     proc = subprocess.run(
         cmd,
         check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         env=dict(env) if env else None,
     )
