@@ -6,24 +6,22 @@ and verifies the scientific summary report contains non-zero metrics.
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
 import pandas as pd
-import pysam
 import pytest
 
+from retro_miner.candidate_loci import build_candidate_loci
 from retro_miner.cleavage_motif import score_cleavage_motif
-from retro_miner.genotyper import GenotypeCall, calculate_mei_genotype
-from retro_miner.subfamily_voter import SubfamilyCall, classify_mei_subfamily
-from retro_miner.transduction_detector import detect_3prime_transduction
+from retro_miner.evidence_extract import extract_split_and_discordant_evidence
+from retro_miner.genotyper import GenotypeCall
+from retro_miner.subfamily_voter import classify_mei_subfamily
+from retro_miner.summary_report import generate_scientific_summary_report
+from retro_miner.transduction_detector import detect_3prime_transduction_from_contig
 from retro_miner.tsd_refiner import TSDResult
 from retro_miner.vcf_export import write_mei_vcf
-from retro_miner.summary_report import generate_scientific_summary_report
 from scripts.generate_synthetic_bam import generate_synthetic_bam
-from retro_miner.evidence_extract import extract_split_and_discordant_evidence
-from retro_miner.candidate_loci import build_candidate_loci
 
 
 def test_end_to_end_summary_report() -> None:
@@ -82,22 +80,22 @@ def test_end_to_end_summary_report() -> None:
         assert not candidates.empty, "Expected non-empty candidate loci table"
 
         vcf_records = []
-        for idx, row in enumerate(candidates.head(5).itertuples(index=False)):
+        for _idx, row in enumerate(candidates.head(5).itertuples(index=False)):
             chrom = str(getattr(row, "chrom", "chr1"))
             pos = int(getattr(row, "window_start", 10000)) + 50
 
             sub_call = classify_mei_subfamily(["ACAGAG", "GACAGAG"], family_hint="L1")
             contig = "TTTTAAAA" + "A" * 12 + "GATTACACATGCAGCTAGCTAGCTAGCTA"
-            tr = detect_3prime_transduction(contig, mei_alignment_end=8, min_transduction_len=20)
+            tr = detect_3prime_transduction_from_contig(contig, mei_alignment_end=8, min_transduction_len=20)
             tsd = TSDResult(
                 chrom=chrom,
                 pos=pos,
                 tsd_seq="ATTGCAG",
                 tsd_length=7,
-                tsd_confidence_score=0.85,
-                polyA_tail_detected=True,
+                confidence_score=0.85,
+                poly_a_detected=True,
                 entropy=1.8,
-                method="tsd_flush_match",
+                locus_id="test",
             )
             vcf_records.append(
                 {

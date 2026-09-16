@@ -27,7 +27,7 @@ from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.subfamily_voter import classify_mei_subfamily
-from retro_miner.transduction_detector import detect_3prime_transduction
+from retro_miner.transduction_detector import detect_3prime_transduction_from_contig
 
 from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 
@@ -8531,7 +8531,7 @@ def _row_bool(row: pd.Series, key: str, default: bool = False) -> bool:
         return default
     if isinstance(val, bool):
         return val
-    if isinstance(val, (int, float)):
+    if isinstance(val, int | float):
         return bool(val)
     txt = str(val).strip().lower()
     if txt in {"true", "t", "1", "yes", "y"}:
@@ -13961,7 +13961,7 @@ def _enrich_candidates_with_scientific_modules(
             unitigs = assemble_locus_clips(contig_seqs, k=min(15, max(4, min(len(s) for s in contig_seqs))), min_coverage=2)
             best_contig = unitigs[0].sequence if unitigs else ""
             if best_contig:
-                tr = detect_3prime_transduction(best_contig, min_transduction_len=20)
+                tr = detect_3prime_transduction_from_contig(best_contig)
                 transduction_rows.append(
                     {
                         "transduction_type": tr.transduction_type if tr.has_transduction else "NONE",
@@ -14591,7 +14591,7 @@ def annotate_candidate_loci_with_mei(
     )
     for full_prefix in ("disease_full", "control_full"):
         full_metrics = candidate.apply(
-            lambda r: _sample_insertion_span_and_orientation(r, full_prefix),
+            lambda r, _full_prefix=full_prefix: _sample_insertion_span_and_orientation(r, _full_prefix),
             axis=1,
             result_type="expand",
         )
