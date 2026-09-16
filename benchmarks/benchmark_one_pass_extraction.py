@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Performance & Memory Benchmark Suite for PR #32 One-Pass Extraction.
+
+Profiles execution runtime (seconds) and peak memory footprint (MB)
+for sequential full-scan vs spatial-index-guided interval fetch.
+"""
+
 import argparse
 import json
 import sys
@@ -7,20 +13,12 @@ import time
 import tracemalloc
 from pathlib import Path
 
+import pysam
+
 # Resolve repository root directory for standalone execution
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-import pysam
-from scripts.generate_synthetic_bam import generate_synthetic_bam
-
-"""
-Performance & Memory Benchmark Suite for PR #32 One-Pass Extraction.
-
-Profiles execution runtime (seconds) and peak memory footprint (MB)
-for sequential full-scan vs spatial-index-guided interval fetch.
-"""
 
 
 def profile_sequential(bam_path: Path):
@@ -86,6 +84,8 @@ def main():
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        from scripts.generate_synthetic_bam import generate_synthetic_bam
+
         bam_path = Path(tmpdir) / "benchmark_input.bam"
         generate_synthetic_bam(bam_path, num_reads=args.num_reads)
 
