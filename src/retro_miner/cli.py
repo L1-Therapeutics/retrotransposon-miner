@@ -1139,5 +1139,43 @@ def annotate_mei_support_cmd(
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 
 
+@cli.command("export-vcf")
+@click.option(
+    "--in-tsv",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Annotated candidate loci TSV from annotate-mei-support (--out-tsv).",
+)
+@click.option(
+    "--out-vcf",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="Output VCF v4.3 path.",
+)
+@click.option(
+    "--sample-name",
+    type=str,
+    default="SAMPLE",
+    show_default=True,
+    help=(
+        "Sample column name in the VCF header. This table reports pooled "
+        "disease-vs-control read support (not a per-individual genotype), "
+        "so this is a label, not a real sample identifier -- name it after "
+        "the cohort/comparison (e.g. 'seqc2_tumor_normal')."
+    ),
+)
+def export_vcf_cmd(in_tsv: Path, out_vcf: Path, sample_name: str) -> None:
+    """Convert an annotated candidate-loci TSV to VCF v4.3.
+
+    Genotype (GT) and genotype quality (GQ) are always written as VCF
+    missing values (./. and .) -- see retro_miner.vcf_export module
+    docstring for why.
+    """
+    from retro_miner.vcf_export import export_vcf_from_tsv
+
+    n = export_vcf_from_tsv(in_tsv, out_vcf, sample_name=sample_name)
+    click.echo(f"[export-vcf] wrote {n} records to {out_vcf}")
+
+
 if __name__ == "__main__":
     cli()
