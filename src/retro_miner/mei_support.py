@@ -27,6 +27,7 @@ from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.bam_io import open_alignment
 from retro_miner.evidence_extract import _longest_soft_clip_from_read, _soft_clip_query_seq
+from retro_miner.mei_panel_index import ensure_bwa_index, ensure_mei_remap_bwa_index, ensure_polya_trimmed_mei_fasta
 
 
 @dataclass
@@ -1162,32 +1163,12 @@ def _write_polya_trimmed_fasta(src: Path, dst: Path, *, min_run: int = _MEI_CONS
 
 def _ensure_polya_trimmed_mei_fasta(mei_fasta: Path) -> Path:
     """Return a polyA-trimmed MEI FASTA (sidecar ``*.nopolya.fa``), refreshing when stale."""
-    src = Path(mei_fasta)
-    if not src.exists():
-        raise FileNotFoundError(f"MEI FASTA not found: {src}")
-    dst = src.with_name(f"{src.stem}.nopolya{src.suffix}")
-    src_mtime = src.stat().st_mtime
-    needs = (not dst.exists()) or (dst.stat().st_mtime < src_mtime) or (dst.stat().st_size <= 0)
-    if needs:
-        _write_polya_trimmed_fasta(src, dst)
-        # Drop stale bwa index so _ensure_bwa_index rebuilds.
-        for suffix in (".amb", ".ann", ".bwt", ".pac", ".sa"):
-            idx = Path(f"{dst}{suffix}")
-            if idx.exists():
-                idx.unlink()
-    return dst
+    return ensure_polya_trimmed_mei_fasta(mei_fasta)
 
 
 def _ensure_bwa_index(mei_fasta: Path) -> None:
     """Build classic bwa index next to ``mei_fasta`` when missing."""
-    if Path(f"{mei_fasta}.bwt").exists() and Path(f"{mei_fasta}.sa").exists():
-        return
-    subprocess.run(
-        ["bwa", "index", str(mei_fasta)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    ensure_bwa_index(Path(mei_fasta))
 
 
 def _align_queries_to_mei_bwa(
@@ -14055,6 +14036,10 @@ def annotate_candidate_loci_with_mei(
         )
 
         remap_t0 = time.monotonic()
+        # Index the shared MEI panel once before disease∥control remaps. Two
+        # workers calling bwa index on the same FASTA can SIGSEGV.
+        click.echo("[mei-annotate] ensuring MEI panel bwa index before disease∥control remaps")
+        ensure_mei_remap_bwa_index(Path(mei_fasta))
         # disease∥control remaps can run together; split bwa threads across them
         # when the caller asked for more than one thread.
         per_sample_bwa_threads = max(1, bwa_threads // 2) if bwa_threads > 1 else 1

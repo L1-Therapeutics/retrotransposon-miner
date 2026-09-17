@@ -26,6 +26,7 @@ import yaml
 _SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
+from retro_miner.mei_panel_index import index_public_mei_remap_fastas
 from retro_miner.s3_transfer import copy_s3_uri, download_s3_uri, process_local_aws_config
 
 
@@ -2880,6 +2881,10 @@ def _postprocess(
         lambda: _build_mei_fragment_to_full_coord_map(
             outdir=outdir, ds_map=ds_map, timeout_sec=timeout_sec, force=force
         ),
+    )
+    run_step(
+        "index_mei_remap_bwa",
+        lambda: index_public_mei_remap_fastas(outdir, force=force),
     )
 
     return steps
