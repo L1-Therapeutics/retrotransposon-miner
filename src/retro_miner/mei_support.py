@@ -415,11 +415,12 @@ _SHORT_MEI_DPE_MAX_AXIS_GAP_BP = 500
 _SHORT_MEI_DPE_PROXIMAL_SLACK_BP = 80
 
 # Minimum soft-clip length for DPE→MEI consensus remap. Shorter clips are too
-# ambiguous among Alu/SVA/L1; full reference-matching read bodies must never be
-# remapped (∼43% of the genome is MEI-derived).
+# ambiguous among Alu/SVA/L1. Same-chromosome clipped mates still remap the
+# clip only — their ref-matched body is usually a local reference MEI nest
+# (∼43% of the genome is MEI-derived) and must not vote as novel insertion.
 _DPE_MEI_REMAP_MIN_CLIP_BP = 20
-# Unclipped mates may still be fully inside the insertion / homologous MEI; allow
-# full-mate remap only when no soft clip meets the threshold above.
+# Unclipped mates, and interchrom clipped mates sitting on a reference-copy
+# Alu/L1/SVA, may remap the mapped body / full mate.
 _DPE_MEI_REMAP_MIN_FULL_MATE_BP = 30
 
 
@@ -438,26 +439,84 @@ def _discordant_anchor_mei_query_seq(row: pd.Series | object) -> str:
     return derived if len(derived) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
 
 
-def _discordant_mate_mei_query_seq(row: pd.Series | object) -> str:
-    """Mate query for MEI remap: soft clip when present, else full mate sequence.
+def _normalize_discordant_chrom(chrom: object) -> str:
+    name = str(chrom or "").strip()
+    if name.lower().startswith("chr"):
+        name = name[3:]
+    return name.lower()
 
-    Clipped mates at the opposite junction must not contribute their
-    reference-matched bases. Unclipped mates may lie entirely in the insertion
-    (or a distant homologous MEI), so the full mate sequence is allowed.
-    """
+
+def _discordant_pair_is_interchrom(row: pd.Series | object) -> bool:
+    """True when the mate landed on a different contig than the anchor."""
+    chrom = _normalize_discordant_chrom(getattr(row, "chrom", ""))
+    mate_chrom = _normalize_discordant_chrom(getattr(row, "mate_chrom", ""))
+    if not chrom or not mate_chrom or mate_chrom in {"*", "."}:
+        return False
+    return chrom != mate_chrom
+
+
+def _discordant_mate_clip_query(row: pd.Series | object) -> str:
+    """Longest mate soft-clip sequence, or empty when the mate is unclipped."""
     mate_clip = str(getattr(row, "mate_soft_clip_seq", "") or "")
     derived = _soft_clip_query_seq(
         str(getattr(row, "mate_seq", "") or ""),
         str(getattr(row, "mate_soft_clip_side", "") or ""),
         int(getattr(row, "mate_soft_clip_len", 0) or 0),
     )
-    best_clip = mate_clip if len(mate_clip) >= len(derived) else derived
-    clip_len = max(int(getattr(row, "mate_soft_clip_len", 0) or 0), len(best_clip))
-    if clip_len > 0:
-        # Any soft clip ⇒ never remap the ref-matched body; clip must be long enough.
-        return best_clip if len(best_clip) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
+    return mate_clip if len(mate_clip) >= len(derived) else derived
+
+
+def _mate_ref_matched_body(row: pd.Series | object) -> str:
+    """Mate bases excluding the longest soft clip (the reference-aligned body)."""
     mate_seq = str(getattr(row, "mate_seq", "") or "")
+    if not mate_seq:
+        return ""
+    clip = _discordant_mate_clip_query(row)
+    clip_len = max(int(getattr(row, "mate_soft_clip_len", 0) or 0), len(clip))
+    if clip_len <= 0:
+        return mate_seq
+    side = str(getattr(row, "mate_soft_clip_side", "") or "").upper()[:1]
+    if side == "L" and len(mate_seq) > clip_len:
+        return mate_seq[clip_len:]
+    if side == "R" and len(mate_seq) > clip_len:
+        return mate_seq[:-clip_len]
+    if clip and mate_seq.startswith(clip) and len(mate_seq) > len(clip):
+        return mate_seq[len(clip) :]
+    if clip and mate_seq.endswith(clip) and len(mate_seq) > len(clip):
+        return mate_seq[: -len(clip)]
+    return mate_seq
+
+
+def _discordant_mate_mei_query_seq(row: pd.Series | object) -> str:
+    """Mate query for MEI remap.
+
+    Same-chrom clipped mates remap the soft clip only — the ref-matched body
+    is usually a nearby reference MEI. Interchrom mates often sit on a
+    reference-copy Alu/L1/SVA with the unique insertion-site flank as the
+    clip; that mapped body is MEI identity and must be remapped even when
+    the copy is already in the reference. Unclipped mates use the full
+    sequence.
+    """
+    mate_seq = str(getattr(row, "mate_seq", "") or "")
+    best_clip = _discordant_mate_clip_query(row)
+    clip_len = max(int(getattr(row, "mate_soft_clip_len", 0) or 0), len(best_clip))
+    if _discordant_pair_is_interchrom(row):
+        body = _mate_ref_matched_body(row)
+        if len(body) >= _DPE_MEI_REMAP_MIN_FULL_MATE_BP:
+            return body
+        if len(mate_seq) >= _DPE_MEI_REMAP_MIN_FULL_MATE_BP:
+            return mate_seq
+        return best_clip if len(best_clip) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
+    if clip_len > 0:
+        return best_clip if len(best_clip) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
     return mate_seq if len(mate_seq) >= _DPE_MEI_REMAP_MIN_FULL_MATE_BP else ""
+
+
+def _discordant_mate_mei_query_is_clip(row: pd.Series | object) -> bool:
+    """True when the MEI query is the mate soft-clip (polyA-trim uses clip side)."""
+    query = _discordant_mate_mei_query_seq(row)
+    clip = _discordant_mate_clip_query(row)
+    return bool(query) and bool(clip) and query == clip
 
 
 def _discordant_mate_ok_for_mei_identity(df: pd.DataFrame) -> pd.Series:
@@ -1703,7 +1762,12 @@ def _align_discordant_mates_with_minimap2(
     *,
     bwa_threads: int = 1,
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
-    """Map discordant mates to MEI consensus (clip-only when mate is soft-clipped)."""
+    """Map discordant mates to MEI consensus.
+
+    Same-chrom clipped mates remap the clip only. Interchrom mates remap the
+    reference-aligned body (or full mate) so a reference-copy Alu/L1/SVA hit
+    still counts as MEI identity.
+    """
     fetch_t0 = time.monotonic()
     enriched = _fetch_discordant_mate_sequences(discordant_df, bam_path)
     click.echo(
@@ -1727,25 +1791,21 @@ def _align_discordant_mates_with_minimap2(
 
     mates["mate_query_id"] = [f"{sample}_mate_{i}" for i in range(len(mates))]
     mate_query = mates.copy()
-    # Shared discordant aligner historically expected read_seq; pass clip/full query.
-    # PolyA trim uses mate soft-clip side when the query is a clip; full-mate queries
-    # leave side empty so trim keeps the longer non-poly residual.
+    # Shared discordant aligner historically expected read_seq; pass clip/body/full.
+    # PolyA trim uses mate soft-clip side only when the query *is* the clip.
+    # Interchrom body remaps leave side empty so trim keeps the longer residual.
     mate_query["read_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
     mate_query["soft_clip_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
-    mate_has_clip = (
-        pd.to_numeric(mate_query.get("mate_soft_clip_len", 0), errors="coerce").fillna(0).astype(int).gt(0)
-        | mate_query.get("mate_soft_clip_seq", pd.Series("", index=mate_query.index))
-        .fillna("")
-        .astype(str)
-        .str.len()
-        .gt(0)
+    query_is_clip = pd.Series(
+        [_discordant_mate_mei_query_is_clip(row) for row in mates.itertuples(index=False)],
+        index=mates.index,
     )
     mate_side = (
         mate_query["mate_soft_clip_side"].fillna("").astype(str)
         if "mate_soft_clip_side" in mate_query.columns
         else pd.Series("", index=mate_query.index)
     )
-    mate_query["soft_clip_side"] = mate_side.where(mate_has_clip, "")
+    mate_query["soft_clip_side"] = mate_side.where(query_is_clip, "")
     mate_query["soft_clip_len"] = mate_query["mei_query_seq"].str.len().astype(int)
     # Force a strong reason so the shared discordant aligner does not drop mates
     # whose only original reason was poly_tail_anchor_rescue (or empty).
