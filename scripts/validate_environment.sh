@@ -83,7 +83,7 @@ bwa 2>&1 | awk 'NR==1 {print "bwa:", $0}' || true
 bwa-mem2 version 2>&1 | awk 'NR==1 {print "bwa-mem2:", $0}'
 bcftools --version | awk 'NR==1 {print "bcftools:", $0}'
 if command -v liftOver >/dev/null 2>&1; then
-  liftOver 2>&1 | awk 'NR==1 {print "liftOver:", $0}'
+  liftOver 2>&1 | awk 'NR==1 {print "liftOver:", $0}' || true
 fi
 
 echo "Environment validation complete."
