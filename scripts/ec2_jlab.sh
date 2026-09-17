@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
+AMI_ID="${AMI_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-r6i.4xlarge}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
 # gp3 throughput/IOPS are independently provisioned, but AWS requires
@@ -86,10 +87,141 @@ imds_get() {
     -H "X-aws-ec2-metadata-token: ${token}" 2>/dev/null
 }
 
+# --- AMI selection --------------------------------------------------------
+# Resolution order used by bootstrap (and the internal test hook below):
+#   1. AMI_ID override: validated via describe-images, never queries SSM.
+#   2. Public SSM parameter (AL2023 kernel-default x86_64); the returned value
+#      is syntax-checked rather than trusted blindly.
+#   3. ec2 describe-images fallback: Amazon-owned, AL2023 kernel 6.1, x86_64,
+#      EBS-backed, available; newest by CreationDate; then fully validated.
+# Only the resolved AMI id is ever printed to stdout; diagnostics go to stderr.
+AL2023_SSM_PARAM="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+AL2023_IMAGE_NAME_PATTERN="al2023-ami-2023.*-kernel-6.1-x86_64"
+
+ami_valid_syntax() {
+  [[ "$1" =~ ^ami-[0-9a-f]+$ ]]
+}
+
 get_latest_al2023_ami() {
-  awsq ssm get-parameter \
-    --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-    --query 'Parameter.Value' --output text
+  local out rc
+  out="$(awsq ssm get-parameter --name "${AL2023_SSM_PARAM}" --query 'Parameter.Value' --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -eq 0 && "${out}" =~ ^ami-[0-9a-f]+$ ]]; then
+    echo "${out}"
+    return 0
+  fi
+  if [[ "${rc}" -eq 0 ]]; then
+    if [[ -z "${out}" || "${out}" == "None" ]]; then
+      log "  ssm get-parameter returned no value."
+    else
+      log "  ssm get-parameter returned a malformed value: ${out}"
+    fi
+  else
+    log "  ssm get-parameter exited ${rc}:"
+    sed 's/^/    /' <<< "${out}" >&2 || true
+  fi
+  return 1
+}
+
+validate_selected_ami() {
+  local ami="$1" out rc img state arch rootdev
+  if ! ami_valid_syntax "${ami}"; then
+    log "Invalid AMI id ${ami}; expected an id like ami-0<hex>."
+    return 1
+  fi
+  out="$(awsq ec2 describe-images \
+    --owners amazon \
+    --image-ids "${ami}" \
+    --query 'Images[0].[ImageId,State,Architecture,RootDeviceType]' \
+    --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ "${out}" == *InvalidAMIID.NotFound* ]]; then
+      log "AMI ${ami} does not exist."
+    else
+      log "Unable to validate AMI ${ami}:"
+      sed 's/^/  /' <<< "${out}" >&2 || true
+    fi
+    return 1
+  fi
+  if [[ -z "${out}" || "${out}" == "None" ]]; then
+    log "AMI ${ami} does not exist or is not Amazon-owned."
+    return 1
+  fi
+  IFS=$'\t' read -r img state arch rootdev <<< "${out}"
+  [[ "${img}" == "${ami}" ]] || {
+    log "AMI validation mismatch for ${ami}."
+    return 1
+  }
+  [[ "${state}" == "available" ]] || {
+    log "AMI ${ami} is not available (state=${state})."
+    return 1
+  }
+  [[ "${arch}" == "x86_64" ]] || {
+    log "AMI ${ami} is not x86_64 (architecture=${arch})."
+    return 1
+  }
+  [[ "${rootdev}" == "ebs" ]] || {
+    log "AMI ${ami} is not EBS-backed (root-device-type=${rootdev})."
+    return 1
+  }
+  echo "${ami}"
+  return 0
+}
+
+ami_fallback_ec2() {
+  local out rc
+  out="$(awsq ec2 describe-images \
+    --owners amazon \
+    --filters \
+      "Name=name,Values=${AL2023_IMAGE_NAME_PATTERN}" \
+      "Name=architecture,Values=x86_64" \
+      "Name=root-device-type,Values=ebs" \
+      "Name=state,Values=available" \
+    --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+    --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    log "  ec2 describe-images exited ${rc}:"
+    sed 's/^/    /' <<< "${out}" >&2 || true
+    return 1
+  fi
+  if [[ -z "${out}" || "${out}" == "None" ]]; then
+    log "  No Amazon Linux 2023 image matches the fallback filters."
+    return 1
+  fi
+  if ! ami_valid_syntax "${out}"; then
+    log "  ec2 describe-images returned a malformed AMI id: ${out}"
+    return 1
+  fi
+  echo "${out}"
+  return 0
+}
+
+resolve_ami() {
+  local ami validated sel
+
+  if [[ -n "${AMI_ID}" ]]; then
+    validated="$(validate_selected_ami "${AMI_ID}")" || return 1
+    echo "${validated}"
+    return 0
+  fi
+
+  if ami="$(get_latest_al2023_ami)"; then
+    echo "${ami}"
+    return 0
+  fi
+
+  log "ssm get-parameter did not yield a usable AMI; using ec2 describe-images fallback."
+  if sel="$(ami_fallback_ec2)"; then
+    validated="$(validate_selected_ami "${sel}")" && {
+      echo "${validated}"
+      return 0
+    }
+    log "  ec2 describe-images selected an invalid AMI: ${sel}"
+  fi
+
+  log "Could not determine an Amazon Linux 2023 x86_64 AMI id."
+  log "Set AMI_ID to an approved Amazon Linux 2023 x86_64 AMI id (Amazon-owned, x86_64, EBS-backed) and re-run:"
+  log "  AMI_ID=ami-<id> $0 bootstrap"
+  return 1
 }
 
 get_default_vpc() {
@@ -631,10 +763,13 @@ bind_instance() {
 
   iid="$(resolve_instance_selector "${sel}")" || exit 1
 
-  awsq ec2 describe-instances --instance-ids "${iid}" >/dev/null 2>&1 || {
+  rc=0
+  probe_instance "${iid}" || rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
     log "Instance not found in ${REGION}: ${iid}"
     exit 1
-  }
+  fi
+  [[ "${rc}" -eq 0 ]] || handle_missing_or_probe_failure "${iid}" "${rc}"
 
   INSTANCE_ID="${iid}"
   export INSTANCE_ID
@@ -645,7 +780,11 @@ bind_instance() {
 create_instance() {
   local instance_id ami subnet sg_id create_name bucket_name ud_file="" tags
   local -a run_args
-  ami="$(get_latest_al2023_ami)"
+  ami="$(resolve_ami)" || exit 1
+  [[ "${ami}" =~ ^ami-[0-9a-f]+$ ]] || {
+    log "No usable AMI id; aborting before run-instances."
+    exit 1
+  }
   subnet="$(get_default_subnet)"
   sg_id="$(ensure_security_group)"
   ensure_key_pair
@@ -704,13 +843,95 @@ ensure_instance() {
   create_instance
 }
 
+instance_missing_diagnostic() {
+  local iid="$1"
+  log "Selected instance no longer exists: ${iid}"
+  log "  $0 list-instances"
+  log "  $0 use <instance-id-or-name>"
+  log "  Stale binding kept at ${INSTANCE_STATE_FILE}; rebind to a live instance (use) or create a new one (bootstrap)."
+}
+
+# probe_instance reports whether instance ${iid} exists, without mislabeling
+# other API failures (auth/network/throttle) as "missing".
+#   returns 0 = describe-instances succeeded (instance exists)
+#   returns 2 = InvalidInstanceID.NotFound (instance definitively gone)
+#   returns 1 = describe-instances failed for another reason
+probe_instance() {
+  local iid="$1"
+  PROBE_ERR="$(awsq ec2 describe-instances --instance-ids "${iid}" 2>&1 >/dev/null || true)"
+  if [[ -z "${PROBE_ERR}" ]]; then
+    return 0
+  fi
+  if grep -q "InvalidInstanceID.NotFound" <<<"${PROBE_ERR}"; then
+    return 2
+  fi
+  return 1
+}
+
+handle_missing_or_probe_failure() {
+  local iid="$1" rc="$2"
+  if [[ "${rc}" -eq 2 ]]; then
+    instance_missing_diagnostic "${iid}"
+  else
+    log "Unable to query instance ${iid}."
+    sed 's/^/  /' <<< "${PROBE_ERR}" >&2 || true
+    log "Check AWS credentials and connectivity, then re-run: $0 status"
+  fi
+  exit 1
+}
+
+# preflight_or_exit probes the bound instance before a lifecycle operation so
+# a since-terminated instance fails fast instead of hanging a wait or silently
+# acting on a stale binding.  Exits via handle_missing_or_probe_failure when
+# the instance is gone or describe-instances fails for another reason.
+preflight_or_exit() {
+  local iid="$1" rc=0
+  probe_instance "${iid}" || rc=$?
+  [[ "${rc}" -eq 0 ]] || handle_missing_or_probe_failure "${iid}" "${rc}"
+}
+
 start_instance() {
-  local iid
+  local iid rc err
+
+  require_cmd aws
+
   iid="$(require_instance_id)"
+
+  # The bound instance may have been terminated since the state file was written;
+  # fail fast rather than letting a hung wait look like a successful start.
+  rc=0
+  probe_instance "${iid}" || rc=$?
+  [[ "${rc}" -eq 0 ]] || handle_missing_or_probe_failure "${iid}" "${rc}"
+
   log "Starting instance ${iid}"
-  awsq ec2 start-instances --instance-ids "${iid}" >/dev/null 2>&1 || true
-  awsq ec2 wait instance-running --instance-ids "${iid}"
-  awsq ec2 wait instance-status-ok --instance-ids "${iid}"
+  if ! err="$(awsq ec2 start-instances --instance-ids "${iid}" 2>&1 >/dev/null)"; then
+    log "Failed to start instance ${iid}:"
+    sed 's/^/  /' <<< "${err}" >&2 || true
+    exit 1
+  fi
+
+  if ! awsq ec2 wait instance-running --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} did not reach the running state."
+      log "Check current state with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
+  if ! awsq ec2 wait instance-status-ok --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} is running but not status-ok yet."
+      log "Check status with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
   log "Instance is running and healthy."
 }
 
@@ -729,30 +950,66 @@ connect() {
 }
 
 stop_instance() {
-  local iid
+  local iid rc err
+
+  require_cmd aws
   iid="$(require_instance_id)"
+  preflight_or_exit "${iid}"
+
   log "Stopping ${iid}"
-  if ! awsq ec2 stop-instances --instance-ids "${iid}" >/dev/null 2>&1; then
-    log "Unable to stop via EC2 API with current credentials."
+  if ! err="$(awsq ec2 stop-instances --instance-ids "${iid}" 2>&1 >/dev/null)"; then
+    log "Failed to stop instance ${iid}:"
+    sed 's/^/  /' <<< "${err}" >&2 || true
     log "If you're currently on this EC2 host, use: sudo shutdown -h now"
     exit 1
   fi
-  awsq ec2 wait instance-stopped --instance-ids "${iid}"
+
+  if ! awsq ec2 wait instance-stopped --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} did not reach the stopped state."
+      log "Check current state with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
   log "Instance stopped."
 }
 
 reboot_instance() {
-  local iid
+  local iid rc err
+
+  require_cmd aws
   iid="$(require_instance_id)"
+  preflight_or_exit "${iid}"
+
   log "Rebooting ${iid}"
-  awsq ec2 reboot-instances --instance-ids "${iid}"
-  awsq ec2 wait instance-status-ok --instance-ids "${iid}"
+  if ! err="$(awsq ec2 reboot-instances --instance-ids "${iid}" 2>&1 >/dev/null)"; then
+    log "Failed to reboot instance ${iid}:"
+    sed 's/^/  /' <<< "${err}" >&2 || true
+    exit 1
+  fi
+
+  if ! awsq ec2 wait instance-status-ok --instance-ids "${iid}" >/dev/null 2>&1; then
+    rc=0
+    probe_instance "${iid}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      log "Instance ${iid} did not become status-ok after reboot."
+      log "Check status with: $0 status"
+      exit 1
+    fi
+    handle_missing_or_probe_failure "${iid}" "${rc}"
+  fi
+
   log "Instance healthy after reboot."
 }
 
 ensure_eip() {
-  local iid alloc_id assoc_id
+  local iid alloc_id assoc_id created=0 rc out_err
   iid="$(require_instance_id)"
+  preflight_or_exit "${iid}"
 
   local eip_tag="${APP_NAME}-${iid}-eip"
   alloc_id="$(awsq ec2 describe-addresses \
@@ -767,12 +1024,29 @@ ensure_eip() {
 
   if [[ -z "${alloc_id}" || "${alloc_id}" == "None" ]]; then
     log "Allocating Elastic IP"
-    alloc_id="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text)"
+    out_err="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text 2>&1)" && rc=0 || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      log "Failed to allocate an Elastic IP."
+      sed 's/^/  /' <<< "${out_err}" >&2 || true
+      exit 1
+    fi
+    alloc_id="${out_err}"
+    created=1
     awsq ec2 create-tags --resources "${alloc_id}" --tags "Key=Name,Value=${eip_tag}" "Key=App,Value=${APP_NAME}" >/dev/null
   fi
 
   log "Associating EIP ${alloc_id} to ${iid}"
-  assoc_id="$(awsq ec2 associate-address --instance-id "${iid}" --allocation-id "${alloc_id}" --allow-reassociation --query 'AssociationId' --output text)"
+  out_err="$(awsq ec2 associate-address --instance-id "${iid}" --allocation-id "${alloc_id}" --allow-reassociation --query 'AssociationId' --output text 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    log "Failed to associate EIP ${alloc_id} to ${iid}:"
+    sed 's/^/  /' <<< "${out_err}" >&2 || true
+    if [[ "${created}" == "1" ]]; then
+      awsq ec2 release-address --allocation-id "${alloc_id}" >/dev/null 2>&1 || true
+      log "Released freshly allocated EIP ${alloc_id}"
+    fi
+    exit 1
+  fi
+  assoc_id="${out_err}"
   log "EIP association: ${assoc_id}"
 }
 
@@ -789,6 +1063,7 @@ get_public_ip_for() {
 get_public_ip() {
   local iid
   iid="$(get_instance_id)" || return 1
+  preflight_or_exit "${iid}"
   get_public_ip_for "${iid}"
 }
 
@@ -980,6 +1255,7 @@ status() {
     instance_not_bound_help
     exit 0
   fi
+  preflight_or_exit "${iid}"
   awsq ec2 describe-instances \
     --instance-ids "${iid}" \
     --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress,Type:InstanceType,Name:Tags[?Key==`Name`]|[0].Value}' \
@@ -1064,6 +1340,7 @@ If you can reach the instance via Instance Connect but not SSH:
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
+  AMI_ID (AL2023 x86_64 AMI id for bootstrap; default: SSM, then describe-images)
   INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default 200)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
   S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
@@ -1071,6 +1348,18 @@ Optional env vars:
   IAM_INSTANCE_PROFILE, IAM_ROLE_NAME
 EOF
 }
+
+# Internal test hook: lets the test suite exercise `resolve_ami` directly
+# without adding a public subcommand. Whitelisted; unused in normal operation.
+if [[ -n "${EC2_JLAB_TEST_FN:-}" ]]; then
+  case "${EC2_JLAB_TEST_FN}" in
+    resolve_ami) resolve_ami ;;
+    *) log "Unknown EC2_JLAB_TEST_FN: ${EC2_JLAB_TEST_FN}"
+       exit 1
+       ;;
+  esac
+  exit $?
+fi
 
 case "${1:-help}" in
   help|-h|--help) usage ;;
