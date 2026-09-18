@@ -18,6 +18,7 @@ from pathlib import Path
 import pandas as pd
 import click
 import pysam
+from Bio.Align import PairwiseAligner
 from intervaltree import IntervalTree
 
 from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
@@ -25,7 +26,7 @@ from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
-from retro_miner.bam_io import open_alignment
+from retro_miner.bam_io import bind_alignment_reference, open_alignment
 from retro_miner.evidence_extract import _longest_soft_clip_from_read, _soft_clip_query_seq
 from retro_miner.mei_panel_index import ensure_bwa_index, ensure_mei_remap_bwa_index, ensure_polya_trimmed_mei_fasta
 
@@ -3214,6 +3215,11 @@ _DEL_MIN_CLUSTER_FRACTION = 0.20
 _DEL_FLANK_BP = 500
 _DEL_DEPTH_MAX_RATIO = 0.65
 _DEL_MIN_INTACT_DEPTH = 8.0
+# Split clips that are the other deletion end, not a novel MEI.
+_DEL_SPLIT_PAD_BP = 500
+_DEL_SPLIT_MIN_QUERY_COVERAGE = 0.95
+_DEL_SPLIT_MIN_EDIT_SIMILARITY = 0.95
+_DEL_SPLIT_MAX_INDEL_BP = 3
 
 
 def _best_same_chrom_deletion_clusters(
@@ -3351,11 +3357,11 @@ def _aggregate_same_chrom_deletion_dpe_metrics(
     return pd.DataFrame(rows)
 
 
-def _same_chrom_deletion_cluster_member_reads(df: pd.DataFrame) -> pd.DataFrame:
-    """Read names in a ≥20% same-chrom del-bridge cluster (excluded from MEI_MAPPED)."""
-    keys = ["chrom", "window_start", "window_end", "read_name"]
-    empty = pd.DataFrame(columns=keys)
-    rows: list[dict[str, object]] = []
+def _iter_qualifying_deletion_clusters(
+    df: pd.DataFrame,
+) -> list[tuple[tuple[object, object, object], pd.DataFrame]]:
+    """Same-chrom del-bridge clusters that pass the ≥20% / span / width gates."""
+    out: list[tuple[tuple[object, object, object], pd.DataFrame]] = []
     for key, cluster, total in _best_same_chrom_deletion_clusters(df):
         width = int(cluster["mate_pos"].max() - cluster["mate_pos"].min())
         span = float(cluster["_gap_bp"].median())
@@ -3368,6 +3374,16 @@ def _same_chrom_deletion_cluster_member_reads(df: pd.DataFrame) -> pd.DataFrame:
             or span < _DEL_MIN_GAP_BP
         ):
             continue
+        out.append((key, cluster))
+    return out
+
+
+def _same_chrom_deletion_cluster_member_reads(df: pd.DataFrame) -> pd.DataFrame:
+    """Read names in a ≥20% same-chrom del-bridge cluster (excluded from MEI_MAPPED)."""
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    empty = pd.DataFrame(columns=keys)
+    rows: list[dict[str, object]] = []
+    for key, cluster in _iter_qualifying_deletion_clusters(df):
         for qname in cluster["read_name"].astype(str).unique():
             if not qname:
                 continue
@@ -3379,6 +3395,231 @@ def _same_chrom_deletion_cluster_member_reads(df: pd.DataFrame) -> pd.DataFrame:
                     "read_name": qname,
                 }
             )
+    return pd.DataFrame(rows) if rows else empty
+
+
+def _qualifying_deletion_far_end_loci(df: pd.DataFrame) -> pd.DataFrame:
+    """Locus keys plus far-end mate position for qualifying del-bridge clusters."""
+    keys = ["chrom", "window_start", "window_end", "deletion_mate_chrom", "deletion_mate_pos_median"]
+    empty = pd.DataFrame(columns=keys)
+    rows: list[dict[str, object]] = []
+    for key, cluster in _iter_qualifying_deletion_clusters(df):
+        rows.append(
+            {
+                "chrom": key[0],
+                "window_start": key[1],
+                "window_end": key[2],
+                "deletion_mate_chrom": str(cluster["mate_chrom"].iloc[0]),
+                "deletion_mate_pos_median": int(cluster["mate_pos"].median()),
+            }
+        )
+    return pd.DataFrame(rows) if rows else empty
+
+
+def _best_ungapped_identity(query: str, subject: str) -> float:
+    """Best full-query ungapped identity of query (or its reverse complement) in subject."""
+    q = (query or "").upper()
+    s = (subject or "").upper()
+    min_bp = int(_DPE_MEI_REMAP_MIN_CLIP_BP)
+    if len(q) < min_bp or not s:
+        return 0.0
+    rq = _revcomp(q)
+    if q in s or rq in s:
+        return 1.0
+    best = 0.0
+    n = len(q)
+    for probe in (q, rq):
+        if len(s) < n:
+            m = len(s)
+            if m < min_bp:
+                continue
+            for s_off, q_off in ((0, 0), (0, n - m)):
+                ident = 1.0 - (_hamming(probe[q_off : q_off + m], s[s_off : s_off + m]) / m)
+                if ident > best:
+                    best = ident
+            continue
+        lim = len(s) - n + 1
+        for i in range(lim):
+            window = s[i : i + n]
+            mism = 0
+            for a, b in zip(probe, window, strict=True):
+                if a != b:
+                    mism += 1
+            ident = 1.0 - (mism / n)
+            if ident > best:
+                best = ident
+                if best >= 0.999:
+                    return 1.0
+    return best
+
+
+def _new_deletion_split_aligner() -> PairwiseAligner:
+    """Create the in-process local aligner used for deletion-breakpoint clips."""
+    aligner = PairwiseAligner()
+    aligner.mode = "local"
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -3.0
+    aligner.open_gap_score = -4.0
+    aligner.extend_gap_score = -1.0
+    return aligner
+
+
+def _gapped_local_match(
+    query: str,
+    subject: str,
+    *,
+    min_query_coverage: float = _DEL_SPLIT_MIN_QUERY_COVERAGE,
+    min_edit_similarity: float = _DEL_SPLIT_MIN_EDIT_SIMILARITY,
+    max_indel_bp: int = _DEL_SPLIT_MAX_INDEL_BP,
+    aligner: PairwiseAligner | None = None,
+) -> bool:
+    """Match a full split clip locally, allowing substitutions and short indels.
+
+    Edit similarity is ``1 - edits/query_length``. Edits include substitutions,
+    all inserted/deleted bases, and query bases omitted from the local
+    alignment. Query coverage is checked independently, and no individual gap
+    may exceed ``max_indel_bp``.
+    """
+    q = (query or "").upper()
+    s = (subject or "").upper()
+    min_bp = int(_DPE_MEI_REMAP_MIN_CLIP_BP)
+    if len(q) < min_bp or not s:
+        return False
+    worker = aligner or _new_deletion_split_aligner()
+    for probe in (q, _revcomp(q)):
+        alignments = worker.align(s, probe)
+        try:
+            best = alignments[0]
+        except IndexError:
+            continue
+        coords = best.coordinates
+        query_start = int(coords[1, 0])
+        query_end = int(coords[1, -1])
+        query_span = query_end - query_start
+        if query_span / len(probe) < float(min_query_coverage):
+            continue
+
+        mismatches = 0
+        gap_bases = 0
+        longest_gap = 0
+        for idx in range(coords.shape[1] - 1):
+            target_start = int(coords[0, idx])
+            target_end = int(coords[0, idx + 1])
+            probe_start = int(coords[1, idx])
+            probe_end = int(coords[1, idx + 1])
+            target_step = target_end - target_start
+            probe_step = probe_end - probe_start
+            if target_step > 0 and probe_step > 0:
+                if target_step != probe_step:
+                    return False
+                mismatches += sum(
+                    a != b
+                    for a, b in zip(
+                        s[target_start:target_end],
+                        probe[probe_start:probe_end],
+                        strict=True,
+                    )
+                )
+            else:
+                gap = max(target_step, probe_step)
+                gap_bases += gap
+                longest_gap = max(longest_gap, gap)
+
+        if longest_gap > int(max_indel_bp):
+            continue
+        unaligned_query_bases = len(probe) - query_span
+        edits = mismatches + gap_bases + unaligned_query_bases
+        edit_similarity = 1.0 - (edits / len(probe))
+        if edit_similarity >= float(min_edit_similarity):
+            return True
+    return False
+
+
+def _same_chrom_deletion_split_member_reads(
+    split_df: pd.DataFrame,
+    disc_df: pd.DataFrame,
+    reference_fasta: Path | None,
+) -> pd.DataFrame:
+    """Split reads whose clip sequence resolves to the opposite deletion breakpoint."""
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    empty = pd.DataFrame(columns=keys)
+    if split_df is None or split_df.empty or reference_fasta is None:
+        return empty
+    fa_path = Path(reference_fasta)
+    if not fa_path.exists():
+        return empty
+    loci = _qualifying_deletion_far_end_loci(disc_df)
+    if loci.empty:
+        return empty
+
+    work = split_df.copy()
+    if "read_name" not in work.columns:
+        return empty
+    # Split evidence stores the clipped sequence as ``clip_seq``.  Do not use
+    # _discordant_anchor_mei_query_seq() here: it reads the DPE-only
+    # ``soft_clip_seq`` schema, which makes every production split row appear
+    # to have an empty clip.
+    if "clip_seq" not in work.columns:
+        return empty
+    work["del_clip_seq"] = work["clip_seq"].fillna("").astype(str)
+    work = work.loc[work["del_clip_seq"].fillna("").astype(str).str.len() >= int(_DPE_MEI_REMAP_MIN_CLIP_BP)]
+    if work.empty:
+        return empty
+    merged = work.merge(loci, on=["chrom", "window_start", "window_end"], how="inner")
+    if merged.empty:
+        return empty
+
+    try:
+        fasta = pysam.FastaFile(str(fa_path))
+    except (OSError, ValueError):
+        return empty
+
+    rows: list[dict[str, object]] = []
+    seq_cache: dict[tuple[str, int, int], str] = {}
+    aligner = _new_deletion_split_aligner()
+    try:
+        for rec in merged.itertuples(index=False):
+            chrom = str(rec.chrom)
+            mate_chrom = str(getattr(rec, "deletion_mate_chrom", "") or chrom)
+            chrom_norm = chrom.replace("chr", "").lower()
+            mate_norm = mate_chrom.replace("chr", "").lower()
+            if mate_chrom and mate_norm not in {chrom_norm, ""}:
+                fetch_chrom = mate_chrom
+            else:
+                fetch_chrom = chrom
+            mate = int(getattr(rec, "deletion_mate_pos_median", 0) or 0)
+            if mate <= 0:
+                continue
+            # The clipped sequence should resolve to the inferred opposite
+            # deletion breakpoint. Fetching candidate..mate spans the entire
+            # deleted interval unnecessarily and makes long deletions costly.
+            lo = max(0, mate - int(_DEL_SPLIT_PAD_BP))
+            hi = mate + int(_DEL_SPLIT_PAD_BP)
+            cache_key = (fetch_chrom, lo, hi)
+            if cache_key not in seq_cache:
+                try:
+                    seq_cache[cache_key] = fasta.fetch(fetch_chrom, lo, hi)
+                except (ValueError, KeyError, OSError):
+                    seq_cache[cache_key] = ""
+            if not _gapped_local_match(
+                str(rec.del_clip_seq),
+                seq_cache[cache_key],
+                aligner=aligner,
+            ):
+                continue
+            qname = str(rec.read_name)
+            if not qname:
+                continue
+            rows.append(
+                {
+                    "chrom": rec.chrom,
+                    "window_start": rec.window_start,
+                    "window_end": rec.window_end,
+                    "read_name": qname,
+                }
+            )
+    finally:
+        fasta.close()
     return pd.DataFrame(rows) if rows else empty
 
 
@@ -4824,6 +5065,7 @@ def _collect_indel_breakpoint_evidence(
     min_mapq: int = 20,
     min_indel_bp: int = 12,
     query_context_bases: int = 12,
+    reference_fasta: Path | None = None,
 ) -> pd.DataFrame:
     """Collect breakpoint-proximal CIGAR indel evidence assigned to candidate loci."""
     key_cols = ["chrom", "window_start", "window_end"]
@@ -4868,7 +5110,7 @@ def _collect_indel_breakpoint_evidence(
             span_by_chrom[chrom] = (min(lo, start), max(hi, end))
 
     rows: list[dict[str, object]] = []
-    with open_alignment(bam_path) as bam:
+    with open_alignment(bam_path, reference_filename=reference_fasta) as bam:
         for chrom, tree in trees.items():
             lo, hi = span_by_chrom[chrom]
             fetch_start0 = max(0, int(lo) - 1)
@@ -14309,6 +14551,7 @@ def annotate_candidate_loci_with_mei(
     bwa_threads: int = 1,
 ) -> Path:
     total_t0 = time.monotonic()
+    bind_alignment_reference(reference_fasta)
     reuse_dir = Path(reuse_mei_annotate_dir) if reuse_mei_annotate_dir is not None else None
     bwa_threads = max(1, int(bwa_threads))
     load_t0 = time.monotonic()
@@ -14388,6 +14631,7 @@ def annotate_candidate_loci_with_mei(
                         disease_bam_path,
                         candidate,
                         sample="disease",
+                        reference_fasta=reference_fasta,
                     )
                 ] = "disease"
             if control_bam_path is not None:
@@ -14397,6 +14641,7 @@ def annotate_candidate_loci_with_mei(
                         control_bam_path,
                         candidate,
                         sample="control",
+                        reference_fasta=reference_fasta,
                     )
                 ] = "control"
             for fut in as_completed(indel_futs):
@@ -14667,6 +14912,35 @@ def annotate_candidate_loci_with_mei(
     control_disc_hits_for_mei = _drop_deletion_cluster_reads(control_disc_hits, del_members_n)
     disease_disc_hits_full_for_mei = _drop_deletion_cluster_reads(disease_disc_hits_full, del_members_t)
     control_disc_hits_full_for_mei = _drop_deletion_cluster_reads(control_disc_hits_full, del_members_n)
+    # Split clips whose sequence is simply the other deletion end also are not MEI.
+    split_del_t = _same_chrom_deletion_split_member_reads(
+        disease_hits, disease_disc_hits, reference_fasta
+    )
+    split_del_n = _same_chrom_deletion_split_member_reads(
+        control_hits, control_disc_hits, reference_fasta
+    )
+    split_disease_mei = _drop_deletion_cluster_reads(split_disease_mei, split_del_t)
+    split_control_mei = _drop_deletion_cluster_reads(split_control_mei, split_del_n)
+    disease_hits_for_side_metrics = _drop_deletion_cluster_reads(disease_hits, split_del_t)
+    control_hits_for_side_metrics = _drop_deletion_cluster_reads(control_hits, split_del_n)
+    disease_hits_full_for_side_metrics = _drop_deletion_cluster_reads(disease_hits_full, split_del_t)
+    control_hits_full_for_side_metrics = _drop_deletion_cluster_reads(control_hits_full, split_del_n)
+    # The same physical read can appear in both SR and DPE evidence tables.
+    # Once its split clip resolves to the opposite reference breakpoint, none
+    # of that read's representations may contribute insertion identity.
+    disease_disc_hits_for_mei = _drop_deletion_cluster_reads(disease_disc_hits_for_mei, split_del_t)
+    control_disc_hits_for_mei = _drop_deletion_cluster_reads(control_disc_hits_for_mei, split_del_n)
+    disease_disc_hits_full_for_mei = _drop_deletion_cluster_reads(
+        disease_disc_hits_full_for_mei, split_del_t
+    )
+    control_disc_hits_full_for_mei = _drop_deletion_cluster_reads(
+        control_disc_hits_full_for_mei, split_del_n
+    )
+    if len(split_del_t) or len(split_del_n):
+        click.echo(
+            f"[mei-annotate] dropped del-breakpoint split clips from MEI_MAPPED "
+            f"disease={len(split_del_t)} control={len(split_del_n)}"
+        )
     # MEI_MAPPED for DPE: exclude same-chr mates within 1 kb (nearby ref MEIs).
     discordant_disease_mei = _discordant_rows_for_mei_mapped_support(
         _mei_rows_only(disease_disc_hits_for_mei, is_split=False)
@@ -14710,10 +14984,10 @@ def annotate_candidate_loci_with_mei(
     anno_parts = []
     side_t0 = time.monotonic()
     for sample_prefix, df, pref_map in (
-        ("disease", disease_hits, disease_pref_target),
-        ("control", control_hits, control_pref_target),
-        ("disease_full", disease_hits_full, disease_pref_target_full),
-        ("control_full", control_hits_full, control_pref_target_full),
+        ("disease", disease_hits_for_side_metrics, disease_pref_target),
+        ("control", control_hits_for_side_metrics, control_pref_target),
+        ("disease_full", disease_hits_full_for_side_metrics, disease_pref_target_full),
+        ("control_full", control_hits_full_for_side_metrics, control_pref_target_full),
     ):
         for side in ("L", "R"):
             anno_parts.append(

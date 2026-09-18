@@ -33,6 +33,20 @@ def resolve_alignment_reference(explicit: str | Path | None = None) -> str | Non
     return env or None
 
 
+def bind_alignment_reference(explicit: str | Path | None = None) -> str | None:
+    """Publish a CRAM reference for this process.
+
+    HTSlib cannot decode CRAM slices without the FASTA. The pipeline wrapper
+    exports ``RTM_ALIGNMENT_REFERENCE``; CLI ``--reference-fasta`` must do the
+    same so ``open_alignment()`` call sites that omit ``reference_filename``
+    still work.
+    """
+    ref = resolve_alignment_reference(explicit)
+    if ref:
+        os.environ["RTM_ALIGNMENT_REFERENCE"] = ref
+    return ref
+
+
 def open_alignment(
     path: str | Path,
     *,

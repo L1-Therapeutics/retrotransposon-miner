@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
+import pysam
 
 from retro_miner.mei_support import (
     _aggregate_same_chrom_deletion_dpe_metrics,
     _apply_complex_ins_with_del,
+    _best_ungapped_identity,
     _deletion_depth_supports_del,
     _deletion_flank_intervals,
     _drop_deletion_cluster_reads,
+    _gapped_local_match,
     _refresh_polya_rescue_excluding_del_cluster,
+    _revcomp,
     _same_chrom_deletion_cluster_member_reads,
+    _same_chrom_deletion_split_member_reads,
 )
 
 
@@ -165,3 +172,180 @@ class TestComplexInsWithDelLabel:
         assert out.loc[0, "insertion_event_class"] == "COMPLEX_INS_WITH_DEL"
         assert not bool(out.loc[1, "complex_ins_with_del"])
         assert out.loc[1, "insertion_event_class"] == "SIMPLE_MEI"
+
+
+def _split_row(**kwargs):
+    base = {
+        "chrom": "chr22",
+        "window_start": 10000,
+        "window_end": 10100,
+        "pos": 10040,
+        "read_name": "split0",
+        "clip_seq": "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT",
+        "clip_side": "L",
+        "clip_len": 40,
+        "read_seq": "",
+        "mei_hit": True,
+    }
+    base.update(kwargs)
+    return base
+
+
+def _indexed_fasta(tmp_path: Path, seq: str, chrom: str = "chr22") -> Path:
+    fa = tmp_path / "ref.fa"
+    fa.write_text(f">{chrom}\n{seq}\n", encoding="utf-8")
+    pysam.faidx(str(fa))
+    return fa
+
+
+class TestDeletionSplitClipMeiDrop:
+    def test_clip_matching_far_end_is_excluded(self, tmp_path: Path):
+        clip = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        # 0-based 14999 == mate_pos 15000 (1-based cluster median).
+        seq = ("N" * 14999) + clip + ("N" * 200)
+        fa = _indexed_fasta(tmp_path, seq)
+        dpe = pd.DataFrame(
+            [
+                _dpe_row(read_name="del0", mate_pos=15000, pos=10040),
+                _dpe_row(read_name="del1", mate_pos=15010, pos=10041),
+            ]
+        )
+        splits = pd.DataFrame(
+            [
+                _split_row(
+                    read_name="hit",
+                    clip_seq=clip,
+                    # A conflicting DPE-schema value proves the production
+                    # split-evidence column is the one being examined.
+                    soft_clip_seq="T" * 40,
+                ),
+                _split_row(read_name="other", clip_seq="T" * 40),
+            ]
+        )
+        members = _same_chrom_deletion_split_member_reads(splits, dpe, fa)
+        assert set(members["read_name"]) == {"hit"}
+        kept = _drop_deletion_cluster_reads(splits, members)
+        assert set(kept["read_name"]) == {"other"}
+
+    def test_matching_split_read_is_also_excluded_from_dpe_representation(self, tmp_path: Path):
+        clip = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        seq = ("N" * 14999) + clip + ("N" * 200)
+        fa = _indexed_fasta(tmp_path, seq)
+        deletion_dpe = pd.DataFrame(
+            [
+                _dpe_row(read_name="del0", mate_pos=15000, pos=10040),
+                _dpe_row(read_name="del1", mate_pos=15010, pos=10041),
+            ]
+        )
+        splits = pd.DataFrame([_split_row(read_name="duplicated", clip_seq=clip)])
+        members = _same_chrom_deletion_split_member_reads(splits, deletion_dpe, fa)
+        dpe_mei_hits = pd.DataFrame(
+            [
+                _dpe_row(read_name="duplicated", mei_hit=True),
+                _dpe_row(read_name="independent", mei_hit=True),
+            ]
+        )
+
+        kept = _drop_deletion_cluster_reads(dpe_mei_hits, members)
+
+        assert set(kept["read_name"]) == {"independent"}
+
+    def test_reverse_complement_clip_is_excluded(self, tmp_path: Path):
+        clip = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        seq = ("N" * 14999) + _revcomp(clip) + ("N" * 200)
+        fa = _indexed_fasta(tmp_path, seq)
+        dpe = pd.DataFrame(
+            [
+                _dpe_row(read_name="del0", mate_pos=15000, pos=10040),
+                _dpe_row(read_name="del1", mate_pos=15010, pos=10041),
+            ]
+        )
+        splits = pd.DataFrame([_split_row(read_name="hit", clip_seq=clip)])
+        members = _same_chrom_deletion_split_member_reads(splits, dpe, fa)
+        assert set(members["read_name"]) == {"hit"}
+
+    def test_unrelated_clip_is_kept(self, tmp_path: Path):
+        clip = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        seq = ("N" * 15200)
+        fa = _indexed_fasta(tmp_path, seq)
+        dpe = pd.DataFrame(
+            [
+                _dpe_row(read_name="del0", mate_pos=15000, pos=10040),
+                _dpe_row(read_name="del1", mate_pos=15010, pos=10041),
+            ]
+        )
+        splits = pd.DataFrame([_split_row(read_name="keep", clip_seq=clip)])
+        members = _same_chrom_deletion_split_member_reads(splits, dpe, fa)
+        assert members.empty
+
+    def test_clip_elsewhere_in_deleted_interval_is_not_excluded(self, tmp_path: Path):
+        clip = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        # The inferred opposite breakpoint is at 15,000. A copy at 12,000 is
+        # inside the broad candidate-to-mate span but outside mate ±500 bp.
+        seq = ("N" * 11999) + clip + ("N" * 3200)
+        fa = _indexed_fasta(tmp_path, seq)
+        dpe = pd.DataFrame(
+            [
+                _dpe_row(read_name="del0", mate_pos=15000, pos=10040),
+                _dpe_row(read_name="del1", mate_pos=15010, pos=10041),
+            ]
+        )
+        splits = pd.DataFrame([_split_row(read_name="interval_only", clip_seq=clip)])
+        members = _same_chrom_deletion_split_member_reads(splits, dpe, fa)
+        assert members.empty
+
+    def test_missing_split_evidence_clip_column_is_not_treated_as_a_match(self, tmp_path: Path):
+        clip = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"
+        seq = ("N" * 14999) + clip + ("N" * 200)
+        fa = _indexed_fasta(tmp_path, seq)
+        dpe = pd.DataFrame(
+            [
+                _dpe_row(read_name="del0", mate_pos=15000, pos=10040),
+                _dpe_row(read_name="del1", mate_pos=15010, pos=10041),
+            ]
+        )
+        legacy_split = _split_row(read_name="legacy", clip_seq=clip)
+        legacy_split.pop("clip_seq")
+        legacy_split["soft_clip_seq"] = clip
+        splits = pd.DataFrame([legacy_split])
+        members = _same_chrom_deletion_split_member_reads(splits, dpe, fa)
+        assert members.empty
+
+    def test_no_fasta_does_not_drop(self, tmp_path: Path):
+        dpe = pd.DataFrame(
+            [
+                _dpe_row(read_name="del0", mate_pos=15000, pos=10040),
+                _dpe_row(read_name="del1", mate_pos=15010, pos=10041),
+            ]
+        )
+        splits = pd.DataFrame([_split_row()])
+        members = _same_chrom_deletion_split_member_reads(splits, dpe, tmp_path / "missing.fa")
+        assert members.empty
+
+    def test_identity_helper_exact_and_mismatch(self):
+        q = "ACGT" * 5
+        assert _best_ungapped_identity(q, "N" * 5 + q + "N" * 5) == 1.0
+        assert _best_ungapped_identity(q, "G" * 40) < 0.3
+        almost = q[:-1] + "C"
+        ident = _best_ungapped_identity(q, almost)
+        assert ident == 0.95
+
+    def test_gapped_matcher_allows_small_query_insertion(self):
+        reference_clip = "ACGTCAGTGCATGACCTAGCGTACCATGCTAGTCAGTGCA"
+        query = reference_clip[:20] + "A" + reference_clip[20:]
+        subject = "N" * 25 + reference_clip + "N" * 25
+        assert _gapped_local_match(query, subject)
+
+    def test_gapped_matcher_allows_small_query_deletion(self):
+        reference_clip = "ACGTCAGTGCATGACCTAGCGTACCATGCTAGTCAGTGCA"
+        query = reference_clip[:20] + reference_clip[21:]
+        subject = "N" * 25 + reference_clip + "N" * 25
+        assert _gapped_local_match(query, subject)
+
+    def test_gapped_matcher_enforces_edit_similarity(self):
+        query = "ACGTTGCA" * 5
+        three_mismatches = list(query)
+        for idx in (3, 17, 31):
+            three_mismatches[idx] = "A" if three_mismatches[idx] != "A" else "C"
+        subject = "N" * 25 + "".join(three_mismatches) + "N" * 25
+        assert not _gapped_local_match(query, subject)
