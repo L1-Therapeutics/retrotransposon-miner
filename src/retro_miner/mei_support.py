@@ -415,12 +415,17 @@ _SHORT_MEI_DPE_MAX_AXIS_GAP_BP = 500
 _SHORT_MEI_DPE_PROXIMAL_SLACK_BP = 80
 
 # Minimum soft-clip length for DPE→MEI consensus remap. Shorter clips are too
-# ambiguous among Alu/SVA/L1; full reference-matching read bodies must never be
-# remapped (∼43% of the genome is MEI-derived).
+# ambiguous among Alu/SVA/L1. Same-chromosome clipped mates still remap the
+# clip only — their ref-matched body is usually a local reference MEI nest
+# (∼43% of the genome is MEI-derived) and must not vote as novel insertion.
 _DPE_MEI_REMAP_MIN_CLIP_BP = 20
-# Unclipped mates may still be fully inside the insertion / homologous MEI; allow
-# full-mate remap only when no soft clip meets the threshold above.
+# Unclipped mates, and interchrom clipped mates sitting on a reference-copy
+# Alu/L1/SVA, may remap the mapped body / full mate.
 _DPE_MEI_REMAP_MIN_FULL_MATE_BP = 30
+# Same-chromosome mates this far from the anchor are also remote enough to treat
+# like interchromosomal placements. Closer clipped mates stay clip-only; coherent
+# deletion bridges are removed separately by the deletion-cluster logic.
+_DPE_MEI_BODY_REMAP_MIN_SAME_CHR_BP = 500_000
 
 
 def _discordant_anchor_mei_query_seq(row: pd.Series | object) -> str:
@@ -438,26 +443,104 @@ def _discordant_anchor_mei_query_seq(row: pd.Series | object) -> str:
     return derived if len(derived) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
 
 
-def _discordant_mate_mei_query_seq(row: pd.Series | object) -> str:
-    """Mate query for MEI remap: soft clip when present, else full mate sequence.
+def _normalize_discordant_chrom(chrom: object) -> str:
+    name = str(chrom or "").strip()
+    if name.lower().startswith("chr"):
+        name = name[3:]
+    return name.lower()
 
-    Clipped mates at the opposite junction must not contribute their
-    reference-matched bases. Unclipped mates may lie entirely in the insertion
-    (or a distant homologous MEI), so the full mate sequence is allowed.
-    """
+
+def _discordant_pair_is_interchrom(row: pd.Series | object) -> bool:
+    """True when the mate landed on a different contig than the anchor."""
+    chrom = _normalize_discordant_chrom(getattr(row, "chrom", ""))
+    mate_chrom = _normalize_discordant_chrom(getattr(row, "mate_chrom", ""))
+    if not chrom or not mate_chrom or mate_chrom in {"*", "."}:
+        return False
+    return chrom != mate_chrom
+
+
+def _discordant_pair_uses_mate_body(row: pd.Series | object) -> bool:
+    """True for interchromosomal or very remote same-chromosome mate placements."""
+    if _discordant_pair_is_interchrom(row):
+        return True
+    chrom = _normalize_discordant_chrom(getattr(row, "chrom", ""))
+    mate_chrom = _normalize_discordant_chrom(getattr(row, "mate_chrom", ""))
+    if not chrom or chrom != mate_chrom:
+        return False
+    try:
+        pos = int(getattr(row, "pos", 0) or 0)
+        mate_pos = int(getattr(row, "mate_pos", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        pos > 0
+        and mate_pos > 0
+        and abs(mate_pos - pos) >= _DPE_MEI_BODY_REMAP_MIN_SAME_CHR_BP
+    )
+
+
+def _discordant_mate_clip_query(row: pd.Series | object) -> str:
+    """Longest mate soft-clip sequence, or empty when the mate is unclipped."""
     mate_clip = str(getattr(row, "mate_soft_clip_seq", "") or "")
     derived = _soft_clip_query_seq(
         str(getattr(row, "mate_seq", "") or ""),
         str(getattr(row, "mate_soft_clip_side", "") or ""),
         int(getattr(row, "mate_soft_clip_len", 0) or 0),
     )
-    best_clip = mate_clip if len(mate_clip) >= len(derived) else derived
-    clip_len = max(int(getattr(row, "mate_soft_clip_len", 0) or 0), len(best_clip))
-    if clip_len > 0:
-        # Any soft clip ⇒ never remap the ref-matched body; clip must be long enough.
-        return best_clip if len(best_clip) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
+    return mate_clip if len(mate_clip) >= len(derived) else derived
+
+
+def _mate_ref_matched_body(row: pd.Series | object) -> str:
+    """Mate bases excluding the longest soft clip (the reference-aligned body)."""
     mate_seq = str(getattr(row, "mate_seq", "") or "")
+    if not mate_seq:
+        return ""
+    clip = _discordant_mate_clip_query(row)
+    clip_len = max(int(getattr(row, "mate_soft_clip_len", 0) or 0), len(clip))
+    if clip_len <= 0:
+        return mate_seq
+    side = str(getattr(row, "mate_soft_clip_side", "") or "").upper()[:1]
+    if side == "L" and len(mate_seq) > clip_len:
+        return mate_seq[clip_len:]
+    if side == "R" and len(mate_seq) > clip_len:
+        return mate_seq[:-clip_len]
+    if clip and mate_seq.startswith(clip) and len(mate_seq) > len(clip):
+        return mate_seq[len(clip) :]
+    if clip and mate_seq.endswith(clip) and len(mate_seq) > len(clip):
+        return mate_seq[: -len(clip)]
+    return mate_seq
+
+
+def _discordant_mate_mei_query_seq(row: pd.Series | object) -> str:
+    """Mate query for MEI remap.
+
+    Nearby same-chrom clipped mates remap the soft clip only — the ref-matched
+    body is usually a local reference MEI. Interchrom and very remote same-chrom
+    mates often sit on a reference-copy Alu/L1/SVA with the unique insertion-site
+    flank as the clip; their mapped body is MEI identity and must be remapped even
+    when the copy is already in the reference. Unclipped mates use the full
+    sequence. Coherent same-chrom deletion bridges are removed downstream.
+    """
+    mate_seq = str(getattr(row, "mate_seq", "") or "")
+    best_clip = _discordant_mate_clip_query(row)
+    clip_len = max(int(getattr(row, "mate_soft_clip_len", 0) or 0), len(best_clip))
+    if _discordant_pair_uses_mate_body(row):
+        body = _mate_ref_matched_body(row)
+        if len(body) >= _DPE_MEI_REMAP_MIN_FULL_MATE_BP:
+            return body
+        if len(mate_seq) >= _DPE_MEI_REMAP_MIN_FULL_MATE_BP:
+            return mate_seq
+        return best_clip if len(best_clip) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
+    if clip_len > 0:
+        return best_clip if len(best_clip) >= _DPE_MEI_REMAP_MIN_CLIP_BP else ""
     return mate_seq if len(mate_seq) >= _DPE_MEI_REMAP_MIN_FULL_MATE_BP else ""
+
+
+def _discordant_mate_mei_query_is_clip(row: pd.Series | object) -> bool:
+    """True when the MEI query is the mate soft-clip (polyA-trim uses clip side)."""
+    query = _discordant_mate_mei_query_seq(row)
+    clip = _discordant_mate_clip_query(row)
+    return bool(query) and bool(clip) and query == clip
 
 
 def _discordant_mate_ok_for_mei_identity(df: pd.DataFrame) -> pd.Series:
@@ -1514,6 +1597,90 @@ def _merge_fetched_mate_sequences(
 _MATE_FETCH_TILE_BP = 16_384
 # Overlap slop around PNEXT for A-B identity with the per-window path.
 _MATE_FETCH_QUERY_BP = 500
+_MATE_CACHE_KEYS = ["read_name", "mate_chrom", "mate_pos"]
+_MATE_CACHE_FIELDS = [
+    "mate_seq",
+    "mate_ref_start",
+    "mate_ref_end",
+    "mate_soft_clip_side",
+    "mate_soft_clip_len",
+    "mate_soft_clip_seq",
+]
+
+
+def _hydrate_discordant_mate_cache(
+    discordant_df: pd.DataFrame,
+    cache_path: Path | None,
+) -> tuple[pd.DataFrame, int]:
+    """Fill missing mate fields from a prior annotation's Parquet sidecar."""
+    out = discordant_df.copy()
+    if cache_path is None or not Path(cache_path).exists() or out.empty:
+        return out, 0
+    try:
+        cache = pd.read_parquet(cache_path)
+    except Exception as exc:  # noqa: BLE001 - stale cache must not block annotation
+        click.echo(f"[mei-annotate] ignoring unreadable mate cache {cache_path}: {exc}")
+        return out, 0
+    required = _MATE_CACHE_KEYS + _MATE_CACHE_FIELDS
+    if cache.empty or not all(col in cache.columns for col in required):
+        return out, 0
+    if not all(col in out.columns for col in _MATE_CACHE_KEYS):
+        return out, 0
+
+    cached = cache.loc[
+        cache["mate_seq"].fillna("").astype(str).str.len().gt(0),
+        required,
+    ].drop_duplicates(_MATE_CACHE_KEYS, keep="last")
+    if cached.empty:
+        return out, 0
+    cached = cached.rename(columns={col: f"{col}__cached" for col in _MATE_CACHE_FIELDS})
+    merged = out.merge(cached, on=_MATE_CACHE_KEYS, how="left", sort=False)
+    cached_seq = merged["mate_seq__cached"].fillna("").astype(str)
+    cache_hit = cached_seq.str.len().gt(0)
+    for col in _MATE_CACHE_FIELDS:
+        cached_col = f"{col}__cached"
+        if col not in merged.columns:
+            merged[col] = "" if col in {"mate_seq", "mate_soft_clip_side", "mate_soft_clip_seq"} else 0
+        if col in {"mate_seq", "mate_soft_clip_side", "mate_soft_clip_seq"}:
+            current = merged[col].fillna("").astype(str)
+            merged[col] = current.where(current.str.len().gt(0), merged[cached_col].fillna("").astype(str))
+        else:
+            current = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(int)
+            cached_values = pd.to_numeric(merged[cached_col], errors="coerce").fillna(0).astype(int)
+            merged[col] = current.where(current.gt(0), cached_values)
+    return merged.drop(columns=[f"{col}__cached" for col in _MATE_CACHE_FIELDS]), int(cache_hit.sum())
+
+
+def _write_discordant_mate_cache(discordant_df: pd.DataFrame, cache_path: Path | None) -> int:
+    """Atomically persist fetched mate fields for future consensus-remap experiments."""
+    if cache_path is None or discordant_df.empty:
+        return 0
+    required = _MATE_CACHE_KEYS + _MATE_CACHE_FIELDS
+    if not all(col in discordant_df.columns for col in required):
+        return 0
+    cache = discordant_df.loc[
+        discordant_df["mate_seq"].fillna("").astype(str).str.len().gt(0),
+        required,
+    ].drop_duplicates(_MATE_CACHE_KEYS, keep="last")
+    if cache.empty:
+        return 0
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+        cache.to_parquet(tmp_path, index=False)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+    return len(cache)
 
 
 def _fetch_discordant_mate_sequences(
@@ -1521,12 +1688,15 @@ def _fetch_discordant_mate_sequences(
     bam_path: Path | None,
     *,
     fetch_fn=None,
+    cache_path: Path | None = None,
 ) -> pd.DataFrame:
     """Attach mate_seq (+ soft-clip fields) to discordant rows."""
     if discordant_df.empty:
         return discordant_df.copy()
 
-    out = discordant_df.copy()
+    out, cache_hits = _hydrate_discordant_mate_cache(discordant_df, cache_path)
+    if cache_hits:
+        click.echo(f"[mei-annotate] mate cache hits={cache_hits} path={cache_path}")
     for col, default in (
         ("mate_seq", ""),
         ("mate_ref_start", 0),
@@ -1556,6 +1726,8 @@ def _fetch_discordant_mate_sequences(
                 out["mate_soft_clip_seq"].str.len().eq(0)
                 & out["mate_soft_clip_len"].eq(0)
                 & out["mate_seq"].str.len().gt(0)
+                & out["mate_ref_start"].eq(0)
+                & out["mate_ref_end"].eq(0)
             )
         )
         & (out["mate_chrom"].fillna("").astype(str) != "*")
@@ -1584,7 +1756,11 @@ def _fetch_discordant_mate_sequences(
     with open_alignment(bam_path) as bam:
         fetched = fetch_impl(bam, windows)
 
-    return _merge_fetched_mate_sequences(out, fetched)
+    out = _merge_fetched_mate_sequences(out, fetched)
+    cached_rows = _write_discordant_mate_cache(out, cache_path)
+    if cached_rows:
+        click.echo(f"[mei-annotate] wrote mate cache rows={cached_rows} path={cache_path}")
+    return out
 
 
 def _mate_alignment_tuple(
@@ -1701,11 +1877,21 @@ def _align_discordant_mates_with_minimap2(
     sample: str,
     bam_path: Path | None = None,
     *,
+    mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
-    """Map discordant mates to MEI consensus (clip-only when mate is soft-clipped)."""
+    """Map discordant mates to MEI consensus.
+
+    Nearby same-chrom clipped mates remap the clip only. Interchrom mates and
+    same-chrom mates at least 500 kb away remap the reference-aligned body (or
+    full mate) so a reference-copy Alu/L1/SVA hit still counts as MEI identity.
+    """
     fetch_t0 = time.monotonic()
-    enriched = _fetch_discordant_mate_sequences(discordant_df, bam_path)
+    enriched = _fetch_discordant_mate_sequences(
+        discordant_df,
+        bam_path,
+        cache_path=mate_cache_path,
+    )
     click.echo(
         f"[mei-annotate] sample={sample} mate_fetch rows={len(discordant_df)} "
         f"elapsed={time.monotonic() - fetch_t0:.1f}s"
@@ -1727,25 +1913,21 @@ def _align_discordant_mates_with_minimap2(
 
     mates["mate_query_id"] = [f"{sample}_mate_{i}" for i in range(len(mates))]
     mate_query = mates.copy()
-    # Shared discordant aligner historically expected read_seq; pass clip/full query.
-    # PolyA trim uses mate soft-clip side when the query is a clip; full-mate queries
-    # leave side empty so trim keeps the longer non-poly residual.
+    # Shared discordant aligner historically expected read_seq; pass clip/body/full.
+    # PolyA trim uses mate soft-clip side only when the query *is* the clip.
+    # Interchrom body remaps leave side empty so trim keeps the longer residual.
     mate_query["read_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
     mate_query["soft_clip_seq"] = mate_query["mei_query_seq"].fillna("").astype(str)
-    mate_has_clip = (
-        pd.to_numeric(mate_query.get("mate_soft_clip_len", 0), errors="coerce").fillna(0).astype(int).gt(0)
-        | mate_query.get("mate_soft_clip_seq", pd.Series("", index=mate_query.index))
-        .fillna("")
-        .astype(str)
-        .str.len()
-        .gt(0)
+    query_is_clip = pd.Series(
+        [_discordant_mate_mei_query_is_clip(row) for row in mates.itertuples(index=False)],
+        index=mates.index,
     )
     mate_side = (
         mate_query["mate_soft_clip_side"].fillna("").astype(str)
         if "mate_soft_clip_side" in mate_query.columns
         else pd.Series("", index=mate_query.index)
     )
-    mate_query["soft_clip_side"] = mate_side.where(mate_has_clip, "")
+    mate_query["soft_clip_side"] = mate_side.where(query_is_clip, "")
     mate_query["soft_clip_len"] = mate_query["mei_query_seq"].str.len().astype(int)
     # Force a strong reason so the shared discordant aligner does not drop mates
     # whose only original reason was poly_tail_anchor_rescue (or empty).
@@ -2069,6 +2251,7 @@ def _remap_one_sample_mei_evidence(
     mei_fasta: Path,
     bam_path: Path | None,
     mate_bam_path: Path | None,
+    mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
 ) -> dict[str, object]:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
@@ -2096,6 +2279,7 @@ def _remap_one_sample_mei_evidence(
         mei_fasta,
         sample=f"{sample}_mate",
         bam_path=mate_bam_path or bam_path,
+        mate_cache_path=mate_cache_path,
         bwa_threads=bwa_threads,
     )
     post_t0 = time.monotonic()
@@ -14714,6 +14898,7 @@ def annotate_candidate_loci_with_mei(
                 mei_fasta=mei_fasta,
                 bam_path=control_bam_path,
                 mate_bam_path=control_mate_bam_path or disease_mate_bam_path,
+                mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.germline.parquet",
                 bwa_threads=per_sample_bwa_threads,
             )
             remap_by_sample = {
@@ -14739,6 +14924,7 @@ def annotate_candidate_loci_with_mei(
                         mei_fasta=mei_fasta,
                         bam_path=disease_bam_path,
                         mate_bam_path=disease_mate_bam_path,
+                        mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.disease.parquet",
                         bwa_threads=per_sample_bwa_threads,
                     ): "disease",
                     pool.submit(
@@ -14749,6 +14935,7 @@ def annotate_candidate_loci_with_mei(
                         mei_fasta=mei_fasta,
                         bam_path=control_bam_path,
                         mate_bam_path=control_mate_bam_path,
+                        mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.control.parquet",
                         bwa_threads=per_sample_bwa_threads,
                     ): "control",
                 }
