@@ -395,6 +395,16 @@ def _family_from_target(target: str) -> str:
 # MEI placements; deletion-vs-insertion is handled by other call logic.
 _DPE_MEI_IDENTITY_MIN_SAME_CHR_BP = 1000
 
+# A reference deletion can make one breakpoint look like an MEI insertion when
+# many long-fragment pairs bridge to the same reference MEI on the same
+# chromosome.  Keep this geometry separate from MEI-consensus coordinates.
+_REFERENCE_DELETION_MATE_CLUSTER_BP = 1000
+_REFERENCE_DELETION_MIN_GAP_BP = 1000
+_REFERENCE_DELETION_MIN_CLUSTER_READS = 4
+_REFERENCE_DELETION_MIN_CLUSTER_FRACTION = 0.70
+_REFERENCE_DELETION_MAX_OPPOSITE_FRACTION = 0.20
+_REFERENCE_DELETION_OPPOSITE_READ_FLOOR = 2
+
 # Short soft-clips may count as SR only when consistent with a strict MEI SR seed
 # (preferred) or a same-side DPE MEI seed (fallback).
 _STRICT_MEI_CLIP_MIN_BP = 20
@@ -5998,6 +6008,140 @@ def _aggregate_side_metrics(
     return agg
 
 
+def _aggregate_reference_deletion_dpe_metrics(
+    mei_df: pd.DataFrame,
+    sample_prefix: str,
+) -> pd.DataFrame:
+    """Summarize one-sided long-FR mate clusters that can represent deletions."""
+    keys = ["chrom", "window_start", "window_end"]
+    metric_cols = [
+        f"{sample_prefix}_reference_deletion_cluster_reads",
+        f"{sample_prefix}_reference_deletion_cluster_fraction",
+        f"{sample_prefix}_reference_deletion_cluster_width_bp",
+        f"{sample_prefix}_reference_deletion_span_bp",
+        f"{sample_prefix}_reference_deletion_anchor_side",
+        f"{sample_prefix}_reference_deletion_mate_chrom",
+        f"{sample_prefix}_reference_deletion_mate_pos_median",
+    ]
+    empty = pd.DataFrame(columns=keys + metric_cols)
+    required = {
+        "chrom",
+        "window_start",
+        "window_end",
+        "pos",
+        "mate_chrom",
+        "mate_pos",
+        "read_name",
+        "is_reverse",
+        "mate_is_reverse",
+        "discordant_reasons",
+    }
+    if mei_df is None or mei_df.empty or not required.issubset(mei_df.columns):
+        return empty
+
+    work = mei_df.copy()
+    work["pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
+    work["mate_pos"] = pd.to_numeric(work["mate_pos"], errors="coerce").fillna(0).astype(int)
+    work["locus_midpoint"] = (
+        pd.to_numeric(work["window_start"], errors="coerce").fillna(0).astype(int)
+        + pd.to_numeric(work["window_end"], errors="coerce").fillna(0).astype(int)
+    ) // 2
+    work["_distance_to_locus"] = (work["pos"] - work["locus_midpoint"]).abs()
+
+    def _bool_values(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(series):
+            return series.fillna(False).astype(bool)
+        return series.fillna("").astype(str).str.lower().isin({"1", "true", "t", "yes"})
+
+    work["_is_reverse"] = _bool_values(work["is_reverse"])
+    work["_mate_is_reverse"] = _bool_values(work["mate_is_reverse"])
+    work["_same_chrom"] = (
+        work["chrom"].fillna("").astype(str).str.replace(r"^chr", "", case=False, regex=True).str.lower()
+        == work["mate_chrom"].fillna("").astype(str).str.replace(r"^chr", "", case=False, regex=True).str.lower()
+    )
+    work["_long_insert"] = (
+        work["discordant_reasons"].fillna("").astype(str).str.contains("large_insert", regex=False)
+    )
+    work["_canonical_fr"] = (
+        (~work["_is_reverse"])
+        & work["_mate_is_reverse"]
+        & (work["pos"] <= work["mate_pos"])
+    ) | (
+        work["_is_reverse"]
+        & (~work["_mate_is_reverse"])
+        & (work["mate_pos"] <= work["pos"])
+    )
+    work["_gap_bp"] = (work["mate_pos"] - work["pos"]).abs()
+
+    # A pair can appear more than once after consensus remapping.  Keep the end
+    # nearest this candidate so each physical pair contributes once.
+    sort_cols = keys + ["read_name", "_distance_to_locus"]
+    work = work.sort_values(sort_cols, kind="mergesort").drop_duplicates(
+        keys + ["read_name"],
+        keep="first",
+    )
+    work["anchor_side"] = work["pos"].le(work["locus_midpoint"]).map({True: "L", False: "R"})
+    eligible = work.loc[
+        work["_same_chrom"]
+        & work["_long_insert"]
+        & work["_canonical_fr"]
+        & work["_gap_bp"].ge(_REFERENCE_DELETION_MIN_GAP_BP)
+        & work["mate_pos"].gt(0)
+    ].copy()
+    if eligible.empty:
+        return empty
+
+    total_reads = (
+        work.groupby(keys, as_index=False)["read_name"]
+        .nunique()
+        .rename(columns={"read_name": "_total_mei_dpe_reads"})
+    )
+    rows: list[dict[str, object]] = []
+    for key, locus in eligible.groupby(keys, sort=False):
+        best: tuple[int, int, int, pd.DataFrame] | None = None
+        for _, side_rows in locus.groupby(["anchor_side", "mate_chrom"], sort=False):
+            side_rows = side_rows.sort_values("mate_pos", kind="mergesort").reset_index(drop=True)
+            left = 0
+            for right in range(len(side_rows)):
+                while (
+                    int(side_rows.loc[right, "mate_pos"])
+                    - int(side_rows.loc[left, "mate_pos"])
+                    > _REFERENCE_DELETION_MATE_CLUSTER_BP
+                ):
+                    left += 1
+                cluster = side_rows.iloc[left : right + 1]
+                width = int(cluster["mate_pos"].max() - cluster["mate_pos"].min())
+                candidate = (len(cluster), -width, -int(cluster["mate_pos"].median()), cluster)
+                if best is None or candidate[:3] > best[:3]:
+                    best = candidate
+        if best is None:
+            continue
+        cluster = best[3]
+        rows.append(
+            {
+                "chrom": key[0],
+                "window_start": key[1],
+                "window_end": key[2],
+                f"{sample_prefix}_reference_deletion_cluster_reads": int(cluster["read_name"].nunique()),
+                f"{sample_prefix}_reference_deletion_cluster_width_bp": int(
+                    cluster["mate_pos"].max() - cluster["mate_pos"].min()
+                ),
+                f"{sample_prefix}_reference_deletion_span_bp": float(cluster["_gap_bp"].median()),
+                f"{sample_prefix}_reference_deletion_anchor_side": str(cluster["anchor_side"].iloc[0]),
+                f"{sample_prefix}_reference_deletion_mate_chrom": str(cluster["mate_chrom"].iloc[0]),
+                f"{sample_prefix}_reference_deletion_mate_pos_median": float(cluster["mate_pos"].median()),
+            }
+        )
+    if not rows:
+        return empty
+    out = pd.DataFrame(rows).merge(total_reads, on=keys, how="left")
+    out[f"{sample_prefix}_reference_deletion_cluster_fraction"] = (
+        out[f"{sample_prefix}_reference_deletion_cluster_reads"]
+        / out["_total_mei_dpe_reads"].clip(lower=1)
+    ).astype(float)
+    return out.drop(columns=["_total_mei_dpe_reads"])
+
+
 def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> pd.DataFrame:
     empty_cols = [
                 "chrom",
@@ -6038,6 +6182,13 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
                 f"{sample_prefix}_discordant_mei_insert_sd_proxy",
                 f"{sample_prefix}_discordant_mei_max_pair_swing",
                 f"{sample_prefix}_discordant_mei_self_consistent",
+                f"{sample_prefix}_reference_deletion_cluster_reads",
+                f"{sample_prefix}_reference_deletion_cluster_fraction",
+                f"{sample_prefix}_reference_deletion_cluster_width_bp",
+                f"{sample_prefix}_reference_deletion_span_bp",
+                f"{sample_prefix}_reference_deletion_anchor_side",
+                f"{sample_prefix}_reference_deletion_mate_chrom",
+                f"{sample_prefix}_reference_deletion_mate_pos_median",
     ]
     if df is None or df.empty or "mei_hit" not in df.columns:
         return pd.DataFrame(columns=empty_cols)
@@ -6051,6 +6202,10 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         axis=1,
     )
     mei_df["anchor_bin_10bp"] = (mei_df["pos"].astype(int) // 10).astype(int)
+    reference_deletion_metrics = _aggregate_reference_deletion_dpe_metrics(
+        mei_df,
+        sample_prefix,
+    )
 
     # Family/subfamily identity: only mates that are interchromosomal or >1 kb away.
     # Prefer mate consensus labels when present. Support counts / geometry below
@@ -6628,6 +6783,11 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
             on=["chrom", "window_start", "window_end"],
             how="left",
         )
+        .merge(
+            reference_deletion_metrics,
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
     )
     agg[f"{sample_prefix}_discordant_mei_left_supported_reads"] = (
         agg[f"{sample_prefix}_discordant_mei_left_supported_reads"].fillna(0).astype(int)
@@ -6771,6 +6931,22 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
             | (agg[f"{sample_prefix}_discordant_mei_anchor_target_spearman_abs_min"] >= 0.6)
         )
     )
+    for col in (
+        f"{sample_prefix}_reference_deletion_cluster_reads",
+        f"{sample_prefix}_reference_deletion_cluster_width_bp",
+    ):
+        agg[col] = pd.to_numeric(agg.get(col, 0), errors="coerce").fillna(0).astype(int)
+    for col in (
+        f"{sample_prefix}_reference_deletion_cluster_fraction",
+        f"{sample_prefix}_reference_deletion_span_bp",
+        f"{sample_prefix}_reference_deletion_mate_pos_median",
+    ):
+        agg[col] = pd.to_numeric(agg.get(col, 0.0), errors="coerce").fillna(0.0).astype(float)
+    for col in (
+        f"{sample_prefix}_reference_deletion_anchor_side",
+        f"{sample_prefix}_reference_deletion_mate_chrom",
+    ):
+        agg[col] = agg.get(col, pd.Series("", index=agg.index)).fillna("").astype(str)
     return agg
 
 
@@ -9092,6 +9268,80 @@ def _match_l1_endonuclease_motif(
     )
 
 
+def _add_reference_deletion_signature(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Flag deletion-bridge DPE clusters lacking an independent opposite junction."""
+    out = candidates.copy()
+    s = lambda col, default: _df_col_series(out, col, default)
+    overlap = pd.to_numeric(s("event_clip_overlap_consistency", 0.0), errors="coerce").fillna(0.0)
+    independent_any = s("classic_polya_mei_sidepair", False).fillna(False).astype(bool)
+    sample_flags: list[pd.Series] = []
+
+    for prefix in ("disease", "control"):
+        cluster_reads = pd.to_numeric(
+            s(f"{prefix}_reference_deletion_cluster_reads", 0),
+            errors="coerce",
+        ).fillna(0).astype(int)
+        cluster_fraction = pd.to_numeric(
+            s(f"{prefix}_reference_deletion_cluster_fraction", 0.0),
+            errors="coerce",
+        ).fillna(0.0)
+        cluster_width = pd.to_numeric(
+            s(f"{prefix}_reference_deletion_cluster_width_bp", 0),
+            errors="coerce",
+        ).fillna(0).astype(int)
+        cluster_span = pd.to_numeric(
+            s(f"{prefix}_reference_deletion_span_bp", 0.0),
+            errors="coerce",
+        ).fillna(0.0)
+        anchor_side = s(f"{prefix}_reference_deletion_anchor_side", "").fillna("").astype(str)
+        left_split = pd.to_numeric(
+            s(f"{prefix}_L_mei_supported_reads", 0),
+            errors="coerce",
+        ).fillna(0).astype(int)
+        right_split = pd.to_numeric(
+            s(f"{prefix}_R_mei_supported_reads", 0),
+            errors="coerce",
+        ).fillna(0).astype(int)
+        opposite_split = right_split.where(anchor_side.eq("L"), left_split.where(anchor_side.eq("R"), 0))
+        allowed_opposite = (cluster_reads.astype(float) * _REFERENCE_DELETION_MAX_OPPOSITE_FRACTION).map(
+            math.floor
+        ).clip(lower=_REFERENCE_DELETION_OPPOSITE_READ_FLOOR).astype(int)
+        out[f"{prefix}_reference_deletion_opposite_mei_reads"] = opposite_split.astype(int)
+        out[f"{prefix}_reference_deletion_allowed_opposite_reads"] = allowed_opposite
+
+        family_agree = pd.to_numeric(
+            s(f"{prefix}_family_agreement", 0),
+            errors="coerce",
+        ).fillna(0).eq(1)
+        strand_agree = pd.to_numeric(
+            s(f"{prefix}_strand_agreement", 0),
+            errors="coerce",
+        ).fillna(0).eq(1)
+        independent_split = (
+            left_split.ge(1)
+            & right_split.ge(1)
+            & family_agree
+            & strand_agree
+            & overlap.ge(0.12)
+        )
+        independent_any = independent_any | independent_split
+        clustered_bridge = (
+            cluster_reads.ge(_REFERENCE_DELETION_MIN_CLUSTER_READS)
+            & cluster_fraction.ge(_REFERENCE_DELETION_MIN_CLUSTER_FRACTION)
+            & cluster_width.le(_REFERENCE_DELETION_MATE_CLUSTER_BP)
+            & cluster_span.ge(_REFERENCE_DELETION_MIN_GAP_BP)
+            & opposite_split.le(allowed_opposite)
+        )
+        out[f"{prefix}_reference_deletion_signature"] = clustered_bridge & (~independent_split)
+        sample_flags.append(out[f"{prefix}_reference_deletion_signature"])
+
+    out["reference_deletion_independent_insertion_junction"] = independent_any
+    out["reference_deletion_signature"] = (
+        sample_flags[0] | sample_flags[1]
+    ) & (~independent_any)
+    return out
+
+
 def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out = _ensure_candidate_schema_defaults(candidates)
     s = lambda col, default: _df_col_series(out, col, default)
@@ -9538,6 +9788,7 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     # Classic simple MEI: polyA/T on one flank + MEI support on the other.
     # Do not label these complex even if residual discordants look SV-like.
     out["classic_polya_mei_sidepair"] = _classic_polya_mei_sidepair(out)
+    out = _add_reference_deletion_signature(out)
     complex_sidepair_event = complex_sidepair_event & ~out["classic_polya_mei_sidepair"]
     out["mei_with_complex_sv_signature"] = (
         out["mei_with_complex_sv_signature"] & ~out["classic_polya_mei_sidepair"]
@@ -11017,6 +11268,22 @@ def _assign_gold_stage(
         fail_tag = "complex_ins_non_mei"
         need_append = complex_ins_gold & prev.ne("")
         need_set = complex_ins_gold & prev.eq("")
+        out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
+        out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
+
+    # Long same-chromosome FR pairs concentrated at one remote locus are
+    # deletion bridges, not independent evidence for a novel MEI.  Preserve the
+    # row as silver for complex-event review.
+    reference_deletion = (
+        _df_col_series(out, "reference_deletion_signature", False).fillna(False).astype(bool)
+    )
+    reference_deletion_gold = silver & out["gold_stage_pass"] & reference_deletion
+    if reference_deletion_gold.any():
+        out.loc[reference_deletion_gold, "gold_stage_pass"] = False
+        prev = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
+        fail_tag = "reference_deletion_signature"
+        need_append = reference_deletion_gold & prev.ne("")
+        need_set = reference_deletion_gold & prev.eq("")
         out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
         out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
 
@@ -12751,6 +13018,24 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "complex_mei_event",
         "classic_polya_mei_sidepair",
         "complex_sv_signature_label",
+        "reference_deletion_signature",
+        "reference_deletion_independent_insertion_junction",
+        "disease_reference_deletion_cluster_reads",
+        "disease_reference_deletion_cluster_fraction",
+        "disease_reference_deletion_cluster_width_bp",
+        "disease_reference_deletion_span_bp",
+        "disease_reference_deletion_anchor_side",
+        "disease_reference_deletion_mate_chrom",
+        "disease_reference_deletion_mate_pos_median",
+        "disease_reference_deletion_opposite_mei_reads",
+        "control_reference_deletion_cluster_reads",
+        "control_reference_deletion_cluster_fraction",
+        "control_reference_deletion_cluster_width_bp",
+        "control_reference_deletion_span_bp",
+        "control_reference_deletion_anchor_side",
+        "control_reference_deletion_mate_chrom",
+        "control_reference_deletion_mate_pos_median",
+        "control_reference_deletion_opposite_mei_reads",
         "discordant_mei_majority",
         "consensus_insertion_orientation",
         "nested_in_same_MEI",
