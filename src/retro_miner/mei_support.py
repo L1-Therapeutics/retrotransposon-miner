@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -7604,11 +7604,267 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
     return pivot
 
 
+_WINDOW_BREAKPOINT_PILE_GAP_BP = 100
+
+
+def _cluster_positions_by_gap(positions: list[int], max_gap_bp: int) -> list[list[int]]:
+    """Cluster sorted unique-ish positions when consecutive gap <= max_gap_bp."""
+    if not positions:
+        return []
+    gap = max(0, int(max_gap_bp))
+    ordered = sorted(int(p) for p in positions)
+    clusters: list[list[int]] = [[ordered[0]]]
+    for pos in ordered[1:]:
+        if pos - clusters[-1][-1] <= gap:
+            clusters[-1].append(pos)
+        else:
+            clusters.append([pos])
+    return clusters
+
+
+def _mode_int_pos(positions: list[int]) -> int:
+    if not positions:
+        return 0
+    counts = Counter(int(p) for p in positions)
+    pos, _n = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))
+    return int(pos)
+
+
+def _collect_window_breakpoint_evidence(
+    split_frames: list[pd.DataFrame | None],
+    discordant_frames: list[pd.DataFrame | None],
+) -> pd.DataFrame:
+    """Per-read junction positions labeled split / polyA / DPE for in-window pile scoring."""
+    rows: list[dict[str, object]] = []
+    required = {"chrom", "window_start", "window_end", "pos", "read_name"}
+    for sdf in split_frames:
+        if sdf is None or sdf.empty or not required.issubset(sdf.columns):
+            continue
+        mei = _split_mei_support_eligible_mask(sdf).reindex(sdf.index).fillna(False).astype(bool)
+        polya = _split_polya_member_mask(sdf).reindex(sdf.index).fillna(False).astype(bool)
+        chrom = sdf["chrom"].astype(str)
+        ws = pd.to_numeric(sdf["window_start"], errors="coerce").fillna(0).astype(int)
+        we = pd.to_numeric(sdf["window_end"], errors="coerce").fillna(0).astype(int)
+        pos = pd.to_numeric(sdf["pos"], errors="coerce").fillna(0).astype(int)
+        names = sdf["read_name"].fillna("").astype(str)
+        for chrom_i, ws_i, we_i, pos_i, name_i, is_mei, is_polya in zip(
+            chrom, ws, we, pos, names, mei, polya, strict=False
+        ):
+            if int(pos_i) <= 0 or not str(name_i):
+                continue
+            if bool(is_mei):
+                kind = "split"
+            elif bool(is_polya):
+                kind = "polya"
+            else:
+                continue
+            rows.append(
+                {
+                    "chrom": str(chrom_i),
+                    "window_start": int(ws_i),
+                    "window_end": int(we_i),
+                    "pos": int(pos_i),
+                    "read_name": str(name_i),
+                    "kind": kind,
+                }
+            )
+    for ddf in discordant_frames:
+        if ddf is None or ddf.empty or not required.issubset(ddf.columns):
+            continue
+        mapped = _discordant_row_mei_mapped(ddf).reindex(ddf.index).fillna(False).astype(bool)
+        if not bool(mapped.any()):
+            continue
+        work = ddf.loc[mapped]
+        chrom = work["chrom"].astype(str)
+        ws = pd.to_numeric(work["window_start"], errors="coerce").fillna(0).astype(int)
+        we = pd.to_numeric(work["window_end"], errors="coerce").fillna(0).astype(int)
+        pos = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
+        if "soft_clip_pos" in work.columns:
+            soft = pd.to_numeric(work["soft_clip_pos"], errors="coerce").fillna(0).astype(int)
+            pos = pos.where(soft.le(0), soft)
+        names = work["read_name"].fillna("").astype(str)
+        for chrom_i, ws_i, we_i, pos_i, name_i in zip(chrom, ws, we, pos, names, strict=False):
+            if int(pos_i) <= 0 or not str(name_i):
+                continue
+            rows.append(
+                {
+                    "chrom": str(chrom_i),
+                    "window_start": int(ws_i),
+                    "window_end": int(we_i),
+                    "pos": int(pos_i),
+                    "read_name": str(name_i),
+                    "kind": "dpe",
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=["chrom", "window_start", "window_end", "pos", "read_name", "kind"])
+    return pd.DataFrame(rows)
+
+
+def _choose_best_pile_for_locus(
+    *,
+    evidence: pd.DataFrame,
+    tsd_left: int,
+    tsd_right: int,
+    tsd_source: str,
+    pile_gap_bp: int,
+) -> tuple[int, str]:
+    """Pick one breakpoint pile: split MEI > TSD > polyA > DPE MEI."""
+    positions: list[int] = []
+    if evidence is not None and not evidence.empty:
+        positions.extend(int(p) for p in evidence["pos"].tolist())
+    tsd_left_i = int(tsd_left or 0)
+    tsd_right_i = int(tsd_right or 0)
+    tsd_ok = tsd_left_i > 0 and tsd_right_i >= tsd_left_i
+    if tsd_ok:
+        positions.extend([tsd_left_i, tsd_right_i])
+    if not positions:
+        return 0, ""
+
+    clusters = _cluster_positions_by_gap(positions, pile_gap_bp)
+    if not clusters:
+        return 0, ""
+
+    def _cluster_idx(pos: int) -> int | None:
+        best: int | None = None
+        best_d: int | None = None
+        for i, cl in enumerate(clusters):
+            lo = int(cl[0])
+            hi = int(cl[-1])
+            if lo <= pos <= hi:
+                return i
+            dist = lo - pos if pos < lo else pos - hi
+            if dist <= int(pile_gap_bp) and (best_d is None or dist < best_d):
+                best_d = dist
+                best = i
+        return best
+
+    n = len(clusters)
+    split_reads: list[set[str]] = [set() for _ in range(n)]
+    polya_reads: list[set[str]] = [set() for _ in range(n)]
+    dpe_reads: list[set[str]] = [set() for _ in range(n)]
+    split_pos: list[list[int]] = [[] for _ in range(n)]
+    polya_pos: list[list[int]] = [[] for _ in range(n)]
+    dpe_pos: list[list[int]] = [[] for _ in range(n)]
+    if evidence is not None and not evidence.empty:
+        for rec in evidence.itertuples(index=False):
+            idx = _cluster_idx(int(rec.pos))
+            if idx is None:
+                continue
+            name = str(rec.read_name)
+            kind = str(rec.kind)
+            pos_i = int(rec.pos)
+            if kind == "split":
+                split_reads[idx].add(name)
+                split_pos[idx].append(pos_i)
+            elif kind == "polya":
+                polya_reads[idx].add(name)
+                polya_pos[idx].append(pos_i)
+            elif kind == "dpe":
+                dpe_reads[idx].add(name)
+                dpe_pos[idx].append(pos_i)
+
+    best_key: tuple[int, int, int, int, int] | None = None
+    best_pos = 0
+    best_source = ""
+    tsd_source_s = str(tsd_source or "").strip() or "tsd"
+    for i, cl in enumerate(clusters):
+        pile_lo = int(cl[0])
+        pile_hi = int(cl[-1])
+        n_split = len(split_reads[i])
+        n_polya = len(polya_reads[i])
+        n_dpe = len(dpe_reads[i])
+        has_tsd = False
+        if tsd_ok:
+            if tsd_left_i <= pile_hi and tsd_right_i >= pile_lo:
+                has_tsd = True
+            else:
+                mid = int((tsd_left_i + tsd_right_i) // 2)
+                if (pile_lo - int(pile_gap_bp)) <= mid <= (pile_hi + int(pile_gap_bp)):
+                    has_tsd = True
+        if n_split == 0 and n_polya == 0 and n_dpe == 0 and not has_tsd:
+            continue
+        # Exact base inside the winning pile: TSD midpoint if present, else the
+        # strongest evidence type's mode.
+        if has_tsd:
+            pos = int((tsd_left_i + tsd_right_i) // 2)
+            source = tsd_source_s
+        elif n_split:
+            pos = _mode_int_pos(split_pos[i])
+            source = "split_mei"
+        elif n_polya:
+            pos = _mode_int_pos(polya_pos[i])
+            source = "polyA"
+        else:
+            pos = _mode_int_pos(dpe_pos[i])
+            source = "dpe_mei"
+        key = (n_split, 1 if has_tsd else 0, n_polya, n_dpe, -int(pos))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_pos = int(pos)
+            best_source = source
+    return int(best_pos), best_source
+
+
+def _choose_window_breakpoints(
+    candidates: pd.DataFrame,
+    *,
+    split_frames: list[pd.DataFrame | None],
+    discordant_frames: list[pd.DataFrame | None],
+    pile_gap_bp: int = _WINDOW_BREAKPOINT_PILE_GAP_BP,
+) -> pd.DataFrame:
+    """Per-locus most-likely insertion breakpoint from in-window evidence piles."""
+    if candidates is None or candidates.empty:
+        return pd.DataFrame(
+            {
+                "insertion_breakpoint_pos": pd.Series(dtype=int),
+                "breakpoint_evidence_source": pd.Series(dtype=str),
+            }
+        )
+    evidence = _collect_window_breakpoint_evidence(split_frames, discordant_frames)
+    grouped: dict[tuple[str, int, int], pd.DataFrame] = {}
+    if not evidence.empty:
+        for key, grp in evidence.groupby(["chrom", "window_start", "window_end"], sort=False):
+            grouped[(str(key[0]), int(key[1]), int(key[2]))] = grp
+    pos_out: list[int] = []
+    src_out: list[str] = []
+    for row in candidates.itertuples(index=False):
+        chrom = str(row.chrom)
+        ws = int(row.window_start)
+        we = int(row.window_end)
+        tsd_left = int(getattr(row, "tsd_left_breakpoint", 0) or 0)
+        tsd_right = int(getattr(row, "tsd_right_breakpoint", 0) or 0)
+        tsd_len = int(getattr(row, "tsd_len_estimate", 0) or 0)
+        tsd_detected = bool(getattr(row, "tsd_detected", False))
+        if tsd_len < 4 and not tsd_detected:
+            tsd_left, tsd_right = 0, 0
+        tsd_source = str(getattr(row, "tsd_evidence_source", "") or "")
+        ev = grouped.get((chrom, ws, we), pd.DataFrame())
+        bp, src = _choose_best_pile_for_locus(
+            evidence=ev,
+            tsd_left=tsd_left,
+            tsd_right=tsd_right,
+            tsd_source=tsd_source,
+            pile_gap_bp=int(pile_gap_bp),
+        )
+        pos_out.append(int(bp))
+        src_out.append(str(src))
+    return pd.DataFrame(
+        {
+            "insertion_breakpoint_pos": pos_out,
+            "breakpoint_evidence_source": src_out,
+        },
+        index=candidates.index,
+    )
+
+
 def _infer_disease_insertion_metrics(
     candidates: pd.DataFrame,
     reference_fasta: Path | None = None,
     split_disease: pd.DataFrame | None = None,
     split_control: pd.DataFrame | None = None,
+    discordant_disease: pd.DataFrame | None = None,
+    discordant_control: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     out = candidates.copy()
     for col in [
@@ -8624,10 +8880,30 @@ def _infer_disease_insertion_metrics(
                 return bp_r, f"{label}_single_clip"
         return 0, ""
 
-    bp_fields = out.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
-    bp_fields.columns = ["insertion_breakpoint_pos", "breakpoint_evidence_source"]
-    out["insertion_breakpoint_pos"] = bp_fields["insertion_breakpoint_pos"].astype(int)
-    out["breakpoint_evidence_source"] = bp_fields["breakpoint_evidence_source"].fillna("").astype(str)
+    def _assign_insertion_breakpoints(frame: pd.DataFrame) -> pd.DataFrame:
+        fallback = frame.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
+        fallback.columns = ["insertion_breakpoint_pos", "breakpoint_evidence_source"]
+        picked = _choose_window_breakpoints(
+            frame,
+            split_frames=[split_disease, split_control],
+            discordant_frames=[discordant_disease, discordant_control],
+        )
+        use = picked["insertion_breakpoint_pos"].astype(int).gt(0)
+        frame = frame.copy()
+        frame["insertion_breakpoint_pos"] = fallback["insertion_breakpoint_pos"].astype(int)
+        frame["breakpoint_evidence_source"] = fallback["breakpoint_evidence_source"].fillna("").astype(str)
+        if bool(use.any()):
+            frame.loc[use, "insertion_breakpoint_pos"] = (
+                picked.loc[use, "insertion_breakpoint_pos"].astype(int)
+            )
+            frame.loc[use, "breakpoint_evidence_source"] = (
+                picked.loc[use, "breakpoint_evidence_source"].fillna("").astype(str)
+            )
+        return frame
+
+    assigned = _assign_insertion_breakpoints(out)
+    out["insertion_breakpoint_pos"] = assigned["insertion_breakpoint_pos"].astype(int)
+    out["breakpoint_evidence_source"] = assigned["breakpoint_evidence_source"].fillna("").astype(str)
     out["tsd_seq"] = ""
     out["breakpoint_context_11bp"] = ""
     out["breakpoint_l1_en_hexamer"] = ""
@@ -8796,10 +9072,9 @@ def _infer_disease_insertion_metrics(
     # rows were filtered, so primary pairs could publish AAAA…/TTTT… as TSD.
     poly_at_filter_mask = _clear_poly_at_artifact_tsd_fields(out)
     if bool(poly_at_filter_mask.any()):
-        bp_fields = out.apply(_breakpoint_pos_and_source, axis=1, result_type="expand")
-        bp_fields.columns = ["insertion_breakpoint_pos", "breakpoint_evidence_source"]
-        out["insertion_breakpoint_pos"] = bp_fields["insertion_breakpoint_pos"].astype(int)
-        out["breakpoint_evidence_source"] = bp_fields["breakpoint_evidence_source"].fillna("").astype(str)
+        assigned = _assign_insertion_breakpoints(out)
+        out["insertion_breakpoint_pos"] = assigned["insertion_breakpoint_pos"].astype(int)
+        out["breakpoint_evidence_source"] = assigned["breakpoint_evidence_source"].fillna("").astype(str)
     else:
         out["tsd_detected"] = out["tsd_len_estimate"].fillna(0).astype(int) >= 4
 
@@ -12595,8 +12870,20 @@ def _derive_breakpoint_interval_fields(
         axis=1,
     )
     split_candidates = split_candidates.where(split_candidates.gt(0))
-    tsd_ok = tsd_left.gt(0) & tsd_right.gt(0)
-    dpe_ok = dpe_left.gt(0) & dpe_right.gt(0)
+    bp_pos_existing = pd.to_numeric(s(breakpoint_pos_col, float("nan")), errors="coerce")
+    has_bp = bp_pos_existing.notna() & bp_pos_existing.gt(0)
+    pile_gap = float(_WINDOW_BREAKPOINT_PILE_GAP_BP)
+    neigh_lo = bp_pos_existing - pile_gap
+    neigh_hi = bp_pos_existing + pile_gap
+    # Once a pile-resolved breakpoint exists, ignore distant TSD/split/DPE
+    # modes from other cores in the same discovery window.
+    tsd_ok = tsd_left.gt(0) & tsd_right.gt(0) & tsd_right.ge(tsd_left)
+    tsd_ok = tsd_ok & ((~has_bp) | ((tsd_left <= neigh_hi) & (tsd_right >= neigh_lo)))
+    dpe_ok = dpe_left.gt(0) & dpe_right.gt(0) & dpe_right.ge(dpe_left)
+    dpe_ok = dpe_ok & ((~has_bp) | ((dpe_left <= neigh_hi) & (dpe_right >= neigh_lo)))
+    far_split = split_candidates.sub(bp_pos_existing, axis=0).abs().gt(pile_gap)
+    far_split = far_split.where(has_bp, False)
+    split_candidates = split_candidates.where(~far_split)
     split_lo = split_candidates.min(axis=1, skipna=True)
     split_hi = split_candidates.max(axis=1, skipna=True)
     split_ok = split_lo.notna() & split_hi.notna()
@@ -15382,6 +15669,8 @@ def annotate_candidate_loci_with_mei(
         reference_fasta=reference_fasta,
         split_disease=split_disease,
         split_control=split_control,
+        discordant_disease=discordant_disease_mei,
+        discordant_control=discordant_control_mei,
     )
     candidate = _apply_discordant_gap_breakpoint_fallback(
         candidate,
