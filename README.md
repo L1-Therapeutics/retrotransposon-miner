@@ -48,6 +48,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 
 - Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. A single full genome wants about 64 vCPU and 256 GiB of memory (see the EC2 section). Local assembly and candidate processing support parallel execution.
 - Artificial intelligence/machine learning (AI/ML) genotyping confidence models are still under active development.
+- Genotyping is not supported: VCF output leaves `GT`/`GQ` blank. Calls are pooled disease-vs-control read support, not per-individual diploid genotypes, and a simple alt/ref read-ratio model is not valid here — split/discordant "alt" evidence and proper-pair "ref" evidence are structurally different read populations, and ploidy varies with chromosome (chrX), somatic copy-number context, and mosaicism. Reliable MEI genotyping would need haplotype-resolved/pangenome references or long reads.
 - Reverse-transcribed pseudogene insertion support is not yet added.
 - Support for species other than *Homo sapiens* (for example, *Mus musculus*) is not yet implemented.
 - Long-read native calling is not yet supported.
@@ -386,6 +387,41 @@ python scripts/plot_locus_read_architecture.py \
   --all-gold \
   --out-dir "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/read_architecture"
 ```
+
+### Export to VCF
+
+Convert the annotated candidate-loci table into standard VCF v4.3 so the
+callset can be fed to downstream tools (`bcftools`, IGV, annotation
+pipelines):
+
+```bash
+python -m retro_miner.cli export-vcf \
+  --in-tsv "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/candidate_loci.mei.tsv" \
+  --out-vcf "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/candidate_loci.mei.vcf" \
+  --sample-name seqc2_tumor_normal
+```
+
+Records are coordinate-sorted, so the output can be compressed and indexed
+directly:
+
+```bash
+bgzip -c candidate_loci.mei.vcf > candidate_loci.mei.vcf.gz
+bcftools index candidate_loci.mei.vcf.gz
+bcftools view -r chr22:19000000-32000000 candidate_loci.mei.vcf.gz
+```
+
+Insertions are emitted as symbolic ALT alleles (`<INS:ME:ALU>`,
+`<INS:ME:LINE1>`, `<INS:ME:SVA>`), following the 1000 Genomes MEI VCF
+convention; `REF` is `N` because `POS` marks the insertion breakpoint
+rather than a called reference base. MEI family/subfamily, TSD sequence,
+poly-A tail length, orientation, nesting status, full-length MEI
+span/coordinates, known-polymorphism cross-references, and the raw
+per-cohort supporting-read evidence strings are carried in `INFO`.
+
+**Genotype fields are intentionally left blank** (`GT=./.`, `GQ=.`). This
+table reports pooled disease-vs-control read support across a cohort
+comparison, not per-individual diploid genotypes, so there is no genotype
+to estimate. See "Current Limitations" below.
 
 HG0001-style germline/control chr22 quickstart (replace with your BAM path):
 
