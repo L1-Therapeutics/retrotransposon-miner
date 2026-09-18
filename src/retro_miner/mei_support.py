@@ -3212,7 +3212,7 @@ _DEL_MIN_GAP_BP = 1000
 _DEL_MIN_CLUSTER_READS = 2
 _DEL_MIN_CLUSTER_FRACTION = 0.20
 _DEL_FLANK_BP = 500
-_DEL_DEPTH_MAX_RATIO = 0.50
+_DEL_DEPTH_MAX_RATIO = 0.65
 _DEL_MIN_INTACT_DEPTH = 8.0
 
 
@@ -9909,7 +9909,7 @@ def _deletion_depth_supports_del(
     max_ratio: float = _DEL_DEPTH_MAX_RATIO,
     min_intact: float = _DEL_MIN_INTACT_DEPTH,
 ) -> bool:
-    """True when interior depth drops to half (or less) of the intact flank."""
+    """True when interior depth is ≤65% of the intact flank (het-del or stronger)."""
     intact = float(intact_depth)
     interior = float(interior_depth)
     if intact < float(min_intact):
@@ -9958,9 +9958,15 @@ def _annotate_deletion_flank_depth(
         for idx in idxs:
             row = out.loc[idx]
             chrom = str(row["chrom"])
-            breakpoint = (
-                int(row["window_start"]) + int(row["window_end"])
-            ) // 2
+            breakpoint = None
+            for col in ("insertion_breakpoint_pos", "consensus_insertion_breakpoint_pos"):
+                if col in row.index:
+                    raw_bp = pd.to_numeric(row.get(col), errors="coerce")
+                    if pd.notna(raw_bp) and int(raw_bp) > 0:
+                        breakpoint = int(raw_bp)
+                        break
+            if breakpoint is None:
+                breakpoint = (int(row["window_start"]) + int(row["window_end"])) // 2
             for prefix in ("disease", "control"):
                 if not _deletion_cluster_is_candidate(row, prefix):
                     continue

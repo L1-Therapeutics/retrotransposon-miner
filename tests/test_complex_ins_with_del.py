@@ -45,9 +45,10 @@ class TestDeletionDepthDrop:
     def test_half_depth_is_a_drop(self):
         assert _deletion_depth_supports_del(30.0, 15.0)
         assert _deletion_depth_supports_del(30.0, 0.0)
+        assert _deletion_depth_supports_del(30.0, 19.5)  # 0.65
 
     def test_no_drop_when_interior_stays_high(self):
-        assert not _deletion_depth_supports_del(30.0, 20.0)
+        assert not _deletion_depth_supports_del(30.0, 20.0)  # 0.667
 
     def test_uninterpretable_low_intact_depth(self):
         assert not _deletion_depth_supports_del(4.0, 0.0)
