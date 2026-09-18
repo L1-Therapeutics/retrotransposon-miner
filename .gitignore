@@ -17,6 +17,8 @@ venv/
 .ec2-instance.env
 
 # Data and temporary outputs
+.rtm_local_workdir/
+abfss:/
 data/
 results/
 workdir-results
