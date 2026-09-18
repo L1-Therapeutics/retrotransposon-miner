@@ -11,6 +11,8 @@ from retro_miner.mei_support import (
     _discordant_anchor_mei_query_seq,
     _discordant_mate_mei_query_is_clip,
     _discordant_mate_mei_query_seq,
+    _hydrate_discordant_mate_cache,
+    _write_discordant_mate_cache,
 )
 
 
@@ -260,3 +262,97 @@ class TestMergeFetchedMateSequences:
         assert merged.loc[1, "mate_seq"] == "BBBB"
         assert int(merged.loc[1, "mate_ref_start"]) == 30
         assert merged.loc[2, "mate_seq"] == ""  # not in fetched
+
+
+class TestDiscordantMateCache:
+    def test_round_trip_hydrates_fetched_mate_fields(self, tmp_path):
+        cache_path = tmp_path / "discordant_mate_cache.germline.parquet"
+        fetched = pd.DataFrame(
+            {
+                "read_name": ["a", "b"],
+                "mate_chrom": ["chr1", "chr7"],
+                "mate_pos": [101, 202],
+                "mate_seq": ["ACGT", ""],
+                "mate_ref_start": [100, 0],
+                "mate_ref_end": [104, 0],
+                "mate_soft_clip_side": ["R", ""],
+                "mate_soft_clip_len": [1, 0],
+                "mate_soft_clip_seq": ["T", ""],
+            }
+        )
+        assert _write_discordant_mate_cache(fetched, cache_path) == 1
+
+        evidence = fetched.copy()
+        for col in ("mate_seq", "mate_soft_clip_side", "mate_soft_clip_seq"):
+            evidence[col] = ""
+        for col in ("mate_ref_start", "mate_ref_end", "mate_soft_clip_len"):
+            evidence[col] = 0
+        hydrated, hits = _hydrate_discordant_mate_cache(evidence, cache_path)
+
+        assert hits == 1
+        assert hydrated.loc[0, "mate_seq"] == "ACGT"
+        assert hydrated.loc[0, "mate_ref_start"] == 100
+        assert hydrated.loc[0, "mate_soft_clip_seq"] == "T"
+        assert hydrated.loc[1, "mate_seq"] == ""
+
+    def test_cache_does_not_replace_existing_sequence(self, tmp_path):
+        cache_path = tmp_path / "discordant_mate_cache.disease.parquet"
+        cached = pd.DataFrame(
+            {
+                "read_name": ["a"],
+                "mate_chrom": ["chr1"],
+                "mate_pos": [101],
+                "mate_seq": ["CACHED"],
+                "mate_ref_start": [100],
+                "mate_ref_end": [106],
+                "mate_soft_clip_side": ["R"],
+                "mate_soft_clip_len": [1],
+                "mate_soft_clip_seq": ["D"],
+            }
+        )
+        _write_discordant_mate_cache(cached, cache_path)
+        evidence = cached.copy()
+        evidence.loc[0, "mate_seq"] = "CURRENT"
+
+        hydrated, hits = _hydrate_discordant_mate_cache(evidence, cache_path)
+
+        assert hits == 1
+        assert hydrated.loc[0, "mate_seq"] == "CURRENT"
+
+    def test_fetch_skips_alignment_when_cache_fills_sequences(self, tmp_path):
+        from retro_miner.mei_support import _fetch_discordant_mate_sequences
+
+        cache_path = tmp_path / "discordant_mate_cache.germline.parquet"
+        cached = pd.DataFrame(
+            {
+                "read_name": ["a"],
+                "mate_chrom": ["chr1"],
+                "mate_pos": [101],
+                "mate_seq": ["ACGTACGTACGTACGTACGTACGTACGTACGT"],
+                "mate_ref_start": [100],
+                "mate_ref_end": [132],
+                "mate_soft_clip_side": ["R"],
+                "mate_soft_clip_len": [4],
+                "mate_soft_clip_seq": ["ACGT"],
+            }
+        )
+        _write_discordant_mate_cache(cached, cache_path)
+        evidence = cached.copy()
+        evidence.loc[0, ["mate_seq", "mate_soft_clip_side", "mate_soft_clip_seq"]] = ""
+        evidence.loc[0, ["mate_ref_start", "mate_ref_end", "mate_soft_clip_len"]] = 0
+        bam = tmp_path / "dummy.bam"
+        bam.write_bytes(b"BAM")
+        called = {"n": 0}
+
+        def fake_fetch(_bam, _windows):
+            called["n"] += 1
+            return {}
+
+        out = _fetch_discordant_mate_sequences(
+            evidence,
+            bam,
+            fetch_fn=fake_fetch,
+            cache_path=cache_path,
+        )
+        assert called["n"] == 0
+        assert out.loc[0, "mate_seq"].startswith("ACGT")

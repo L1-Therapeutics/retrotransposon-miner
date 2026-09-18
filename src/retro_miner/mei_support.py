@@ -1597,6 +1597,90 @@ def _merge_fetched_mate_sequences(
 _MATE_FETCH_TILE_BP = 16_384
 # Overlap slop around PNEXT for A-B identity with the per-window path.
 _MATE_FETCH_QUERY_BP = 500
+_MATE_CACHE_KEYS = ["read_name", "mate_chrom", "mate_pos"]
+_MATE_CACHE_FIELDS = [
+    "mate_seq",
+    "mate_ref_start",
+    "mate_ref_end",
+    "mate_soft_clip_side",
+    "mate_soft_clip_len",
+    "mate_soft_clip_seq",
+]
+
+
+def _hydrate_discordant_mate_cache(
+    discordant_df: pd.DataFrame,
+    cache_path: Path | None,
+) -> tuple[pd.DataFrame, int]:
+    """Fill missing mate fields from a prior annotation's Parquet sidecar."""
+    out = discordant_df.copy()
+    if cache_path is None or not Path(cache_path).exists() or out.empty:
+        return out, 0
+    try:
+        cache = pd.read_parquet(cache_path)
+    except Exception as exc:  # noqa: BLE001 - stale cache must not block annotation
+        click.echo(f"[mei-annotate] ignoring unreadable mate cache {cache_path}: {exc}")
+        return out, 0
+    required = _MATE_CACHE_KEYS + _MATE_CACHE_FIELDS
+    if cache.empty or not all(col in cache.columns for col in required):
+        return out, 0
+    if not all(col in out.columns for col in _MATE_CACHE_KEYS):
+        return out, 0
+
+    cached = cache.loc[
+        cache["mate_seq"].fillna("").astype(str).str.len().gt(0),
+        required,
+    ].drop_duplicates(_MATE_CACHE_KEYS, keep="last")
+    if cached.empty:
+        return out, 0
+    cached = cached.rename(columns={col: f"{col}__cached" for col in _MATE_CACHE_FIELDS})
+    merged = out.merge(cached, on=_MATE_CACHE_KEYS, how="left", sort=False)
+    cached_seq = merged["mate_seq__cached"].fillna("").astype(str)
+    cache_hit = cached_seq.str.len().gt(0)
+    for col in _MATE_CACHE_FIELDS:
+        cached_col = f"{col}__cached"
+        if col not in merged.columns:
+            merged[col] = "" if col in {"mate_seq", "mate_soft_clip_side", "mate_soft_clip_seq"} else 0
+        if col in {"mate_seq", "mate_soft_clip_side", "mate_soft_clip_seq"}:
+            current = merged[col].fillna("").astype(str)
+            merged[col] = current.where(current.str.len().gt(0), merged[cached_col].fillna("").astype(str))
+        else:
+            current = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(int)
+            cached_values = pd.to_numeric(merged[cached_col], errors="coerce").fillna(0).astype(int)
+            merged[col] = current.where(current.gt(0), cached_values)
+    return merged.drop(columns=[f"{col}__cached" for col in _MATE_CACHE_FIELDS]), int(cache_hit.sum())
+
+
+def _write_discordant_mate_cache(discordant_df: pd.DataFrame, cache_path: Path | None) -> int:
+    """Atomically persist fetched mate fields for future consensus-remap experiments."""
+    if cache_path is None or discordant_df.empty:
+        return 0
+    required = _MATE_CACHE_KEYS + _MATE_CACHE_FIELDS
+    if not all(col in discordant_df.columns for col in required):
+        return 0
+    cache = discordant_df.loc[
+        discordant_df["mate_seq"].fillna("").astype(str).str.len().gt(0),
+        required,
+    ].drop_duplicates(_MATE_CACHE_KEYS, keep="last")
+    if cache.empty:
+        return 0
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+        cache.to_parquet(tmp_path, index=False)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+    return len(cache)
 
 
 def _fetch_discordant_mate_sequences(
@@ -1604,12 +1688,15 @@ def _fetch_discordant_mate_sequences(
     bam_path: Path | None,
     *,
     fetch_fn=None,
+    cache_path: Path | None = None,
 ) -> pd.DataFrame:
     """Attach mate_seq (+ soft-clip fields) to discordant rows."""
     if discordant_df.empty:
         return discordant_df.copy()
 
-    out = discordant_df.copy()
+    out, cache_hits = _hydrate_discordant_mate_cache(discordant_df, cache_path)
+    if cache_hits:
+        click.echo(f"[mei-annotate] mate cache hits={cache_hits} path={cache_path}")
     for col, default in (
         ("mate_seq", ""),
         ("mate_ref_start", 0),
@@ -1639,6 +1726,8 @@ def _fetch_discordant_mate_sequences(
                 out["mate_soft_clip_seq"].str.len().eq(0)
                 & out["mate_soft_clip_len"].eq(0)
                 & out["mate_seq"].str.len().gt(0)
+                & out["mate_ref_start"].eq(0)
+                & out["mate_ref_end"].eq(0)
             )
         )
         & (out["mate_chrom"].fillna("").astype(str) != "*")
@@ -1667,7 +1756,11 @@ def _fetch_discordant_mate_sequences(
     with open_alignment(bam_path) as bam:
         fetched = fetch_impl(bam, windows)
 
-    return _merge_fetched_mate_sequences(out, fetched)
+    out = _merge_fetched_mate_sequences(out, fetched)
+    cached_rows = _write_discordant_mate_cache(out, cache_path)
+    if cached_rows:
+        click.echo(f"[mei-annotate] wrote mate cache rows={cached_rows} path={cache_path}")
+    return out
 
 
 def _mate_alignment_tuple(
@@ -1784,6 +1877,7 @@ def _align_discordant_mates_with_minimap2(
     sample: str,
     bam_path: Path | None = None,
     *,
+    mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
     """Map discordant mates to MEI consensus.
@@ -1793,7 +1887,11 @@ def _align_discordant_mates_with_minimap2(
     full mate) so a reference-copy Alu/L1/SVA hit still counts as MEI identity.
     """
     fetch_t0 = time.monotonic()
-    enriched = _fetch_discordant_mate_sequences(discordant_df, bam_path)
+    enriched = _fetch_discordant_mate_sequences(
+        discordant_df,
+        bam_path,
+        cache_path=mate_cache_path,
+    )
     click.echo(
         f"[mei-annotate] sample={sample} mate_fetch rows={len(discordant_df)} "
         f"elapsed={time.monotonic() - fetch_t0:.1f}s"
@@ -2153,6 +2251,7 @@ def _remap_one_sample_mei_evidence(
     mei_fasta: Path,
     bam_path: Path | None,
     mate_bam_path: Path | None,
+    mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
 ) -> dict[str, object]:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
@@ -2180,6 +2279,7 @@ def _remap_one_sample_mei_evidence(
         mei_fasta,
         sample=f"{sample}_mate",
         bam_path=mate_bam_path or bam_path,
+        mate_cache_path=mate_cache_path,
         bwa_threads=bwa_threads,
     )
     post_t0 = time.monotonic()
@@ -14798,6 +14898,7 @@ def annotate_candidate_loci_with_mei(
                 mei_fasta=mei_fasta,
                 bam_path=control_bam_path,
                 mate_bam_path=control_mate_bam_path or disease_mate_bam_path,
+                mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.germline.parquet",
                 bwa_threads=per_sample_bwa_threads,
             )
             remap_by_sample = {
@@ -14823,6 +14924,7 @@ def annotate_candidate_loci_with_mei(
                         mei_fasta=mei_fasta,
                         bam_path=disease_bam_path,
                         mate_bam_path=disease_mate_bam_path,
+                        mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.disease.parquet",
                         bwa_threads=per_sample_bwa_threads,
                     ): "disease",
                     pool.submit(
@@ -14833,6 +14935,7 @@ def annotate_candidate_loci_with_mei(
                         mei_fasta=mei_fasta,
                         bam_path=control_bam_path,
                         mate_bam_path=control_mate_bam_path,
+                        mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.control.parquet",
                         bwa_threads=per_sample_bwa_threads,
                     ): "control",
                 }
