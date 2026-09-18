@@ -18,7 +18,7 @@ import pandas as pd
 import pysam
 
 from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
-from .bam_io import open_alignment
+from .bam_io import alignment_path_is_cram, open_alignment, resolve_alignment_reference
 
 _XVFB_PROC: subprocess.Popen[bytes] | None = None
 
@@ -191,6 +191,86 @@ def _resolve_bam_index(bam_path: Path) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+# Genome-only IGV PNGs (CRAM track failed to load) are ~9–15 KB. BAM-backed
+# snapshots with reads are typically ≥40 KB.
+_EMPTY_IGV_PNG_MAX_BYTES = 20_000
+
+
+def _snapshot_png_looks_empty(path: Path) -> bool:
+    """True when a snapshot PNG exists but has no alignment track."""
+    try:
+        return path.stat().st_size < _EMPTY_IGV_PNG_MAX_BYTES
+    except OSError:
+        return True
+
+
+def _igv_chroms_from_variants(variants: pd.DataFrame) -> list[str]:
+    chroms: list[str] = []
+    seen: set[str] = set()
+    for row in variants.itertuples(index=False):
+        chrom, start, end = _row_discovery_window(row)
+        if not chrom or start <= 0 or end < start:
+            continue
+        if chrom in seen:
+            continue
+        seen.add(chrom)
+        chroms.append(chrom)
+    return chroms
+
+
+def _run_samtools(args: list[str]) -> None:
+    exe = shutil.which("samtools")
+    if exe is None:
+        raise FileNotFoundError("samtools not found on PATH (required to convert CRAM for IGV snapshots)")
+    result = subprocess.run([exe, *args], check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-1500:]
+        raise RuntimeError(f"samtools {' '.join(args[:3])} failed: {detail}")
+
+
+def _materialize_alignment_for_igv(
+    alignment: Path,
+    variants: pd.DataFrame,
+    dest_bam: Path,
+    reference_fasta: Path | None,
+) -> Path:
+    """Return a BAM IGV can load.
+
+    The bundled IGV/htsjdk build cannot open some 1000G CRAMs (CRAI unmapped
+    slice) and still writes genome-only PNGs. Convert those CRAMs to BAM
+    covering the snapshot chromosomes before launching IGV.
+    """
+    alignment = Path(alignment)
+    if not alignment_path_is_cram(alignment):
+        if _resolve_bam_index(alignment) is None:
+            _run_samtools(["index", str(alignment.resolve())])
+        return alignment
+
+    dest_bam = Path(dest_bam)
+    dest_bam.parent.mkdir(parents=True, exist_ok=True)
+    index_path = Path(f"{dest_bam}.bai")
+    if dest_bam.exists() and index_path.exists() and dest_bam.stat().st_mtime >= alignment.stat().st_mtime:
+        return dest_bam
+
+    chroms = _igv_chroms_from_variants(variants)
+    if not chroms:
+        raise RuntimeError("No valid snapshot windows to extract from CRAM for IGV")
+    ref = resolve_alignment_reference(reference_fasta)
+    if not ref:
+        raise FileNotFoundError(
+            "CRAM→BAM for IGV requires a reference FASTA "
+            "(--reference-fasta or RTM_ALIGNMENT_REFERENCE)"
+        )
+    click.echo(
+        f"[igv-plots] converting CRAM to BAM for IGV (htsjdk cannot load some CRAI indexes): "
+        f"{alignment.name} → {dest_bam.name} chroms={','.join(chroms)}"
+    )
+    view_args = ["view", "-b", "-T", str(ref), "-o", str(dest_bam.resolve()), str(alignment.resolve()), *chroms]
+    _run_samtools(view_args)
+    _run_samtools(["index", str(dest_bam.resolve())])
+    return dest_bam
 
 
 def resolve_igv_launcher(launcher: Path | None = None) -> Path:
@@ -501,6 +581,7 @@ def build_igv_batch_script(
         f"genome {_quote_igv_path(reference_fasta.resolve())}",
         f"snapshotDirectory {_quote_igv_path(snapshot_dir.resolve())}",
         "preference SAM.SHOW_SOFT_CLIPPED true",
+        "setSleepInterval 2",
         f"load {_quote_igv_path(disease_bam.resolve())} index={_quote_igv_path(disease_index.resolve())}",
         f"load {_quote_igv_path(control_bam.resolve())} index={_quote_igv_path(control_index.resolve())}",
     ]
@@ -566,6 +647,12 @@ def _verify_snapshot_pngs(index_rows: list[dict[str, object]]) -> int:
     if created == 0 and paths:
         raise RuntimeError(
             f"IGV produced 0/{len(paths)} snapshot PNGs. {_headless_display_help()}"
+        )
+    empty = [path for path in paths if path.exists() and _snapshot_png_looks_empty(path)]
+    if empty and len(empty) == created:
+        raise RuntimeError(
+            f"IGV wrote {created} snapshot PNGs but all look empty (genome only, no reads). "
+            "This usually means IGV/htsjdk failed to load a CRAM; snapshots must use BAM."
         )
     return created
 
@@ -639,6 +726,23 @@ def generate_gold_review_igv_plots(
         return None
 
     snapshot_dir.mkdir(parents=True, exist_ok=True)
+    disease_src = Path(disease_bam)
+    control_src = Path(control_bam)
+    disease_bam = _materialize_alignment_for_igv(
+        disease_src,
+        variants,
+        snapshot_dir / "igv_disease.bam",
+        reference_fasta,
+    )
+    if control_src.resolve() == disease_src.resolve():
+        control_bam = disease_bam
+    else:
+        control_bam = _materialize_alignment_for_igv(
+            control_src,
+            variants,
+            snapshot_dir / "igv_control.bam",
+            reference_fasta,
+        )
     contig_annotation_bed = _write_contig_annotation_bed(variants, snapshot_dir)
     contig_alignment_bam: Path | None = None
     if assembly_cache_dir is not None and assembly_cache_dir.exists():
