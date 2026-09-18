@@ -23,9 +23,12 @@ from retro_miner._utils import safe_locus_id
 from retro_miner.igv_plots import (
     _build_assembly_contig_track,
     _igv_singleton_lock,
+    _materialize_alignment_for_igv,
     _quote_igv_path,
     _safe_snapshot_stem,
+    _snapshot_png_looks_empty,
     _validate_igv_chrom,
+    _verify_snapshot_pngs,
     build_igv_batch_script,
 )
 
@@ -769,3 +772,58 @@ class TestIgvSingletonLock:
                 with pytest.raises(RuntimeError, match=str(expected)):
                     with _igv_singleton_lock(timeout_sec=0.0, poll_sec=0.1):
                         pass
+
+
+class TestIgvCramMaterialize:
+    def test_bam_with_index_is_passed_through(self, tmp_path):
+        bam = tmp_path / "reads.bam"
+        bam.write_bytes(b"BAM")
+        Path(f"{bam}.bai").write_bytes(b"BAI")
+        dest = tmp_path / "igv.bam"
+        out = _materialize_alignment_for_igv(bam, _make_batch_variants("chr22"), dest, tmp_path / "ref.fa")
+        assert out == bam
+        assert not dest.exists()
+
+    def test_cram_is_converted_to_bam(self, tmp_path, monkeypatch):
+        cram = tmp_path / "reads.cram"
+        cram.write_bytes(b"CRAM")
+        Path(f"{cram}.crai").write_bytes(b"CRAI")
+        ref = tmp_path / "ref.fa"
+        ref.write_text(">chr22\nACGT\n", encoding="utf-8")
+        dest = tmp_path / "igv.bam"
+        calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if len(args) > 1 and args[1] == "view":
+                Path(args[args.index("-o") + 1]).write_bytes(b"BAM")
+            elif len(args) > 1 and args[1] == "index":
+                Path(f"{args[2]}.bai").write_bytes(b"BAI")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(igv_plots.shutil, "which", lambda name: "/usr/bin/samtools")
+        monkeypatch.setattr(igv_plots.subprocess, "run", fake_run)
+        out = _materialize_alignment_for_igv(cram, _make_batch_variants("chr22"), dest, ref)
+        assert out == dest
+        assert dest.exists()
+        assert any(c[1] == "view" and "chr22" in c for c in calls)
+        assert any(c[1] == "index" for c in calls)
+
+    def test_empty_png_is_detected(self, tmp_path):
+        tiny = tmp_path / "empty.png"
+        tiny.write_bytes(b"\x89PNG" + b"\0" * 100)
+        assert _snapshot_png_looks_empty(tiny)
+        fat = tmp_path / "reads.png"
+        fat.write_bytes(b"\x89PNG" + b"\0" * 50_000)
+        assert not _snapshot_png_looks_empty(fat)
+
+    def test_all_empty_snapshots_fail_verification(self, tmp_path):
+        png = tmp_path / "rank001.png"
+        png.write_bytes(b"\x89PNG" + b"\0" * 100)
+        with pytest.raises(RuntimeError, match="look empty"):
+            _verify_snapshot_pngs([{"snapshot_png": str(png)}])
+
+    def test_batch_waits_for_tracks_to_load(self, batch_setup):
+        with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
+            batch = build_igv_batch_script(_make_batch_variants("chr22"), **batch_setup)
+        assert "setSleepInterval 2" in batch
