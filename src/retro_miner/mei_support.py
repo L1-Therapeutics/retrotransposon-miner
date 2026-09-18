@@ -422,6 +422,10 @@ _DPE_MEI_REMAP_MIN_CLIP_BP = 20
 # Unclipped mates, and interchrom clipped mates sitting on a reference-copy
 # Alu/L1/SVA, may remap the mapped body / full mate.
 _DPE_MEI_REMAP_MIN_FULL_MATE_BP = 30
+# Same-chromosome mates this far from the anchor are also remote enough to treat
+# like interchromosomal placements. Closer clipped mates stay clip-only; coherent
+# deletion bridges are removed separately by the deletion-cluster logic.
+_DPE_MEI_BODY_REMAP_MIN_SAME_CHR_BP = 500_000
 
 
 def _discordant_anchor_mei_query_seq(row: pd.Series | object) -> str:
@@ -453,6 +457,26 @@ def _discordant_pair_is_interchrom(row: pd.Series | object) -> bool:
     if not chrom or not mate_chrom or mate_chrom in {"*", "."}:
         return False
     return chrom != mate_chrom
+
+
+def _discordant_pair_uses_mate_body(row: pd.Series | object) -> bool:
+    """True for interchromosomal or very remote same-chromosome mate placements."""
+    if _discordant_pair_is_interchrom(row):
+        return True
+    chrom = _normalize_discordant_chrom(getattr(row, "chrom", ""))
+    mate_chrom = _normalize_discordant_chrom(getattr(row, "mate_chrom", ""))
+    if not chrom or chrom != mate_chrom:
+        return False
+    try:
+        pos = int(getattr(row, "pos", 0) or 0)
+        mate_pos = int(getattr(row, "mate_pos", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        pos > 0
+        and mate_pos > 0
+        and abs(mate_pos - pos) >= _DPE_MEI_BODY_REMAP_MIN_SAME_CHR_BP
+    )
 
 
 def _discordant_mate_clip_query(row: pd.Series | object) -> str:
@@ -490,17 +514,17 @@ def _mate_ref_matched_body(row: pd.Series | object) -> str:
 def _discordant_mate_mei_query_seq(row: pd.Series | object) -> str:
     """Mate query for MEI remap.
 
-    Same-chrom clipped mates remap the soft clip only — the ref-matched body
-    is usually a nearby reference MEI. Interchrom mates often sit on a
-    reference-copy Alu/L1/SVA with the unique insertion-site flank as the
-    clip; that mapped body is MEI identity and must be remapped even when
-    the copy is already in the reference. Unclipped mates use the full
-    sequence.
+    Nearby same-chrom clipped mates remap the soft clip only — the ref-matched
+    body is usually a local reference MEI. Interchrom and very remote same-chrom
+    mates often sit on a reference-copy Alu/L1/SVA with the unique insertion-site
+    flank as the clip; their mapped body is MEI identity and must be remapped even
+    when the copy is already in the reference. Unclipped mates use the full
+    sequence. Coherent same-chrom deletion bridges are removed downstream.
     """
     mate_seq = str(getattr(row, "mate_seq", "") or "")
     best_clip = _discordant_mate_clip_query(row)
     clip_len = max(int(getattr(row, "mate_soft_clip_len", 0) or 0), len(best_clip))
-    if _discordant_pair_is_interchrom(row):
+    if _discordant_pair_uses_mate_body(row):
         body = _mate_ref_matched_body(row)
         if len(body) >= _DPE_MEI_REMAP_MIN_FULL_MATE_BP:
             return body
@@ -1764,9 +1788,9 @@ def _align_discordant_mates_with_minimap2(
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
     """Map discordant mates to MEI consensus.
 
-    Same-chrom clipped mates remap the clip only. Interchrom mates remap the
-    reference-aligned body (or full mate) so a reference-copy Alu/L1/SVA hit
-    still counts as MEI identity.
+    Nearby same-chrom clipped mates remap the clip only. Interchrom mates and
+    same-chrom mates at least 500 kb away remap the reference-aligned body (or
+    full mate) so a reference-copy Alu/L1/SVA hit still counts as MEI identity.
     """
     fetch_t0 = time.monotonic()
     enriched = _fetch_discordant_mate_sequences(discordant_df, bam_path)

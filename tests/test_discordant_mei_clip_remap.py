@@ -1,4 +1,4 @@
-"""DPE MEI remap: same-chrom mates use clips; interchrom mates use the mapped body."""
+"""DPE MEI remap: nearby mates use clips; remote mates use the mapped body."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import pandas as pd
 
 from retro_miner.evidence_extract import _soft_clip_query_seq
 from retro_miner.mei_support import (
+    _DPE_MEI_BODY_REMAP_MIN_SAME_CHR_BP,
     _DPE_MEI_REMAP_MIN_CLIP_BP,
     _discordant_anchor_mei_query_seq,
     _discordant_mate_mei_query_is_clip,
@@ -78,11 +79,13 @@ class TestDiscordantMeiQuerySelection:
         assert _discordant_anchor_mei_query_seq(row) == ""
 
     def test_mate_clip_only_when_soft_clipped(self):
-        """Same-chrom opposite-junction mate: 50bp clip + 100bp ref → clip only."""
+        """Nearby same-chrom mate: 50bp clip + 100bp ref → clip only."""
         row = pd.Series(
             {
                 "chrom": "chr22",
                 "mate_chrom": "chr22",
+                "pos": 1_000_000,
+                "mate_pos": 1_100_000,
                 "mate_seq": ("I" * 50) + ("R" * 100),
                 "mate_soft_clip_side": "L",
                 "mate_soft_clip_len": 50,
@@ -92,6 +95,39 @@ class TestDiscordantMeiQuerySelection:
         q = _discordant_mate_mei_query_seq(row)
         assert q == "I" * 50
         assert q.count("R") == 0
+
+    def test_same_chrom_mate_at_500kb_uses_reference_body(self):
+        """Very remote same-chrom placements behave like interchrom placements."""
+        row = pd.Series(
+            {
+                "chrom": "chr22",
+                "mate_chrom": "22",
+                "pos": 1_000_000,
+                "mate_pos": 1_000_000 + _DPE_MEI_BODY_REMAP_MIN_SAME_CHR_BP,
+                "mate_seq": ("I" * 50) + ("R" * 100),
+                "mate_soft_clip_side": "L",
+                "mate_soft_clip_len": 50,
+                "mate_soft_clip_seq": "I" * 50,
+            }
+        )
+        assert _discordant_mate_mei_query_seq(row) == "R" * 100
+        assert not _discordant_mate_mei_query_is_clip(row)
+
+    def test_same_chrom_mate_below_500kb_stays_clip_only(self):
+        row = pd.Series(
+            {
+                "chrom": "chr22",
+                "mate_chrom": "chr22",
+                "pos": 1_000_000,
+                "mate_pos": 1_000_000 + _DPE_MEI_BODY_REMAP_MIN_SAME_CHR_BP - 1,
+                "mate_seq": ("I" * 50) + ("R" * 100),
+                "mate_soft_clip_side": "L",
+                "mate_soft_clip_len": 50,
+                "mate_soft_clip_seq": "I" * 50,
+            }
+        )
+        assert _discordant_mate_mei_query_seq(row) == "I" * 50
+        assert _discordant_mate_mei_query_is_clip(row)
 
     def test_same_chrom_clipped_mate_without_chrom_fields_stays_clip_only(self):
         """Missing chrom/mate_chrom must not silently switch to body remap."""
