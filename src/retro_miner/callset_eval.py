@@ -535,6 +535,7 @@ def _query_vcf_rows(
         else:
             aliases.append(f"chr{chrom}")
     last_err = ""
+    saw_success = False
     for region in aliases:
         cmd = [bcftools, "query"]
         if region:
@@ -544,8 +545,14 @@ def _query_vcf_rows(
         cmd.extend(["-f", fmt, str(vcf_path)])
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode == 0:
-            return [line.rstrip("\n").split("\t") for line in proc.stdout.splitlines() if line.strip()]
+            saw_success = True
+            rows = [line.rstrip("\n").split("\t") for line in proc.stdout.splitlines() if line.strip()]
+            if rows or region is None:
+                return rows
+            continue
         last_err = (proc.stderr or proc.stdout or "").strip()
+    if saw_success:
+        return []
     region_label = chrom or "whole genome"
     raise RuntimeError(f"bcftools query failed for {vcf_path} {region_label}: {last_err[:800]}")
 

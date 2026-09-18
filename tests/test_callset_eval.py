@@ -200,3 +200,23 @@ def test_whole_genome_query_omits_region(monkeypatch, tmp_path) -> None:
     assert rows == [["chr1", "100"], ["chr22", "200"]]
     assert "-r" not in commands[0]
     assert commands[0][commands[0].index("-s") + 1] == "HG00100"
+
+
+def test_query_retries_chromosome_alias_after_empty_success(monkeypatch, tmp_path) -> None:
+    commands = []
+    monkeypatch.setattr(callset_eval.shutil, "which", lambda _: "/usr/bin/bcftools")
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        stdout = "" if command[command.index("-r") + 1] == "chr22" else "22\t100\n"
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(callset_eval.subprocess, "run", fake_run)
+    rows = callset_eval._query_vcf_rows(
+        tmp_path / "input.vcf.gz",
+        chrom="chr22",
+        sample="HG00100",
+        fmt="%CHROM\t%POS\n",
+    )
+    assert rows == [["22", "100"]]
+    assert [command[command.index("-r") + 1] for command in commands] == ["chr22", "22"]
