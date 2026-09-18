@@ -1,5 +1,7 @@
 """Tests for vcf_export, built against real rows from the README gold-tier example table."""
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -200,6 +202,95 @@ class TestExportVcfFromTsv:
             export_vcf_from_tsv(tmp_path / "does_not_exist.tsv", tmp_path / "out.vcf")
 
 
+class TestCoordinateSorting:
+    """VCF requires contig-then-position order; the upstream TSV is sorted by
+    enrichment_ratio instead, which makes the file unindexable."""
+
+    def _rows_out_of_order(self):
+        return [
+            dict(SVA_ROW, chrom="chr22", consensus_insertion_breakpoint_pos="49029650"),
+            dict(SVA_ROW, chrom="chr22", consensus_insertion_breakpoint_pos="31355872"),
+            dict(SVA_ROW, chrom="chr2", consensus_insertion_breakpoint_pos="17567662"),
+            dict(SVA_ROW, chrom="chr1", consensus_insertion_breakpoint_pos="900000"),
+        ]
+
+    def test_records_are_coordinate_sorted_by_default(self, tmp_path: Path):
+        out_path = tmp_path / "out.vcf"
+        export_vcf(self._rows_out_of_order(), out_path)
+        data = [
+            line.split("\t")[:2]
+            for line in out_path.read_text().splitlines()
+            if not line.startswith("#")
+        ]
+        assert data == [
+            ["chr1", "900000"],
+            ["chr2", "17567662"],
+            ["chr22", "31355872"],
+            ["chr22", "49029650"],
+        ]
+
+    def test_contig_order_follows_header_not_lexicographic(self, tmp_path: Path):
+        # Lexicographically "chr22" < "chr2"[sic] is false, but naive string
+        # sorting would place chr10/chr2/chr22 wrongly relative to chr3.
+        rows = [
+            dict(SVA_ROW, chrom="chr3", consensus_insertion_breakpoint_pos="100"),
+            dict(SVA_ROW, chrom="chr10", consensus_insertion_breakpoint_pos="100"),
+            dict(SVA_ROW, chrom="chr2", consensus_insertion_breakpoint_pos="100"),
+        ]
+        out_path = tmp_path / "out.vcf"
+        export_vcf(rows, out_path)
+        chroms = [
+            line.split("\t")[0]
+            for line in out_path.read_text().splitlines()
+            if not line.startswith("#")
+        ]
+        assert chroms == ["chr2", "chr3", "chr10"]
+
+    def test_unknown_contig_sorts_last_and_is_not_dropped(self, tmp_path: Path):
+        rows = [
+            dict(SVA_ROW, chrom="chrUn_decoy1", consensus_insertion_breakpoint_pos="500"),
+            dict(SVA_ROW, chrom="chr1", consensus_insertion_breakpoint_pos="500"),
+        ]
+        out_path = tmp_path / "out.vcf"
+        n = export_vcf(rows, out_path)
+        assert n == 2  # nothing dropped
+        chroms = [
+            line.split("\t")[0]
+            for line in out_path.read_text().splitlines()
+            if not line.startswith("#")
+        ]
+        assert chroms == ["chr1", "chrUn_decoy1"]
+
+    def test_sort_false_preserves_input_order(self, tmp_path: Path):
+        out_path = tmp_path / "out.vcf"
+        export_vcf(self._rows_out_of_order(), out_path, sort=False)
+        data = [
+            line.split("\t")[:2]
+            for line in out_path.read_text().splitlines()
+            if not line.startswith("#")
+        ]
+        assert data[0] == ["chr22", "49029650"]
+
+    def test_output_is_indexable_by_bcftools(self, tmp_path: Path):
+        """The actual downstream requirement: bcftools must be able to index it."""
+        bcftools = shutil.which("bcftools")
+        bgzip = shutil.which("bgzip")
+        if not bcftools or not bgzip:
+            pytest.skip("bcftools/bgzip not installed")
+
+        vcf_path = tmp_path / "out.vcf"
+        export_vcf(self._rows_out_of_order(), vcf_path)
+
+        gz_path = tmp_path / "out.vcf.gz"
+        with open(gz_path, "wb") as fh:
+            subprocess.run([bgzip, "-c", str(vcf_path)], stdout=fh, check=True)
+
+        result = subprocess.run(
+            [bcftools, "index", str(gz_path)], capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"bcftools index failed: {result.stderr}"
+
+
 class TestPysamRoundTrip:
     """Parse our own output with a real VCF library, not just string checks."""
 
@@ -215,9 +306,12 @@ class TestPysamRoundTrip:
 
         records = list(vf)
         assert len(records) == 3
-        assert records[0].chrom == "chr22"
-        assert records[0].pos == 49029650
-        assert records[0].id == "nssv14064350"
-        assert records[0].alts == ("<INS:ME:SVA>",)
-        assert records[0].samples[0]["GT"] == (None, None)  # ./. -- blank, not fabricated
-        assert records[0].samples[0]["GQ"] is None  # . -- blank, not fabricated
+        # Output is coordinate-sorted, so look the record up by position
+        # rather than assuming the input order is preserved.
+        sva = next(r for r in records if r.pos == 49029650)
+        assert sva.chrom == "chr22"
+        assert sva.id == "nssv14064350"
+        assert sva.alts == ("<INS:ME:SVA>",)
+        assert sva.samples[0]["GT"] == (None, None)  # ./. -- blank, not fabricated
+        assert sva.samples[0]["GQ"] is None  # . -- blank, not fabricated
+        assert [r.pos for r in records] == sorted(r.pos for r in records)

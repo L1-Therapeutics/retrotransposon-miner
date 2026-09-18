@@ -165,24 +165,57 @@ def build_vcf_record(row: dict[str, Any]) -> str:
     return "\t".join([chrom, pos, vcf_id, ref, alt, qual, filt, info, fmt, sample_value])
 
 
+#: Contig -> ordinal, matching the order contigs are declared in the header.
+#: VCF requires records be sorted by contig (in header-declaration order)
+#: then by position; otherwise ``bcftools index`` refuses the file and most
+#: downstream annotation tools cannot consume it.
+_CONTIG_ORDER = {name: i for i, name in enumerate(_STANDARD_CONTIGS)}
+
+
+def _sort_key(row: dict[str, Any]) -> tuple[int, str, int]:
+    """Coordinate sort key: (contig ordinal, contig name, position).
+
+    Contigs not in the standard set sort after all standard ones, then
+    alphabetically by name, so an unexpected contig (e.g. a decoy or alt
+    scaffold) is still emitted deterministically rather than dropped.
+    """
+    chrom = str(row.get("chrom", "")).strip()
+    ordinal = _CONTIG_ORDER.get(chrom, len(_CONTIG_ORDER))
+    try:
+        pos = int(float(row.get("consensus_insertion_breakpoint_pos")))
+    except (TypeError, ValueError):
+        pos = 0
+    return (ordinal, chrom, pos)
+
+
 def export_vcf(
     rows: list[dict[str, Any]],
     out_path: Path,
     *,
     sample_name: str = "SAMPLE",
+    sort: bool = True,
 ) -> int:
     """Write ``rows`` (annotated candidate loci) to ``out_path`` as VCF v4.3.
+
+    Records are coordinate-sorted by default. The upstream candidate-loci
+    table is sorted by ``enrichment_ratio`` (most interesting first), which
+    is useful for human review but is not valid VCF ordering -- ``bcftools
+    index`` rejects it with "Unsorted positions", and an unindexable VCF
+    cannot be fed to most downstream annotation tools. Pass ``sort=False``
+    only if the caller has already guaranteed coordinate order.
 
     Returns the number of records written.
     """
     header = list(VCF_HEADER_LINES)
     header.append(VCF_COLUMN_HEADER.format(sample=sample_name))
 
+    ordered = sorted(rows, key=_sort_key) if sort else list(rows)
+
     with open(out_path, "w", newline="") as fh:
         for line in header:
             fh.write(line + "\n")
         n = 0
-        for row in rows:
+        for row in ordered:
             fh.write(build_vcf_record(row) + "\n")
             n += 1
     return n
@@ -195,7 +228,13 @@ def load_tsv_rows(tsv_path: Path) -> list[dict[str, Any]]:
         return list(reader)
 
 
-def export_vcf_from_tsv(tsv_path: Path, out_path: Path, *, sample_name: str = "SAMPLE") -> int:
+def export_vcf_from_tsv(
+    tsv_path: Path,
+    out_path: Path,
+    *,
+    sample_name: str = "SAMPLE",
+    sort: bool = True,
+) -> int:
     """Convenience wrapper: read an annotated TSV, write it out as VCF."""
     rows = load_tsv_rows(tsv_path)
-    return export_vcf(rows, out_path, sample_name=sample_name)
+    return export_vcf(rows, out_path, sample_name=sample_name, sort=sort)
