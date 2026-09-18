@@ -15,11 +15,13 @@ import pytest
 from retro_miner.candidate_loci import (
     _DISCORDANT_EVIDENCE_REQUIRED_COLS,
     _SPLIT_EVIDENCE_REQUIRED_COLS,
+    _build_loci_from_evidence,
     _cluster_sorted_positions,
     _distance_to_closed_interval,
     _merge_overlapping_loci,
     _read_passing_counts,
     _split_cluster_positions,
+    _split_rows_for_seeds,
     _validate_evidence_columns,
 )
 
@@ -214,6 +216,93 @@ class TestMergeOverlappingLoci:
         assert len(result) == 1
         assert result.iloc[0]["window_start"] == 100
         assert result.iloc[0]["window_end"] == 350
+
+
+def _split_row(chrom: str, pos: int, name: str) -> dict[str, object]:
+    return {
+        "chrom": chrom,
+        "pos": pos,
+        "read_name": name,
+        "mapq": 30,
+        "clip_len": 25,
+        "has_sa": False,
+    }
+
+
+class TestBuildLociLowMapqSeeds:
+    def test_low_mapq_non_poly_does_not_seed_new_locus(self):
+        split = pd.DataFrame(
+            [
+                {**_split_row("chr22", 1000, "hi"), "low_mapq_clip_rescued": False, "poly_tail_rescued": False},
+                {**_split_row("chr22", 5000, "lo"), "low_mapq_clip_rescued": True, "poly_tail_rescued": False},
+            ]
+        )
+        empty = split.iloc[0:0].copy()
+        result = _build_loci_from_evidence(
+            split_disease=split,
+            split_control=empty,
+            discordant_disease=empty.assign(discordant_reasons="", template_len=0),
+            discordant_control=empty.assign(discordant_reasons="", template_len=0),
+            split_cluster_bp=100,
+            discordant_cluster_bp=400,
+            max_locus_span_bp=2000,
+        )
+        assert len(result) == 1
+        assert int(result.iloc[0]["window_start"]) <= 1000
+        assert int(result.iloc[0]["window_end"]) >= 1000
+        assert not ((result["window_start"] <= 5000) & (result["window_end"] >= 5000)).any()
+
+    def test_low_mapq_poly_still_seeds(self):
+        split = pd.DataFrame(
+            [
+                {**_split_row("chr22", 49879732, "poly"), "low_mapq_clip_rescued": True, "poly_tail_rescued": True},
+            ]
+        )
+        empty = split.iloc[0:0].copy()
+        result = _build_loci_from_evidence(
+            split_disease=split,
+            split_control=empty,
+            discordant_disease=empty.assign(discordant_reasons="", template_len=0),
+            discordant_control=empty.assign(discordant_reasons="", template_len=0),
+            split_cluster_bp=100,
+            discordant_cluster_bp=400,
+            max_locus_span_bp=2000,
+        )
+        assert len(result) == 1
+        assert int(result.iloc[0]["window_start"]) <= 49879732 <= int(result.iloc[0]["window_end"])
+
+    def test_low_mapq_non_poly_attaches_to_existing_seed(self):
+        split = pd.DataFrame(
+            [
+                {**_split_row("chr22", 49879732, "hi"), "low_mapq_clip_rescued": False, "poly_tail_rescued": False},
+                {**_split_row("chr22", 49879732, "lo"), "low_mapq_clip_rescued": True, "poly_tail_rescued": False},
+            ]
+        )
+        empty = split.iloc[0:0].copy()
+        result = _build_loci_from_evidence(
+            split_disease=split,
+            split_control=empty,
+            discordant_disease=empty.assign(discordant_reasons="", template_len=0),
+            discordant_control=empty.assign(discordant_reasons="", template_len=0),
+            split_cluster_bp=100,
+            discordant_cluster_bp=400,
+            max_locus_span_bp=2000,
+        )
+        assert len(result) == 1
+        assert int(result.iloc[0]["window_start"]) <= 49879732 <= int(result.iloc[0]["window_end"])
+
+
+class TestSplitRowsForSeeds:
+    def test_keeps_high_mapq_and_poly_low_mapq(self):
+        df = pd.DataFrame(
+            [
+                {"pos": 1, "low_mapq_clip_rescued": False, "poly_tail_rescued": False},
+                {"pos": 2, "low_mapq_clip_rescued": True, "poly_tail_rescued": True},
+                {"pos": 3, "low_mapq_clip_rescued": True, "poly_tail_rescued": False},
+            ]
+        )
+        out = _split_rows_for_seeds(df)
+        assert set(out["pos"].astype(int)) == {1, 2}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

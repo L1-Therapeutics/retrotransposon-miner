@@ -151,6 +151,24 @@ def _distance_to_closed_interval(pos: int, start: int, end: int) -> int:
     return 0
 
 
+def _split_rows_for_seeds(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop low-MAPQ rescued clips from locus seeding unless they are polyA/T.
+
+    Those rows still get assigned to windows later. They must not invent new
+    seeds from scattered MAPQ-0 non-poly clips.
+    """
+    if df is None or df.empty:
+        return df
+    if "low_mapq_clip_rescued" not in df.columns:
+        return df
+    low = df["low_mapq_clip_rescued"].fillna(False).astype(bool)
+    if "poly_tail_rescued" in df.columns:
+        poly = df["poly_tail_rescued"].fillna(False).astype(bool)
+    else:
+        poly = pd.Series(False, index=df.index)
+    return df.loc[(~low) | poly].copy()
+
+
 def _build_loci_from_evidence(
     split_disease: pd.DataFrame,
     split_control: pd.DataFrame,
@@ -172,9 +190,10 @@ def _build_loci_from_evidence(
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
     loci_by_chrom: dict[str, list[dict[str, object]]] = {}
+    split_seed_all = _split_rows_for_seeds(split_all)
 
-    if not split_all.empty:
-        split_pos = split_all.loc[:, ["chrom", "pos"]].copy()
+    if not split_seed_all.empty:
+        split_pos = split_seed_all.loc[:, ["chrom", "pos"]].copy()
         split_pos["pos"] = split_pos["pos"].astype(int)
         for chrom, chrom_df in split_pos.groupby("chrom", sort=False):
             positions = sorted(chrom_df["pos"].tolist())
