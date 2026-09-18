@@ -3216,22 +3216,11 @@ _DEL_DEPTH_MAX_RATIO = 0.65
 _DEL_MIN_INTACT_DEPTH = 8.0
 
 
-def _aggregate_same_chrom_deletion_dpe_metrics(
+def _best_same_chrom_deletion_clusters(
     df: pd.DataFrame,
-    sample_prefix: str,
-) -> pd.DataFrame:
-    """Best same-chrom long-FR mate cluster per locus (deletion-bridge geometry)."""
+) -> list[tuple[tuple[object, object, object], pd.DataFrame, int]]:
+    """Best same-chrom long-FR mate cluster per locus, plus that locus's total DPE count."""
     keys = ["chrom", "window_start", "window_end"]
-    metric_cols = [
-        f"{sample_prefix}_deletion_cluster_reads",
-        f"{sample_prefix}_deletion_cluster_fraction",
-        f"{sample_prefix}_deletion_cluster_width_bp",
-        f"{sample_prefix}_deletion_span_bp",
-        f"{sample_prefix}_deletion_anchor_side",
-        f"{sample_prefix}_deletion_mate_chrom",
-        f"{sample_prefix}_deletion_mate_pos_median",
-    ]
-    empty = pd.DataFrame(columns=keys + metric_cols)
     required = {
         "chrom",
         "window_start",
@@ -3245,7 +3234,7 @@ def _aggregate_same_chrom_deletion_dpe_metrics(
         "discordant_reasons",
     }
     if df is None or df.empty or not required.issubset(df.columns):
-        return empty
+        return []
 
     work = df.copy()
     work["pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
@@ -3293,14 +3282,10 @@ def _aggregate_same_chrom_deletion_dpe_metrics(
         & work["mate_pos"].gt(0)
     ].copy()
     if eligible.empty:
-        return empty
+        return []
 
-    total_reads = (
-        work.groupby(keys, as_index=False)["read_name"]
-        .nunique()
-        .rename(columns={"read_name": "_total_dpe_reads"})
-    )
-    rows: list[dict[str, object]] = []
+    total_by_key = work.groupby(keys, sort=False)["read_name"].nunique()
+    out: list[tuple[tuple[object, object, object], pd.DataFrame, int]] = []
     for key, locus in eligible.groupby(keys, sort=False):
         best: tuple[int, int, int, pd.DataFrame] | None = None
         for _, side_rows in locus.groupby(["anchor_side", "mate_chrom"], sort=False):
@@ -3320,13 +3305,39 @@ def _aggregate_same_chrom_deletion_dpe_metrics(
                     best = candidate
         if best is None:
             continue
-        cluster = best[3]
+        total = int(total_by_key.get(key, 0))
+        out.append((key, best[3], total))
+    return out
+
+
+def _aggregate_same_chrom_deletion_dpe_metrics(
+    df: pd.DataFrame,
+    sample_prefix: str,
+) -> pd.DataFrame:
+    """Best same-chrom long-FR mate cluster per locus (deletion-bridge geometry)."""
+    keys = ["chrom", "window_start", "window_end"]
+    metric_cols = [
+        f"{sample_prefix}_deletion_cluster_reads",
+        f"{sample_prefix}_deletion_cluster_fraction",
+        f"{sample_prefix}_deletion_cluster_width_bp",
+        f"{sample_prefix}_deletion_span_bp",
+        f"{sample_prefix}_deletion_anchor_side",
+        f"{sample_prefix}_deletion_mate_chrom",
+        f"{sample_prefix}_deletion_mate_pos_median",
+    ]
+    empty = pd.DataFrame(columns=keys + metric_cols)
+    clusters = _best_same_chrom_deletion_clusters(df)
+    if not clusters:
+        return empty
+    rows: list[dict[str, object]] = []
+    for key, cluster, total in clusters:
+        n_reads = int(cluster["read_name"].nunique())
         rows.append(
             {
                 "chrom": key[0],
                 "window_start": key[1],
                 "window_end": key[2],
-                f"{sample_prefix}_deletion_cluster_reads": int(cluster["read_name"].nunique()),
+                f"{sample_prefix}_deletion_cluster_reads": n_reads,
                 f"{sample_prefix}_deletion_cluster_width_bp": int(
                     cluster["mate_pos"].max() - cluster["mate_pos"].min()
                 ),
@@ -3334,15 +3345,102 @@ def _aggregate_same_chrom_deletion_dpe_metrics(
                 f"{sample_prefix}_deletion_anchor_side": str(cluster["anchor_side"].iloc[0]),
                 f"{sample_prefix}_deletion_mate_chrom": str(cluster["mate_chrom"].iloc[0]),
                 f"{sample_prefix}_deletion_mate_pos_median": float(cluster["mate_pos"].median()),
+                f"{sample_prefix}_deletion_cluster_fraction": float(n_reads / max(int(total), 1)),
             }
         )
-    if not rows:
-        return empty
-    out = pd.DataFrame(rows).merge(total_reads, on=keys, how="left")
-    out[f"{sample_prefix}_deletion_cluster_fraction"] = (
-        out[f"{sample_prefix}_deletion_cluster_reads"] / out["_total_dpe_reads"].clip(lower=1)
-    ).astype(float)
-    return out.drop(columns=["_total_dpe_reads"])
+    return pd.DataFrame(rows)
+
+
+def _same_chrom_deletion_cluster_member_reads(df: pd.DataFrame) -> pd.DataFrame:
+    """Read names in a ≥20% same-chrom del-bridge cluster (excluded from MEI_MAPPED)."""
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    empty = pd.DataFrame(columns=keys)
+    rows: list[dict[str, object]] = []
+    for key, cluster, total in _best_same_chrom_deletion_clusters(df):
+        width = int(cluster["mate_pos"].max() - cluster["mate_pos"].min())
+        span = float(cluster["_gap_bp"].median())
+        n_reads = int(cluster["read_name"].nunique())
+        frac = n_reads / max(int(total), 1)
+        if (
+            n_reads < _DEL_MIN_CLUSTER_READS
+            or frac < _DEL_MIN_CLUSTER_FRACTION
+            or width > _DEL_MATE_CLUSTER_BP
+            or span < _DEL_MIN_GAP_BP
+        ):
+            continue
+        for qname in cluster["read_name"].astype(str).unique():
+            if not qname:
+                continue
+            rows.append(
+                {
+                    "chrom": key[0],
+                    "window_start": key[1],
+                    "window_end": key[2],
+                    "read_name": qname,
+                }
+            )
+    return pd.DataFrame(rows) if rows else empty
+
+
+def _drop_deletion_cluster_reads(df: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
+    """Remove del-bridge cluster reads so they do not count as MEI identity/support."""
+    if df is None or df.empty or members is None or members.empty:
+        return df
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    if not all(col in df.columns for col in keys):
+        return df
+    flagged = df.merge(
+        members.loc[:, keys].drop_duplicates().assign(_del_cluster=1),
+        on=keys,
+        how="left",
+    )
+    return flagged.loc[flagged["_del_cluster"].isna()].drop(columns=["_del_cluster"])
+
+
+def _deletion_cluster_member_mask(df: pd.DataFrame, members: pd.DataFrame) -> pd.Series:
+    """Boolean mask of rows whose read is in a ≥20% same-chrom del-bridge cluster."""
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    if members is None or members.empty or not all(col in df.columns for col in keys):
+        return pd.Series(False, index=df.index)
+    row_key = df.loc[:, keys].astype(str).agg("\t".join, axis=1)
+    member_key = members.loc[:, keys].astype(str).agg("\t".join, axis=1)
+    return row_key.isin(set(member_key.tolist()))
+
+
+def _refresh_polya_rescue_excluding_del_cluster(
+    disc_hits: pd.DataFrame,
+    members: pd.DataFrame,
+) -> pd.DataFrame:
+    """Recompute polyA rescue without letting del-bridge Alu/L1 mates unlock it."""
+    if disc_hits is None or disc_hits.empty:
+        return disc_hits
+    work = disc_hits.copy()
+    del_mask = _deletion_cluster_member_mask(work, members)
+    if del_mask.any():
+        if "mei_hit" in work.columns:
+            work.loc[del_mask, "mei_hit"] = False
+        if "mate_mei_hit" in work.columns:
+            work.loc[del_mask, "mate_mei_hit"] = False
+    if "polya_rescue" in work.columns:
+        work["polya_rescue"] = False
+    if "mei_hit_source" in work.columns:
+        src = work["mei_hit_source"].fillna("").astype(str)
+        work.loc[src.eq("polya_rescue"), "mei_hit_source"] = ""
+    rescued = _rescue_polya_like_discordant_mei_hits(work)
+    out = disc_hits.copy()
+    if "polya_rescue" not in out.columns:
+        out["polya_rescue"] = False
+    out["polya_rescue"] = rescued["polya_rescue"].fillna(False).astype(bool)
+    if "mei_hit_source" in rescued.columns:
+        if "mei_hit_source" not in out.columns:
+            out["mei_hit_source"] = ""
+        old_src = out["mei_hit_source"].fillna("").astype(str)
+        out.loc[old_src.eq("polya_rescue"), "mei_hit_source"] = ""
+        new_src = rescued["mei_hit_source"].fillna("").astype(str)
+        out.loc[out["polya_rescue"], "mei_hit_source"] = new_src.loc[out["polya_rescue"]].to_numpy()
+    return out
 
 
 def _enrich_split_hits_with_mate_positions(
@@ -14559,19 +14657,29 @@ def annotate_candidate_loci_with_mei(
 
     split_disease_mei = _mei_rows_only(disease_hits, is_split=True)
     split_control_mei = _mei_rows_only(control_hits, is_split=True)
+    # Del-bridge clusters (same-chrom long-FR mates piling at one remote locus)
+    # are SV geometry, not insertion identity — drop them from MEI_MAPPED.
+    del_members_t = _same_chrom_deletion_cluster_member_reads(disease_disc_hits)
+    del_members_n = _same_chrom_deletion_cluster_member_reads(control_disc_hits)
+    disease_disc_hits = _refresh_polya_rescue_excluding_del_cluster(disease_disc_hits, del_members_t)
+    control_disc_hits = _refresh_polya_rescue_excluding_del_cluster(control_disc_hits, del_members_n)
+    disease_disc_hits_for_mei = _drop_deletion_cluster_reads(disease_disc_hits, del_members_t)
+    control_disc_hits_for_mei = _drop_deletion_cluster_reads(control_disc_hits, del_members_n)
+    disease_disc_hits_full_for_mei = _drop_deletion_cluster_reads(disease_disc_hits_full, del_members_t)
+    control_disc_hits_full_for_mei = _drop_deletion_cluster_reads(control_disc_hits_full, del_members_n)
     # MEI_MAPPED for DPE: exclude same-chr mates within 1 kb (nearby ref MEIs).
     discordant_disease_mei = _discordant_rows_for_mei_mapped_support(
-        _mei_rows_only(disease_disc_hits, is_split=False)
+        _mei_rows_only(disease_disc_hits_for_mei, is_split=False)
     )
     discordant_control_mei = _discordant_rows_for_mei_mapped_support(
-        _mei_rows_only(control_disc_hits, is_split=False)
+        _mei_rows_only(control_disc_hits_for_mei, is_split=False)
     )
 
     metrics_t0 = time.monotonic()
-    disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits, sample_prefix="disease")
-    disc_n = _aggregate_discordant_mei_metrics(control_disc_hits, sample_prefix="control")
-    disc_t_full = _aggregate_discordant_mei_metrics(disease_disc_hits_full, sample_prefix="disease_full")
-    disc_n_full = _aggregate_discordant_mei_metrics(control_disc_hits_full, sample_prefix="control_full")
+    disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits_for_mei, sample_prefix="disease")
+    disc_n = _aggregate_discordant_mei_metrics(control_disc_hits_for_mei, sample_prefix="control")
+    disc_t_full = _aggregate_discordant_mei_metrics(disease_disc_hits_full_for_mei, sample_prefix="disease_full")
+    disc_n_full = _aggregate_discordant_mei_metrics(control_disc_hits_full_for_mei, sample_prefix="control_full")
     disc_anchor_t = _aggregate_discordant_anchor_side_metrics(disease_disc_hits, sample_prefix="disease")
     disc_anchor_n = _aggregate_discordant_anchor_side_metrics(control_disc_hits, sample_prefix="control")
     disc_residual_t = _aggregate_discordant_residual_complex_metrics(disease_disc_hits, sample_prefix="disease")

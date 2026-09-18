@@ -9,6 +9,9 @@ from retro_miner.mei_support import (
     _apply_complex_ins_with_del,
     _deletion_depth_supports_del,
     _deletion_flank_intervals,
+    _drop_deletion_cluster_reads,
+    _refresh_polya_rescue_excluding_del_cluster,
+    _same_chrom_deletion_cluster_member_reads,
 )
 
 
@@ -72,6 +75,80 @@ class TestDeletionClusterFraction:
         assert len(out) == 1
         assert int(out.iloc[0]["disease_deletion_cluster_reads"]) == 3
         assert abs(float(out.iloc[0]["disease_deletion_cluster_fraction"]) - 0.3) < 1e-9
+
+
+class TestDeletionClusterMeiMappedDrop:
+    def test_cluster_members_are_excluded_from_mei_support(self):
+        rows = []
+        for i in range(3):
+            rows.append(_dpe_row(read_name=f"del{i}", mate_pos=15000 + i * 10, pos=10040 + i))
+        for i in range(7):
+            rows.append(
+                _dpe_row(
+                    read_name=f"mei{i}",
+                    mate_chrom="chr1",
+                    mate_pos=2000 + i,
+                    discordant_reasons="interchrom",
+                )
+            )
+        dpe = pd.DataFrame(rows)
+        members = _same_chrom_deletion_cluster_member_reads(dpe)
+        assert set(members["read_name"]) == {"del0", "del1", "del2"}
+        kept = _drop_deletion_cluster_reads(dpe, members)
+        assert set(kept["read_name"]) == {f"mei{i}" for i in range(7)}
+
+    def test_sub_threshold_cluster_keeps_mei_reads(self):
+        rows = [_dpe_row(read_name="del0", mate_pos=15000, pos=10040)]
+        for i in range(9):
+            rows.append(
+                _dpe_row(
+                    read_name=f"other{i}",
+                    mate_chrom="chr1",
+                    mate_pos=2000 + i,
+                    discordant_reasons="interchrom",
+                )
+            )
+        dpe = pd.DataFrame(rows)
+        members = _same_chrom_deletion_cluster_member_reads(dpe)
+        assert members.empty
+        kept = _drop_deletion_cluster_reads(dpe, members)
+        assert len(kept) == 10
+
+    def test_del_cluster_mei_hits_do_not_unlock_polya_rescue(self):
+        rows = []
+        for i in range(4):
+            rows.append(
+                _dpe_row(
+                    read_name=f"del{i}",
+                    mate_pos=15000 + i * 10,
+                    pos=10040 + i,
+                    mei_hit=True,
+                    mate_mei_hit=True,
+                    family="ALU",
+                    target="AluY#SINE/Alu",
+                    polya_rescue=False,
+                )
+            )
+        rows.append(
+            _dpe_row(
+                read_name="poly",
+                mate_pos=20000,
+                pos=10050,
+                discordant_reasons="large_insert",
+                mei_hit=False,
+                mate_mei_hit=False,
+                mate_seq="A" * 40,
+                polya_rescue=True,
+                family="ALU",
+                target="ALU_polyA_rescue#SINE/Alu",
+                mei_hit_source="polya_rescue",
+            )
+        )
+        dpe = pd.DataFrame(rows)
+        members = _same_chrom_deletion_cluster_member_reads(dpe)
+        out = _refresh_polya_rescue_excluding_del_cluster(dpe, members)
+        poly = out.loc[out["read_name"].eq("poly")].iloc[0]
+        assert not bool(poly["polya_rescue"])
 
 
 class TestComplexInsWithDelLabel:
