@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import retro_miner.callset_eval as callset_eval
+
 from retro_miner.callset_eval import (
     Variant,
+    catalog_overlap,
+    filter_variants_to_regions,
     is_carrier_alleles,
     is_carrier_gt_string,
+    is_insertion_svtype,
     is_mei_like_text,
+    is_melt_mei_insertion,
     normalize_strand,
     strand_from_meinfo,
     label_rtm_calls,
     match_variants,
+    merge_unique_events,
     normalize_chrom,
     normalize_mei_family,
     overlap_metrics,
@@ -32,6 +41,18 @@ def test_normalize_mei_family_aliases() -> None:
     assert normalize_mei_family("L1HS") == "LINE1"
     assert normalize_mei_family("SVA_E") == "SVA"
     assert normalize_mei_family("VNTR") == ""
+    assert normalize_mei_family("BI_GS_DEL1_B1_P4126_65") == ""
+
+
+def test_only_mei_insertions_are_truth_records() -> None:
+    assert is_insertion_svtype("INS", "<INS:ME:ALU>")
+    assert is_insertion_svtype("ALU", "<INS:ME:ALU>")
+    assert not is_insertion_svtype("DEL", "<DEL>")
+    assert is_melt_mei_insertion(
+        "ALU_umary_ALU_12446", "<INS:ME:ALU>", "ALU", "ALU,1,280,+"
+    )
+    assert not is_melt_mei_insertion("DEL_ALU_1", "<DEL>", "DEL")
+    assert not is_melt_mei_insertion("BI_GS_DEL1_B1_P4126_65", "<DEL>", "DEL")
 
 
 def test_is_mei_like_and_carrier() -> None:
@@ -129,3 +150,53 @@ def test_padded_interval_is_half_open_positive() -> None:
     start, end = padded_interval(10, 10, 5)
     assert start == 5
     assert end == 15
+
+
+def test_shared_callable_filter_and_unique_events(tmp_path) -> None:
+    callable_bed = tmp_path / "callable.bed"
+    callable_bed.write_text("chr22\t900\t6000\n", encoding="utf-8")
+    junk_bed = tmp_path / "junk.bed"
+    junk_bed.write_text("chr22\t4900\t5100\n", encoding="utf-8")
+    melt = [
+        Variant("chr22", 1000, 1000, "m1", "ALU", "melt"),
+        Variant("chr22", 5000, 5000, "m_junk", "SVA", "melt"),
+    ]
+    ont = [
+        Variant("22", 1050, 1050, "o1", "ALU", "ont"),
+        Variant("chr22", 3000, 3000, "o2", "LINE1", "ont"),
+    ]
+    region_args = {"include_beds": [callable_bed], "exclude_beds": [junk_bed]}
+    melt = filter_variants_to_regions(melt, **region_args)
+    ont = filter_variants_to_regions(ont, **region_args)
+    assert [variant.variant_id for variant in melt] == ["m1"]
+    assert [variant.variant_id for variant in ont] == ["o1", "o2"]
+
+    overlap = catalog_overlap(melt, ont, pad_bp=200, require_family=True)
+    assert [variant.variant_id for variant in overlap["shared"]] == ["m1"]
+    assert [variant.variant_id for variant in overlap["right_only"]] == ["o2"]
+
+    events = merge_unique_events([melt, ont], pad_bp=200, require_family=True)
+    assert len(events) == 2
+    assert events[0].source == "melt,ont"
+    assert events[0].extra["source_ids"] == {"melt": ["m1"], "ont": ["o1"]}
+    assert events[1].variant_id == "ont:o2"
+
+
+def test_whole_genome_query_omits_region(monkeypatch, tmp_path) -> None:
+    commands = []
+    monkeypatch.setattr(callset_eval.shutil, "which", lambda _: "/usr/bin/bcftools")
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="chr1\t100\nchr22\t200\n", stderr="")
+
+    monkeypatch.setattr(callset_eval.subprocess, "run", fake_run)
+    rows = callset_eval._query_vcf_rows(
+        tmp_path / "input.bcf",
+        chrom=None,
+        sample="HG00100",
+        fmt="%CHROM\t%POS\n",
+    )
+    assert rows == [["chr1", "100"], ["chr22", "200"]]
+    assert "-r" not in commands[0]
+    assert commands[0][commands[0].index("-s") + 1] == "HG00100"

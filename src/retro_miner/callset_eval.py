@@ -6,13 +6,17 @@ score/tier cutoff, and list RTM calls that are novel to both truth sets.
 
 from __future__ import annotations
 
+import gzip
+import re
 import shutil
 import subprocess
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 MEI_FAMILIES = frozenset({"ALU", "LINE1", "SVA"})
+_LINE1_TOKEN = re.compile(r"(?:LINE1|L1HS|<INS:ME:L1\b|(?<![A-Z0-9])L1(?![A-Z0-9]))")
 _SCORE_COLUMNS = (
     "insertion_model_score",
     "read_support_heuristic_score",
@@ -61,9 +65,26 @@ def normalize_mei_family(token: str) -> str:
         return "ALU"
     if "SVA" in text:
         return "SVA"
-    if "LINE1" in text or "L1" in text:
+    if _LINE1_TOKEN.search(text):
         return "LINE1"
     return ""
+
+
+def is_insertion_svtype(svtype: str, alt: str = "") -> bool:
+    """Return whether a record represents an insertion rather than an ME deletion."""
+    sv = (svtype or "").upper()
+    alt_u = (alt or "").upper()
+    if sv.startswith("DEL") or alt_u.startswith("<DEL"):
+        return False
+    return sv.startswith("INS") or alt_u.startswith("<INS")
+
+
+def is_melt_mei_insertion(variant_id: str, alt: str, svtype: str, meinfo: str = "") -> bool:
+    """Recognize Phase 3 MELT insertion records without matching DEL1/DEL_ALU IDs."""
+    if not is_insertion_svtype(svtype, alt):
+        return False
+    family = normalize_mei_family(f"{alt} {meinfo}") or normalize_mei_family(variant_id)
+    return family in MEI_FAMILIES
 
 
 def normalize_strand(token: str) -> str:
@@ -208,12 +229,11 @@ def load_rtm_calls(path: Path, chrom: str | None = None) -> tuple[list[Variant],
         pos = rtm_breakpoint(rec)
         if pos <= 0:
             continue
-        end = _as_int(rec.get("window_end"), pos)
         vid = str(rec.get("locus_id") or rec.get("window_id") or f"rtm_{row_chrom}_{pos}_{i}")
         var = Variant(
             chrom=row_chrom,
             pos=pos,
-            end=max(pos, end),
+            end=pos,
             variant_id=vid,
             family=rtm_family(rec),
             source="rtm",
@@ -236,28 +256,27 @@ def load_rtm_calls(path: Path, chrom: str | None = None) -> tuple[list[Variant],
 def load_melt_sample_meis(
     vcf_path: Path,
     sample: str,
-    chrom: str,
+    chrom: str | None,
 ) -> list[Variant]:
-    want = normalize_chrom(chrom)
+    want = normalize_chrom(chrom) if chrom else None
     out: list[Variant] = []
     fmt = "%CHROM\t%POS\t%END\t%ID\t%ALT\t%INFO/SVTYPE\t%INFO/SVLEN\t%INFO/MEINFO\t[%GT]\n"
     for row in _query_vcf_rows(vcf_path, chrom=want, sample=sample, fmt=fmt):
         chrom_s, pos_s, end_s, vid, alt, svtype, svlen_s, meinfo, gt = _pad_row(row, 9)
         if not is_carrier_gt_string(gt):
             continue
-        if not is_mei_like_text(vid, alt, svtype, meinfo):
+        if not is_melt_mei_insertion(vid, alt, svtype, meinfo):
             continue
         pos = _as_int(pos_s, 0)
         if pos <= 0:
             continue
-        end = _as_int(end_s, pos)
         out.append(
             Variant(
                 chrom=normalize_chrom(chrom_s),
                 pos=pos,
-                end=max(pos, end),
+                end=pos,
                 variant_id=vid if vid not in {"", "."} else f"melt_{chrom_s}_{pos}",
-                family=normalize_mei_family(f"{vid} {alt} {meinfo}"),
+                family=normalize_mei_family(f"{alt} {meinfo}") or normalize_mei_family(vid),
                 source="melt",
                 genotype=gt.split(":")[0],
                 svtype=svtype or alt,
@@ -272,9 +291,9 @@ def load_ont_sample_meis(
     svim_path: Path,
     svan_path: Path | None,
     sample: str,
-    chrom: str,
+    chrom: str | None,
 ) -> list[Variant]:
-    want = normalize_chrom(chrom)
+    want = normalize_chrom(chrom) if chrom else None
     anns = load_svan_index(svan_path, want) if svan_path is not None else {}
     out: list[Variant] = []
     fmt = "%CHROM\t%POS\t%END\t%ID\t%INFO/SVTYPE\t%INFO/SVLEN\t[%GT]\n"
@@ -282,21 +301,22 @@ def load_ont_sample_meis(
         chrom_s, pos_s, end_s, vid, svtype, svlen_s, gt = _pad_row(row, 7)
         if not is_carrier_gt_string(gt):
             continue
+        if not is_insertion_svtype(svtype):
+            continue
         pos = _as_int(pos_s, 0)
         if pos <= 0:
             continue
-        ann = anns.get(vid) or anns.get(f"{want}:{pos}")
+        ann = anns.get(vid) or anns.get(f"{normalize_chrom(chrom_s)}:{pos}")
         family = normalize_mei_family(str((ann or {}).get("fam_n", "")))
         if family not in MEI_FAMILIES:
             continue
         itype = str((ann or {}).get("itype_n", "") or "")
         ins_len = _as_int((ann or {}).get("ins_len"), _as_int(svlen_s, -1))
-        end = _as_int(end_s, pos)
         out.append(
             Variant(
                 chrom=normalize_chrom(chrom_s),
                 pos=pos,
-                end=max(pos, end),
+                end=pos,
                 variant_id=vid if vid not in {"", "."} else f"ont_{chrom_s}_{pos}",
                 family=family,
                 source="ont",
@@ -310,8 +330,174 @@ def load_ont_sample_meis(
     return out
 
 
-def load_svan_index(svan_path: Path, chrom: str) -> dict[str, dict[str, Any]]:
-    want = normalize_chrom(chrom)
+def load_bed_intervals(path: Path) -> dict[str, list[tuple[int, int]]]:
+    """Load and merge 0-based, half-open BED intervals by normalized chromosome."""
+    intervals: dict[str, list[tuple[int, int]]] = {}
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith(("#", "track", "browser")):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 3:
+                continue
+            try:
+                start, end = int(fields[1]), int(fields[2])
+            except ValueError:
+                continue
+            if end > start:
+                intervals.setdefault(normalize_chrom(fields[0]), []).append((start, end))
+    for chrom, chrom_intervals in intervals.items():
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(chrom_intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        intervals[chrom] = merged
+    return intervals
+
+
+def merge_bed_interval_maps(
+    maps: Iterable[dict[str, list[tuple[int, int]]]],
+) -> dict[str, list[tuple[int, int]]]:
+    combined: dict[str, list[tuple[int, int]]] = {}
+    for mapping in maps:
+        for chrom, intervals in mapping.items():
+            combined.setdefault(chrom, []).extend(intervals)
+    merged: dict[str, list[tuple[int, int]]] = {}
+    for chrom, intervals in combined.items():
+        packed: list[tuple[int, int]] = []
+        for start, end in sorted(intervals):
+            if packed and start <= packed[-1][1]:
+                packed[-1] = (packed[-1][0], max(packed[-1][1], end))
+            else:
+                packed.append((start, end))
+        merged[chrom] = packed
+    return merged
+
+
+def position_in_intervals(
+    chrom: str,
+    pos_1based: int,
+    intervals: dict[str, list[tuple[int, int]]],
+) -> bool:
+    """Return whether a 1-based variant position lies in BED intervals."""
+    pos0 = int(pos_1based) - 1
+    chrom_intervals = intervals.get(normalize_chrom(chrom), [])
+    index = bisect_right(chrom_intervals, (pos0, float("inf"))) - 1
+    return index >= 0 and chrom_intervals[index][0] <= pos0 < chrom_intervals[index][1]
+
+
+def filter_variants_to_regions(
+    variants: list[Variant],
+    *,
+    include_beds: Iterable[Path] = (),
+    exclude_beds: Iterable[Path] = (),
+) -> list[Variant]:
+    """Apply the same callable include/exclude domain to any variant catalog."""
+    include_paths = [Path(path) for path in include_beds]
+    exclude_paths = [Path(path) for path in exclude_beds]
+    includes = merge_bed_interval_maps(load_bed_intervals(path) for path in include_paths)
+    excludes = merge_bed_interval_maps(load_bed_intervals(path) for path in exclude_paths)
+    return [
+        variant
+        for variant in variants
+        if (not includes or position_in_intervals(variant.chrom, variant.pos, includes))
+        and (not excludes or not position_in_intervals(variant.chrom, variant.pos, excludes))
+    ]
+
+
+def catalog_overlap(
+    left: list[Variant],
+    right: list[Variant],
+    *,
+    pad_bp: int,
+    require_family: bool = False,
+) -> dict[str, list[Variant]]:
+    """Partition two catalogs into shared representatives and source-only records."""
+    left_hits = match_variants(left, right, pad_bp=pad_bp, require_family=require_family)
+    right_hits = match_variants(right, left, pad_bp=pad_bp, require_family=require_family)
+    return {
+        "shared": [variant for variant in left if left_hits[variant.key]],
+        "left_only": [variant for variant in left if not left_hits[variant.key]],
+        "right_only": [variant for variant in right if not right_hits[variant.key]],
+    }
+
+
+def merge_unique_events(
+    catalogs: Iterable[list[Variant]],
+    *,
+    pad_bp: int,
+    require_family: bool = False,
+) -> list[Variant]:
+    """Cluster overlapping catalog records into unique biological truth events."""
+    variants = [variant for catalog in catalogs for variant in catalog]
+    if not variants:
+        return []
+    parents = list(range(len(variants)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left, left_variant in enumerate(variants):
+        for right in range(left + 1, len(variants)):
+            right_variant = variants[right]
+            if (
+                require_family
+                and left_variant.family
+                and right_variant.family
+                and left_variant.family != right_variant.family
+            ):
+                continue
+            if intervals_overlap(left_variant, right_variant, pad_bp):
+                union(left, right)
+
+    groups: dict[int, list[Variant]] = {}
+    for index, variant in enumerate(variants):
+        groups.setdefault(find(index), []).append(variant)
+
+    events: list[Variant] = []
+    for members in groups.values():
+        ordered = sorted(members, key=lambda variant: (variant.chrom, variant.pos, variant.variant_id))
+        positions = sorted(variant.pos for variant in members)
+        pos = positions[len(positions) // 2]
+        families = sorted({variant.family for variant in members if variant.family})
+        strands = sorted({variant.strand for variant in members if variant.strand})
+        lengths = sorted(variant.svlen for variant in members if variant.svlen >= 0)
+        sources = sorted({variant.source for variant in members})
+        source_ids = {source: [] for source in sources}
+        for variant in ordered:
+            source_ids[variant.source].append(variant.variant_id)
+        event_id = "|".join(
+            f"{source}:{','.join(source_ids[source])}" for source in sources
+        )
+        events.append(
+            Variant(
+                chrom=ordered[0].chrom,
+                pos=pos,
+                end=pos,
+                variant_id=event_id,
+                family=families[0] if len(families) == 1 else ",".join(families),
+                source=",".join(sources),
+                svlen=lengths[len(lengths) // 2] if lengths else -1,
+                strand=strands[0] if len(strands) == 1 else "",
+                extra={"source_ids": source_ids, "member_count": len(members)},
+            )
+        )
+    return sorted(events, key=lambda variant: (normalize_chrom(variant.chrom), variant.pos))
+
+
+def load_svan_index(svan_path: Path, chrom: str | None) -> dict[str, dict[str, Any]]:
+    want = normalize_chrom(chrom) if chrom else None
     index: dict[str, dict[str, Any]] = {}
     fmt = "%CHROM\t%POS\t%ID\t%INFO/FAM_N\t%INFO/ITYPE_N\t%INFO/INS_LEN\t%INFO/STRAND\n"
     for row in _query_vcf_rows(svan_path, chrom=want, sample=None, fmt=fmt):
@@ -335,28 +521,33 @@ def load_svan_index(svan_path: Path, chrom: str) -> dict[str, dict[str, Any]]:
 def _query_vcf_rows(
     vcf_path: Path,
     *,
-    chrom: str,
+    chrom: str | None,
     sample: str | None,
     fmt: str,
 ) -> list[list[str]]:
     bcftools = shutil.which("bcftools")
     if bcftools is None:
         raise RuntimeError("bcftools is required to read genotype callsets")
-    aliases = [chrom]
-    if chrom.startswith("chr"):
-        aliases.append(chrom[3:])
-    else:
-        aliases.append(f"chr{chrom}")
+    aliases: list[str | None] = [chrom]
+    if chrom:
+        if chrom.startswith("chr"):
+            aliases.append(chrom[3:])
+        else:
+            aliases.append(f"chr{chrom}")
     last_err = ""
     for region in aliases:
-        cmd = [bcftools, "query", "-r", region, "-f", fmt, str(vcf_path)]
+        cmd = [bcftools, "query"]
+        if region:
+            cmd.extend(["-r", region])
         if sample:
-            cmd = [bcftools, "query", "-r", region, "-s", sample, "-f", fmt, str(vcf_path)]
+            cmd.extend(["-s", sample])
+        cmd.extend(["-f", fmt, str(vcf_path)])
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode == 0:
             return [line.rstrip("\n").split("\t") for line in proc.stdout.splitlines() if line.strip()]
         last_err = (proc.stderr or proc.stdout or "").strip()
-    raise RuntimeError(f"bcftools query failed for {vcf_path} {chrom}: {last_err[:800]}")
+    region_label = chrom or "whole genome"
+    raise RuntimeError(f"bcftools query failed for {vcf_path} {region_label}: {last_err[:800]}")
 
 
 def _pad_row(row: list[str], n: int) -> list[str]:
@@ -474,8 +665,12 @@ def _sweep_row(
     ]
     melt_m = overlap_metrics(melt, calls, pad_bp=pad_bp, require_family=require_family)
     ont_m = overlap_metrics(ont, calls, pad_bp=pad_bp, require_family=require_family)
-    both = melt + [v for v in ont if v.key not in {x.key for x in melt}]
-    both_m = overlap_metrics(both, calls, pad_bp=pad_bp, require_family=require_family)
+    truth_union = merge_unique_events(
+        [melt, ont],
+        pad_bp=pad_bp,
+        require_family=require_family,
+    )
+    union_m = overlap_metrics(truth_union, calls, pad_bp=pad_bp, require_family=require_family)
     return {
         "cutoff": cutoff_name,
         "value": cutoff_value,
@@ -486,9 +681,10 @@ def _sweep_row(
         "ont_recall": ont_m["recall"],
         "ont_recovered": ont_m["truth_recovered"],
         "ont_truth": ont_m["n_truth"],
-        "union_recall": both_m["recall"],
-        "novel_calls": both_m["novel_calls"],
-        "precision_vs_union": both_m["precision_vs_truth"],
+        "union_recall": union_m["recall"],
+        "union_truth": union_m["n_truth"],
+        "novel_calls": union_m["novel_calls"],
+        "precision_vs_union": union_m["precision_vs_truth"],
     }
 
 
