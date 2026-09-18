@@ -18,6 +18,7 @@ from pathlib import Path
 import pandas as pd
 import click
 import pysam
+from Bio.Align import PairwiseAligner
 from intervaltree import IntervalTree
 
 from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
@@ -25,7 +26,7 @@ from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
-from retro_miner.bam_io import open_alignment
+from retro_miner.bam_io import bind_alignment_reference, open_alignment
 from retro_miner.evidence_extract import (
     _longest_soft_clip_from_read,
     _soft_clip_query_seq,
@@ -3215,6 +3216,482 @@ def _aggregate_discordant_residual_complex_metrics(df: pd.DataFrame, sample_pref
     return out.drop(columns=["_total_unique"])
 
 
+_DEL_MATE_CLUSTER_BP = 1000
+_DEL_MIN_GAP_BP = 1000
+_DEL_MIN_CLUSTER_READS = 2
+_DEL_MIN_CLUSTER_FRACTION = 0.20
+_DEL_FLANK_BP = 500
+_DEL_DEPTH_MAX_RATIO = 0.65
+_DEL_MIN_INTACT_DEPTH = 8.0
+# Split clips that are the other deletion end, not a novel MEI.
+_DEL_SPLIT_PAD_BP = 500
+_DEL_SPLIT_MIN_QUERY_COVERAGE = 0.95
+_DEL_SPLIT_MIN_EDIT_SIMILARITY = 0.95
+_DEL_SPLIT_MAX_INDEL_BP = 3
+
+
+def _best_same_chrom_deletion_clusters(
+    df: pd.DataFrame,
+) -> list[tuple[tuple[object, object, object], pd.DataFrame, int]]:
+    """Best same-chrom long-FR mate cluster per locus, plus that locus's total DPE count."""
+    keys = ["chrom", "window_start", "window_end"]
+    required = {
+        "chrom",
+        "window_start",
+        "window_end",
+        "pos",
+        "mate_chrom",
+        "mate_pos",
+        "read_name",
+        "is_reverse",
+        "mate_is_reverse",
+        "discordant_reasons",
+    }
+    if df is None or df.empty or not required.issubset(df.columns):
+        return []
+
+    work = df.copy()
+    work["pos"] = pd.to_numeric(work["pos"], errors="coerce").fillna(0).astype(int)
+    work["mate_pos"] = pd.to_numeric(work["mate_pos"], errors="coerce").fillna(0).astype(int)
+    work["locus_midpoint"] = (
+        pd.to_numeric(work["window_start"], errors="coerce").fillna(0).astype(int)
+        + pd.to_numeric(work["window_end"], errors="coerce").fillna(0).astype(int)
+    ) // 2
+    work["_distance_to_locus"] = (work["pos"] - work["locus_midpoint"]).abs()
+
+    def _bool_values(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(series):
+            return series.fillna(False).astype(bool)
+        return series.fillna("").astype(str).str.lower().isin({"1", "true", "t", "yes"})
+
+    work["_is_reverse"] = _bool_values(work["is_reverse"])
+    work["_mate_is_reverse"] = _bool_values(work["mate_is_reverse"])
+    work["_same_chrom"] = (
+        work["chrom"].fillna("").astype(str).str.replace(r"^chr", "", case=False, regex=True).str.lower()
+        == work["mate_chrom"].fillna("").astype(str).str.replace(r"^chr", "", case=False, regex=True).str.lower()
+    )
+    work["_long_insert"] = (
+        work["discordant_reasons"].fillna("").astype(str).str.contains("large_insert", regex=False)
+    )
+    work["_canonical_fr"] = (
+        (~work["_is_reverse"])
+        & work["_mate_is_reverse"]
+        & (work["pos"] <= work["mate_pos"])
+    ) | (
+        work["_is_reverse"]
+        & (~work["_mate_is_reverse"])
+        & (work["mate_pos"] <= work["pos"])
+    )
+    work["_gap_bp"] = (work["mate_pos"] - work["pos"]).abs()
+    work = work.sort_values(keys + ["read_name", "_distance_to_locus"], kind="mergesort").drop_duplicates(
+        keys + ["read_name"],
+        keep="first",
+    )
+    work["anchor_side"] = work["pos"].le(work["locus_midpoint"]).map({True: "L", False: "R"})
+    eligible = work.loc[
+        work["_same_chrom"]
+        & work["_long_insert"]
+        & work["_canonical_fr"]
+        & work["_gap_bp"].ge(_DEL_MIN_GAP_BP)
+        & work["mate_pos"].gt(0)
+    ].copy()
+    if eligible.empty:
+        return []
+
+    total_by_key = work.groupby(keys, sort=False)["read_name"].nunique()
+    out: list[tuple[tuple[object, object, object], pd.DataFrame, int]] = []
+    for key, locus in eligible.groupby(keys, sort=False):
+        best: tuple[int, int, int, pd.DataFrame] | None = None
+        for _, side_rows in locus.groupby(["anchor_side", "mate_chrom"], sort=False):
+            side_rows = side_rows.sort_values("mate_pos", kind="mergesort").reset_index(drop=True)
+            left = 0
+            for right in range(len(side_rows)):
+                while (
+                    int(side_rows.loc[right, "mate_pos"])
+                    - int(side_rows.loc[left, "mate_pos"])
+                    > _DEL_MATE_CLUSTER_BP
+                ):
+                    left += 1
+                cluster = side_rows.iloc[left : right + 1]
+                width = int(cluster["mate_pos"].max() - cluster["mate_pos"].min())
+                candidate = (len(cluster), -width, -int(cluster["mate_pos"].median()), cluster)
+                if best is None or candidate[:3] > best[:3]:
+                    best = candidate
+        if best is None:
+            continue
+        total = int(total_by_key.get(key, 0))
+        out.append((key, best[3], total))
+    return out
+
+
+def _aggregate_same_chrom_deletion_dpe_metrics(
+    df: pd.DataFrame,
+    sample_prefix: str,
+) -> pd.DataFrame:
+    """Best same-chrom long-FR mate cluster per locus (deletion-bridge geometry)."""
+    keys = ["chrom", "window_start", "window_end"]
+    metric_cols = [
+        f"{sample_prefix}_deletion_cluster_reads",
+        f"{sample_prefix}_deletion_cluster_fraction",
+        f"{sample_prefix}_deletion_cluster_width_bp",
+        f"{sample_prefix}_deletion_span_bp",
+        f"{sample_prefix}_deletion_anchor_side",
+        f"{sample_prefix}_deletion_mate_chrom",
+        f"{sample_prefix}_deletion_mate_pos_median",
+    ]
+    empty = pd.DataFrame(columns=keys + metric_cols)
+    clusters = _best_same_chrom_deletion_clusters(df)
+    if not clusters:
+        return empty
+    rows: list[dict[str, object]] = []
+    for key, cluster, total in clusters:
+        n_reads = int(cluster["read_name"].nunique())
+        rows.append(
+            {
+                "chrom": key[0],
+                "window_start": key[1],
+                "window_end": key[2],
+                f"{sample_prefix}_deletion_cluster_reads": n_reads,
+                f"{sample_prefix}_deletion_cluster_width_bp": int(
+                    cluster["mate_pos"].max() - cluster["mate_pos"].min()
+                ),
+                f"{sample_prefix}_deletion_span_bp": float(cluster["_gap_bp"].median()),
+                f"{sample_prefix}_deletion_anchor_side": str(cluster["anchor_side"].iloc[0]),
+                f"{sample_prefix}_deletion_mate_chrom": str(cluster["mate_chrom"].iloc[0]),
+                f"{sample_prefix}_deletion_mate_pos_median": float(cluster["mate_pos"].median()),
+                f"{sample_prefix}_deletion_cluster_fraction": float(n_reads / max(int(total), 1)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _iter_qualifying_deletion_clusters(
+    df: pd.DataFrame,
+) -> list[tuple[tuple[object, object, object], pd.DataFrame]]:
+    """Same-chrom del-bridge clusters that pass the ≥20% / span / width gates."""
+    out: list[tuple[tuple[object, object, object], pd.DataFrame]] = []
+    for key, cluster, total in _best_same_chrom_deletion_clusters(df):
+        width = int(cluster["mate_pos"].max() - cluster["mate_pos"].min())
+        span = float(cluster["_gap_bp"].median())
+        n_reads = int(cluster["read_name"].nunique())
+        frac = n_reads / max(int(total), 1)
+        if (
+            n_reads < _DEL_MIN_CLUSTER_READS
+            or frac < _DEL_MIN_CLUSTER_FRACTION
+            or width > _DEL_MATE_CLUSTER_BP
+            or span < _DEL_MIN_GAP_BP
+        ):
+            continue
+        out.append((key, cluster))
+    return out
+
+
+def _same_chrom_deletion_cluster_member_reads(df: pd.DataFrame) -> pd.DataFrame:
+    """Read names in a ≥20% same-chrom del-bridge cluster (excluded from MEI_MAPPED)."""
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    empty = pd.DataFrame(columns=keys)
+    rows: list[dict[str, object]] = []
+    for key, cluster in _iter_qualifying_deletion_clusters(df):
+        for qname in cluster["read_name"].astype(str).unique():
+            if not qname:
+                continue
+            rows.append(
+                {
+                    "chrom": key[0],
+                    "window_start": key[1],
+                    "window_end": key[2],
+                    "read_name": qname,
+                }
+            )
+    return pd.DataFrame(rows) if rows else empty
+
+
+def _qualifying_deletion_far_end_loci(df: pd.DataFrame) -> pd.DataFrame:
+    """Locus keys plus far-end mate position for qualifying del-bridge clusters."""
+    keys = ["chrom", "window_start", "window_end", "deletion_mate_chrom", "deletion_mate_pos_median"]
+    empty = pd.DataFrame(columns=keys)
+    rows: list[dict[str, object]] = []
+    for key, cluster in _iter_qualifying_deletion_clusters(df):
+        rows.append(
+            {
+                "chrom": key[0],
+                "window_start": key[1],
+                "window_end": key[2],
+                "deletion_mate_chrom": str(cluster["mate_chrom"].iloc[0]),
+                "deletion_mate_pos_median": int(cluster["mate_pos"].median()),
+            }
+        )
+    return pd.DataFrame(rows) if rows else empty
+
+
+def _best_ungapped_identity(query: str, subject: str) -> float:
+    """Best full-query ungapped identity of query (or its reverse complement) in subject."""
+    q = (query or "").upper()
+    s = (subject or "").upper()
+    min_bp = int(_DPE_MEI_REMAP_MIN_CLIP_BP)
+    if len(q) < min_bp or not s:
+        return 0.0
+    rq = _revcomp(q)
+    if q in s or rq in s:
+        return 1.0
+    best = 0.0
+    n = len(q)
+    for probe in (q, rq):
+        if len(s) < n:
+            m = len(s)
+            if m < min_bp:
+                continue
+            for s_off, q_off in ((0, 0), (0, n - m)):
+                ident = 1.0 - (_hamming(probe[q_off : q_off + m], s[s_off : s_off + m]) / m)
+                if ident > best:
+                    best = ident
+            continue
+        lim = len(s) - n + 1
+        for i in range(lim):
+            window = s[i : i + n]
+            mism = 0
+            for a, b in zip(probe, window, strict=True):
+                if a != b:
+                    mism += 1
+            ident = 1.0 - (mism / n)
+            if ident > best:
+                best = ident
+                if best >= 0.999:
+                    return 1.0
+    return best
+
+
+def _new_deletion_split_aligner() -> PairwiseAligner:
+    """Create the in-process local aligner used for deletion-breakpoint clips."""
+    aligner = PairwiseAligner()
+    aligner.mode = "local"
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -3.0
+    aligner.open_gap_score = -4.0
+    aligner.extend_gap_score = -1.0
+    return aligner
+
+
+def _gapped_local_match(
+    query: str,
+    subject: str,
+    *,
+    min_query_coverage: float = _DEL_SPLIT_MIN_QUERY_COVERAGE,
+    min_edit_similarity: float = _DEL_SPLIT_MIN_EDIT_SIMILARITY,
+    max_indel_bp: int = _DEL_SPLIT_MAX_INDEL_BP,
+    aligner: PairwiseAligner | None = None,
+) -> bool:
+    """Match a full split clip locally, allowing substitutions and short indels.
+
+    Edit similarity is ``1 - edits/query_length``. Edits include substitutions,
+    all inserted/deleted bases, and query bases omitted from the local
+    alignment. Query coverage is checked independently, and no individual gap
+    may exceed ``max_indel_bp``.
+    """
+    q = (query or "").upper()
+    s = (subject or "").upper()
+    min_bp = int(_DPE_MEI_REMAP_MIN_CLIP_BP)
+    if len(q) < min_bp or not s:
+        return False
+    worker = aligner or _new_deletion_split_aligner()
+    for probe in (q, _revcomp(q)):
+        alignments = worker.align(s, probe)
+        try:
+            best = alignments[0]
+        except IndexError:
+            continue
+        coords = best.coordinates
+        query_start = int(coords[1, 0])
+        query_end = int(coords[1, -1])
+        query_span = query_end - query_start
+        if query_span / len(probe) < float(min_query_coverage):
+            continue
+
+        mismatches = 0
+        gap_bases = 0
+        longest_gap = 0
+        for idx in range(coords.shape[1] - 1):
+            target_start = int(coords[0, idx])
+            target_end = int(coords[0, idx + 1])
+            probe_start = int(coords[1, idx])
+            probe_end = int(coords[1, idx + 1])
+            target_step = target_end - target_start
+            probe_step = probe_end - probe_start
+            if target_step > 0 and probe_step > 0:
+                if target_step != probe_step:
+                    return False
+                mismatches += sum(
+                    a != b
+                    for a, b in zip(
+                        s[target_start:target_end],
+                        probe[probe_start:probe_end],
+                        strict=True,
+                    )
+                )
+            else:
+                gap = max(target_step, probe_step)
+                gap_bases += gap
+                longest_gap = max(longest_gap, gap)
+
+        if longest_gap > int(max_indel_bp):
+            continue
+        unaligned_query_bases = len(probe) - query_span
+        edits = mismatches + gap_bases + unaligned_query_bases
+        edit_similarity = 1.0 - (edits / len(probe))
+        if edit_similarity >= float(min_edit_similarity):
+            return True
+    return False
+
+
+def _same_chrom_deletion_split_member_reads(
+    split_df: pd.DataFrame,
+    disc_df: pd.DataFrame,
+    reference_fasta: Path | None,
+) -> pd.DataFrame:
+    """Split reads whose clip sequence resolves to the opposite deletion breakpoint."""
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    empty = pd.DataFrame(columns=keys)
+    if split_df is None or split_df.empty or reference_fasta is None:
+        return empty
+    fa_path = Path(reference_fasta)
+    if not fa_path.exists():
+        return empty
+    loci = _qualifying_deletion_far_end_loci(disc_df)
+    if loci.empty:
+        return empty
+
+    work = split_df.copy()
+    if "read_name" not in work.columns:
+        return empty
+    # Split evidence stores the clipped sequence as ``clip_seq``.  Do not use
+    # _discordant_anchor_mei_query_seq() here: it reads the DPE-only
+    # ``soft_clip_seq`` schema, which makes every production split row appear
+    # to have an empty clip.
+    if "clip_seq" not in work.columns:
+        return empty
+    work["del_clip_seq"] = work["clip_seq"].fillna("").astype(str)
+    work = work.loc[work["del_clip_seq"].fillna("").astype(str).str.len() >= int(_DPE_MEI_REMAP_MIN_CLIP_BP)]
+    if work.empty:
+        return empty
+    merged = work.merge(loci, on=["chrom", "window_start", "window_end"], how="inner")
+    if merged.empty:
+        return empty
+
+    try:
+        fasta = pysam.FastaFile(str(fa_path))
+    except (OSError, ValueError):
+        return empty
+
+    rows: list[dict[str, object]] = []
+    seq_cache: dict[tuple[str, int, int], str] = {}
+    aligner = _new_deletion_split_aligner()
+    try:
+        for rec in merged.itertuples(index=False):
+            chrom = str(rec.chrom)
+            mate_chrom = str(getattr(rec, "deletion_mate_chrom", "") or chrom)
+            chrom_norm = chrom.replace("chr", "").lower()
+            mate_norm = mate_chrom.replace("chr", "").lower()
+            if mate_chrom and mate_norm not in {chrom_norm, ""}:
+                fetch_chrom = mate_chrom
+            else:
+                fetch_chrom = chrom
+            mate = int(getattr(rec, "deletion_mate_pos_median", 0) or 0)
+            if mate <= 0:
+                continue
+            # The clipped sequence should resolve to the inferred opposite
+            # deletion breakpoint. Fetching candidate..mate spans the entire
+            # deleted interval unnecessarily and makes long deletions costly.
+            lo = max(0, mate - int(_DEL_SPLIT_PAD_BP))
+            hi = mate + int(_DEL_SPLIT_PAD_BP)
+            cache_key = (fetch_chrom, lo, hi)
+            if cache_key not in seq_cache:
+                try:
+                    seq_cache[cache_key] = fasta.fetch(fetch_chrom, lo, hi)
+                except (ValueError, KeyError, OSError):
+                    seq_cache[cache_key] = ""
+            if not _gapped_local_match(
+                str(rec.del_clip_seq),
+                seq_cache[cache_key],
+                aligner=aligner,
+            ):
+                continue
+            qname = str(rec.read_name)
+            if not qname:
+                continue
+            rows.append(
+                {
+                    "chrom": rec.chrom,
+                    "window_start": rec.window_start,
+                    "window_end": rec.window_end,
+                    "read_name": qname,
+                }
+            )
+    finally:
+        fasta.close()
+    return pd.DataFrame(rows) if rows else empty
+
+
+def _drop_deletion_cluster_reads(df: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
+    """Remove del-bridge cluster reads so they do not count as MEI identity/support."""
+    if df is None or df.empty or members is None or members.empty:
+        return df
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    if not all(col in df.columns for col in keys):
+        return df
+    flagged = df.merge(
+        members.loc[:, keys].drop_duplicates().assign(_del_cluster=1),
+        on=keys,
+        how="left",
+    )
+    return flagged.loc[flagged["_del_cluster"].isna()].drop(columns=["_del_cluster"])
+
+
+def _deletion_cluster_member_mask(df: pd.DataFrame, members: pd.DataFrame) -> pd.Series:
+    """Boolean mask of rows whose read is in a ≥20% same-chrom del-bridge cluster."""
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    keys = ["chrom", "window_start", "window_end", "read_name"]
+    if members is None or members.empty or not all(col in df.columns for col in keys):
+        return pd.Series(False, index=df.index)
+    row_key = df.loc[:, keys].astype(str).agg("\t".join, axis=1)
+    member_key = members.loc[:, keys].astype(str).agg("\t".join, axis=1)
+    return row_key.isin(set(member_key.tolist()))
+
+
+def _refresh_polya_rescue_excluding_del_cluster(
+    disc_hits: pd.DataFrame,
+    members: pd.DataFrame,
+) -> pd.DataFrame:
+    """Recompute polyA rescue without letting del-bridge Alu/L1 mates unlock it."""
+    if disc_hits is None or disc_hits.empty:
+        return disc_hits
+    work = disc_hits.copy()
+    del_mask = _deletion_cluster_member_mask(work, members)
+    if del_mask.any():
+        if "mei_hit" in work.columns:
+            work.loc[del_mask, "mei_hit"] = False
+        if "mate_mei_hit" in work.columns:
+            work.loc[del_mask, "mate_mei_hit"] = False
+    if "polya_rescue" in work.columns:
+        work["polya_rescue"] = False
+    if "mei_hit_source" in work.columns:
+        src = work["mei_hit_source"].fillna("").astype(str)
+        work.loc[src.eq("polya_rescue"), "mei_hit_source"] = ""
+    rescued = _rescue_polya_like_discordant_mei_hits(work)
+    out = disc_hits.copy()
+    if "polya_rescue" not in out.columns:
+        out["polya_rescue"] = False
+    out["polya_rescue"] = rescued["polya_rescue"].fillna(False).astype(bool)
+    if "mei_hit_source" in rescued.columns:
+        if "mei_hit_source" not in out.columns:
+            out["mei_hit_source"] = ""
+        old_src = out["mei_hit_source"].fillna("").astype(str)
+        out.loc[old_src.eq("polya_rescue"), "mei_hit_source"] = ""
+        new_src = rescued["mei_hit_source"].fillna("").astype(str)
+        out.loc[out["polya_rescue"], "mei_hit_source"] = new_src.loc[out["polya_rescue"]].to_numpy()
+    return out
+
+
 def _enrich_split_hits_with_mate_positions(
     split_hits: pd.DataFrame,
     bam_path: Path | None,
@@ -4596,6 +5073,7 @@ def _collect_indel_breakpoint_evidence(
     min_mapq: int = 20,
     min_indel_bp: int = 12,
     query_context_bases: int = 12,
+    reference_fasta: Path | None = None,
 ) -> pd.DataFrame:
     """Collect breakpoint-proximal CIGAR indel evidence assigned to candidate loci."""
     key_cols = ["chrom", "window_start", "window_end"]
@@ -4640,7 +5118,7 @@ def _collect_indel_breakpoint_evidence(
             span_by_chrom[chrom] = (min(lo, start), max(hi, end))
 
     rows: list[dict[str, object]] = []
-    with open_alignment(bam_path) as bam:
+    with open_alignment(bam_path, reference_filename=reference_fasta) as bam:
         for chrom, tree in trees.items():
             lo, hi = span_by_chrom[chrom]
             fetch_start0 = max(0, int(lo) - 1)
@@ -9743,6 +10221,141 @@ def _mean_depth_for_interval(
     return mean_depth
 
 
+def _deletion_flank_intervals(
+    breakpoint: int,
+    mate_pos: int,
+    *,
+    flank_bp: int = _DEL_FLANK_BP,
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """Intact flank and deletion-interior windows immediately beside the breakpoint."""
+    bp = int(breakpoint)
+    mate = int(mate_pos)
+    width = max(1, int(flank_bp))
+    if mate > bp:
+        interior_end = min(mate, bp + width)
+        if interior_end <= bp:
+            return None
+        intact = (max(1, bp - width), max(1, bp - 1))
+        interior = (bp + 1, interior_end)
+    elif mate < bp:
+        interior_start = max(1, mate, bp - width)
+        if interior_start >= bp:
+            return None
+        intact = (bp + 1, bp + width)
+        interior = (interior_start, bp - 1)
+    else:
+        return None
+    if intact[1] < intact[0] or interior[1] < interior[0]:
+        return None
+    return intact, interior
+
+
+def _deletion_depth_supports_del(
+    intact_depth: float,
+    interior_depth: float,
+    *,
+    max_ratio: float = _DEL_DEPTH_MAX_RATIO,
+    min_intact: float = _DEL_MIN_INTACT_DEPTH,
+) -> bool:
+    """True when interior depth is ≤65% of the intact flank (het-del or stronger)."""
+    intact = float(intact_depth)
+    interior = float(interior_depth)
+    if intact < float(min_intact):
+        return False
+    return interior <= intact * float(max_ratio)
+
+
+def _deletion_cluster_is_candidate(row: pd.Series, prefix: str) -> bool:
+    reads = float(pd.to_numeric(row.get(f"{prefix}_deletion_cluster_reads", 0), errors="coerce") or 0)
+    frac = float(pd.to_numeric(row.get(f"{prefix}_deletion_cluster_fraction", 0), errors="coerce") or 0)
+    width = float(pd.to_numeric(row.get(f"{prefix}_deletion_cluster_width_bp", 0), errors="coerce") or 0)
+    span = float(pd.to_numeric(row.get(f"{prefix}_deletion_span_bp", 0), errors="coerce") or 0)
+    return (
+        reads >= _DEL_MIN_CLUSTER_READS
+        and frac >= _DEL_MIN_CLUSTER_FRACTION
+        and width <= _DEL_MATE_CLUSTER_BP
+        and span >= _DEL_MIN_GAP_BP
+    )
+
+
+def _annotate_deletion_flank_depth(
+    candidates: pd.DataFrame,
+    disease_bam_path: Path | None,
+    control_bam_path: Path | None = None,
+) -> pd.DataFrame:
+    """Measure intact vs deletion-side depth for clustered del-bridge candidates."""
+    out = candidates.copy()
+    for prefix in ("disease", "control"):
+        out[f"{prefix}_deletion_intact_depth"] = 0.0
+        out[f"{prefix}_deletion_interior_depth"] = 0.0
+        out[f"{prefix}_deletion_depth_ratio"] = float("nan")
+        out[f"{prefix}_deletion_depth_drop"] = False
+    if out.empty or disease_bam_path is None:
+        return out
+
+    def _need_depth(row: pd.Series) -> bool:
+        return _deletion_cluster_is_candidate(row, "disease") or _deletion_cluster_is_candidate(row, "control")
+
+    idxs = [idx for idx, row in out.iterrows() if _need_depth(row)]
+    if not idxs:
+        return out
+
+    paths = {"disease": disease_bam_path, "control": control_bam_path or disease_bam_path}
+    with open_alignment(paths["disease"]) as disease_bam, open_alignment(paths["control"]) as control_bam:
+        bams = {"disease": disease_bam, "control": control_bam}
+        for idx in idxs:
+            row = out.loc[idx]
+            chrom = str(row["chrom"])
+            breakpoint = None
+            for col in ("insertion_breakpoint_pos", "consensus_insertion_breakpoint_pos"):
+                if col in row.index:
+                    raw_bp = pd.to_numeric(row.get(col), errors="coerce")
+                    if pd.notna(raw_bp) and int(raw_bp) > 0:
+                        breakpoint = int(raw_bp)
+                        break
+            if breakpoint is None:
+                breakpoint = (int(row["window_start"]) + int(row["window_end"])) // 2
+            for prefix in ("disease", "control"):
+                if not _deletion_cluster_is_candidate(row, prefix):
+                    continue
+                mate = int(
+                    pd.to_numeric(row.get(f"{prefix}_deletion_mate_pos_median", 0), errors="coerce") or 0
+                )
+                intervals = _deletion_flank_intervals(breakpoint, mate)
+                if intervals is None:
+                    continue
+                intact, interior = intervals
+                intact_d = _mean_depth_for_interval(bams[prefix], chrom, intact[0], intact[1])
+                interior_d = _mean_depth_for_interval(bams[prefix], chrom, interior[0], interior[1])
+                ratio = (interior_d / intact_d) if intact_d > 0 else float("nan")
+                out.at[idx, f"{prefix}_deletion_intact_depth"] = float(intact_d)
+                out.at[idx, f"{prefix}_deletion_interior_depth"] = float(interior_d)
+                out.at[idx, f"{prefix}_deletion_depth_ratio"] = float(ratio)
+                out.at[idx, f"{prefix}_deletion_depth_drop"] = _deletion_depth_supports_del(
+                    intact_d, interior_d
+                )
+    return out
+
+
+def _apply_complex_ins_with_del(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Label clustered same-chrom del bridges that also drop depth across the breakpoint."""
+    out = candidates.copy()
+    disease_drop = (
+        out["disease_deletion_depth_drop"].fillna(False).astype(bool)
+        if "disease_deletion_depth_drop" in out.columns
+        else pd.Series(False, index=out.index)
+    )
+    control_drop = (
+        out["control_deletion_depth_drop"].fillna(False).astype(bool)
+        if "control_deletion_depth_drop" in out.columns
+        else pd.Series(False, index=out.index)
+    )
+    out["complex_ins_with_del"] = disease_drop | control_drop
+    if out["complex_ins_with_del"].any():
+        out.loc[out["complex_ins_with_del"], "insertion_event_class"] = "COMPLEX_INS_WITH_DEL"
+    return out
+
+
 def _has_long_soft_clip(read: pysam.AlignedSegment, min_softclip: int = 20) -> bool:
     cigar = read.cigartuples
     if not cigar:
@@ -12756,6 +13369,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "known_mei_polymorphism_id",
         "known_mei_polymorphism_source",
         "insertion_event_class",
+        "complex_ins_with_del",
         "complex_mei_event",
         "classic_polya_mei_sidepair",
         "complex_sv_signature_label",
@@ -12772,6 +13386,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "sample_status_label",
         "insertion_call_tier",
         "insertion_event_class",
+        "complex_ins_with_del",
         "complex_mei_event",
         "asm_complex_class",
         "chrom",
@@ -13963,6 +14578,7 @@ def annotate_candidate_loci_with_mei(
     bwa_threads: int = 1,
 ) -> Path:
     total_t0 = time.monotonic()
+    bind_alignment_reference(reference_fasta)
     reuse_dir = Path(reuse_mei_annotate_dir) if reuse_mei_annotate_dir is not None else None
     bwa_threads = max(1, int(bwa_threads))
     load_t0 = time.monotonic()
@@ -14040,7 +14656,10 @@ def annotate_candidate_loci_with_mei(
             src_bam = control_bam_path or disease_bam_path
             if src_bam is not None:
                 indel_jobs["control"] = _collect_indel_breakpoint_evidence(
-                    src_bam, candidate, sample="control"
+                    src_bam,
+                    candidate,
+                    sample="control",
+                    reference_fasta=reference_fasta,
                 )
             indel_control = indel_jobs.get("control", pd.DataFrame())
             indel_disease = _relabel_frame_sample(indel_control, "disease")
@@ -14054,6 +14673,7 @@ def annotate_candidate_loci_with_mei(
                             disease_bam_path,
                             candidate,
                             sample="disease",
+                            reference_fasta=reference_fasta,
                         )
                     ] = "disease"
                 if control_bam_path is not None:
@@ -14063,6 +14683,7 @@ def annotate_candidate_loci_with_mei(
                             control_bam_path,
                             candidate,
                             sample="control",
+                            reference_fasta=reference_fasta,
                         )
                     ] = "control"
                 for fut in as_completed(indel_futs):
@@ -14344,23 +14965,64 @@ def annotate_candidate_loci_with_mei(
 
     split_disease_mei = _mei_rows_only(disease_hits, is_split=True)
     split_control_mei = _mei_rows_only(control_hits, is_split=True)
+    # Del-bridge clusters (same-chrom long-FR mates piling at one remote locus)
+    # are SV geometry, not insertion identity — drop them from MEI_MAPPED.
+    del_members_t = _same_chrom_deletion_cluster_member_reads(disease_disc_hits)
+    del_members_n = _same_chrom_deletion_cluster_member_reads(control_disc_hits)
+    disease_disc_hits = _refresh_polya_rescue_excluding_del_cluster(disease_disc_hits, del_members_t)
+    control_disc_hits = _refresh_polya_rescue_excluding_del_cluster(control_disc_hits, del_members_n)
+    disease_disc_hits_for_mei = _drop_deletion_cluster_reads(disease_disc_hits, del_members_t)
+    control_disc_hits_for_mei = _drop_deletion_cluster_reads(control_disc_hits, del_members_n)
+    disease_disc_hits_full_for_mei = _drop_deletion_cluster_reads(disease_disc_hits_full, del_members_t)
+    control_disc_hits_full_for_mei = _drop_deletion_cluster_reads(control_disc_hits_full, del_members_n)
+    # Split clips whose sequence is simply the other deletion end also are not MEI.
+    split_del_t = _same_chrom_deletion_split_member_reads(
+        disease_hits, disease_disc_hits, reference_fasta
+    )
+    split_del_n = _same_chrom_deletion_split_member_reads(
+        control_hits, control_disc_hits, reference_fasta
+    )
+    split_disease_mei = _drop_deletion_cluster_reads(split_disease_mei, split_del_t)
+    split_control_mei = _drop_deletion_cluster_reads(split_control_mei, split_del_n)
+    disease_hits_for_side_metrics = _drop_deletion_cluster_reads(disease_hits, split_del_t)
+    control_hits_for_side_metrics = _drop_deletion_cluster_reads(control_hits, split_del_n)
+    disease_hits_full_for_side_metrics = _drop_deletion_cluster_reads(disease_hits_full, split_del_t)
+    control_hits_full_for_side_metrics = _drop_deletion_cluster_reads(control_hits_full, split_del_n)
+    # The same physical read can appear in both SR and DPE evidence tables.
+    # Once its split clip resolves to the opposite reference breakpoint, none
+    # of that read's representations may contribute insertion identity.
+    disease_disc_hits_for_mei = _drop_deletion_cluster_reads(disease_disc_hits_for_mei, split_del_t)
+    control_disc_hits_for_mei = _drop_deletion_cluster_reads(control_disc_hits_for_mei, split_del_n)
+    disease_disc_hits_full_for_mei = _drop_deletion_cluster_reads(
+        disease_disc_hits_full_for_mei, split_del_t
+    )
+    control_disc_hits_full_for_mei = _drop_deletion_cluster_reads(
+        control_disc_hits_full_for_mei, split_del_n
+    )
+    if len(split_del_t) or len(split_del_n):
+        click.echo(
+            f"[mei-annotate] dropped del-breakpoint split clips from MEI_MAPPED "
+            f"disease={len(split_del_t)} control={len(split_del_n)}"
+        )
     # MEI_MAPPED for DPE: exclude same-chr mates within 1 kb (nearby ref MEIs).
     discordant_disease_mei = _discordant_rows_for_mei_mapped_support(
-        _mei_rows_only(disease_disc_hits, is_split=False)
+        _mei_rows_only(disease_disc_hits_for_mei, is_split=False)
     )
     discordant_control_mei = _discordant_rows_for_mei_mapped_support(
-        _mei_rows_only(control_disc_hits, is_split=False)
+        _mei_rows_only(control_disc_hits_for_mei, is_split=False)
     )
 
     metrics_t0 = time.monotonic()
-    disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits, sample_prefix="disease")
-    disc_n = _aggregate_discordant_mei_metrics(control_disc_hits, sample_prefix="control")
-    disc_t_full = _aggregate_discordant_mei_metrics(disease_disc_hits_full, sample_prefix="disease_full")
-    disc_n_full = _aggregate_discordant_mei_metrics(control_disc_hits_full, sample_prefix="control_full")
+    disc_t = _aggregate_discordant_mei_metrics(disease_disc_hits_for_mei, sample_prefix="disease")
+    disc_n = _aggregate_discordant_mei_metrics(control_disc_hits_for_mei, sample_prefix="control")
+    disc_t_full = _aggregate_discordant_mei_metrics(disease_disc_hits_full_for_mei, sample_prefix="disease_full")
+    disc_n_full = _aggregate_discordant_mei_metrics(control_disc_hits_full_for_mei, sample_prefix="control_full")
     disc_anchor_t = _aggregate_discordant_anchor_side_metrics(disease_disc_hits, sample_prefix="disease")
     disc_anchor_n = _aggregate_discordant_anchor_side_metrics(control_disc_hits, sample_prefix="control")
     disc_residual_t = _aggregate_discordant_residual_complex_metrics(disease_disc_hits, sample_prefix="disease")
     disc_residual_n = _aggregate_discordant_residual_complex_metrics(control_disc_hits, sample_prefix="control")
+    disc_del_t = _aggregate_same_chrom_deletion_dpe_metrics(disease_disc_hits, sample_prefix="disease")
+    disc_del_n = _aggregate_same_chrom_deletion_dpe_metrics(control_disc_hits, sample_prefix="control")
     click.echo(
         f"[mei-annotate] aggregated discordant MEI metrics "
         f"elapsed={time.monotonic() - metrics_t0:.1f}s"
@@ -14385,10 +15047,10 @@ def annotate_candidate_loci_with_mei(
     anno_parts = []
     side_t0 = time.monotonic()
     for sample_prefix, df, pref_map in (
-        ("disease", disease_hits, disease_pref_target),
-        ("control", control_hits, control_pref_target),
-        ("disease_full", disease_hits_full, disease_pref_target_full),
-        ("control_full", control_hits_full, control_pref_target_full),
+        ("disease", disease_hits_for_side_metrics, disease_pref_target),
+        ("control", control_hits_for_side_metrics, control_pref_target),
+        ("disease_full", disease_hits_full_for_side_metrics, disease_pref_target_full),
+        ("control_full", control_hits_full_for_side_metrics, control_pref_target_full),
     ):
         for side in ("L", "R"):
             anno_parts.append(
@@ -14428,6 +15090,10 @@ def annotate_candidate_loci_with_mei(
         candidate = candidate.merge(disc_residual_t, on=["chrom", "window_start", "window_end"], how="left")
     if not disc_residual_n.empty:
         candidate = candidate.merge(disc_residual_n, on=["chrom", "window_start", "window_end"], how="left")
+    if not disc_del_t.empty:
+        candidate = candidate.merge(disc_del_t, on=["chrom", "window_start", "window_end"], how="left")
+    if not disc_del_n.empty:
+        candidate = candidate.merge(disc_del_n, on=["chrom", "window_start", "window_end"], how="left")
     click.echo(
         f"[mei-annotate] merged discordant MEI support metrics "
         f"elapsed={time.monotonic() - merge_t0:.1f}s"
@@ -14669,6 +15335,18 @@ def annotate_candidate_loci_with_mei(
         )
     elif not empirical_stage:
         click.echo("[mei-annotate] empirical stage disabled (--no-empirical-stage)")
+    if disease_bam_path is not None:
+        del_t0 = time.monotonic()
+        candidate = _annotate_deletion_flank_depth(
+            candidate,
+            disease_bam_path=disease_bam_path,
+            control_bam_path=control_bam_path,
+        )
+        click.echo(
+            f"[mei-annotate] deletion flank depth candidates "
+            f"elapsed={time.monotonic() - del_t0:.1f}s"
+        )
+    candidate = _apply_complex_ins_with_del(candidate)
     candidate = _add_heuristic_assembly_like_vaf_fields(candidate)
     candidate = _assign_gold_stage(candidate, empirical_stage=empirical_stage)
 

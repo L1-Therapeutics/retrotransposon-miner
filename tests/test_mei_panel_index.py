@@ -111,10 +111,10 @@ def test_download_script_wires_postprocess_step() -> None:
     assert "index_public_mei_remap_fastas(outdir, force=force)" in text
 
 
-def test_annotate_indexes_panel_before_parallel_remaps() -> None:
+def test_annotate_indexes_panel_before_any_remaps() -> None:
     src = Path(__file__).resolve().parents[1] / "src" / "retro_miner" / "mei_support.py"
     text = src.read_text(encoding="utf-8")
-    marker = "ensuring MEI panel bwa index before disease∥control remaps"
+    marker = "ensuring MEI panel bwa index before remaps"
     assert marker in text
     after = text.split(marker, 1)[1]
     before_pool, _sep, _rest = after.partition("ThreadPoolExecutor(max_workers=2)")
