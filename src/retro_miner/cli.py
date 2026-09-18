@@ -10,8 +10,11 @@ import click
 from retro_miner.candidate_loci import build_candidate_loci
 from retro_miner.evidence_extract import (
     ExtractionSummary,
+    clone_extraction_summary,
+    clone_sample_evidence_tables,
     extract_split_and_discordant_evidence,
     extract_split_evidence,
+    same_alignment_path,
 )
 from retro_miner.mei_support import annotate_candidate_loci_with_mei
 
@@ -329,25 +332,39 @@ def extract_split_evidence_cmd(
     if not region_list:
         raise click.ClickException("No valid regions provided via --region/--regions.")
 
+    germline_same_bam = same_alignment_path(disease_bam, control_bam) and (
+        (disease_mate_bam is None and control_mate_bam is None)
+        or same_alignment_path(disease_mate_bam or disease_bam, control_mate_bam or control_bam)
+    )
     sample_jobs = [
         {
-            "sample": "disease",
-            "bam": disease_bam,
-            "mate_bam": disease_mate_bam,
-        },
-        {
-            "sample": "control",
-            "bam": control_bam,
-            "mate_bam": control_mate_bam,
+            "sample": "control" if germline_same_bam else "disease",
+            "bam": control_bam if germline_same_bam else disease_bam,
+            "mate_bam": (control_mate_bam or disease_mate_bam) if germline_same_bam else disease_mate_bam,
         },
     ]
-    workers = int(sample_workers)
-    mode = "in parallel" if workers > 1 else "sequentially"
-    click.echo(
-        f"[extract] running disease and control {mode} "
-        f"(sample_workers={workers}; regions={','.join(region_list)}; "
-        f"with_discordant={with_discordant}; fetch_mate_seq={fetch_mate_seq})"
-    )
+    if not germline_same_bam:
+        sample_jobs.append(
+            {
+                "sample": "control",
+                "bam": control_bam,
+                "mate_bam": control_mate_bam,
+            }
+        )
+    workers = 1 if germline_same_bam else int(sample_workers)
+    if germline_same_bam:
+        click.echo(
+            f"[extract] germline single-pass (same BAM for disease and control; "
+            f"regions={','.join(region_list)}; with_discordant={with_discordant}; "
+            f"fetch_mate_seq={fetch_mate_seq})"
+        )
+    else:
+        mode = "in parallel" if workers > 1 else "sequentially"
+        click.echo(
+            f"[extract] running disease and control {mode} "
+            f"(sample_workers={workers}; regions={','.join(region_list)}; "
+            f"with_discordant={with_discordant}; fetch_mate_seq={fetch_mate_seq})"
+        )
 
     results_by_sample: dict[str, _SampleExtractResult] = {}
     errors: list[str] = []
@@ -403,6 +420,26 @@ def extract_split_evidence_cmd(
             "Extract failed for one or more samples:\n  - " + "\n  - ".join(errors)
         )
 
+    if germline_same_bam:
+        src = next(iter(results_by_sample.values()))
+        dst_sample = "disease"
+        clone_sample_evidence_tables(outdir, src_sample=src.sample, dst_sample=dst_sample)
+        results_by_sample[dst_sample] = _SampleExtractResult(
+            sample=dst_sample,
+            split=clone_extraction_summary(src.split, dst_sample),
+            discordant=(
+                clone_extraction_summary(src.discordant, dst_sample)
+                if src.discordant is not None
+                else None
+            ),
+            split_elapsed_s=0.0,
+            discordant_elapsed_s=0.0,
+            total_elapsed_s=0.0,
+        )
+        click.echo(
+            f"[extract] cloned {src.sample} evidence -> {dst_sample} (no second BAM scan)"
+        )
+
     # Stable disease→control order for the summary table.
     split_summaries: list[ExtractionSummary] = []
     discordant_summaries: dict[str, ExtractionSummary] = {}
@@ -443,7 +480,12 @@ def extract_split_evidence_cmd(
                 f"{discordant_rows}\t{insert_threshold}\t{weak_only_filtered}\n"
             )
     click.echo(f"[summary] {summary_path}")
-    parallel_note = "disease∥control" if workers > 1 else "sequential samples"
+    if germline_same_bam:
+        parallel_note = "germline single-pass"
+    elif workers > 1:
+        parallel_note = "disease∥control"
+    else:
+        parallel_note = "sequential samples"
     click.echo(f"[extract] total_elapsed={time.monotonic() - cmd_t0:.1f}s ({parallel_note})")
 
 
