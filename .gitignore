@@ -27,6 +27,9 @@ tmp/
 *.cram
 *.crai
 *.sam
+# Small real-locus pytest snippets (see tests/fixtures/loci/)
+!tests/fixtures/**/*.bam
+!tests/fixtures/**/*.bai
 *.fastq
 *.fq
 *.vcf

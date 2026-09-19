@@ -1,0 +1,14 @@
+---
+description: Use real BAM/CRAM locus snippets for named-site tests; do not invent cartoon piles
+globs: tests/**/*.py
+alwaysApply: false
+---
+
+# Real locus fixtures
+
+When a test covers a named catalog/sentinel site, load
+`tests/fixtures/loci/<id>/` (BAM snippet + extract tables). Do not invent
+split/DPE piles for that locus.
+
+Cut new fixtures with `scripts/extract_locus_fixture.py`. Follow
+`.cursor/skills/real-locus-test-fixtures/SKILL.md`.
