@@ -129,6 +129,24 @@ Known control-only LINE-1 (`L1HS`, `nssv14066334`) with split-read and discordan
 
 Soft-clips and discordant clipped ends remap to the Dfam Alu/LINE-1/SVA panel with `bwa mem -k10 -T10` (`--bwa-threads`; wrapper auto: `nproc` single-chrom, `1` under multi-chrom concurrency). Nearby same-chrom clipped DPE mates remap the clip only; interchrom mates and same-chrom mates ≥500 kb away remap the reference-aligned body so a mate sitting on a reference-copy Alu/L1/SVA still counts as MEI identity. Coherent same-chrom deletion bridges are removed separately before MEI support is counted. Annotate writes fetched mate sequences to `discordant_mate_cache.*.parquet` beside the extract so later remaps skip CRAM. Queries are polyA/T-trimmed (≥8 bp) before align; consensus targets are also terminal-polyA-trimmed (sidecar `*.nopolya.fa`, and prep writes body-only Dfam/panel FASTAs) so clips cannot map onto the A-tail. Junction clips that are themselves polyA/T count as `polyA_MAPPED` only — never also `MEI_MAPPED`/SR. Short tips (≤30 bp) need qcov≥0.80 and pid≥0.90, longer clips need pid≥0.90 and alnlen≥20. Panel fragment hits project onto one family-consistent `*_full` axis via `mei_fragment_to_full_coords.tsv` (prep: `bwa mem -a` on trimmed sequences). Assembly contig-to-MEI still uses minimap2. Benchmark: `scripts/benchmark_mei_aligners.py`.
 
+## Gene annotation (Ensembl VEP)
+
+`rtm annotate-genes` adds gene-level consequence fields to an MEI VCF (symbolic `<INS:ME:ALU|LINE1|SVA>` ALT alleles). Each record gains `GENE` (symbols), `GENEID` (Ensembl IDs), `CSQ` (most severe Sequence Ontology term), `CSQ_TERMS` (all distinct terms), and `CSQ_NTX` (overlapping transcripts); `--tsv` also writes a flat table. Two backends share that contract:
+
+```bash
+# default: Ensembl VEP REST -- no install, no local data, network-bound (~0.3-0.6 s/variant)
+rtm annotate-genes --vcf calls.vcf --out calls.annot.vcf --tsv calls.annot.tsv
+
+# production / whole-genome: local snpEff -- ~55 s startup, then ~30 variants/s, Ensembl release pinned
+conda install -c bioconda -c conda-forge snpeff openjdk
+snpEff download -v GRCh38.115            # one-time, ~600 MB; use -v: silent mirror failures are common
+rtm annotate-genes --backend snpeff --snpeff-genome GRCh38.115 --vcf calls.vcf --out calls.annot.vcf
+```
+
+Measured on the 30 chr22 GRCh38 calls in `tests/data/chr22_mei.vcf` (VEP release 116; snpEff 5.4c `GRCh38.99`): both backends annotate 30/30; VEP 24 in genes, snpEff 23; most-severe term concordant at 25/30 after ranking snpEff's `ANN` list with Ensembl's severity table, with the 5 differences all due to genes absent from the older release-99 database. VEP: 9–19 s per 30 variants. snpEff: 57 s wall, ~1 s of it annotation; needs `-Xmx8g` (default heap OOMs on GRCh38).
+
+**SVLEN is not sent to VEP by default** (snpEff is unaffected). VEP recomputes a symbolic insertion's reference span as `POS + SVLEN` and ignores `END`, so a 6,018 bp L1 at chr22:19223382 was evaluated as a 6 kb span and reported `coding_sequence_variant` on 38 CLTCL1 transcripts; the breakpoint is intronic. The output VCF keeps `SVLEN` untouched (it is correct per VCF 4.4 §5.6); only the request omits it. `--keep-svlen` restores the old behaviour for comparison. Tool choice and measurements: [`docs/gene_annotation_tool_choice.md`](docs/gene_annotation_tool_choice.md).
+
 ## Getting Started on Amazon EC2 (Elastic Compute Cloud)
 
 For whole-genome runs, use at least `r6i.4xlarge`.
