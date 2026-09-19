@@ -557,6 +557,49 @@ def _write_contig_annotation_bed(variants: pd.DataFrame, snapshot_dir: Path) -> 
     return bed_path
 
 
+def _row_inferred_breakpoint_pos(row: object) -> int:
+    """Published insertion base, preferring consensus over the raw picker field."""
+    for attr in ("consensus_insertion_breakpoint_pos", "insertion_breakpoint_pos"):
+        raw = getattr(row, attr, 0)
+        try:
+            pos = int(raw or 0)
+        except (TypeError, ValueError):
+            pos = 0
+        if pos > 0:
+            return pos
+    return 0
+
+
+def _write_inferred_breakpoint_bed(variants: pd.DataFrame, snapshot_dir: Path) -> Path | None:
+    """One-base BED ticks so IGV snapshots show the inferred insertion coordinate."""
+    rows: list[str] = []
+    for rank, row in enumerate(variants.itertuples(index=False), start=1):
+        chrom = str(getattr(row, "chrom", "") or "")
+        pos = _row_inferred_breakpoint_pos(row)
+        if not chrom or pos <= 0:
+            continue
+        try:
+            _validate_igv_chrom(chrom)
+        except ValueError:
+            continue
+        source = re.sub(
+            r"[\t\n\r]+",
+            "_",
+            str(getattr(row, "breakpoint_evidence_source", "") or "") or "inferred_breakpoint",
+        )
+        label = re.sub(r"[\t\n\r]+", "_", f"rank{rank:03d}|{source}|{pos}")
+        start0 = pos - 1
+        # BED9 so IGV paints a red tick instead of the default feature color.
+        rows.append(
+            f"{chrom}\t{start0}\t{pos}\t{label}\t1000\t.\t{start0}\t{pos}\t220,20,60"
+        )
+    if not rows:
+        return None
+    bed_path = snapshot_dir / "inferred_breakpoints.bed"
+    bed_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return bed_path
+
+
 def build_igv_batch_script(
     variants: pd.DataFrame,
     *,
@@ -566,6 +609,7 @@ def build_igv_batch_script(
     snapshot_dir: Path,
     contig_annotation_bed: Path | None = None,
     contig_alignment_bam: Path | None = None,
+    breakpoint_bed: Path | None = None,
     panel_height_min: int = 250,
     panel_height_max: int = 8000,
 ) -> str:
@@ -593,6 +637,8 @@ def build_igv_batch_script(
             )
     if contig_annotation_bed is not None and contig_annotation_bed.exists():
         lines.append(f"load {_quote_igv_path(contig_annotation_bed.resolve())}")
+    if breakpoint_bed is not None and breakpoint_bed.exists():
+        lines.append(f"load {_quote_igv_path(breakpoint_bed.resolve())}")
 
     for rank, row in enumerate(variants.itertuples(index=False), start=1):
         chrom, start, end = _row_discovery_window(row)
@@ -744,6 +790,7 @@ def generate_gold_review_igv_plots(
             reference_fasta,
         )
     contig_annotation_bed = _write_contig_annotation_bed(variants, snapshot_dir)
+    breakpoint_bed = _write_inferred_breakpoint_bed(variants, snapshot_dir)
     contig_alignment_bam: Path | None = None
     if assembly_cache_dir is not None and assembly_cache_dir.exists():
         contig_alignment_bam = _build_assembly_contig_track(
@@ -761,6 +808,7 @@ def generate_gold_review_igv_plots(
         snapshot_dir=snapshot_dir,
         contig_annotation_bed=contig_annotation_bed,
         contig_alignment_bam=contig_alignment_bam,
+        breakpoint_bed=breakpoint_bed,
         panel_height_min=panel_height_min,
         panel_height_max=panel_height_max,
     )
