@@ -25,10 +25,12 @@ from retro_miner.igv_plots import (
     _igv_singleton_lock,
     _materialize_alignment_for_igv,
     _quote_igv_path,
+    _row_inferred_breakpoint_pos,
     _safe_snapshot_stem,
     _snapshot_png_looks_empty,
     _validate_igv_chrom,
     _verify_snapshot_pngs,
+    _write_inferred_breakpoint_bed,
     build_igv_batch_script,
 )
 
@@ -827,3 +829,48 @@ class TestIgvCramMaterialize:
         with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
             batch = build_igv_batch_script(_make_batch_variants("chr22"), **batch_setup)
         assert "setSleepInterval 2" in batch
+
+
+class TestInferredBreakpointBed:
+    def test_prefers_consensus_breakpoint(self):
+        row = pd.DataFrame(
+            [
+                {
+                    "chrom": "chr22",
+                    "consensus_insertion_breakpoint_pos": 49879732,
+                    "insertion_breakpoint_pos": 49879574,
+                }
+            ]
+        ).iloc[0]
+        assert _row_inferred_breakpoint_pos(row) == 49879732
+
+    def test_writes_one_base_red_tick_and_batch_loads_it(self, batch_setup, tmp_path):
+        variants = pd.DataFrame(
+            [
+                {
+                    "chrom": "chr22",
+                    "window_start": 49878612,
+                    "window_end": 49880399,
+                    "discovery_window_start": 49878612,
+                    "discovery_window_end": 49880399,
+                    "insertion_breakpoint_pos": 49879732,
+                    "breakpoint_evidence_source": "polyA",
+                    "assembly_best_contig_id": "",
+                }
+            ]
+        )
+        bed = _write_inferred_breakpoint_bed(variants, tmp_path)
+        assert bed is not None
+        text = bed.read_text(encoding="utf-8")
+        assert text.startswith("chr22\t49879731\t49879732\t")
+        assert "220,20,60" in text
+        assert "polyA" in text
+        with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
+            batch = build_igv_batch_script(variants, breakpoint_bed=bed, **batch_setup)
+        assert "inferred_breakpoints.bed" in batch
+
+    def test_skips_missing_breakpoint(self, tmp_path):
+        variants = pd.DataFrame(
+            [{"chrom": "chr22", "insertion_breakpoint_pos": 0, "assembly_best_contig_id": ""}]
+        )
+        assert _write_inferred_breakpoint_bed(variants, tmp_path) is None
