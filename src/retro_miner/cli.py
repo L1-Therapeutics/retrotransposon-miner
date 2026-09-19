@@ -1105,5 +1105,49 @@ def annotate_mei_support_cmd(
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 
 
+@cli.command("annotate-genes")
+@click.option("--vcf", "vcf_path", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Input MEI VCF (symbolic <INS:ME:*> ALT alleles; .vcf or .vcf.gz).")
+@click.option("--out", "out_path", required=True, type=click.Path(dir_okay=False, path_type=Path),
+              help="Output VCF with GENE/GENEID/CSQ/CSQ_TERMS/CSQ_NTX added to INFO.")
+@click.option("--tsv", "tsv_path", default=None, type=click.Path(dir_okay=False, path_type=Path),
+              help="Optional flat TSV (one row per record) alongside the VCF.")
+@click.option("--batch-size", default=200, show_default=True, type=click.IntRange(1, 200),
+              help="Variants per VEP REST request (rest.ensembl.org caps POST bodies at 200).")
+@click.option("--keep-svlen", is_flag=True, default=False,
+              help="[vep] Send SVLEN to VEP. Off by default because VEP widens symbolic insertions to a "
+                   "POS+SVLEN span and reports spurious exonic consequences (see gene_annotation.py).")
+@click.option("--backend", type=click.Choice(["vep", "snpeff"]), default="vep", show_default=True,
+              help="vep: Ensembl VEP REST, no install, network-bound (~0.3-0.6 s/variant). "
+                   "snpeff: local snpEff, ~55 s fixed startup then ~30 variants/s; needs a downloaded database.")
+@click.option("--snpeff-genome", default="GRCh38.99", show_default=True,
+              help="[snpeff] Database name as listed by `snpEff databases` (e.g. GRCh38.99, GRCh38.115, GRCh38.mane.1.2.ensembl).")
+@click.option("--snpeff-bin", default="snpEff", show_default=True, help="[snpeff] Launcher on PATH or full path.")
+@click.option("--snpeff-config", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="[snpeff] snpEff.config path (conda installs: <env>/share/snpeff-<ver>/snpEff.config).")
+@click.option("--snpeff-xmx", default="8g", show_default=True,
+              help="[snpeff] JVM heap. Default heap runs out of memory building the GRCh38 interval forest.")
+def annotate_genes_cmd(
+    vcf_path: Path, out_path: Path, tsv_path: Path | None, batch_size: int, keep_svlen: bool,
+    backend: str, snpeff_genome: str, snpeff_bin: str, snpeff_config: Path | None, snpeff_xmx: str,
+) -> None:
+    """Add gene / consequence annotation to an MEI VCF (Ensembl VEP REST or local snpEff)."""
+    from retro_miner.gene_annotation import annotate_vcf, annotate_vcf_snpeff
+
+    t0 = time.monotonic()
+    if backend == "snpeff":
+        stats = annotate_vcf_snpeff(vcf_path, out_path, snpeff_genome, tsv_path=tsv_path,
+                                    snpeff_bin=snpeff_bin, config=snpeff_config, xmx=snpeff_xmx)
+    else:
+        stats = annotate_vcf(vcf_path, out_path, tsv_path=tsv_path, keep_svlen=keep_svlen, batch_size=batch_size)
+    click.echo(
+        f"[annotate-genes] backend={backend} records={stats.n_records} annotated={stats.n_annotated} "
+        f"with_gene={stats.n_with_gene} unmatched={stats.n_unmatched} "
+        f"vep_seconds={stats.seconds:.1f} elapsed={time.monotonic() - t0:.1f}s -> {out_path}"
+    )
+    if stats.n_unmatched:
+        click.echo(f"[annotate-genes] WARNING: {stats.n_unmatched} record(s) not echoed back by VEP; left unannotated.", err=True)
+
+
 if __name__ == "__main__":
     cli()
