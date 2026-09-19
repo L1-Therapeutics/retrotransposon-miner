@@ -1,0 +1,2 @@
+chrom	window_start	window_end	tsd_left_breakpoint	tsd_right_breakpoint	tsd_len_estimate	tsd_detected	tsd_evidence_source
+chr22	49878612	49880399	0	0	0	False	

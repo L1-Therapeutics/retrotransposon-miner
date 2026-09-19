@@ -7605,6 +7605,18 @@ def _aggregate_discordant_anchor_side_metrics(df: pd.DataFrame, sample_prefix: s
 
 
 _WINDOW_BREAKPOINT_PILE_GAP_BP = 100
+# Discordant mates and leftover clips are a smear around the junction, not a
+# second breakpoint. Assign them to the nearest split/TSD/polyA pile.
+_DPE_SMEAR_ASSIGN_BP = 500
+# Per-read pile weights: type still prefers split > TSD > polyA > DPE, but a
+# handful of polyA/split reads cannot veto a much heavier insertion pile.
+_PILE_SCORE_SPLIT_MEI = 5
+_PILE_SCORE_POLYA = 3
+_PILE_SCORE_TSD = 4
+_PILE_SCORE_DPE = 1
+_PILE_SCORE_SPLIT_CLIP = 1
+_JUNCTION_EVIDENCE_KINDS = frozenset({"split", "polya"})
+_SMEAR_EVIDENCE_KINDS = frozenset({"dpe", "clip"})
 
 
 def _cluster_positions_by_gap(positions: list[int], max_gap_bp: int) -> list[list[int]]:
@@ -7622,6 +7634,28 @@ def _cluster_positions_by_gap(positions: list[int], max_gap_bp: int) -> list[lis
     return clusters
 
 
+def _nearest_cluster_idx(
+    pos: int,
+    clusters: list[list[int]],
+    max_dist_bp: int,
+) -> int | None:
+    """Return cluster index containing pos, or the nearest within max_dist_bp."""
+    best: int | None = None
+    best_d: int | None = None
+    for i, cl in enumerate(clusters):
+        lo = int(cl[0])
+        hi = int(cl[-1])
+        if lo <= pos <= hi:
+            return i
+        dist = lo - pos if pos < lo else pos - hi
+        if best_d is None or dist < best_d:
+            best_d = dist
+            best = i
+    if best is not None and best_d is not None and best_d <= int(max_dist_bp):
+        return best
+    return None
+
+
 def _mode_int_pos(positions: list[int]) -> int:
     if not positions:
         return 0
@@ -7630,11 +7664,29 @@ def _mode_int_pos(positions: list[int]) -> int:
     return int(pos)
 
 
+def _score_breakpoint_pile(
+    *,
+    n_split: int,
+    n_polya: int,
+    n_dpe: int,
+    n_clip: int,
+    has_tsd: bool,
+) -> int:
+    """Weighted MEI-support score for one evidence pile."""
+    return (
+        int(_PILE_SCORE_SPLIT_MEI) * int(n_split)
+        + int(_PILE_SCORE_POLYA) * int(n_polya)
+        + (int(_PILE_SCORE_TSD) if has_tsd else 0)
+        + int(_PILE_SCORE_DPE) * int(n_dpe)
+        + int(_PILE_SCORE_SPLIT_CLIP) * int(n_clip)
+    )
+
+
 def _collect_window_breakpoint_evidence(
     split_frames: list[pd.DataFrame | None],
     discordant_frames: list[pd.DataFrame | None],
 ) -> pd.DataFrame:
-    """Per-read junction positions labeled split / polyA / DPE for in-window pile scoring."""
+    """Per-read junction positions labeled split / polyA / clip / DPE for pile scoring."""
     rows: list[dict[str, object]] = []
     required = {"chrom", "window_start", "window_end", "pos", "read_name"}
     for sdf in split_frames:
@@ -7657,7 +7709,7 @@ def _collect_window_breakpoint_evidence(
             elif bool(is_polya):
                 kind = "polya"
             else:
-                continue
+                kind = "clip"
             rows.append(
                 {
                     "chrom": str(chrom_i),
@@ -7708,72 +7760,107 @@ def _choose_best_pile_for_locus(
     tsd_right: int,
     tsd_source: str,
     pile_gap_bp: int,
+    dpe_smear_bp: int = _DPE_SMEAR_ASSIGN_BP,
 ) -> tuple[int, str]:
-    """Pick one breakpoint pile: split MEI > TSD > polyA > DPE MEI."""
-    positions: list[int] = []
-    if evidence is not None and not evidence.empty:
-        positions.extend(int(p) for p in evidence["pos"].tolist())
+    """Pick the junction pile with the highest weighted score.
+
+    Split / TSD / polyA define piles. Discordant MEI reads and leftover clips
+    are a smear around those junctions and are assigned to the nearest pile;
+    they do not set the published coordinate when junction evidence exists.
+    """
     tsd_left_i = int(tsd_left or 0)
     tsd_right_i = int(tsd_right or 0)
     tsd_ok = tsd_left_i > 0 and tsd_right_i >= tsd_left_i
-    if tsd_ok:
-        positions.extend([tsd_left_i, tsd_right_i])
-    if not positions:
-        return 0, ""
+    tsd_source_s = str(tsd_source or "").strip() or "tsd"
 
-    clusters = _cluster_positions_by_gap(positions, pile_gap_bp)
+    junction_pos: list[int] = []
+    smear_recs: list[object] = []
+    if evidence is not None and not evidence.empty:
+        for rec in evidence.itertuples(index=False):
+            kind = str(rec.kind)
+            pos_i = int(rec.pos)
+            if pos_i <= 0:
+                continue
+            if kind in _SMEAR_EVIDENCE_KINDS:
+                smear_recs.append(rec)
+            elif kind in _JUNCTION_EVIDENCE_KINDS:
+                junction_pos.append(pos_i)
+    if tsd_ok:
+        junction_pos.extend([tsd_left_i, tsd_right_i])
+
+    leftover_smear: list[object] = []
+    if junction_pos:
+        clusters = _cluster_positions_by_gap(junction_pos, pile_gap_bp)
+        for rec in smear_recs:
+            if _nearest_cluster_idx(int(rec.pos), clusters, int(dpe_smear_bp)) is None:
+                leftover_smear.append(rec)
+    else:
+        clusters = []
+        leftover_smear = list(smear_recs)
+
+    extra_start = len(clusters)
+    if leftover_smear:
+        extra = _cluster_positions_by_gap([int(rec.pos) for rec in leftover_smear], pile_gap_bp)
+        clusters = clusters + extra
+
     if not clusters:
         return 0, ""
-
-    def _cluster_idx(pos: int) -> int | None:
-        best: int | None = None
-        best_d: int | None = None
-        for i, cl in enumerate(clusters):
-            lo = int(cl[0])
-            hi = int(cl[-1])
-            if lo <= pos <= hi:
-                return i
-            dist = lo - pos if pos < lo else pos - hi
-            if dist <= int(pile_gap_bp) and (best_d is None or dist < best_d):
-                best_d = dist
-                best = i
-        return best
 
     n = len(clusters)
     split_reads: list[set[str]] = [set() for _ in range(n)]
     polya_reads: list[set[str]] = [set() for _ in range(n)]
     dpe_reads: list[set[str]] = [set() for _ in range(n)]
+    clip_reads: list[set[str]] = [set() for _ in range(n)]
     split_pos: list[list[int]] = [[] for _ in range(n)]
     polya_pos: list[list[int]] = [[] for _ in range(n)]
     dpe_pos: list[list[int]] = [[] for _ in range(n)]
+    clip_pos: list[list[int]] = [[] for _ in range(n)]
+
+    def _add(idx: int | None, rec: object) -> None:
+        if idx is None:
+            return
+        name = str(rec.read_name)
+        kind = str(rec.kind)
+        pos_i = int(rec.pos)
+        if kind == "split":
+            split_reads[idx].add(name)
+            split_pos[idx].append(pos_i)
+        elif kind == "polya":
+            polya_reads[idx].add(name)
+            polya_pos[idx].append(pos_i)
+        elif kind == "dpe":
+            dpe_reads[idx].add(name)
+            dpe_pos[idx].append(pos_i)
+        elif kind == "clip":
+            clip_reads[idx].add(name)
+            clip_pos[idx].append(pos_i)
+
     if evidence is not None and not evidence.empty:
         for rec in evidence.itertuples(index=False):
-            idx = _cluster_idx(int(rec.pos))
-            if idx is None:
-                continue
-            name = str(rec.read_name)
             kind = str(rec.kind)
             pos_i = int(rec.pos)
-            if kind == "split":
-                split_reads[idx].add(name)
-                split_pos[idx].append(pos_i)
-            elif kind == "polya":
-                polya_reads[idx].add(name)
-                polya_pos[idx].append(pos_i)
-            elif kind == "dpe":
-                dpe_reads[idx].add(name)
-                dpe_pos[idx].append(pos_i)
+            if kind in _JUNCTION_EVIDENCE_KINDS:
+                _add(_nearest_cluster_idx(pos_i, clusters[:extra_start] or clusters, int(pile_gap_bp)), rec)
+            elif kind in _SMEAR_EVIDENCE_KINDS:
+                idx = None
+                if extra_start:
+                    idx = _nearest_cluster_idx(pos_i, clusters[:extra_start], int(dpe_smear_bp))
+                if idx is None and leftover_smear:
+                    idx = _nearest_cluster_idx(pos_i, clusters[extra_start:], int(pile_gap_bp))
+                    if idx is not None:
+                        idx = extra_start + idx
+                _add(idx, rec)
 
-    best_key: tuple[int, int, int, int, int] | None = None
+    best_key: tuple[int, int, int, int, int, int, int] | None = None
     best_pos = 0
     best_source = ""
-    tsd_source_s = str(tsd_source or "").strip() or "tsd"
     for i, cl in enumerate(clusters):
         pile_lo = int(cl[0])
         pile_hi = int(cl[-1])
         n_split = len(split_reads[i])
         n_polya = len(polya_reads[i])
         n_dpe = len(dpe_reads[i])
+        n_clip = len(clip_reads[i])
         has_tsd = False
         if tsd_ok:
             if tsd_left_i <= pile_hi and tsd_right_i >= pile_lo:
@@ -7782,10 +7869,16 @@ def _choose_best_pile_for_locus(
                 mid = int((tsd_left_i + tsd_right_i) // 2)
                 if (pile_lo - int(pile_gap_bp)) <= mid <= (pile_hi + int(pile_gap_bp)):
                     has_tsd = True
-        if n_split == 0 and n_polya == 0 and n_dpe == 0 and not has_tsd:
+        if n_split == 0 and n_polya == 0 and n_dpe == 0 and n_clip == 0 and not has_tsd:
             continue
-        # Exact base inside the winning pile: TSD midpoint if present, else the
-        # strongest evidence type's mode.
+        score = _score_breakpoint_pile(
+            n_split=n_split,
+            n_polya=n_polya,
+            n_dpe=n_dpe,
+            n_clip=n_clip,
+            has_tsd=has_tsd,
+        )
+        # Junction evidence sets the published base. DPE mode is last-resort.
         if has_tsd:
             pos = int((tsd_left_i + tsd_right_i) // 2)
             source = tsd_source_s
@@ -7795,10 +7888,21 @@ def _choose_best_pile_for_locus(
         elif n_polya:
             pos = _mode_int_pos(polya_pos[i])
             source = "polyA"
+        elif n_clip:
+            pos = _mode_int_pos(clip_pos[i])
+            source = "split_clip"
         else:
             pos = _mode_int_pos(dpe_pos[i])
             source = "dpe_mei"
-        key = (n_split, 1 if has_tsd else 0, n_polya, n_dpe, -int(pos))
+        key = (
+            int(score),
+            n_split,
+            1 if has_tsd else 0,
+            n_polya,
+            n_dpe,
+            n_clip,
+            -int(pos),
+        )
         if best_key is None or key > best_key:
             best_key = key
             best_pos = int(pos)
