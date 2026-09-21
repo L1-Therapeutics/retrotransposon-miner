@@ -166,7 +166,7 @@ After the instance is running:
 
 Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab). On a shared AWS account, each IAM user gets their own key pair (`retrotransposon-miner-<region>-<iam-user>`). If `~/.ssh/id_ed25519.pub` or `id_rsa.pub` exists, that public key is imported — bootstrap does not reuse another user’s PEM.
 
-`bootstrap` launches an **on-demand** `m7i.8xlarge` by default (32 vCPU / 128 GiB). `SPOT=1` switches to cheaper Spot (persistent, stop-on-interruption: reclaim keeps the EBS disk and `start-instance` / `stop-instance` still work). Launch does **not** pin an AZ; AWS places the instance in a default-VPC zone that has capacity. `SUBNET_ID` pins a subnet (and therefore an AZ). `start-instance` cannot change AZ; if start fails for capacity, retry later or `bootstrap` a new VM. If you terminate a Spot instance from the console, cancel its Spot request or AWS may launch a replacement.
+`bootstrap` launches an **on-demand** `m7i.4xlarge` by default (16 vCPU / 64 GiB). `INSTANCE_TYPE=m7i.8xlarge` is the larger shape for whole-genome runs. `SPOT=1` switches to cheaper Spot (persistent, stop-on-interruption: reclaim keeps the EBS disk and `start-instance` / `stop-instance` still work). Launch does **not** pin an AZ; AWS places the instance in a default-VPC zone that has capacity. `SUBNET_ID` pins a subnet (and therefore an AZ). `start-instance` cannot change AZ; if start fails for capacity, retry later or `bootstrap` a new VM. If you terminate a Spot instance from the console, cancel its Spot request or AWS may launch a replacement.
 
 ```bash
 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap
@@ -213,7 +213,7 @@ Optional environment variables:
 - `SSH_USER` — SSH login user (auto-detected from AMI if unset; e.g. `ec2-user`, `ubuntu`)
 - `KEY_PATH` — path to the private key for the instance (PEM or `~/.ssh/id_ed25519`)
 - `KEY_NAME` / `KEY_OWNER` — override the per-user EC2 key pair name (default: `retrotransposon-miner-<region>-<iam-user>`)
-- `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `m7i.8xlarge`)
+- `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `m7i.4xlarge`)
 - `SPOT` — `0` (default) launches on-demand; `1` launches a Spot instance (`bootstrap` only)
 - `SUBNET_ID` — pin `bootstrap` to one subnet/AZ. Default: omit subnet so AWS chooses an AZ with capacity.
 - `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)

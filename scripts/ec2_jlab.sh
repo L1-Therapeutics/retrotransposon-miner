@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-m7i.8xlarge}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-m7i.4xlarge}"
 # On-demand by default (stable first-run). SPOT=1 launches cheaper Spot instead.
 SPOT="${SPOT:-0}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
@@ -1083,7 +1083,7 @@ Lifecycle:
 JupyterLab:
   start-jlab | stop-jlab | start-tunnel
 
-Create a new EC2 for this project (on-demand m7i.8xlarge by default):
+Create a new EC2 for this project (on-demand m7i.4xlarge by default):
   bootstrap
   S3_BUCKET=s3://<your-bucket> $0 bootstrap
   SPOT=1 $0 bootstrap
@@ -1096,7 +1096,7 @@ If you can reach the instance via Instance Connect but not SSH:
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
-  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.8xlarge / 200)
+  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.4xlarge / 200)
   SPOT (bootstrap only; default 0 = on-demand; 1 = Spot)
   SUBNET_ID (bootstrap only; pin one subnet/AZ. Default: AWS chooses AZ)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
