@@ -109,7 +109,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--loci", type=Path, required=True)
     p.add_argument("--truth", type=Path, nargs="+", required=True)
-    p.add_argument("--pad", type=int, default=200)
+    p.add_argument("--pad", type=int, default=300)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 

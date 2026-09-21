@@ -9822,9 +9822,10 @@ _COMPLEX_SPLIT_MIN_MODE_FRAC = 0.50
 _COMPLEX_LOCUS_STRONG_MIN_FRACTION = 0.60
 _COMPLEX_LOCUS_WEAK_MIN_FRACTION = 0.50
 _COMPLEX_RESIDUAL_MIN_UNIQUE_READS = 2
-# COMPLEX_INS: MEI_MAPPED must be weak relative to residual discordants.
-_COMPLEX_INS_MAX_MEI_MAPPED = 2
-_COMPLEX_INS_MEI_FRAC_OF_RESIDUAL = 0.25
+# COMPLEX_INS only when MEI is weak vs DPE *and* the absolute MEI pile is small.
+# Keep as MEI (SIMPLE_MEI / MEI_WITH_COMPLEX) when MEI/DPE >= 0.25 or MEI_MAPPED >= 8.
+_COMPLEX_INS_MAX_MEI_MAPPED = 8
+_COMPLEX_INS_MEI_FRAC_OF_DPE = 0.25
 _COMPLEX_INS_MIN_SPLIT_MODE_SUPPORT = 2
 # DPE anchors closer than this to the breakpoint are "parked" at the junction
 # and do not occupy a genomic flank in read-architecture plots.
@@ -10869,12 +10870,14 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
         ],
         axis=1,
     ).max(axis=1)
-    mei_of_residual = mei_mapped_max.astype(float) / (
-        mei_mapped_max.astype(float) + residual_unique.astype(float)
-    ).clip(lower=1.0)
-    weak_mei_for_complex_ins = (mei_mapped_max <= int(_COMPLEX_INS_MAX_MEI_MAPPED)) | (
-        mei_of_residual < float(_COMPLEX_INS_MEI_FRAC_OF_RESIDUAL)
+    dpe_mapped_max = pd.concat([d_dpe_l + d_dpe_r, c_dpe_l + c_dpe_r], axis=1).max(axis=1)
+    mei_of_dpe = mei_mapped_max.astype(float) / dpe_mapped_max.astype(float).clip(lower=1.0)
+    # No DPE pile: treat any MEI hit as a passing ratio so COMPLEX_INS cannot fire.
+    mei_of_dpe = mei_of_dpe.where(dpe_mapped_max.gt(0), mei_mapped_max.gt(0).astype(float))
+    strong_mei_against_complex_ins = (mei_of_dpe >= float(_COMPLEX_INS_MEI_FRAC_OF_DPE)) | (
+        mei_mapped_max >= int(_COMPLEX_INS_MAX_MEI_MAPPED)
     )
+    weak_mei_for_complex_ins = ~strong_mei_against_complex_ins
     strong_residual_ins = (
         out["complex_sv_interchrom_flag"].fillna(False).astype(bool)
         | out["complex_sv_large_insert_flag"].fillna(False).astype(bool)

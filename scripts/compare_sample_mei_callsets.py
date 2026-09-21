@@ -87,7 +87,7 @@ def main() -> None:
     p.add_argument("--ont-svim", type=Path, required=True, help="SVIM-asm multi-sample BCF/VCF")
     p.add_argument("--ont-svan", type=Path, required=True, help="SVAN noGt annotation BCF for those IDs")
     p.add_argument("--outdir", type=Path, required=True)
-    p.add_argument("--pad-bp", type=int, default=200, help="Overlap pad around the RTM breakpoint")
+    p.add_argument("--pad-bp", type=int, default=300, help="Overlap pad around the RTM breakpoint")
     p.add_argument("--require-family", action="store_true", help="Require ALU/LINE1/SVA to match")
     p.add_argument("--min-ont-recall", type=float, default=0.80)
     p.add_argument(
