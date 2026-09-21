@@ -46,7 +46,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 
 ## Current Limitations
 
-- Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. For larger runs, `r6i.4xlarge` or greater is recommended, and local assembly/candidate processing support parallel execution.
+- Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. For larger runs, `r7a.4xlarge` or greater is recommended, and local assembly/candidate processing support parallel execution.
 - Artificial intelligence/machine learning (AI/ML) genotyping confidence models are still under active development.
 - Reverse-transcribed pseudogene insertion support is not yet added.
 - Support for species other than *Homo sapiens* (for example, *Mus musculus*) is not yet implemented.
@@ -131,7 +131,7 @@ Soft-clips and discordant clipped ends remap to the Dfam Alu/LINE-1/SVA panel wi
 
 ## Getting Started on Amazon EC2 (Elastic Compute Cloud)
 
-For whole-genome runs, use at least `r6i.4xlarge`.
+For whole-genome runs, use at least `r7a.4xlarge`.
 
 The EC2 helper script (`scripts/ec2_jlab.sh`) works with **any existing EC2 instance** in your AWS account. Instance IDs and names are **not hardcoded in the repository**; each user binds their own instance locally to `.ec2-instance.env` (gitignored).
 
@@ -166,7 +166,7 @@ After the instance is running:
 
 Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab). On a shared AWS account, each IAM user gets their own key pair (`retrotransposon-miner-<region>-<iam-user>`). If `~/.ssh/id_ed25519.pub` or `id_rsa.pub` exists, that public key is imported — bootstrap does not reuse another user’s PEM.
 
-`bootstrap` launches a **Spot** `r6i.4xlarge` by default. Pipeline data lives on EBS; the Spot request is persistent with stop-on-interruption, so if AWS reclaims the VM the disk is kept and `start-instance` / `stop-instance` still work. If start fails for capacity, retry later or use on-demand. If you terminate the instance from the console, cancel its Spot request or AWS may launch a replacement.
+`bootstrap` launches a **Spot** `r7a.4xlarge` by default. Pipeline data lives on EBS; the Spot request is persistent with stop-on-interruption, so if AWS reclaims the VM the disk is kept and `start-instance` / `stop-instance` still work. If start fails for capacity, retry later, pick another AZ with `SUBNET_ID`, or use on-demand. If you terminate the instance from the console, cancel its Spot request or AWS may launch a replacement.
 
 ```bash
 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap
@@ -213,8 +213,9 @@ Optional environment variables:
 - `SSH_USER` — SSH login user (auto-detected from AMI if unset; e.g. `ec2-user`, `ubuntu`)
 - `KEY_PATH` — path to the private key for the instance (PEM or `~/.ssh/id_ed25519`)
 - `KEY_NAME` / `KEY_OWNER` — override the per-user EC2 key pair name (default: `retrotransposon-miner-<region>-<iam-user>`)
-- `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r6i.4xlarge`)
+- `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r7a.4xlarge`)
 - `SPOT` — `1` (default) launches a Spot instance; `0` launches on-demand (`bootstrap` only)
+- `SUBNET_ID` — subnet for `bootstrap` only (default: first default-for-AZ subnet). Set this to land in another AZ when Spot capacity is tight.
 - `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)
 - `ROOT_VOLUME_IOPS` / `ROOT_VOLUME_THROUGHPUT_MB` — gp3 IOPS and MB/s for `bootstrap` only (default: `4000` / `1000`). AWS requires throughput ≤ 0.25 × IOPS; 1000 MB/s needs at least 4000 IOPS. The gp3 baseline (3000 / 125) is the usual WGS stage bottleneck.
 - `S3_BUCKET` — bucket the instance may read/write (example: `s3://<your-bucket>`); creates/reuses an instance profile, does not copy local keys
