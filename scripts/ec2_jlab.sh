@@ -5,6 +5,8 @@ APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-r6i.4xlarge}"
+# Spot by default (cheaper). SPOT=0 launches on-demand instead.
+SPOT="${SPOT:-1}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
 # gp3 throughput/IOPS are independently provisioned, but AWS requires
 # throughput (MB/s) <= 0.25 * IOPS. 1000 MB/s therefore needs >= 4000 IOPS.
@@ -621,6 +623,13 @@ default_create_instance_name() {
   echo "${APP_NAME}-${INSTANCE_TYPE}-$(date +%Y%m%d%H%M%S)"
 }
 
+want_spot() {
+  case "${SPOT}" in
+    0|false|False|no|NO|off|OFF|on-demand|ondemand) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 bind_instance() {
   local sel="${1:-${INSTANCE_ID:-}}" iid
   [[ -n "${sel}" ]] || {
@@ -643,7 +652,7 @@ bind_instance() {
 }
 
 create_instance() {
-  local instance_id ami subnet sg_id create_name bucket_name ud_file="" tags
+  local instance_id ami subnet sg_id create_name bucket_name ud_file="" tags market_tag=""
   local -a run_args
   ami="$(get_latest_al2023_ami)"
   subnet="$(get_default_subnet)"
@@ -651,7 +660,10 @@ create_instance() {
   ensure_key_pair
 
   create_name="$(default_create_instance_name)"
-  tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}}]"
+  if want_spot; then
+    market_tag=",{Key=Market,Value=spot}"
+  fi
+  tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}}${market_tag}]"
   if [[ -n "${S3_BUCKET}" ]]; then
     bucket_name="$(s3_bucket_name "${S3_BUCKET}")"
     S3_BUCKET="$(s3_bucket_uri "${S3_BUCKET}")"
@@ -661,10 +673,14 @@ create_instance() {
     ensure_iam_instance_profile_for_bucket "${bucket_name}"
     ud_file="$(mktemp)"
     build_s3_user_data > "${ud_file}"
-    tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}},{Key=S3Bucket,Value=${bucket_name}},{Key=S3CachePrefix,Value=${S3_CACHE_PREFIX}}]"
+    tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}},{Key=S3Bucket,Value=${bucket_name}},{Key=S3CachePrefix,Value=${S3_CACHE_PREFIX}}${market_tag}]"
   fi
 
-  log "Creating instance ${create_name} (${INSTANCE_TYPE})"
+  if want_spot; then
+    log "Creating Spot instance ${create_name} (${INSTANCE_TYPE}; persistent, stop on interruption so EBS is kept)"
+  else
+    log "Creating on-demand instance ${create_name} (${INSTANCE_TYPE})"
+  fi
   run_args=(
     --image-id "${ami}"
     --instance-type "${INSTANCE_TYPE}"
@@ -677,6 +693,12 @@ create_instance() {
     --query "Instances[0].InstanceId"
     --output text
   )
+  if want_spot; then
+    # Persistent + stop: AWS reclaim (or stop-instance) keeps the EBS root
+    # volume; start-instance attaches the same disk. Omit MaxPrice so the
+    # cap is the on-demand price.
+    run_args+=(--instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}')
+  fi
   if [[ -n "${S3_BUCKET}" ]]; then
     run_args+=(--iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}")
     run_args+=(--user-data "file://${ud_file}")
@@ -708,7 +730,10 @@ start_instance() {
   local iid
   iid="$(require_instance_id)"
   log "Starting instance ${iid}"
-  awsq ec2 start-instances --instance-ids "${iid}" >/dev/null 2>&1 || true
+  if ! awsq ec2 start-instances --instance-ids "${iid}" >/dev/null; then
+    log "Start failed. If this is a Spot instance, AWS may not have capacity; retry later or bootstrap with SPOT=0 for on-demand."
+    exit 1
+  fi
   awsq ec2 wait instance-running --instance-ids "${iid}"
   awsq ec2 wait instance-status-ok --instance-ids "${iid}"
   log "Instance is running and healthy."
@@ -982,14 +1007,14 @@ status() {
   fi
   awsq ec2 describe-instances \
     --instance-ids "${iid}" \
-    --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress,Type:InstanceType,Name:Tags[?Key==`Name`]|[0].Value}' \
+    --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress,Type:InstanceType,Lifecycle:InstanceLifecycle,Name:Tags[?Key==`Name`]|[0].Value}' \
     --output table
 }
 
 list_instances() {
   awsq ec2 describe-instances \
     --filters Name=instance-state-name,Values=pending,running,stopping,stopped \
-    --query 'sort_by(Reservations[].Instances[], &LaunchTime)[].{InstanceId:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value,Type:InstanceType,PublicIp:PublicIpAddress,LaunchTime:LaunchTime}' \
+    --query 'sort_by(Reservations[].Instances[], &LaunchTime)[].{InstanceId:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value,Type:InstanceType,Lifecycle:InstanceLifecycle,PublicIp:PublicIpAddress,LaunchTime:LaunchTime}' \
     --output table
 }
 
@@ -1052,9 +1077,10 @@ Lifecycle:
 JupyterLab:
   start-jlab | stop-jlab | start-tunnel
 
-Create a new EC2 for this project:
+Create a new EC2 for this project (Spot r6i.4xlarge by default):
   bootstrap
   S3_BUCKET=s3://<your-bucket> $0 bootstrap
+  SPOT=0 $0 bootstrap
   S3_BUCKET=s3://<your-bucket> $0 attach-s3
 
 If you can reach the instance via Instance Connect but not SSH:
@@ -1064,7 +1090,8 @@ If you can reach the instance via Instance Connect but not SSH:
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
-  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default 200)
+  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default r6i.4xlarge / 200)
+  SPOT (bootstrap only; default 1 = Spot; 0 = on-demand)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
   S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
   S3_CACHE_PREFIX (default: s3://<bucket>/public)

@@ -166,8 +166,11 @@ After the instance is running:
 
 Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab). On a shared AWS account, each IAM user gets their own key pair (`retrotransposon-miner-<region>-<iam-user>`). If `~/.ssh/id_ed25519.pub` or `id_rsa.pub` exists, that public key is imported — bootstrap does not reuse another user’s PEM.
 
+`bootstrap` launches a **Spot** `r6i.4xlarge` by default. Pipeline data lives on EBS; the Spot request is persistent with stop-on-interruption, so if AWS reclaims the VM the disk is kept and `start-instance` / `stop-instance` still work. If start fails for capacity, retry later or use on-demand. If you terminate the instance from the console, cancel its Spot request or AWS may launch a replacement.
+
 ```bash
 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap
+SPOT=0 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap   # on-demand
 ```
 
 That uses your **local** AWS CLI profile only on your laptop, to:
@@ -211,6 +214,7 @@ Optional environment variables:
 - `KEY_PATH` — path to the private key for the instance (PEM or `~/.ssh/id_ed25519`)
 - `KEY_NAME` / `KEY_OWNER` — override the per-user EC2 key pair name (default: `retrotransposon-miner-<region>-<iam-user>`)
 - `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r6i.4xlarge`)
+- `SPOT` — `1` (default) launches a Spot instance; `0` launches on-demand (`bootstrap` only)
 - `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)
 - `ROOT_VOLUME_IOPS` / `ROOT_VOLUME_THROUGHPUT_MB` — gp3 IOPS and MB/s for `bootstrap` only (default: `4000` / `1000`). AWS requires throughput ≤ 0.25 × IOPS; 1000 MB/s needs at least 4000 IOPS. The gp3 baseline (3000 / 125) is the usual WGS stage bottleneck.
 - `S3_BUCKET` — bucket the instance may read/write (example: `s3://<your-bucket>`); creates/reuses an instance profile, does not copy local keys
@@ -260,7 +264,7 @@ Additional permissions for `bootstrap` (new instance provisioning):
 - Starts, stops, and reboots the bound instance without creating new ones.
 - Writes SSH aliases (`retro-ec2`, `jlab`) into local `~/.ssh/config`.
 - Refreshes SSH security group ingress for your current public IP on connect.
-- Optionally creates a new instance (`bootstrap`), a **per-IAM-user** key pair (or imports your laptop `id_ed25519.pub`), security group, and Elastic IP. Does not reuse another user's PEM.
+- Optionally creates a new instance (`bootstrap`), a **per-IAM-user** key pair (or imports your laptop `id_ed25519.pub`), security group, and Elastic IP. New instances are **Spot** by default (`SPOT=0` for on-demand). Does not reuse another user's PEM.
 - `install-my-key` pushes your laptop public key via EC2 Instance Connect and appends it to `authorized_keys`.
 - Optionally attaches an IAM instance profile for a user-specified `S3_BUCKET` and caches public data under `s3://<bucket>/public`.
 - Starts JupyterLab remotely and tunnels it locally.
