@@ -28,6 +28,7 @@ from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.bam_io import bind_alignment_reference, open_alignment
 from retro_miner.mate_resolution import require_interchrom_mate_sequences
+from retro_miner.candidate_loci import annotate_segdup_on_breakpoint_windows
 from retro_miner.evidence_extract import (
     _longest_soft_clip_from_read,
     _soft_clip_query_seq,
@@ -15369,6 +15370,8 @@ def annotate_candidate_loci_with_mei(
     empirical_highconf_bed: Path | None = None,
     empirical_exclude_merged_bed: Path | None = None,
     empirical_exclude_segdup_bed: Path | None = None,
+    segdup_bed: Path | None = None,
+    segdup_min_fraction: float = 0.1,
     empirical_exclude_mappability_bedgraph: Path | None = None,
     empirical_exclude_mappability_threshold: float = 0.5,
     empirical_exclude_gap_bed: Path | None = None,
@@ -16038,6 +16041,12 @@ def annotate_candidate_loci_with_mei(
         breakpoint_pos_col="insertion_breakpoint_pos",
         output_prefix="insertion_",
     )
+    segdup_path = segdup_bed if segdup_bed is not None else empirical_exclude_segdup_bed
+    candidate = annotate_segdup_on_breakpoint_windows(
+        candidate,
+        segdup_bed=segdup_path,
+        min_fraction=float(segdup_min_fraction),
+    )
     for full_prefix in ("disease_full", "control_full"):
         full_metrics = candidate.apply(
             lambda r: _sample_insertion_span_and_orientation(r, full_prefix),
@@ -16094,6 +16103,12 @@ def annotate_candidate_loci_with_mei(
                 breakpoint_pos_col="insertion_breakpoint_pos",
                 output_prefix="insertion_",
             )
+            candidate = annotate_segdup_on_breakpoint_windows(
+                candidate,
+                segdup_bed=segdup_path,
+                min_fraction=float(segdup_min_fraction),
+            )
+            candidate = _assign_bronze_silver_stages(candidate)
         click.echo(
             f"[mei-annotate] local assembly complete loci={len(asm_df)} "
             f"cache={asm_dir} elapsed={time.monotonic() - asm_t0:.1f}s"
