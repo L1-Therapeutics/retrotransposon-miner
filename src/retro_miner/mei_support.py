@@ -6263,6 +6263,18 @@ def _add_candidate_support_info_fields(
         )
         if max_len_col in out.columns:
             out[max_len_col] = pd.to_numeric(out[max_len_col], errors="coerce").fillna(0).astype(int)
+        flank_tbl = _genomic_flank_evidence_table(
+            split_df=split_support_df,
+            disc_df=disc_df,
+            breakpoints=bp_tbl,
+            prefix=prefix,
+        )
+        if not flank_tbl.empty:
+            out = out.merge(flank_tbl, on=key_cols, how="left")
+        for col in (f"{prefix}_{c}" for c in _FLANK_COUNT_COLS):
+            if col not in out.columns:
+                out[col] = 0
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
     return out
 
 
@@ -9814,6 +9826,18 @@ _COMPLEX_RESIDUAL_MIN_UNIQUE_READS = 2
 _COMPLEX_INS_MAX_MEI_MAPPED = 2
 _COMPLEX_INS_MEI_FRAC_OF_RESIDUAL = 0.25
 _COMPLEX_INS_MIN_SPLIT_MODE_SUPPORT = 2
+# DPE anchors closer than this to the breakpoint are "parked" at the junction
+# and do not occupy a genomic flank in read-architecture plots.
+_FLANK_DPE_MIN_SPAN_BP = 30
+# "Multiple" MEI-mapped SR/DPE on a genomic flank. PolyA-only opposite
+# flank may be a single supporting tail.
+_GOLD_MIN_FLANK_MEI_READS = 2
+_FLANK_COUNT_COLS = (
+    "left_flank_mei_reads",
+    "right_flank_mei_reads",
+    "left_flank_polya_reads",
+    "right_flank_polya_reads",
+)
 
 
 def _support_string_token(series: pd.Series, label: str) -> pd.Series:
@@ -9975,6 +9999,195 @@ def _complex_locus_strong_companion_fraction(df: pd.DataFrame) -> pd.Series:
     if not parts:
         return pd.Series(0.0, index=df.index)
     return pd.concat(parts, axis=1).max(axis=1)
+
+
+def _series_flag(df: pd.DataFrame, *names: str) -> pd.Series:
+    out = pd.Series(False, index=df.index)
+    for name in names:
+        if name in df.columns:
+            out = out | df[name].fillna(False).astype(bool)
+    return out
+
+
+def _row_is_polya_evidence(df: pd.DataFrame) -> pd.Series:
+    out = _series_flag(df, "polya_rescue", "poly_tail_rescued", "poly_tail_anchor_rescued")
+    if "clip_poly_at_run" in df.columns:
+        out = out | (pd.to_numeric(df["clip_poly_at_run"], errors="coerce").fillna(0).astype(int) >= 8)
+    return out
+
+
+def _sr_clip_to_genomic_flank(clip_side: pd.Series) -> pd.Series:
+    """L soft-clip sits on the right genomic flank; R clip on the left."""
+    side = clip_side.fillna("").astype(str).str.upper().str[:1]
+    return side.map({"L": "R", "R": "L"})
+
+
+def _genomic_flank_evidence_table(
+    split_df: pd.DataFrame,
+    disc_df: pd.DataFrame,
+    breakpoints: pd.DataFrame,
+    *,
+    prefix: str,
+    min_dpe_span_bp: int = _FLANK_DPE_MIN_SPAN_BP,
+) -> pd.DataFrame:
+    """Unique MEI vs polyA anchors on each genomic flank.
+
+    SR uses clip geometry (L clip → right flank). DPE uses genomic position
+    relative to the breakpoint; anchors within ``min_dpe_span_bp`` are ignored.
+    A read counts as polyA or MEI, not both (polyA wins).
+    """
+    key_cols = ["chrom", "window_start", "window_end"]
+    out_cols = [f"{prefix}_{c}" for c in _FLANK_COUNT_COLS]
+    empty = pd.DataFrame(columns=key_cols + out_cols)
+    if breakpoints is None or breakpoints.empty:
+        return empty
+    bp_tbl = breakpoints.loc[:, [c for c in key_cols + ["insertion_breakpoint_pos"] if c in breakpoints.columns]].copy()
+    if not all(c in bp_tbl.columns for c in key_cols):
+        return empty
+    if "insertion_breakpoint_pos" not in bp_tbl.columns:
+        bp_tbl["insertion_breakpoint_pos"] = 0
+    bp_tbl["insertion_breakpoint_pos"] = pd.to_numeric(
+        bp_tbl["insertion_breakpoint_pos"], errors="coerce"
+    ).fillna(0).astype(int)
+    mid = (pd.to_numeric(bp_tbl["window_start"], errors="coerce").fillna(0).astype(int)
+           + pd.to_numeric(bp_tbl["window_end"], errors="coerce").fillna(0).astype(int)) // 2
+    bp_tbl["insertion_breakpoint_pos"] = bp_tbl["insertion_breakpoint_pos"].where(
+        bp_tbl["insertion_breakpoint_pos"] > 0, mid
+    )
+    bp_tbl = bp_tbl.drop_duplicates(key_cols)
+
+    parts: list[pd.DataFrame] = []
+
+    if split_df is not None and not split_df.empty and "read_name" in split_df.columns:
+        work = split_df.copy()
+        clip = pd.Series("", index=work.index, dtype="object")
+        for col in ("clip_side", "soft_clip_side", "anchor_side"):
+            if col in work.columns:
+                clip = clip.where(clip.isin(["L", "R"]), work[col].fillna("").astype(str).str.upper().str[:1])
+        work["flank"] = _sr_clip_to_genomic_flank(clip)
+        polya = _row_is_polya_evidence(work)
+        mei = _series_flag(work, "mei_hit", "mei_hit_coord")
+        kind = pd.Series("", index=work.index, dtype="object")
+        kind = kind.where(~polya, "polya")
+        kind = kind.where(~((~polya) & mei), "mei")
+        keep = work["flank"].isin(["L", "R"]) & kind.isin(["mei", "polya"])
+        if bool(keep.any()):
+            tmp = work.loc[keep, [c for c in key_cols + ["read_name"] if c in work.columns]].copy()
+            tmp["flank"] = work.loc[keep, "flank"].to_numpy()
+            tmp["kind"] = kind.loc[keep].to_numpy()
+            parts.append(tmp)
+
+    if disc_df is not None and not disc_df.empty and "read_name" in disc_df.columns:
+        work = disc_df.copy()
+        pos_col = "genomic_pos" if "genomic_pos" in work.columns else "pos" if "pos" in work.columns else ""
+        if pos_col:
+            work = work.merge(bp_tbl, on=key_cols, how="inner")
+            if not work.empty:
+                pos = pd.to_numeric(work[pos_col], errors="coerce")
+                bp = pd.to_numeric(work["insertion_breakpoint_pos"], errors="coerce")
+                span = int(min_dpe_span_bp)
+                flank = pd.Series("", index=work.index, dtype="object")
+                flank = flank.where(~(pos <= bp - span), "L")
+                flank = flank.where(~(pos >= bp + span), "R")
+                polya = _row_is_polya_evidence(work)
+                mei = _series_flag(work, "mei_hit", "mate_mei_hit")
+                kind = pd.Series("", index=work.index, dtype="object")
+                kind = kind.where(~polya, "polya")
+                kind = kind.where(~((~polya) & mei), "mei")
+                keep = flank.isin(["L", "R"]) & kind.isin(["mei", "polya"])
+                if bool(keep.any()):
+                    tmp = work.loc[keep, [c for c in key_cols + ["read_name"] if c in work.columns]].copy()
+                    tmp["flank"] = flank.loc[keep].to_numpy()
+                    tmp["kind"] = kind.loc[keep].to_numpy()
+                    parts.append(tmp)
+
+    zeros = bp_tbl.loc[:, key_cols].copy()
+    for col in out_cols:
+        zeros[col] = 0
+    if not parts:
+        return zeros
+    all_rows = pd.concat(parts, ignore_index=True)
+    all_rows["read_name"] = all_rows["read_name"].fillna("").astype(str)
+    all_rows = all_rows.loc[all_rows["read_name"].str.len() > 0]
+    if all_rows.empty:
+        return zeros
+    counts = (
+        all_rows.drop_duplicates(key_cols + ["read_name", "flank", "kind"])
+        .groupby(key_cols + ["flank", "kind"], as_index=False)["read_name"]
+        .nunique()
+        .rename(columns={"read_name": "n"})
+    )
+    for flank, kind, col in (
+        ("L", "mei", f"{prefix}_left_flank_mei_reads"),
+        ("R", "mei", f"{prefix}_right_flank_mei_reads"),
+        ("L", "polya", f"{prefix}_left_flank_polya_reads"),
+        ("R", "polya", f"{prefix}_right_flank_polya_reads"),
+    ):
+        hit = counts.loc[(counts["flank"] == flank) & (counts["kind"] == kind), key_cols + ["n"]]
+        zeros = zeros.merge(hit.rename(columns={"n": col}), on=key_cols, how="left")
+        if f"{col}_x" in zeros.columns:
+            zeros[col] = pd.to_numeric(zeros[f"{col}_y"], errors="coerce").fillna(
+                pd.to_numeric(zeros[f"{col}_x"], errors="coerce")
+            )
+            zeros = zeros.drop(columns=[f"{col}_x", f"{col}_y"])
+        zeros[col] = pd.to_numeric(zeros[col], errors="coerce").fillna(0).astype(int)
+    return zeros.loc[:, key_cols + out_cols]
+
+
+def _event_orientation_series(df: pd.DataFrame) -> pd.Series:
+    ori = pd.Series("", index=df.index, dtype="object")
+    for col in (
+        "consensus_insertion_orientation",
+        "insertion_orientation",
+        "disease_insertion_orientation",
+        "control_insertion_orientation",
+    ):
+        if col not in df.columns:
+            continue
+        cand = df[col].fillna("").astype(str).str.strip()
+        ori = ori.where(ori.isin(["+", "-"]), cand)
+    return ori.where(ori.isin(["+", "-"]), "")
+
+
+def _sample_orientation_consistent_sidepair(df: pd.DataFrame, prefix: str) -> pd.Series:
+    """Two-sided genomic-flank support with orientation-consistent MEI.
+
+    Counts are SR or DPE (not an SR-only cutoff). A flank is MEI-supported
+    when at least ``_GOLD_MIN_FLANK_MEI_READS`` unique reads remap to MEI.
+
+    Pass either:
+    - MEI on both genomic flanks, or
+    - MEI on one flank and polyA on the other, with 3′ tail on the expected
+      side (+ → right-flank polyA; − → left-flank polyA).
+    """
+    min_mei = int(_GOLD_MIN_FLANK_MEI_READS)
+    l_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_mei_reads", 0), errors="coerce").fillna(0)
+    r_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_mei_reads", 0), errors="coerce").fillna(0)
+    l_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_polya_reads", 0), errors="coerce").fillna(0)
+    r_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_polya_reads", 0), errors="coerce").fillna(0)
+    l_mei = l_mei_n >= min_mei
+    r_mei = r_mei_n >= min_mei
+    l_poly = l_poly_n >= 1
+    r_poly = r_poly_n >= 1
+    two_sided_mei = l_mei & r_mei
+    plus_pair = l_mei & r_poly
+    minus_pair = r_mei & l_poly
+    ori = _event_orientation_series(df)
+    return two_sided_mei | (ori.eq("+") & plus_pair) | (ori.eq("-") & minus_pair) | (
+        ori.eq("") & (plus_pair | minus_pair)
+    )
+
+
+def _orientation_consistent_two_sided_support(df: pd.DataFrame) -> pd.Series:
+    """Disease or control has orientation-consistent two-sided flank support."""
+    flank_present = any(
+        f"{prefix}_{col}" in df.columns for prefix in ("disease", "control") for col in _FLANK_COUNT_COLS
+    )
+    if not flank_present:
+        return pd.Series(True, index=df.index)
+    return _sample_orientation_consistent_sidepair(df, "disease") | _sample_orientation_consistent_sidepair(
+        df, "control"
+    )
 
 
 def _classic_polya_mei_sidepair(df: pd.DataFrame) -> pd.Series:
@@ -12213,6 +12426,20 @@ def _assign_gold_stage(
         out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
         out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
 
+    # Two-sided genomic-flank MEI (SR or DPE) or orientation-consistent MEI+polyA.
+    # One-sided piles (all anchors on one flank, polyA on the same flank, or
+    # the 3′ tail on the wrong side) stay silver.
+    out["gold_orientation_consistent_two_sided"] = _orientation_consistent_two_sided_support(out)
+    one_sided_or_inconsistent = silver & out["gold_stage_pass"] & (~out["gold_orientation_consistent_two_sided"])
+    if one_sided_or_inconsistent.any():
+        out.loc[one_sided_or_inconsistent, "gold_stage_pass"] = False
+        prev = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
+        fail_tag = "one_sided_or_inconsistent_flank_support"
+        need_append = one_sided_or_inconsistent & prev.ne("")
+        need_set = one_sided_or_inconsistent & prev.eq("")
+        out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
+        out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
+
     # Non-empirical depth-outlier guard for obvious pileup artifacts.
     # Use a run-adaptive 3-sigma threshold and keep known overlaps exempt.
     known_poly = _df_col_series(out, "known_mei_polymorphism", False).fillna(False).astype(bool)
@@ -14019,6 +14246,15 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "control_family_agreement",
         "control_strand_agreement",
         "two_sided_support",
+        "gold_orientation_consistent_two_sided",
+        "disease_left_flank_mei_reads",
+        "disease_right_flank_mei_reads",
+        "disease_left_flank_polya_reads",
+        "disease_right_flank_polya_reads",
+        "control_left_flank_mei_reads",
+        "control_right_flank_mei_reads",
+        "control_left_flank_polya_reads",
+        "control_right_flank_polya_reads",
         "assembly_best_contig_id",
         "asm_insertion_mei_start",
         "asm_insertion_mei_end",

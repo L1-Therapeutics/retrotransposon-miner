@@ -1,0 +1,16 @@
+{
+  "catalog_id": "ALU_umary_ALU_12520",
+  "sample": "HG00100",
+  "chrom": "chr22",
+  "expected_breakpoint": 45595639,
+  "discovery_window_start": 45595538,
+  "discovery_window_end": 45596030,
+  "fetch_start": 45594738,
+  "fetch_end": 45596830,
+  "bam": "HG00100.chr22_45594738_45596830.bam",
+  "n_bam_reads": 966,
+  "source_results": "/home/ec2-user/retrotransposon-workdir/results/hg00100_germline_chr22_main_wgs_mates",
+  "source_cram": "/home/ec2-user/retrotransposon-workdir/data/bam_stage/HG00100.final.cram",
+  "plot_rank": 13,
+  "expect_gold": false
+}
