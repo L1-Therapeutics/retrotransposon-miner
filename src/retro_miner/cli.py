@@ -701,6 +701,15 @@ def build_candidate_loci_cmd(
     help="Optional full-genome control BAM for discordant mate-seq fallback during annotation.",
 )
 @click.option(
+    "--allow-missing-interchrom-mates/--no-allow-missing-interchrom-mates",
+    default=False,
+    show_default=True,
+    help=(
+        "Do not fail when off-chromosome discordant mates still have empty mate_seq. "
+        "Default is to fail so a chr-sliced BAM cannot silently drop remote DPE support."
+    ),
+)
+@click.option(
     "--rmsk-table",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
@@ -991,6 +1000,7 @@ def annotate_mei_support_cmd(
     control_bam_depth: Path | None,
     disease_mate_bam: Path | None,
     control_mate_bam: Path | None,
+    allow_missing_interchrom_mates: bool,
     rmsk_table: Path | None,
     g1k_mei_vcf: Path | None,
     lr_mei_vcf: Path | None,
@@ -1101,6 +1111,7 @@ def annotate_mei_support_cmd(
         mei_full_fasta=mei_full_fasta,
         reuse_mei_annotate_dir=reuse_mei_annotate_dir,
         bwa_threads=bwa_threads,
+        allow_missing_interchrom_mates=allow_missing_interchrom_mates,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 
