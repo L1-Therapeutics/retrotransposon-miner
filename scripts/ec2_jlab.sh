@@ -100,18 +100,6 @@ get_default_vpc() {
     --query 'Vpcs[0].VpcId' --output text
 }
 
-get_default_subnet() {
-  local vpc_id
-  if [[ -n "${SUBNET_ID:-}" ]]; then
-    echo "${SUBNET_ID}"
-    return
-  fi
-  vpc_id="$(get_default_vpc)"
-  awsq ec2 describe-subnets \
-    --filters Name=vpc-id,Values="${vpc_id}" Name=default-for-az,Values=true \
-    --query 'Subnets[0].SubnetId' --output text
-}
-
 sanitize_key_token() {
   echo "$1" | tr -c 'A-Za-z0-9+=.@_-' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//'
 }
@@ -656,10 +644,9 @@ bind_instance() {
 }
 
 create_instance() {
-  local instance_id ami subnet sg_id create_name bucket_name ud_file="" tags market_tag=""
+  local instance_id ami az sg_id create_name bucket_name ud_file="" tags market_tag=""
   local -a run_args
   ami="$(get_latest_al2023_ami)"
-  subnet="$(get_default_subnet)"
   sg_id="$(ensure_security_group)"
   ensure_key_pair
 
@@ -689,7 +676,6 @@ create_instance() {
     --image-id "${ami}"
     --instance-type "${INSTANCE_TYPE}"
     --key-name "${KEY_BASENAME}"
-    --subnet-id "${subnet}"
     --security-group-ids "${sg_id}"
     --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${ROOT_VOLUME_GB},VolumeType=gp3,Iops=${ROOT_VOLUME_IOPS},Throughput=${ROOT_VOLUME_THROUGHPUT_MB},DeleteOnTermination=true}"
     --tag-specifications "ResourceType=instance,Tags=${tags}"
@@ -697,6 +683,14 @@ create_instance() {
     --query "Instances[0].InstanceId"
     --output text
   )
+  if [[ -n "${SUBNET_ID:-}" ]]; then
+    log "SUBNET_ID=${SUBNET_ID} (pinned AZ)"
+    run_args+=(--subnet-id "${SUBNET_ID}")
+  else
+    # No subnet/AZ: AWS places into a default-VPC AZ that has capacity.
+    # Pinning a subnet is what made bootstrap fail when that one AZ was empty.
+    log "Letting AWS choose AZ (no --subnet-id)"
+  fi
   if want_spot; then
     # Persistent + stop: AWS reclaim (or stop-instance) keeps the EBS root
     # volume; start-instance attaches the same disk. Omit MaxPrice so the
@@ -709,6 +703,9 @@ create_instance() {
   fi
   instance_id="$(awsq ec2 run-instances "${run_args[@]}")"
   [[ -n "${ud_file}" ]] && rm -f "${ud_file}"
+  az="$(awsq ec2 describe-instances --instance-ids "${instance_id}" \
+    --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)"
+  log "Launched ${instance_id} in ${az}"
 
   INSTANCE_ID="${instance_id}"
   INSTANCE_NAME="${create_name}"
@@ -735,7 +732,7 @@ start_instance() {
   iid="$(require_instance_id)"
   log "Starting instance ${iid}"
   if ! awsq ec2 start-instances --instance-ids "${iid}" >/dev/null; then
-    log "Start failed. If this is a Spot instance, AWS may not have capacity; retry later or bootstrap with SPOT=0 for on-demand."
+    log "Start failed. If this is a Spot instance, AWS may not have capacity in this instance's AZ (start cannot change AZ). Retry later or bootstrap a new VM."
     exit 1
   fi
   awsq ec2 wait instance-running --instance-ids "${iid}"
@@ -967,6 +964,11 @@ Host ${JLAB_ALIAS}
   StrictHostKeyChecking accept-new
 EOF
 
+  # ProxyCommand stores the key under the alias, so rebinding a new VM
+  # looks like a host-key change. Drop the stale alias keys.
+  ssh-keygen -R "${HOST_ALIAS}" >/dev/null 2>&1 || true
+  ssh-keygen -R "${JLAB_ALIAS}" >/dev/null 2>&1 || true
+
   log "Updated ${cfg} for ${iid} (${name}) using ${identity_file}."
 }
 
@@ -1096,7 +1098,7 @@ Optional env vars:
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
   INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.8xlarge / 200)
   SPOT (bootstrap only; default 1 = Spot; 0 = on-demand)
-  SUBNET_ID (bootstrap only; default AZ subnet; set to pick another AZ)
+  SUBNET_ID (bootstrap only; pin one subnet/AZ. Default: AWS chooses AZ)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
   S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
   S3_CACHE_PREFIX (default: s3://<bucket>/public)

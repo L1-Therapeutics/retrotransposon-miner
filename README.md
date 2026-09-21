@@ -166,7 +166,7 @@ After the instance is running:
 
 Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab). On a shared AWS account, each IAM user gets their own key pair (`retrotransposon-miner-<region>-<iam-user>`). If `~/.ssh/id_ed25519.pub` or `id_rsa.pub` exists, that public key is imported — bootstrap does not reuse another user’s PEM.
 
-`bootstrap` launches a **Spot** `m7i.8xlarge` by default (32 vCPU / 128 GiB). Pipeline data lives on EBS; the Spot request is persistent with stop-on-interruption, so if AWS reclaims the VM the disk is kept and `start-instance` / `stop-instance` still work. If start fails for capacity, retry later, pick another AZ with `SUBNET_ID`, or use on-demand. If you terminate the instance from the console, cancel its Spot request or AWS may launch a replacement.
+`bootstrap` launches a **Spot** `m7i.8xlarge` by default (32 vCPU / 128 GiB). Pipeline data lives on EBS; the Spot request is persistent with stop-on-interruption, so if AWS reclaims the VM the disk is kept and `start-instance` / `stop-instance` still work. Launch does **not** pin an AZ; AWS places the instance in a default-VPC zone that has capacity. `SUBNET_ID` pins a subnet (and therefore an AZ). `start-instance` cannot change AZ; if start fails for capacity, retry later or `bootstrap` a new VM. `SPOT=0` is on-demand. If you terminate the instance from the console, cancel its Spot request or AWS may launch a replacement.
 
 ```bash
 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap
@@ -215,7 +215,7 @@ Optional environment variables:
 - `KEY_NAME` / `KEY_OWNER` — override the per-user EC2 key pair name (default: `retrotransposon-miner-<region>-<iam-user>`)
 - `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `m7i.8xlarge`)
 - `SPOT` — `1` (default) launches a Spot instance; `0` launches on-demand (`bootstrap` only)
-- `SUBNET_ID` — subnet for `bootstrap` only (default: first default-for-AZ subnet). Set this to land in another AZ when Spot capacity is tight.
+- `SUBNET_ID` — pin `bootstrap` to one subnet/AZ. Default: omit subnet so AWS chooses an AZ with capacity.
 - `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)
 - `ROOT_VOLUME_IOPS` / `ROOT_VOLUME_THROUGHPUT_MB` — gp3 IOPS and MB/s for `bootstrap` only (default: `4000` / `1000`). AWS requires throughput ≤ 0.25 × IOPS; 1000 MB/s needs at least 4000 IOPS. The gp3 baseline (3000 / 125) is the usual WGS stage bottleneck.
 - `S3_BUCKET` — bucket the instance may read/write (example: `s3://<your-bucket>`); creates/reuses an instance profile, does not copy local keys
