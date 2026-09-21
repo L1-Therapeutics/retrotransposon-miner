@@ -4,13 +4,13 @@ set -euo pipefail
 APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-r7a.4xlarge}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-m7i.8xlarge}"
 # Spot by default (cheaper). SPOT=0 launches on-demand instead.
 SPOT="${SPOT:-1}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
 # gp3 throughput/IOPS are independently provisioned, but AWS requires
 # throughput (MB/s) <= 0.25 * IOPS. 1000 MB/s therefore needs >= 4000 IOPS.
-# Default 125 MB/s is the WGS stage bottleneck on r7a.4xlarge (EBS max 1250).
+# Default 125 MB/s is the WGS stage bottleneck on m7i.8xlarge (EBS max 1250).
 ROOT_VOLUME_IOPS="${ROOT_VOLUME_IOPS:-4000}"
 ROOT_VOLUME_THROUGHPUT_MB="${ROOT_VOLUME_THROUGHPUT_MB:-1000}"
 S3_BUCKET="${S3_BUCKET:-}"
@@ -1081,7 +1081,7 @@ Lifecycle:
 JupyterLab:
   start-jlab | stop-jlab | start-tunnel
 
-Create a new EC2 for this project (Spot r7a.4xlarge by default):
+Create a new EC2 for this project (Spot m7i.8xlarge by default):
   bootstrap
   S3_BUCKET=s3://<your-bucket> $0 bootstrap
   SPOT=0 $0 bootstrap
@@ -1094,7 +1094,7 @@ If you can reach the instance via Instance Connect but not SSH:
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
-  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default r7a.4xlarge / 200)
+  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.8xlarge / 200)
   SPOT (bootstrap only; default 1 = Spot; 0 = on-demand)
   SUBNET_ID (bootstrap only; default AZ subnet; set to pick another AZ)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
