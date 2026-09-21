@@ -65,6 +65,7 @@ EMPIRICAL_HIGHCONF_BED=""
 EMPIRICAL_STAGE="0"
 LOCAL_ASSEMBLY="0"
 ANNOTATE_ONLY="0"
+ALLOW_MISSING_INTERCHROM_MATES="${ALLOW_MISSING_INTERCHROM_MATES:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
@@ -353,6 +354,14 @@ while [[ $# -gt 0 ]]; do
       ANNOTATE_ONLY="1"
       shift 1
       ;;
+    --allow-missing-interchrom-mates)
+      ALLOW_MISSING_INTERCHROM_MATES="1"
+      shift 1
+      ;;
+    --no-allow-missing-interchrom-mates)
+      ALLOW_MISSING_INTERCHROM_MATES="0"
+      shift 1
+      ;;
     --python-bin)
       PYTHON_BIN="$2"
       shift 2
@@ -522,6 +531,46 @@ require_alignment_readable() {
   fi
 }
 
+resolve_sliced_mate_bams() {
+  # Chr-sliced HG00100 BAM has no off-chr mate sequences. Use the WGS CRAM if
+  # it is already on disk (bam_stage or the S3 full/ cache). Fail otherwise so
+  # annotate cannot silently drop remote DPE support.
+  if [[ -z "${BAM_STAGE_DIR}" ]]; then
+    BAM_STAGE_DIR="${RTM_WORKDIR}/data/bam_stage"
+  fi
+  if [[ -n "${DISEASE_MATE_BAM}" ]]; then
+    if [[ -z "${CONTROL_MATE_BAM}" ]]; then
+      CONTROL_MATE_BAM="${DISEASE_MATE_BAM}"
+    fi
+    return 0
+  fi
+  local bn
+  bn="$(basename "${DISEASE_BAM}")"
+  if [[ "${bn}" != "hg00100.shortread.chr22.hg38.bam" ]]; then
+    return 0
+  fi
+  local cand
+  for cand in \
+    "${BAM_STAGE_DIR}/HG00100.final.cram" \
+    "${RTM_PUBLIC_DATA_DIR}/test_data/full/hg00100_shortread_highcov_cram/HG00100.final.cram"
+  do
+    if [[ -f "${cand}" ]]; then
+      DISEASE_MATE_BAM="${cand}"
+      CONTROL_MATE_BAM="${CONTROL_MATE_BAM:-${cand}}"
+      echo "[candidate-pipeline] inferred full-genome mate BAM ${cand} (sliced disease BAM ${bn})"
+      return 0
+    fi
+  done
+  if [[ "${ALLOW_MISSING_INTERCHROM_MATES}" == "1" ]]; then
+    echo "[candidate-pipeline] warning: no WGS mate BAM for ${bn}; interchrom mates will be empty" >&2
+    return 0
+  fi
+  echo "ERROR: ${bn} is a chromosome slice. Off-chromosome discordant mates are not in that BAM." >&2
+  echo "Download HG00100.final.cram to ${BAM_STAGE_DIR}/ (s3://l1tx-data/public/test_data/full/hg00100_shortread_highcov_cram/) and re-run, or pass --disease-mate-bam." >&2
+  echo "Override with --allow-missing-interchrom-mates only if that loss is intentional." >&2
+  exit 1
+}
+
 stage_remote_bams_if_needed() {
   local envf="${OUTDIR}/.rtm_bam_stage.env"
   local extra=()
@@ -673,6 +722,9 @@ run_annotate_mei_support() {
   fi
   if [[ -n "${CONTROL_MATE_BAM}" ]]; then
     annotate_cmd+=(--control-mate-bam "${CONTROL_MATE_BAM}")
+  fi
+  if [[ "${ALLOW_MISSING_INTERCHROM_MATES}" == "1" ]]; then
+    annotate_cmd+=(--allow-missing-interchrom-mates)
   fi
   annotate_cmd+=(
     --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
@@ -853,6 +905,7 @@ if [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${LOCAL_ASSEMBLY}" == "1" ]] && [[ "${CH
 fi
 
 stage_remote_bams_if_needed
+resolve_sliced_mate_bams
 
 if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   REGION="${CHR_LIST[0]}"

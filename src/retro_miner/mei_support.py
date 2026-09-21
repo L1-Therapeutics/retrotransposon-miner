@@ -27,6 +27,7 @@ from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.bam_io import bind_alignment_reference, open_alignment
+from retro_miner.mate_resolution import require_interchrom_mate_sequences
 from retro_miner.evidence_extract import (
     _longest_soft_clip_from_read,
     _soft_clip_query_seq,
@@ -1879,6 +1880,7 @@ def _align_discordant_mates_with_minimap2(
     *,
     mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
+    allow_missing_interchrom_mates: bool = False,
 ) -> tuple[pd.DataFrame, ClipAlignmentSummary]:
     """Map discordant mates to MEI consensus.
 
@@ -1895,6 +1897,11 @@ def _align_discordant_mates_with_minimap2(
     click.echo(
         f"[mei-annotate] sample={sample} mate_fetch rows={len(discordant_df)} "
         f"elapsed={time.monotonic() - fetch_t0:.1f}s"
+    )
+    require_interchrom_mate_sequences(
+        enriched,
+        mate_bam=bam_path,
+        allow_missing=allow_missing_interchrom_mates,
     )
     if enriched.empty:
         summary = ClipAlignmentSummary(sample=sample, clip_count=0, paf_hits=0)
@@ -2253,6 +2260,7 @@ def _remap_one_sample_mei_evidence(
     mate_bam_path: Path | None,
     mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
+    allow_missing_interchrom_mates: bool = False,
 ) -> dict[str, object]:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
     t0 = time.monotonic()
@@ -2281,6 +2289,7 @@ def _remap_one_sample_mei_evidence(
         bam_path=mate_bam_path or bam_path,
         mate_cache_path=mate_cache_path,
         bwa_threads=bwa_threads,
+        allow_missing_interchrom_mates=allow_missing_interchrom_mates,
     )
     post_t0 = time.monotonic()
     disc_hits = _attach_mei_hits_to_discordant_rows(discordant_df, disc_anchor_hits, disc_mate_hits)
@@ -15151,6 +15160,7 @@ def annotate_candidate_loci_with_mei(
     mei_full_fasta: Path | None = None,
     reuse_mei_annotate_dir: Path | None = None,
     bwa_threads: int = 1,
+    allow_missing_interchrom_mates: bool = False,
 ) -> Path:
     total_t0 = time.monotonic()
     bind_alignment_reference(reference_fasta)
@@ -15291,6 +15301,7 @@ def annotate_candidate_loci_with_mei(
                 mate_bam_path=control_mate_bam_path or disease_mate_bam_path,
                 mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.germline.parquet",
                 bwa_threads=per_sample_bwa_threads,
+                allow_missing_interchrom_mates=allow_missing_interchrom_mates,
             )
             remap_by_sample = {
                 "control": remap_control,
@@ -15317,6 +15328,7 @@ def annotate_candidate_loci_with_mei(
                         mate_bam_path=disease_mate_bam_path,
                         mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.disease.parquet",
                         bwa_threads=per_sample_bwa_threads,
+                        allow_missing_interchrom_mates=allow_missing_interchrom_mates,
                     ): "disease",
                     pool.submit(
                         _remap_one_sample_mei_evidence,
@@ -15328,6 +15340,7 @@ def annotate_candidate_loci_with_mei(
                         mate_bam_path=control_mate_bam_path,
                         mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.control.parquet",
                         bwa_threads=per_sample_bwa_threads,
+                        allow_missing_interchrom_mates=allow_missing_interchrom_mates,
                     ): "control",
                 }
                 for fut in as_completed(remap_futs):
