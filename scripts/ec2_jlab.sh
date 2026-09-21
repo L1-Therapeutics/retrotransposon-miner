@@ -5,8 +5,8 @@ APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-m7i.8xlarge}"
-# Spot by default (cheaper). SPOT=0 launches on-demand instead.
-SPOT="${SPOT:-1}"
+# On-demand by default (stable first-run). SPOT=1 launches cheaper Spot instead.
+SPOT="${SPOT:-0}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
 # gp3 throughput/IOPS are independently provisioned, but AWS requires
 # throughput (MB/s) <= 0.25 * IOPS. 1000 MB/s therefore needs >= 4000 IOPS.
@@ -1083,10 +1083,10 @@ Lifecycle:
 JupyterLab:
   start-jlab | stop-jlab | start-tunnel
 
-Create a new EC2 for this project (Spot m7i.8xlarge by default):
+Create a new EC2 for this project (on-demand m7i.8xlarge by default):
   bootstrap
   S3_BUCKET=s3://<your-bucket> $0 bootstrap
-  SPOT=0 $0 bootstrap
+  SPOT=1 $0 bootstrap
   S3_BUCKET=s3://<your-bucket> $0 attach-s3
 
 If you can reach the instance via Instance Connect but not SSH:
@@ -1097,7 +1097,7 @@ Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
   INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.8xlarge / 200)
-  SPOT (bootstrap only; default 1 = Spot; 0 = on-demand)
+  SPOT (bootstrap only; default 0 = on-demand; 1 = Spot)
   SUBNET_ID (bootstrap only; pin one subnet/AZ. Default: AWS chooses AZ)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
   S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
