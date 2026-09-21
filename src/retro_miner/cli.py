@@ -537,7 +537,10 @@ def extract_split_evidence_cmd(
     type=float,
     default=0.1,
     show_default=True,
-    help="Minimum fraction of candidate window required for segdup overlap flag.",
+    help=(
+        "Minimum overlap fraction for mate-in-segdup flags during locus build. "
+        "Locus flag_segdup is applied later, on the inferred breakpoint window."
+    ),
 )
 @click.option(
     "--mappability-bedgraph",
@@ -801,6 +804,22 @@ def build_candidate_loci_cmd(
     help="Optional segdup BED to exclude from empirical random-window sampling.",
 )
 @click.option(
+    "--segdup-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Optional BED for locus flag_segdup on the inferred breakpoint window. "
+        "Defaults to --empirical-exclude-segdup-bed when omitted."
+    ),
+)
+@click.option(
+    "--segdup-min-fraction",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help="Minimum fraction of the breakpoint window required for flag_segdup.",
+)
+@click.option(
     "--empirical-exclude-mappability-bedgraph",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
@@ -1015,6 +1034,8 @@ def annotate_mei_support_cmd(
     empirical_highconf_bed: Path | None,
     empirical_exclude_merged_bed: Path | None,
     empirical_exclude_segdup_bed: Path | None,
+    segdup_bed: Path | None,
+    segdup_min_fraction: float,
     empirical_exclude_mappability_bedgraph: Path | None,
     empirical_exclude_mappability_threshold: float,
     empirical_exclude_gap_bed: Path | None,
@@ -1082,6 +1103,8 @@ def annotate_mei_support_cmd(
         empirical_highconf_bed=empirical_highconf_bed,
         empirical_exclude_merged_bed=empirical_exclude_merged_bed,
         empirical_exclude_segdup_bed=empirical_exclude_segdup_bed,
+        segdup_bed=segdup_bed,
+        segdup_min_fraction=segdup_min_fraction,
         empirical_exclude_mappability_bedgraph=empirical_exclude_mappability_bedgraph,
         empirical_exclude_mappability_threshold=empirical_exclude_mappability_threshold,
         empirical_exclude_gap_bed=empirical_exclude_gap_bed,

@@ -1,0 +1,18 @@
+{
+  "catalog_id": "nssv14077938",
+  "sample": "HG00100",
+  "chrom": "chr19",
+  "expected_breakpoint": 23828491,
+  "discovery_window_start": 23827977,
+  "discovery_window_end": 23828977,
+  "fetch_start": 23827177,
+  "fetch_end": 23829777,
+  "bam": "HG00100.chr19_23827177_23829777.bam",
+  "n_bam_reads": 702,
+  "source_results": "/home/ec2-user/retrotransposon-workdir/results/hg00100_germline_chr19_main_wgs_mates",
+  "source_cram": "/home/ec2-user/retrotransposon-workdir/data/bam_stage/HG00100.final.cram",
+  "plot_rank": 6,
+  "expect_gold": true,
+  "expect_flag_segdup": false,
+  "segdup_bed": "genomicSuperDups.nearby.bed"
+}

@@ -729,6 +729,8 @@ run_annotate_mei_support() {
   annotate_cmd+=(
     --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
     --empirical-exclude-segdup-bed "${SEG_DUP_BED}"
+    --segdup-bed "${SEG_DUP_BED}"
+    --segdup-min-fraction 0.1
     --empirical-exclude-mappability-bedgraph "${MAPPABILITY_LOW_BED}"
     --empirical-exclude-mappability-threshold 0.5
     --empirical-exclude-gap-bed "${GAP_BED}"
