@@ -10024,6 +10024,88 @@ def _sr_clip_to_genomic_flank(clip_side: pd.Series) -> pd.Series:
     return side.map({"L": "R", "R": "L"})
 
 
+def _inferred_flank_breakpoint_series(df: pd.DataFrame) -> pd.Series:
+    """Prefer inferred/TSD breakpoint; discovery-window midpoint is last resort.
+
+    Gold two-sided flanks must be measured from the junction the plots use, not
+    the center of the (often 1–2 kb) discovery bin.
+    """
+    out = pd.Series(0, index=df.index, dtype=int)
+    for col in (
+        "consensus_insertion_breakpoint_pos",
+        "insertion_breakpoint_pos",
+    ):
+        if col not in df.columns:
+            continue
+        cand = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        out = out.where(out.gt(0), cand.where(cand.gt(0), 0))
+    for start_col, end_col in (
+        ("consensus_breakpoint_interval_start", "consensus_breakpoint_interval_end"),
+        ("insertion_breakpoint_interval_start", "insertion_breakpoint_interval_end"),
+    ):
+        if start_col not in df.columns or end_col not in df.columns:
+            continue
+        lo = pd.to_numeric(df[start_col], errors="coerce")
+        hi = pd.to_numeric(df[end_col], errors="coerce")
+        ok = lo.gt(0) & hi.ge(lo)
+        mid = ((lo + hi) // 2).fillna(0).astype(int)
+        out = out.where(out.gt(0), mid.where(ok, 0))
+    ws = pd.to_numeric(df["window_start"], errors="coerce") if "window_start" in df.columns else pd.Series(0, index=df.index)
+    we = pd.to_numeric(df["window_end"], errors="coerce") if "window_end" in df.columns else ws
+    disc_mid = ((ws.fillna(0) + we.fillna(0)) // 2).astype(int)
+    return out.where(out.gt(0), disc_mid).astype(int)
+
+
+def annotate_flanks_on_breakpoint_windows(
+    candidates: pd.DataFrame,
+    *,
+    split_disease: pd.DataFrame,
+    split_control: pd.DataFrame,
+    discordant_disease: pd.DataFrame,
+    discordant_control: pd.DataFrame,
+) -> pd.DataFrame:
+    """Recount genomic-flank MEI/polyA after the inferred breakpoint exists.
+
+    Early support-string construction only has the discovery window, so DPE
+    flanks get split at the bin midpoint. Gold must use the TSD/inferred
+    junction instead (same reorder as breakpoint-window segdup).
+    """
+    out = candidates.copy()
+    key_cols = ["chrom", "window_start", "window_end"]
+    if out.empty or not all(c in out.columns for c in key_cols):
+        return out
+    bp_tbl = out.loc[:, key_cols].copy()
+    bp_tbl["insertion_breakpoint_pos"] = _inferred_flank_breakpoint_series(out)
+    resolved = int((bp_tbl["insertion_breakpoint_pos"] > 0).sum())
+    for prefix, split_df, disc_df in (
+        ("disease", split_disease, discordant_disease),
+        ("control", split_control, discordant_control),
+    ):
+        drop = [f"{prefix}_{c}" for c in _FLANK_COUNT_COLS if f"{prefix}_{c}" in out.columns]
+        if drop:
+            out = out.drop(columns=drop)
+        flank_tbl = _genomic_flank_evidence_table(
+            split_df=split_df,
+            disc_df=disc_df,
+            breakpoints=bp_tbl,
+            prefix=prefix,
+        )
+        if flank_tbl.empty:
+            for col in (f"{prefix}_{c}" for c in _FLANK_COUNT_COLS):
+                out[col] = 0
+            continue
+        out = out.merge(flank_tbl, on=key_cols, how="left")
+        for col in (f"{prefix}_{c}" for c in _FLANK_COUNT_COLS):
+            if col not in out.columns:
+                out[col] = 0
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+    click.echo(
+        f"[mei-annotate] breakpoint-window flank recount loci={len(out)} "
+        f"resolved_bp={resolved}"
+    )
+    return out
+
+
 def _genomic_flank_evidence_table(
     split_df: pd.DataFrame,
     disc_df: pd.DataFrame,
@@ -16195,6 +16277,13 @@ def annotate_candidate_loci_with_mei(
         )
     candidate = _apply_complex_ins_with_del(candidate)
     candidate = _add_heuristic_assembly_like_vaf_fields(candidate)
+    candidate = annotate_flanks_on_breakpoint_windows(
+        candidate,
+        split_disease=disease_hits if disease_hits is not None and not disease_hits.empty else split_disease,
+        split_control=control_hits if control_hits is not None and not control_hits.empty else split_control,
+        discordant_disease=disease_disc_hits,
+        discordant_control=control_disc_hits,
+    )
     candidate = _assign_gold_stage(candidate, empirical_stage=empirical_stage)
 
     candidate = _apply_breakpoint_motif_report_gating(candidate)
