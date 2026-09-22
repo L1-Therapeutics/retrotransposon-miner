@@ -1,0 +1,41 @@
+sample	evidence_type	read_name	chrom	window_start	window_end	anchor_side	genomic_pos	mate_chrom	mate_genomic_pos	mei_start	mei_end	mate_mei_start	mate_mei_end	mei_target	mate_mei_target	mei_strand	mate_mei_strand	mei_hit	mate_mei_hit	short_mei_seed_rescued	polya_rescue	mei_hit_source	clip_len	soft_clip_len	soft_clip_side	soft_clip_pos	poly_tail_rescued	clip_poly_at_run	polya_base	clip_poly_base	vntr_rescue	mate_seq_len	anchor_poly_at_run	anchor_poly_base	anchor_poly_side	poly_tail_anchor_rescued
+disease	SR	A00297:35:HFKWWDSXX:4:2571:25111:30545	chr19	877304	879503	R	877655	chr19	877763	652	663	0	0	L1M2b_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	12.0	12	R	877655	False	0.0								
+disease	SR	A00404:40:HFGYNDSXX:4:1474:28664:5697	chr19	877304	879503	R	877655	chr19	878020	1205	1217	0	0	L1P4d_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	16.0	16	R	877655	False	2.0								
+disease	SR	A00404:40:HFGYNDSXX:2:2366:26404:2378	chr19	877304	879503	R	877676	chr19	877904	516	535	0	0	L1MEi_5end#LINE/L1		-		True	False	False	False	mei	59.0	59	R	877676	False	1.0								
+disease	SR	A00404:41:HFH25DSXX:1:1208:3305:20306	chr19	877304	879503	R	877792	chr19	877893	1696	1717	0	0	L1MEj_5end#LINE/L1		+		True	False	False	False	mei	64.0	64	R	877792	False	2.0								
+disease	SR	A00404:41:HFH25DSXX:4:2521:13105:13228	chr19	877304	879503	L	878174	chr19	878174	311	330	0	0	L1PA14_5end#LINE/L1		+		True	False	False	False	mei	106.0	106	L	878174	False	2.0								
+disease	SR	A00404:40:HFGYNDSXX:3:2477:2049:31031	chr19	877304	879503	R	878191	chr19	878438	677	689	0	0	L1P4b_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	16.0	16	R	878191	False	0.0								
+disease	SR	A00297:35:HFKWWDSXX:3:2477:3803:14058	chr19	877304	879503	R	878251	chr19	878496	5988	6009	0	0	L1PA4_full#LINE/L1		-		True	False	False	False	mei	80.0	80	R	878251	False	1.0								
+disease	SR	A00297:35:HFKWWDSXX:1:1558:9109:31579	chr19	877304	879503	R	878272	chr19	878308	5989	6009	0	0	L1PA4_full#LINE/L1		+		True	False	False	False	mei	61.0	61	R	878272	False	2.0								
+disease	SR	A00404:56:HFJ7VDSXX:1:1518:3766:30592	chr19	877304	879503	R	878322	chr19	878236	6292	6312	0	0	L1PA8A_full#LINE/L1		+		True	False	False	False	mei	63.0	63	R	878322	False	2.0								
+disease	SR	A00404:41:HFH25DSXX:1:1425:24542:4445	chr19	877304	879503	R	878394	chr19	878788	6285	6309	0	0	L1PA8A_full#LINE/L1		-		True	False	False	False	mei	69.0	69	R	878394	False	4.0								
+disease	SR	A00404:41:HFH25DSXX:4:2617:15004:10629	chr19	877304	879503	R	878621	chr19	878614	644	660	0	0	L1M2b_5end#LINE/L1		+		True	False	False	False	mei	20.0	20	R	878621	False	1.0								
+disease	SR	A00404:40:HFGYNDSXX:4:2325:19298:35258	chr19	877304	879503	R	878740	chr19	879136	1471	1492	0	0	L1M2b_5end#LINE/L1		-		True	False	False	False	mei	46.0	46	R	878740	False	1.0								
+disease	SR	A00404:40:HFGYNDSXX:1:2456:29894:31782	chr19	877304	879503	R	878860	chr19	878722	1651	1662	0	0	L1M2b_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	12.0	12	R	878860	False	1.0								
+disease	SR	A00404:40:HFGYNDSXX:3:1345:15393:12524	chr19	877304	879503	R	879021	chr19	879229	1075	1094	0	0	L1PA13_5end#LINE/L1		+		True	False	False	False	mei	55.0	55	R	879021	False	1.0								
+disease	SR	A00404:40:HFGYNDSXX:4:2212:14931:16611	chr19	877304	879503	R	879076	chr19	879214	572	584	0	0	L1M3e_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	16.0	16	R	879076	False	1.0								
+disease	SR	A00297:35:HFKWWDSXX:1:1242:24677:9314	chr19	877304	879503	R	879115	chr19	879312	5994	6015	0	0	L1PA3_full#LINE/L1		-		True	False	False	False	mei	66.0	66	R	879115	False	3.0								
+disease	SR	A00297:35:HFKWWDSXX:4:2527:15284:19633	chr19	877304	879503	L	879299	chr19	878687	0	0	0	0					False	False	False	True	polya_clip	113.0	113	L	879299	True	12.0	T	T						
+disease	SR	A00404:40:HFGYNDSXX:3:2262:17300:34773	chr19	879305	880642	L	879366	chr19	879366	0	0	0	0					False	False	False	True	polya_clip	107.0	107	L	879366	True	14.0	T	T						
+disease	SR	A00404:41:HFH25DSXX:2:1553:10664:35681	chr19	879305	880642	R	879587	chr19	879504	303	322	0	0	L1PA14_5end#LINE/L1		-		True	False	False	False	mei	68.0	68	R	879587	False	1.0								
+disease	DPE	A00297:35:HFKWWDSXX:1:1148:20193:24126	chr19	877304	879503	L	877553	chr2	32916353	711	730	711	730	L1MCa_5end#LINE/L1	L1MCa_5end#LINE/L1	-	-	True	True	False	False	consensus		0		0	False				False	0.0	2.0	A	R	False
+control	SR	A00297:35:HFKWWDSXX:4:2571:25111:30545	chr19	877304	879503	R	877655	chr19	877763	652	663	0	0	L1M2b_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	12.0	12	R	877655	False	0.0								
+control	SR	A00404:40:HFGYNDSXX:4:1474:28664:5697	chr19	877304	879503	R	877655	chr19	878020	1205	1217	0	0	L1P4d_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	16.0	16	R	877655	False	2.0								
+control	SR	A00404:40:HFGYNDSXX:2:2366:26404:2378	chr19	877304	879503	R	877676	chr19	877904	516	535	0	0	L1MEi_5end#LINE/L1		-		True	False	False	False	mei	59.0	59	R	877676	False	1.0								
+control	SR	A00404:41:HFH25DSXX:1:1208:3305:20306	chr19	877304	879503	R	877792	chr19	877893	1696	1717	0	0	L1MEj_5end#LINE/L1		+		True	False	False	False	mei	64.0	64	R	877792	False	2.0								
+control	SR	A00404:41:HFH25DSXX:4:2521:13105:13228	chr19	877304	879503	L	878174	chr19	878174	311	330	0	0	L1PA14_5end#LINE/L1		+		True	False	False	False	mei	106.0	106	L	878174	False	2.0								
+control	SR	A00404:40:HFGYNDSXX:3:2477:2049:31031	chr19	877304	879503	R	878191	chr19	878438	677	689	0	0	L1P4b_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	16.0	16	R	878191	False	0.0								
+control	SR	A00297:35:HFKWWDSXX:3:2477:3803:14058	chr19	877304	879503	R	878251	chr19	878496	5988	6009	0	0	L1PA4_full#LINE/L1		-		True	False	False	False	mei	80.0	80	R	878251	False	1.0								
+control	SR	A00297:35:HFKWWDSXX:1:1558:9109:31579	chr19	877304	879503	R	878272	chr19	878308	5989	6009	0	0	L1PA4_full#LINE/L1		+		True	False	False	False	mei	61.0	61	R	878272	False	2.0								
+control	SR	A00404:56:HFJ7VDSXX:1:1518:3766:30592	chr19	877304	879503	R	878322	chr19	878236	6292	6312	0	0	L1PA8A_full#LINE/L1		+		True	False	False	False	mei	63.0	63	R	878322	False	2.0								
+control	SR	A00404:41:HFH25DSXX:1:1425:24542:4445	chr19	877304	879503	R	878394	chr19	878788	6285	6309	0	0	L1PA8A_full#LINE/L1		-		True	False	False	False	mei	69.0	69	R	878394	False	4.0								
+control	SR	A00404:41:HFH25DSXX:4:2617:15004:10629	chr19	877304	879503	R	878621	chr19	878614	644	660	0	0	L1M2b_5end#LINE/L1		+		True	False	False	False	mei	20.0	20	R	878621	False	1.0								
+control	SR	A00404:40:HFGYNDSXX:4:2325:19298:35258	chr19	877304	879503	R	878740	chr19	879136	1471	1492	0	0	L1M2b_5end#LINE/L1		-		True	False	False	False	mei	46.0	46	R	878740	False	1.0								
+control	SR	A00404:40:HFGYNDSXX:1:2456:29894:31782	chr19	877304	879503	R	878860	chr19	878722	1651	1662	0	0	L1M2b_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	12.0	12	R	878860	False	1.0								
+control	SR	A00404:40:HFGYNDSXX:3:1345:15393:12524	chr19	877304	879503	R	879021	chr19	879229	1075	1094	0	0	L1PA13_5end#LINE/L1		+		True	False	False	False	mei	55.0	55	R	879021	False	1.0								
+control	SR	A00404:40:HFGYNDSXX:4:2212:14931:16611	chr19	877304	879503	R	879076	chr19	879214	572	584	0	0	L1M3e_5end#LINE/L1		+		True	False	True	False	short_mei_rescue	16.0	16	R	879076	False	1.0								
+control	SR	A00297:35:HFKWWDSXX:1:1242:24677:9314	chr19	877304	879503	R	879115	chr19	879312	5994	6015	0	0	L1PA3_full#LINE/L1		-		True	False	False	False	mei	66.0	66	R	879115	False	3.0								
+control	SR	A00297:35:HFKWWDSXX:4:2527:15284:19633	chr19	877304	879503	L	879299	chr19	878687	0	0	0	0					False	False	False	True	polya_clip	113.0	113	L	879299	True	12.0	T	T						
+control	SR	A00404:40:HFGYNDSXX:3:2262:17300:34773	chr19	879305	880642	L	879366	chr19	879366	0	0	0	0					False	False	False	True	polya_clip	107.0	107	L	879366	True	14.0	T	T						
+control	SR	A00404:41:HFH25DSXX:2:1553:10664:35681	chr19	879305	880642	R	879587	chr19	879504	303	322	0	0	L1PA14_5end#LINE/L1		-		True	False	False	False	mei	68.0	68	R	879587	False	1.0								
+control	DPE	A00297:35:HFKWWDSXX:1:1148:20193:24126	chr19	877304	879503	L	877553	chr2	32916353	711	730	711	730	L1MCa_5end#LINE/L1	L1MCa_5end#LINE/L1	-	-	True	True	False	False	consensus		0		0	False				False	0.0	2.0	A	R	False

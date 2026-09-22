@@ -24,7 +24,11 @@ from intervaltree import IntervalTree
 from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 
 from retro_miner.igv_plots import generate_gold_review_igv_plots
-from retro_miner.read_architecture import generate_gold_read_architecture_plots
+from retro_miner.read_architecture import (
+    _clustered_coord_extent,
+    _robust_coord_extent,
+    generate_gold_read_architecture_plots,
+)
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.bam_io import bind_alignment_reference, open_alignment
 from retro_miner.mate_resolution import require_interchrom_mate_sequences
@@ -4692,35 +4696,199 @@ def _overlay_full_consensus_coords_onto_detail(
     return out
 
 
-def _robust_coord_extent(lo_values: pd.Series, hi_values: pd.Series) -> tuple[float, float]:
-    """Return outlier-resistant min/max MEI coords for one locus/sample group.
+def _series_mei_family(values: pd.Series) -> pd.Series:
+    return values.fillna("").astype(str).map(_normalize_mei_family_token)
 
-    Uses Tukey fences (k=3) on the pooled start/end endpoints when enough
-    points exist; otherwise falls back to raw min/max. This keeps true full-
-    length SVA/LINE1 footprints while dropping rare off-target mates that can
-    inflate an Alu-sized insertion to >1 kb.
-    """
-    pts = pd.concat(
-        [
-            pd.to_numeric(lo_values, errors="coerce"),
-            pd.to_numeric(hi_values, errors="coerce"),
-        ],
-        ignore_index=True,
+
+def _frame_row_mei_family(df: pd.DataFrame) -> pd.Series:
+    """Family of the MEI target that supplied this row's coordinates."""
+    mei = (
+        _series_mei_family(df["mei_target"])
+        if "mei_target" in df.columns
+        else pd.Series("", index=df.index)
     )
-    pts = pts[pts.gt(0)].astype(float)
-    if pts.empty:
-        return float("nan"), float("nan")
-    if len(pts) < 8:
-        return float(pts.min()), float(pts.max())
-    q1 = float(pts.quantile(0.25))
-    q3 = float(pts.quantile(0.75))
-    iqr = max(q3 - q1, 1.0)
-    lo_fence = q1 - 3.0 * iqr
-    hi_fence = q3 + 3.0 * iqr
-    kept = pts[(pts >= lo_fence) & (pts <= hi_fence)]
-    if kept.empty:
-        return float(pts.min()), float(pts.max())
-    return float(kept.min()), float(kept.max())
+    mate = (
+        _series_mei_family(df["mate_mei_target"])
+        if "mate_mei_target" in df.columns
+        else pd.Series("", index=df.index)
+    )
+    fam = (
+        _series_mei_family(df["family"])
+        if "family" in df.columns
+        else pd.Series("", index=df.index)
+    )
+    out = mei.where(mei.ne(""), mate)
+    return out.where(out.ne(""), fam)
+
+
+def _locus_families_from_candidates(candidates: pd.DataFrame | None) -> pd.DataFrame:
+    key_cols = ["chrom", "window_start", "window_end"]
+    empty = pd.DataFrame(columns=key_cols + ["locus_mei_family"])
+    if candidates is None or candidates.empty or not set(key_cols).issubset(candidates.columns):
+        return empty
+    fam = pd.Series("", index=candidates.index)
+    for col in ("consensus_mei_family", "mei_family", "event_family"):
+        if col not in candidates.columns:
+            continue
+        token = _series_mei_family(candidates[col])
+        fam = fam.where(fam.ne(""), token)
+    work = candidates.loc[:, key_cols].copy()
+    work["locus_mei_family"] = fam.astype(str)
+    work = work.loc[work["locus_mei_family"].ne("")]
+    if work.empty:
+        return empty
+    return work.drop_duplicates(key_cols, keep="first")
+
+
+def _locus_families_from_detail(detail: pd.DataFrame | None) -> pd.DataFrame:
+    key_cols = ["chrom", "window_start", "window_end"]
+    empty = pd.DataFrame(columns=key_cols + ["locus_mei_family"])
+    if detail is None or detail.empty or not set(key_cols).issubset(detail.columns):
+        return empty
+    keep_cols = [c for c in key_cols + ["mei_target", "mate_mei_target", "family", "read_name"] if c in detail.columns]
+    work = detail.loc[:, keep_cols].copy()
+    work["locus_mei_family"] = _frame_row_mei_family(work)
+    work = work.loc[work["locus_mei_family"].ne("")]
+    if work.empty:
+        return empty
+    if "read_name" in work.columns:
+        counts = (
+            work.groupby(key_cols + ["locus_mei_family"], as_index=False)["read_name"]
+            .nunique()
+            .rename(columns={"read_name": "n"})
+        )
+    else:
+        counts = work.groupby(key_cols + ["locus_mei_family"], as_index=False).size().rename(columns={"size": "n"})
+    return (
+        counts.sort_values(key_cols + ["n"], ascending=[True, True, True, False])
+        .drop_duplicates(key_cols, keep="first")
+        .loc[:, key_cols + ["locus_mei_family"]]
+    )
+
+
+def _filter_rows_to_locus_mei_family(
+    df: pd.DataFrame,
+    locus_families: pd.DataFrame | None,
+    *,
+    row_family: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Keep rows whose MEI target family matches the locus winning family."""
+    key_cols = ["chrom", "window_start", "window_end"]
+    if df is None or df.empty or locus_families is None or locus_families.empty:
+        return df
+    if not set(key_cols).issubset(df.columns) or "locus_mei_family" not in locus_families.columns:
+        return df
+    fam = row_family if row_family is not None else _frame_row_mei_family(df)
+    work = df.copy()
+    work["_row_mei_family"] = fam.reindex(work.index).fillna("").astype(str)
+    merged = work.merge(locus_families.loc[:, key_cols + ["locus_mei_family"]], on=key_cols, how="left")
+    locus_fam = merged["locus_mei_family"].fillna("").astype(str)
+    keep = locus_fam.eq("") | merged["_row_mei_family"].eq(locus_fam)
+    return merged.loc[keep].drop(columns=["_row_mei_family", "locus_mei_family"], errors="ignore")
+
+
+def _max_unique_interval_overlap(
+    start: pd.Series,
+    end: pd.Series,
+    read_name: pd.Series,
+) -> int:
+    """Largest number of unique reads covering one consensus coordinate."""
+    lo = pd.to_numeric(start, errors="coerce")
+    hi = pd.to_numeric(end, errors="coerce")
+    names = read_name.fillna("").astype(str)
+    ok = lo.gt(0) & hi.ge(lo) & names.str.len().gt(0)
+    if not bool(ok.any()):
+        return 0
+    iv = (
+        pd.DataFrame({"lo": lo.loc[ok].astype(int), "hi": hi.loc[ok].astype(int), "read_name": names.loc[ok]})
+        .drop_duplicates(["read_name", "lo", "hi"])
+    )
+    events: list[tuple[int, int, str]] = []
+    for rec in iv.itertuples(index=False):
+        events.append((int(rec.lo), 1, str(rec.read_name)))
+        events.append((int(rec.hi) + 1, -1, str(rec.read_name)))
+    events.sort(key=lambda item: (item[0], item[1]))
+    active: dict[str, int] = {}
+    best = 0
+    for _, delta, name in events:
+        active[name] = active.get(name, 0) + int(delta)
+        if active[name] <= 0:
+            active.pop(name, None)
+        n = len(active)
+        if n > best:
+            best = n
+    return int(best)
+
+
+def annotate_mei_overlap_piles(
+    candidates: pd.DataFrame,
+    detail: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Per-locus max unique-read overlap on one MEI family consensus.
+
+    Training feature, not a gold gate. Alu / SVA / L1 are piled separately.
+    Subfamilies within a family may stack (L1HS with L1PA). Scattered seeds
+    that never cover the same coordinate do not count as a pile.
+    """
+    out = candidates.copy()
+    key_cols = ["chrom", "window_start", "window_end"]
+    out["mei_consensus_overlap_reads"] = 0
+    if detail is None or detail.empty or not set(key_cols).issubset(detail.columns):
+        return out
+    if "chrom" not in out.columns or "window_start" not in out.columns:
+        return out
+    join = out.loc[:, ["chrom"]].copy()
+    ws = pd.to_numeric(out["window_start"], errors="coerce")
+    we = pd.to_numeric(out["window_end"], errors="coerce") if "window_end" in out.columns else ws
+    if "discovery_window_start" in out.columns:
+        dws = pd.to_numeric(out["discovery_window_start"], errors="coerce")
+        dwe = pd.to_numeric(out["discovery_window_end"], errors="coerce") if "discovery_window_end" in out.columns else dws
+        ws = dws.where(dws.gt(0), ws)
+        we = dwe.where(dwe.gt(0), we)
+    join["window_start"] = ws.fillna(0).astype(int)
+    join["window_end"] = we.fillna(0).astype(int)
+    for col in ("consensus_mei_family", "mei_family", "event_family"):
+        if col in out.columns:
+            join[col] = out[col]
+    work = detail.copy()
+    fam_tbl = _locus_families_from_candidates(join)
+    if fam_tbl is None or fam_tbl.empty:
+        fam_tbl = _locus_families_from_detail(work)
+    work = _filter_rows_to_locus_mei_family(work, fam_tbl)
+    if work.empty:
+        return out
+    mei_hit = (
+        work["mei_hit"].fillna(False).astype(bool)
+        if "mei_hit" in work.columns
+        else pd.Series(True, index=work.index)
+    )
+    work = work.loc[mei_hit].copy()
+    if work.empty or "read_name" not in work.columns:
+        return out
+    work["_pile_family"] = _frame_row_mei_family(work)
+    work = work.loc[work["_pile_family"].isin(["ALU", "SVA", "LINE1"])]
+    if work.empty:
+        return out
+    rows: list[dict[str, object]] = []
+    group_cols = key_cols + (["sample"] if "sample" in work.columns else []) + ["_pile_family"]
+    for key, grp in work.groupby(group_cols, sort=False):
+        n = _max_unique_interval_overlap(grp["mei_start"], grp["mei_end"], grp["read_name"])
+        rec = {"mei_consensus_overlap_reads": int(n)}
+        keys = key if isinstance(key, tuple) else (key,)
+        for col, val in zip(group_cols, keys):
+            if col == "_pile_family":
+                continue
+            rec[col] = val
+        rows.append(rec)
+    if not rows:
+        return out
+    piles = pd.DataFrame(rows)
+    locus = piles.groupby(key_cols, as_index=False)["mei_consensus_overlap_reads"].max()
+    scored = join.loc[:, key_cols].merge(locus, on=key_cols, how="left")
+    out["mei_consensus_overlap_reads"] = (
+        pd.to_numeric(scored["mei_consensus_overlap_reads"], errors="coerce").fillna(0).astype(int).to_numpy()
+    )
+    return out
 
 
 def _candidate_mei_target_lengths(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -4749,15 +4917,42 @@ def _candidate_mei_target_lengths(candidates: pd.DataFrame) -> pd.DataFrame:
         if "asm_mei_target_length" in candidates.columns
         else pd.Series(float("nan"), index=candidates.index)
     )
-    present = [c for c in fallback_cols if c in candidates.columns]
-    if present:
-        fallback = pd.concat(
-            [pd.to_numeric(candidates[c], errors="coerce") for c in present],
-            axis=1,
-        )
-        fallback_len = fallback.where(fallback.gt(0)).max(axis=1, skipna=True)
+    fam = pd.Series("", index=candidates.index)
+    for col in ("consensus_mei_family", "mei_family", "event_family"):
+        if col in candidates.columns:
+            token = _series_mei_family(candidates[col])
+            fam = fam.where(fam.ne(""), token)
+    side_pairs = (
+        ("disease_L_mei_target_len", "disease_L_mei_family"),
+        ("disease_R_mei_target_len", "disease_R_mei_family"),
+        ("control_L_mei_target_len", "control_L_mei_family"),
+        ("control_R_mei_target_len", "control_R_mei_family"),
+        ("disease_full_L_mei_target_len", "disease_full_L_mei_family"),
+        ("disease_full_R_mei_target_len", "disease_full_R_mei_family"),
+        ("control_full_L_mei_target_len", "control_full_L_mei_family"),
+        ("control_full_R_mei_target_len", "control_full_R_mei_family"),
+    )
+    same_family_parts: list[pd.Series] = []
+    for len_col, fam_col in side_pairs:
+        if len_col not in candidates.columns:
+            continue
+        lens = pd.to_numeric(candidates[len_col], errors="coerce")
+        if fam_col in candidates.columns:
+            side_fam = _series_mei_family(candidates[fam_col])
+            lens = lens.where(fam.eq("") | side_fam.eq("") | side_fam.eq(fam))
+        same_family_parts.append(lens)
+    if same_family_parts:
+        fallback_len = pd.concat(same_family_parts, axis=1).where(lambda x: x.gt(0)).max(axis=1, skipna=True)
     else:
-        fallback_len = pd.Series(float("nan"), index=candidates.index)
+        present = [c for c in fallback_cols if c in candidates.columns]
+        if present:
+            fallback = pd.concat(
+                [pd.to_numeric(candidates[c], errors="coerce") for c in present],
+                axis=1,
+            )
+            fallback_len = fallback.where(fallback.gt(0)).max(axis=1, skipna=True)
+        else:
+            fallback_len = pd.Series(float("nan"), index=candidates.index)
     work["mei_target_length"] = asm.where(asm.gt(0), fallback_len)
     return (
         work.groupby(key_cols, as_index=False)["mei_target_length"]
@@ -4808,6 +5003,7 @@ def _on_target_extent_ok(
 def _aggregate_detail_mei_extents(
     detail: pd.DataFrame,
     target_lengths: pd.DataFrame | None = None,
+    locus_families: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Per-locus min/max MEI consensus coords from supporting-read detail rows.
 
@@ -4816,7 +5012,8 @@ def _aggregate_detail_mei_extents(
     and control samples separately, plus a combined locus extent.
 
     Only intervals that map within the consensus target element length are
-    included when that length is known.
+    included when that length is known. Min/max is restricted to the locus
+    winning MEI family so Alu + L1 mates cannot form one 2–6 kb axis.
 
     Also emits per-side SR extents (``{sample}_{L|R}_detail_mei_start/end``) so
     gold/annotation rebuilds can restore zeroed L/R aggregated coords, and
@@ -4847,11 +5044,16 @@ def _aggregate_detail_mei_extents(
     if not required.issubset(set(detail.columns)):
         return pd.DataFrame(columns=empty_cols)
 
-    work = detail.loc[
-        :, list(required | {"mei_hit", "mate_mei_hit", "evidence_type", "anchor_side", "read_name"})
-    ].copy()
+    extra = {"mei_hit", "mate_mei_hit", "evidence_type", "anchor_side", "read_name", "mei_target", "mate_mei_target", "family"}
+    work = detail.loc[:, [c for c in (required | extra) if c in detail.columns]].copy()
     work["sample"] = work["sample"].fillna("").astype(str).str.lower()
     work = work.loc[work["sample"].isin(["disease", "control"])].copy()
+    if work.empty:
+        return pd.DataFrame(columns=empty_cols)
+    fam_tbl = locus_families
+    if fam_tbl is None or fam_tbl.empty:
+        fam_tbl = _locus_families_from_detail(work)
+    work = _filter_rows_to_locus_mei_family(work, fam_tbl)
     if work.empty:
         return pd.DataFrame(columns=empty_cols)
 
@@ -4896,7 +5098,8 @@ def _aggregate_detail_mei_extents(
 
     rows: list[dict[str, object]] = []
     for (chrom, ws, we, sample), grp in work.groupby(key_cols + ["sample"], sort=False):
-        lo, hi = _robust_coord_extent(grp["extent_lo"], grp["extent_hi"])
+        names = grp["read_name"] if "read_name" in grp.columns else None
+        lo, hi = _clustered_coord_extent(grp["extent_lo"], grp["extent_hi"], names)
         n_reads = (
             grp["read_name"].fillna("").astype(str).nunique()
             if "read_name" in grp.columns
@@ -4930,7 +5133,8 @@ def _aggregate_detail_mei_extents(
     )
     combined_rows: list[dict[str, object]] = []
     for (chrom, ws, we), grp in work.groupby(key_cols, sort=False):
-        lo, hi = _robust_coord_extent(grp["extent_lo"], grp["extent_hi"])
+        names = grp["read_name"] if "read_name" in grp.columns else None
+        lo, hi = _clustered_coord_extent(grp["extent_lo"], grp["extent_hi"], names)
         combined_rows.append(
             {
                 "chrom": chrom,
@@ -4955,7 +5159,8 @@ def _aggregate_detail_mei_extents(
             for (chrom, ws, we, sample, side), grp in sr.groupby(
                 key_cols + ["sample", "anchor_side"], sort=False
             ):
-                lo, hi = _robust_coord_extent(grp["extent_lo"], grp["extent_hi"])
+                names = grp["read_name"] if "read_name" in grp.columns else None
+                lo, hi = _clustered_coord_extent(grp["extent_lo"], grp["extent_hi"], names)
                 side_rows.append(
                     {
                         "chrom": chrom,
@@ -4996,9 +5201,13 @@ def _merge_detail_mei_extents(candidates: pd.DataFrame, detail: pd.DataFrame | N
     """
     if detail is None or detail.empty or candidates.empty:
         return candidates
+    fam_tbl = _locus_families_from_candidates(candidates)
+    if fam_tbl.empty:
+        fam_tbl = _locus_families_from_detail(detail)
     extents = _aggregate_detail_mei_extents(
         detail,
         target_lengths=_candidate_mei_target_lengths(candidates),
+        locus_families=fam_tbl,
     )
     if extents.empty:
         return candidates
@@ -6745,8 +6954,8 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
     mei_df["anchor_bin_10bp"] = (mei_df["pos"].astype(int) // 10).astype(int)
 
     # Family/subfamily identity: only mates that are interchromosomal or >1 kb away.
-    # Prefer mate consensus labels when present. Support counts / geometry below
-    # still use the full mei_df.
+    # Prefer mate consensus labels when present. Support counts stay on the full
+    # mei_df; MEI-axis geometry (medians / min-max span) uses the winning family.
     identity_df = _discordant_rows_for_mei_identity(mei_df)
     family_top, subfamily_top = _top_family_then_subfamily(
         identity_df,
@@ -6822,15 +7031,30 @@ def _aggregate_discordant_mei_metrics(df: pd.DataFrame, sample_prefix: str) -> p
         }
     )
 
+    geom_df = mei_df
+    fam_col = f"{sample_prefix}_discordant_mei_family"
+    if not family_top.empty and "family" in mei_df.columns and fam_col in family_top.columns:
+        geom_df = mei_df.merge(
+            family_top[["chrom", "window_start", "window_end", fam_col]],
+            on=["chrom", "window_start", "window_end"],
+            how="left",
+        )
+        geom_fam = geom_df[fam_col].fillna("").astype(str)
+        geom_df = geom_df.loc[geom_fam.eq("") | geom_df["family"].astype(str).eq(geom_fam)]
+        geom_df = geom_df.drop(columns=[fam_col], errors="ignore")
+        if geom_df.empty:
+            geom_df = mei_df
+    geom_df = geom_df.copy()
+    geom_df["target_mid"] = ((geom_df["target_start"].astype(int) + geom_df["target_end"].astype(int)) // 2).astype(int)
     mei_df["target_mid"] = ((mei_df["target_start"].astype(int) + mei_df["target_end"].astype(int)) // 2).astype(int)
     mei_df["target_bin_25bp"] = (mei_df["target_mid"].astype(int) // 25).astype(int)
     side_target_mid = (
-        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)["target_mid"]
+        geom_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)["target_mid"]
         .median()
         .rename(columns={"target_mid": "target_mid_median"})
     )
     side_target_extent = (
-        mei_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)
+        geom_df.groupby(["chrom", "window_start", "window_end", "anchor_side"], as_index=False)
         .agg(
             target_start_min=("target_start", "min"),
             target_end_max=("target_end", "max"),
@@ -9925,6 +10149,7 @@ def _ensure_candidate_schema_defaults(candidates: pd.DataFrame) -> pd.DataFrame:
         "known_mei_polymorphism_family": "",
         "known_mei_polymorphism_subfamily": "",
         "known_mei_polymorphism_id": "",
+        "mei_consensus_overlap_reads": 0,
     }
     for col, default in defaults.items():
         if col not in out.columns:
@@ -13374,6 +13599,11 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     out = _annotate_consensus_retrotransposition_fields(out)
     out["two_sided_support"] = _two_sided_support_mask(out)
     out["poly_at_supported"] = _poly_at_supported_mask(out)
+    out["mei_consensus_overlap_reads"] = (
+        pd.to_numeric(_series_or_default("mei_consensus_overlap_reads", 0), errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
     out["disease_vaf"] = _series_or_default("asm_disease_vaf", float("nan")).astype(float)
     out["control_vaf"] = _series_or_default("asm_control_vaf", float("nan")).astype(float)
     out["vaf_delta"] = _series_or_default("asm_vaf_delta", float("nan")).astype(float)
@@ -14333,6 +14563,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "control_strand_agreement",
         "two_sided_support",
         "gold_orientation_consistent_two_sided",
+        "mei_consensus_overlap_reads",
         "disease_left_flank_mei_reads",
         "disease_right_flank_mei_reads",
         "disease_left_flank_polya_reads",
@@ -16232,6 +16463,8 @@ def annotate_candidate_loci_with_mei(
         )
     candidate = _add_known_mei_polymorphism_consensus(candidate)
     candidate = _add_consolidated_event_fields(candidate)
+    if supporting_reads_detail is not None and not supporting_reads_detail.empty:
+        candidate = _merge_detail_mei_extents(candidate, supporting_reads_detail)
     candidate = _broaden_poly_at_fields(candidate)
     if rmsk_table_path is not None:
         rmsk_t0 = time.monotonic()
@@ -16284,6 +16517,7 @@ def annotate_candidate_loci_with_mei(
         discordant_disease=disease_disc_hits,
         discordant_control=control_disc_hits,
     )
+    candidate = annotate_mei_overlap_piles(candidate, supporting_reads_detail)
     candidate = _assign_gold_stage(candidate, empirical_stage=empirical_stage)
 
     candidate = _apply_breakpoint_motif_report_gating(candidate)
