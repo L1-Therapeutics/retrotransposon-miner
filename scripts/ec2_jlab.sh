@@ -668,7 +668,7 @@ create_instance() {
   fi
 
   if want_spot; then
-    log "Creating Spot instance ${create_name} (${INSTANCE_TYPE}; persistent, stop on interruption so EBS is kept)"
+    log "Creating Spot instance ${create_name} (${INSTANCE_TYPE}; one-time, stop on interruption, no automatic restart)"
   else
     log "Creating on-demand instance ${create_name} (${INSTANCE_TYPE})"
   fi
@@ -692,10 +692,10 @@ create_instance() {
     log "Letting AWS choose AZ (no --subnet-id)"
   fi
   if want_spot; then
-    # Persistent + stop: AWS reclaim (or stop-instance) keeps the EBS root
-    # volume; start-instance attaches the same disk. Omit MaxPrice so the
-    # cap is the on-demand price.
-    run_args+=(--instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}')
+    # One-time + stop: reclaim keeps the EBS root volume and closes the
+    # request. AWS does not start the instance again; start-instance is
+    # explicit user input. Omit MaxPrice so the cap is the on-demand price.
+    run_args+=(--instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"stop"}}')
   fi
   if [[ -n "${S3_BUCKET}" ]]; then
     run_args+=(--iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}")
@@ -792,8 +792,23 @@ ensure_eip() {
   fi
 
   if [[ -z "${alloc_id}" || "${alloc_id}" == "None" ]]; then
+    # Account EIP quota counts unattached addresses. Reuse one left behind by
+    # a previous instance of this app instead of allocating a sixth.
+    alloc_id="$(awsq ec2 describe-addresses \
+      --filters "Name=tag:App,Values=${APP_NAME}" \
+      --query 'Addresses[?InstanceId==null] | [0].AllocationId' --output text 2>/dev/null || true)"
+    if [[ -n "${alloc_id}" && "${alloc_id}" != "None" ]]; then
+      log "Reusing unattached Elastic IP ${alloc_id}"
+      awsq ec2 create-tags --resources "${alloc_id}" --tags "Key=Name,Value=${eip_tag}" "Key=App,Value=${APP_NAME}" >/dev/null
+    fi
+  fi
+
+  if [[ -z "${alloc_id}" || "${alloc_id}" == "None" ]]; then
     log "Allocating Elastic IP"
-    alloc_id="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text)"
+    if ! alloc_id="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text)"; then
+      log "Elastic IP quota is full. Release an unattached address, then rerun: $0 ensure-eip"
+      exit 1
+    fi
     awsq ec2 create-tags --resources "${alloc_id}" --tags "Key=Name,Value=${eip_tag}" "Key=App,Value=${APP_NAME}" >/dev/null
   fi
 
