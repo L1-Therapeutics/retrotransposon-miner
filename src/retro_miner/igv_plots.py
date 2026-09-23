@@ -687,6 +687,45 @@ def _wrap_headless_command(launcher: Path, batch_script: Path) -> list[str]:
     return base
 
 
+_IGV_GENOME_LINE = re.compile(r'^genome\s+"([^"]+)"\s*$')
+
+
+def _local_genome_from_batch(batch_script: Path) -> Path | None:
+    """Return the FASTA path from a batch ``genome`` line, when it is a local file."""
+    try:
+        lines = Path(batch_script).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = _IGV_GENOME_LINE.match(line.strip())
+        if match is None:
+            continue
+        genome = Path(match.group(1))
+        if genome.is_file():
+            return genome
+    return None
+
+
+def _pin_igv_default_genome(reference_fasta: Path, igv_dir: Path | None = None) -> Path:
+    """Point IGV's startup genome at the local FASTA.
+
+    With no prefs file, IGV loads genome id ``hg38`` from the hosted igv-genomes
+    JSON, and that JSON pulls the UCSC RefSeq track. Snapshots already load the
+    local reference in the batch file; this keeps startup on that same file.
+    """
+    fasta = Path(reference_fasta).resolve()
+    root = Path(igv_dir) if igv_dir is not None else Path.home() / ".igv"
+    root.mkdir(parents=True, exist_ok=True)
+    prefs_path = root / "prefs.properties"
+    existing = prefs_path.read_text(encoding="utf-8") if prefs_path.exists() else ""
+    kept = [line for line in existing.splitlines() if line and not line.startswith("DEFAULT_GENOME=")]
+    prefs_path.write_text(
+        "\n".join([f"DEFAULT_GENOME={fasta}", *kept]) + "\n",
+        encoding="utf-8",
+    )
+    return prefs_path
+
+
 def _verify_snapshot_pngs(index_rows: list[dict[str, object]]) -> int:
     paths = [Path(str(row["snapshot_png"])) for row in index_rows if row.get("snapshot_png")]
     created = sum(1 for path in paths if path.exists() and path.stat().st_size > 0)
@@ -712,6 +751,10 @@ def run_igv_batch(
     bind_retry_sleep_sec: float = 2.0,
 ) -> None:
     igv = resolve_igv_launcher(launcher)
+    local_genome = _local_genome_from_batch(batch_script_path)
+    if local_genome is not None:
+        _pin_igv_default_genome(local_genome)
+        click.echo(f"[igv-plots] pinned default genome to local FASTA {local_genome}")
     cmd = _wrap_headless_command(igv, batch_script_path)
     if _needs_virtual_display() and not shutil.which("xvfb-run"):
         if _find_xvfb_binary() is None:
