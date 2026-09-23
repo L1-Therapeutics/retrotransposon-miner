@@ -33,6 +33,7 @@ from retro_miner.local_assembly import annotate_silver_with_local_assembly
 from retro_miner.bam_io import bind_alignment_reference, open_alignment
 from retro_miner.mate_resolution import require_interchrom_mate_sequences
 from retro_miner.candidate_loci import annotate_segdup_on_breakpoint_windows
+from retro_miner.split_cluster_z import annotate_split_cluster_binomial_z
 from retro_miner.evidence_extract import (
     _longest_soft_clip_from_read,
     _soft_clip_query_seq,
@@ -14916,6 +14917,10 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "local_bam_peak_depth_z",
         "insertion_model_score",
         "coherence_score",
+        "split_cluster_window_reads",
+        "split_cluster_reads",
+        "split_cluster_binomial_p",
+        "split_cluster_binomial_z",
         "mei_score_enrichment_ratio",
         "read_support_heuristic_score",
         "consensus_insertion_mei_span",
@@ -14952,6 +14957,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "insertion_model_score",
         "local_bam_peak_depth_z",
         "coherence_score",
+        "split_cluster_binomial_p",
+        "split_cluster_binomial_z",
         "mei_score_enrichment_ratio",
         "read_support_heuristic_score",
     ]
@@ -16853,6 +16860,11 @@ def annotate_candidate_loci_with_mei(
     )
     candidate = annotate_mei_overlap_piles(candidate, supporting_reads_detail)
     candidate = _assign_gold_stage(candidate, empirical_stage=empirical_stage)
+    cluster_t0 = time.monotonic()
+    candidate = annotate_split_cluster_binomial_z(candidate, split_disease_raw)
+    click.echo(
+        f"[mei-annotate] split-cluster binomial z elapsed={time.monotonic() - cluster_t0:.1f}s"
+    )
 
     candidate = _apply_breakpoint_motif_report_gating(candidate)
     candidate = _prioritize_mei_candidates(candidate, stage_first=True)
