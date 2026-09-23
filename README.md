@@ -146,7 +146,7 @@ S3_BUCKET=s3://<your-bucket> \
 
 Convert the CRAM to one coordinate-sorted BAM before the run (`samtools view -@ 24 -b -T ref.fa -o sample.bam sample.cram`, then `samtools index -@ 24`). Pass that BAM as both `--disease-bam` and `--control-bam`. Extract, mate fetch, peak-depth, and IGV then read it in place. IGV converts a path only when it ends in `.cram`. A 30× CRAM of about 15 GB becomes a BAM of about 40 GB. With the reference (~12 GB) and per-chromosome tables, 200 GB still has room to keep the CRAM until the BAM is indexed.
 
-Run chromosomes in order at concurrency 16 (`--chr chr1,chr2,...,chr22,chrX,chrY --chr_concurrency 16`). Each chromosome is mostly one thread, so extra cores past that do not shorten the longest chromosome. Sixteen leaves memory for the jobs and for caching the BAM; 24 is the chromosome count and the useful ceiling. A larger instance does not finish faster than chromosome 1.
+Run a full genome with `--chr all --chr_concurrency 16`. `--chr all` expands to chrX, chrY, then chr1 through chr22, so chromosome X starts in the first 16 slots. Chromosome X is about the length of chromosome 8. Each chromosome is mostly one thread, so extra cores past the chromosome count do not shorten the longest chromosome. Sixteen leaves memory for the jobs and for caching the BAM; 24 is the chromosome count and the useful ceiling. A larger instance does not finish faster than chromosome 1.
 
 A 64-vCPU on-demand instance uses the whole default standard-family vCPU quota (64) on a new account. Stop other A/C/D/H/I/M/R/T/Z instances before launch.
 
