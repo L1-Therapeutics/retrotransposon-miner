@@ -7,6 +7,7 @@ score/tier cutoff, and list RTM calls that are novel to both truth sets.
 from __future__ import annotations
 
 import gzip
+import os
 import re
 import shutil
 import subprocess
@@ -387,6 +388,32 @@ def position_in_intervals(
     chrom_intervals = intervals.get(normalize_chrom(chrom), [])
     index = bisect_right(chrom_intervals, (pos0, float("inf"))) - 1
     return index >= 0 and chrom_intervals[index][0] <= pos0 < chrom_intervals[index][1]
+
+
+def default_junk_exclusion_bed(reference_build: str = "hg38") -> Path:
+    """Caller junk mask: segdup, low mappability, gaps, and the ENCODE blacklist."""
+    env = (os.environ.get("RTM_PUBLIC_DATA_DIR") or "").strip()
+    root = Path(env).expanduser() if env else Path.home() / "retrotransposon-workdir" / "data" / "public"
+    return root / "annotation" / reference_build / "junk" / "junk_exclusion_merged.bed"
+
+
+def resolve_exclude_beds(
+    exclude_beds: Iterable[Path] | None,
+    *,
+    apply_default_junk: bool,
+    reference_build: str = "hg38",
+) -> list[Path]:
+    """Use explicit exclude beds, or the caller junk mask unless that default is off."""
+    beds = [Path(path) for path in (exclude_beds or [])]
+    if beds or not apply_default_junk:
+        return beds
+    default = default_junk_exclusion_bed(reference_build)
+    if not default.is_file():
+        raise FileNotFoundError(
+            f"Default junk exclusion bed not found: {default}. "
+            "Pass --exclude-bed or --no-junk-filter."
+        )
+    return [default]
 
 
 def filter_variants_to_regions(

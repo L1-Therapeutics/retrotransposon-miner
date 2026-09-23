@@ -220,3 +220,29 @@ def test_query_retries_chromosome_alias_after_empty_success(monkeypatch, tmp_pat
     )
     assert rows == [["22", "100"]]
     assert [command[command.index("-r") + 1] for command in commands] == ["chr22", "22"]
+
+
+def test_default_junk_exclusion_bed_uses_public_data_dir(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("RTM_PUBLIC_DATA_DIR", str(tmp_path))
+    assert callset_eval.default_junk_exclusion_bed() == (
+        tmp_path / "annotation" / "hg38" / "junk" / "junk_exclusion_merged.bed"
+    )
+
+
+def test_resolve_exclude_beds_uses_default_when_present(monkeypatch, tmp_path) -> None:
+    bed = tmp_path / "annotation" / "hg38" / "junk" / "junk_exclusion_merged.bed"
+    bed.parent.mkdir(parents=True)
+    bed.write_text("chr1\t0\t10\n", encoding="utf-8")
+    monkeypatch.setenv("RTM_PUBLIC_DATA_DIR", str(tmp_path))
+    assert callset_eval.resolve_exclude_beds(None, apply_default_junk=True) == [bed]
+
+
+def test_resolve_exclude_beds_keeps_explicit_beds(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("RTM_PUBLIC_DATA_DIR", str(tmp_path))
+    explicit = tmp_path / "custom.bed"
+    assert callset_eval.resolve_exclude_beds([explicit], apply_default_junk=True) == [explicit]
+
+
+def test_resolve_exclude_beds_skips_missing_default_when_disabled(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("RTM_PUBLIC_DATA_DIR", str(tmp_path))
+    assert callset_eval.resolve_exclude_beds(None, apply_default_junk=False) == []
