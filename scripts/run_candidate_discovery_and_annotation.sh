@@ -60,8 +60,9 @@ EMPIRICAL_RANDOM_WINDOWS="1000"
 EMPIRICAL_RANDOM_SCOPE="chromosome"
 EMPIRICAL_RANDOM_SEED="13"
 EMPIRICAL_HIGHCONF_BED=""
-# Empirical BAM/context outlier gating is off by default (slow; little callset
-# impact). Pass --empirical-stage to enable.
+# Random-window empirical p-values stay off by default (slow; little callset
+# impact). Pass --empirical-stage to enable. The silver peak-depth z-score is
+# separate and runs whenever annotate has BAMs.
 EMPIRICAL_STAGE="0"
 LOCAL_ASSEMBLY="0"
 ANNOTATE_ONLY="0"

@@ -23,7 +23,9 @@ from retro_miner._utils import safe_locus_id
 from retro_miner.igv_plots import (
     _build_assembly_contig_track,
     _igv_singleton_lock,
+    _local_genome_from_batch,
     _materialize_alignment_for_igv,
+    _pin_igv_default_genome,
     _quote_igv_path,
     _row_inferred_breakpoint_pos,
     _safe_snapshot_stem,
@@ -874,3 +876,34 @@ class TestInferredBreakpointBed:
             [{"chrom": "chr22", "insertion_breakpoint_pos": 0, "assembly_best_contig_id": ""}]
         )
         assert _write_inferred_breakpoint_bed(variants, tmp_path) is None
+
+
+class TestIgvDefaultGenomePin:
+    """Startup must use the local FASTA, not the hosted hg38 genome and its RefSeq track."""
+
+    def test_pin_writes_local_fasta_and_keeps_other_prefs(self, tmp_path):
+        fasta = tmp_path / "Homo_sapiens_assembly38.fasta"
+        fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+        igv_dir = tmp_path / ".igv"
+        igv_dir.mkdir()
+        (igv_dir / "prefs.properties").write_text(
+            "DEFAULT_GENOME=hg38\nSAM.SHOW_SOFT_CLIPPED=true\n",
+            encoding="utf-8",
+        )
+        prefs = _pin_igv_default_genome(fasta, igv_dir=igv_dir)
+        text = prefs.read_text(encoding="utf-8")
+        assert f"DEFAULT_GENOME={fasta.resolve()}" in text
+        assert "DEFAULT_GENOME=hg38" not in text
+        assert "SAM.SHOW_SOFT_CLIPPED=true" in text
+        assert "hgdownload" not in text
+        assert "ncbiRefSeq" not in text
+
+    def test_local_genome_from_batch_ignores_missing_files(self, tmp_path):
+        batch = tmp_path / "igv_batch.txt"
+        missing = tmp_path / "nope.fasta"
+        batch.write_text(f'genome "{missing}"\n', encoding="utf-8")
+        assert _local_genome_from_batch(batch) is None
+        fasta = tmp_path / "ref.fasta"
+        fasta.write_text(">chr1\nA\n", encoding="utf-8")
+        batch.write_text(f'new\ngenome "{fasta}"\n', encoding="utf-8")
+        assert _local_genome_from_batch(batch) == fasta

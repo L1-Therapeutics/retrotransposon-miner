@@ -55,6 +55,9 @@ class ClipAlignmentSummary:
 _MIN_MEI_ANCHOR_BP = 25
 _MIN_POLYA_RUN_FOR_END_IMPUTE = 12
 _MIN_MEI_ANCHOR_BP_RELAXED = 15
+# Right tail of the silver peak-depth distribution. A normal z of 2 is the
+# 97.7th percentile; these depths are skewed, so this cutoff is higher.
+_PEAK_DEPTH_Z_CUTOFF = 2.0
 _MIN_REPORTABLE_MEI_SPAN_BP = 20
 
 
@@ -2255,6 +2258,225 @@ def _hydrate_sample_mei_hits_from_detail(
     }
 
 
+def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+        df.to_parquet(tmp_path, index=False)
+        tmp_path.replace(path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _atomic_write_json(payload: dict[str, object], path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+        tmp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _table_key_token(df: pd.DataFrame, columns: list[str]) -> str:
+    """Stable hash of the rows that a cached scan has to cover."""
+    if df is None or df.empty or any(col not in df.columns for col in columns):
+        payload = ""
+    else:
+        work = df.loc[:, columns].copy()
+        for col in columns:
+            if col in {"window_start", "window_end"}:
+                work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0).astype("int64")
+            else:
+                work[col] = work[col].fillna("").astype(str)
+        work = work.drop_duplicates().sort_values(columns)
+        payload = "\n".join("\t".join(str(value) for value in row) for row in work.itertuples(index=False, name=None))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _evidence_row_key(df: pd.DataFrame) -> str:
+    return _table_key_token(df, ["chrom", "window_start", "window_end", "read_name"])
+
+
+def _candidate_window_key(candidates: pd.DataFrame) -> str:
+    return _table_key_token(candidates, ["chrom", "window_start", "window_end"])
+
+
+def _remap_cache_paths(cache_dir: Path, cache_name: str) -> dict[str, Path]:
+    root = Path(cache_dir)
+    return {
+        "meta": root / f"mei_remap_cache.{cache_name}.json",
+        "split": root / f"mei_remap_cache.{cache_name}.split.parquet",
+        "discordant": root / f"mei_remap_cache.{cache_name}.discordant.parquet",
+    }
+
+
+def _load_mei_remap_cache(
+    cache_dir: Path,
+    cache_name: str,
+    split_df: pd.DataFrame,
+    discordant_df: pd.DataFrame,
+    *,
+    sample: str,
+) -> dict[str, object] | None:
+    paths = _remap_cache_paths(cache_dir, cache_name)
+    if not all(path.exists() for path in paths.values()):
+        return None
+    try:
+        meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+        if meta.get("split_key") != _evidence_row_key(split_df):
+            return None
+        if meta.get("discordant_key") != _evidence_row_key(discordant_df):
+            return None
+        split_hits = pd.read_parquet(paths["split"])
+        disc_hits = pd.read_parquet(paths["discordant"])
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        click.echo(f"[mei-annotate] ignoring unreadable remap cache {cache_name}: {exc}")
+        return None
+    return {
+        "sample": sample,
+        "split_hits": split_hits,
+        "split_summary": ClipAlignmentSummary(
+            sample=sample,
+            clip_count=int(meta.get("split_rows", len(split_hits))),
+            paf_hits=int(meta.get("split_paf_hits", 0)),
+        ),
+        "disc_hits": disc_hits,
+        "disc_summary": ClipAlignmentSummary(
+            sample=sample,
+            clip_count=int(meta.get("disc_rows", len(disc_hits))),
+            paf_hits=int(meta.get("disc_paf_hits", 0)),
+        ),
+        "disc_mate_summary": ClipAlignmentSummary(
+            sample=f"{sample}_mate",
+            clip_count=int(meta.get("disc_mate_rows", len(disc_hits))),
+            paf_hits=int(meta.get("disc_mate_paf_hits", 0)),
+        ),
+    }
+
+
+def _write_mei_remap_cache(
+    cache_dir: Path,
+    cache_name: str,
+    split_df: pd.DataFrame,
+    discordant_df: pd.DataFrame,
+    result: dict[str, object],
+) -> None:
+    paths = _remap_cache_paths(cache_dir, cache_name)
+    split_summary = result["split_summary"]
+    disc_summary = result["disc_summary"]
+    disc_mate_summary = result["disc_mate_summary"]
+    meta = {
+        "split_key": _evidence_row_key(split_df),
+        "discordant_key": _evidence_row_key(discordant_df),
+        "split_rows": int(getattr(split_summary, "clip_count", 0)),
+        "split_paf_hits": int(getattr(split_summary, "paf_hits", 0)),
+        "disc_rows": int(getattr(disc_summary, "clip_count", 0)),
+        "disc_paf_hits": int(getattr(disc_summary, "paf_hits", 0)),
+        "disc_mate_rows": int(getattr(disc_mate_summary, "clip_count", 0)),
+        "disc_mate_paf_hits": int(getattr(disc_mate_summary, "paf_hits", 0)),
+    }
+    _atomic_write_parquet(result["split_hits"], paths["split"])  # type: ignore[arg-type]
+    _atomic_write_parquet(result["disc_hits"], paths["discordant"])  # type: ignore[arg-type]
+    _atomic_write_json(meta, paths["meta"])
+    click.echo(
+        f"[mei-annotate] wrote remap cache name={cache_name} "
+        f"split_rows={len(result['split_hits'])} disc_rows={len(result['disc_hits'])}"
+    )
+
+
+def _indel_cache_paths(cache_dir: Path, cache_name: str) -> dict[str, Path]:
+    root = Path(cache_dir)
+    return {
+        "meta": root / f"indel_evidence_cache.{cache_name}.json",
+        "table": root / f"indel_evidence_cache.{cache_name}.parquet",
+    }
+
+
+def _load_indel_evidence_cache(
+    cache_dir: Path,
+    cache_name: str,
+    candidates: pd.DataFrame,
+) -> pd.DataFrame | None:
+    paths = _indel_cache_paths(cache_dir, cache_name)
+    if not paths["meta"].exists() or not paths["table"].exists():
+        return None
+    try:
+        meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+        if meta.get("window_key") != _candidate_window_key(candidates):
+            return None
+        return pd.read_parquet(paths["table"])
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        click.echo(f"[mei-annotate] ignoring unreadable indel cache {cache_name}: {exc}")
+        return None
+
+
+def _write_indel_evidence_cache(
+    df: pd.DataFrame,
+    cache_dir: Path,
+    cache_name: str,
+    candidates: pd.DataFrame,
+) -> None:
+    paths = _indel_cache_paths(cache_dir, cache_name)
+    _atomic_write_parquet(df, paths["table"])
+    _atomic_write_json(
+        {"window_key": _candidate_window_key(candidates), "rows": int(len(df))},
+        paths["meta"],
+    )
+    click.echo(f"[mei-annotate] wrote indel cache name={cache_name} rows={len(df)}")
+
+
+def _cached_indel_breakpoint_evidence(
+    bam_path: Path,
+    candidates: pd.DataFrame,
+    *,
+    sample: str,
+    reference_fasta: Path | None,
+    cache_dir: Path,
+    cache_name: str,
+) -> pd.DataFrame:
+    loaded = _load_indel_evidence_cache(cache_dir, cache_name, candidates)
+    if loaded is not None:
+        click.echo(
+            f"[mei-annotate] indel cache hit sample={sample} rows={len(loaded)} name={cache_name}"
+        )
+        if "sample" in loaded.columns:
+            loaded = loaded.copy()
+            loaded["sample"] = sample
+        return loaded
+    collected = _collect_indel_breakpoint_evidence(
+        bam_path,
+        candidates,
+        sample=sample,
+        reference_fasta=reference_fasta,
+    )
+    try:
+        _write_indel_evidence_cache(collected, cache_dir, cache_name, candidates)
+    except (OSError, ValueError) as exc:
+        click.echo(f"[mei-annotate] indel cache write failed name={cache_name}: {exc}")
+    return collected
+
+
 def _remap_one_sample_mei_evidence(
     *,
     sample: str,
@@ -2266,8 +2488,22 @@ def _remap_one_sample_mei_evidence(
     mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
     allow_missing_interchrom_mates: bool = False,
+    remap_cache_dir: Path | None = None,
+    remap_cache_name: str | None = None,
 ) -> dict[str, object]:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
+    cache_name = remap_cache_name or sample
+    if remap_cache_dir is not None:
+        cached = _load_mei_remap_cache(
+            Path(remap_cache_dir),
+            cache_name,
+            split_df,
+            discordant_df,
+            sample=sample,
+        )
+        if cached is not None:
+            click.echo(f"[mei-annotate] sample={sample} remap cache hit name={cache_name}")
+            return cached
     t0 = time.monotonic()
     click.echo(f"[mei-annotate] sample={sample} remap start bwa_threads={max(1, int(bwa_threads))}")
     split_t0 = time.monotonic()
@@ -2328,7 +2564,7 @@ def _remap_one_sample_mei_evidence(
         f"disc_anchor_mei={getattr(disc_summary, 'paf_hits', 0)} "
         f"disc_mate_mei={getattr(disc_mate_summary, 'paf_hits', 0)}"
     )
-    return {
+    result = {
         "sample": sample,
         "split_hits": split_hits,
         "split_summary": split_summary,
@@ -2336,6 +2572,18 @@ def _remap_one_sample_mei_evidence(
         "disc_summary": disc_summary,
         "disc_mate_summary": disc_mate_summary,
     }
+    if remap_cache_dir is not None:
+        try:
+            _write_mei_remap_cache(
+                Path(remap_cache_dir),
+                cache_name,
+                split_df,
+                discordant_df,
+                result,
+            )
+        except (OSError, ValueError) as exc:
+            click.echo(f"[mei-annotate] remap cache write failed name={cache_name}: {exc}")
+    return result
 
 
 def _enrich_discordant_anchor_hits_with_mate_mei(
@@ -12000,6 +12248,73 @@ def _empirical_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _annotate_local_peak_depth(
+    candidates: pd.DataFrame,
+    disease_bam_path: Path,
+    control_bam_path: Path,
+) -> pd.DataFrame:
+    """Fill per-locus peak depth used by the gold pileup z-score.
+
+    This is the breakpoint-window maximum, not the empirical random-window
+    p-value screen. Germline runs share one BAM, so the control scan is skipped
+    when both paths are the same file.
+    """
+    out = candidates.copy()
+    for col in (
+        "disease_local_bam_mean_depth",
+        "control_local_bam_mean_depth",
+        "disease_local_bam_peak_depth",
+        "control_local_bam_peak_depth",
+    ):
+        if col not in out.columns:
+            out[col] = 0.0
+    if out.empty:
+        return out
+    silver = _df_col_series(out, "silver_stage_pass", False).fillna(False).astype(bool)
+    idxs = out.index[silver].tolist()
+    if not idxs:
+        click.echo("[mei-annotate] peak-depth z-score skipped: no silver loci")
+        return out
+    same_bam = Path(disease_bam_path).resolve() == Path(control_bam_path).resolve()
+    click.echo(
+        f"[mei-annotate] peak-depth z-score: {len(idxs)} silver loci "
+        f"same_bam={same_bam}"
+    )
+    t0 = time.monotonic()
+    with open_alignment(disease_bam_path) as disease_bam:
+        control_cm = None if same_bam else open_alignment(control_bam_path)
+        control_bam = disease_bam if same_bam else control_cm.__enter__()
+        try:
+            for i, idx in enumerate(idxs, start=1):
+                row = out.loc[idx]
+                chrom = str(row["chrom"])
+                start = int(row["window_start"])
+                end = int(row["window_end"])
+                d_mean, d_peak = _depth_stats_for_interval(
+                    bam=disease_bam, chrom=chrom, start_1based=start, end_1based=end
+                )
+                if same_bam:
+                    c_mean, c_peak = d_mean, d_peak
+                else:
+                    c_mean, c_peak = _depth_stats_for_interval(
+                        bam=control_bam, chrom=chrom, start_1based=start, end_1based=end
+                    )
+                out.at[idx, "disease_local_bam_mean_depth"] = float(d_mean)
+                out.at[idx, "control_local_bam_mean_depth"] = float(c_mean)
+                out.at[idx, "disease_local_bam_peak_depth"] = float(d_peak)
+                out.at[idx, "control_local_bam_peak_depth"] = float(c_peak)
+                if i % 2000 == 0 or i == len(idxs):
+                    click.echo(
+                        f"[mei-annotate] peak-depth z-score {i}/{len(idxs)} "
+                        f"elapsed={time.monotonic() - t0:.1f}s"
+                    )
+        finally:
+            if control_cm is not None:
+                control_cm.__exit__(None, None, None)
+    click.echo(f"[mei-annotate] peak-depth z-score done elapsed={time.monotonic() - t0:.1f}s")
+    return out
+
+
 def _annotate_bam_depth_for_consistent_loci(
     candidates: pd.DataFrame,
     disease_bam_path: Path,
@@ -12751,9 +13066,6 @@ def _assign_gold_stage(
         out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
         out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
 
-    # Non-empirical depth-outlier guard for obvious pileup artifacts.
-    # Use a run-adaptive 3-sigma threshold and keep known overlaps exempt.
-    known_poly = _df_col_series(out, "known_mei_polymorphism", False).fillna(False).astype(bool)
     d_depth_peak = pd.to_numeric(_df_col_series(out, "disease_local_bam_peak_depth", 0.0), errors="coerce").fillna(0.0)
     c_depth_peak = pd.to_numeric(_df_col_series(out, "control_local_bam_peak_depth", 0.0), errors="coerce").fillna(0.0)
     max_depth = pd.concat([d_depth_peak, c_depth_peak], axis=1).max(axis=1)
@@ -12767,18 +13079,17 @@ def _assign_gold_stage(
         depth_ref = max_depth.loc[max_depth.gt(0.0)]
     depth_mean = float(depth_ref.mean()) if not depth_ref.empty else 0.0
     depth_sigma = float(depth_ref.std(ddof=0)) if not depth_ref.empty else 0.0
+    out["local_bam_peak_depth"] = max_depth
+    out["local_bam_peak_depth_z"] = pd.NA
     if depth_sigma > 1e-6:
         depth_z = (max_depth - depth_mean) / depth_sigma
-        depth_outlier = depth_z >= 3.0
+        out.loc[silver, "local_bam_peak_depth_z"] = depth_z.loc[silver]
+        depth_outlier = depth_z >= _PEAK_DEPTH_Z_CUTOFF
     else:
         depth_outlier = pd.Series(False, index=out.index)
-    # Depth-only artifact gate (user requested): reject extreme peak-depth
-    # outliers among silver loci, except known polymorphism overlaps.
-    depth_pileup_artifact = (
-        silver
-        & (~known_poly)
-        & depth_outlier
-    )
+    # Depth-only artifact gate: drop a silver peak at or above the z cutoff.
+    # A catalog overlap does not exempt it.
+    depth_pileup_artifact = silver & depth_outlier
     if depth_pileup_artifact.any():
         out.loc[depth_pileup_artifact, "gold_stage_pass"] = False
         prev = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
@@ -14601,6 +14912,8 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "poly_at_supported",
         "tsd_or_polyA_supported",
         "gold_stage_fail_reason",
+        "local_bam_peak_depth",
+        "local_bam_peak_depth_z",
         "insertion_model_score",
         "coherence_score",
         "mei_score_enrichment_ratio",
@@ -14627,6 +14940,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "disease_vaf",
         "control_vaf",
         "vaf_delta",
+        "local_bam_peak_depth",
     ]
     if empirical_stage:
         sig4_cols.extend(empirical_cols[:-1])
@@ -14636,6 +14950,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "control_poly_at_fraction_weighted",
         "breakpoint_yyrrrr_logodds_shift1_mt_adj",
         "insertion_model_score",
+        "local_bam_peak_depth_z",
         "coherence_score",
         "mei_score_enrichment_ratio",
         "read_support_heuristic_score",
@@ -15795,11 +16110,13 @@ def annotate_candidate_loci_with_mei(
         if germline_same_bam:
             src_bam = control_bam_path or disease_bam_path
             if src_bam is not None:
-                indel_jobs["control"] = _collect_indel_breakpoint_evidence(
+                indel_jobs["control"] = _cached_indel_breakpoint_evidence(
                     src_bam,
                     candidate,
                     sample="control",
                     reference_fasta=reference_fasta,
+                    cache_dir=Path(evidence_dir),
+                    cache_name="germline",
                 )
             indel_control = indel_jobs.get("control", pd.DataFrame())
             indel_disease = _relabel_frame_sample(indel_control, "disease")
@@ -15809,21 +16126,25 @@ def annotate_candidate_loci_with_mei(
                 if disease_bam_path is not None:
                     indel_futs[
                         pool.submit(
-                            _collect_indel_breakpoint_evidence,
+                            _cached_indel_breakpoint_evidence,
                             disease_bam_path,
                             candidate,
                             sample="disease",
                             reference_fasta=reference_fasta,
+                            cache_dir=Path(evidence_dir),
+                            cache_name="disease",
                         )
                     ] = "disease"
                 if control_bam_path is not None:
                     indel_futs[
                         pool.submit(
-                            _collect_indel_breakpoint_evidence,
+                            _cached_indel_breakpoint_evidence,
                             control_bam_path,
                             candidate,
                             sample="control",
                             reference_fasta=reference_fasta,
+                            cache_dir=Path(evidence_dir),
+                            cache_name="control",
                         )
                     ] = "control"
                 for fut in as_completed(indel_futs):
@@ -15857,6 +16178,8 @@ def annotate_candidate_loci_with_mei(
                 mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.germline.parquet",
                 bwa_threads=per_sample_bwa_threads,
                 allow_missing_interchrom_mates=allow_missing_interchrom_mates,
+                remap_cache_dir=Path(evidence_dir),
+                remap_cache_name="germline",
             )
             remap_by_sample = {
                 "control": remap_control,
@@ -15884,6 +16207,8 @@ def annotate_candidate_loci_with_mei(
                         mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.disease.parquet",
                         bwa_threads=per_sample_bwa_threads,
                         allow_missing_interchrom_mates=allow_missing_interchrom_mates,
+                        remap_cache_dir=Path(evidence_dir),
+                        remap_cache_name="disease",
                     ): "disease",
                     pool.submit(
                         _remap_one_sample_mei_evidence,
@@ -15896,6 +16221,8 @@ def annotate_candidate_loci_with_mei(
                         mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.control.parquet",
                         bwa_threads=per_sample_bwa_threads,
                         allow_missing_interchrom_mates=allow_missing_interchrom_mates,
+                        remap_cache_dir=Path(evidence_dir),
+                        remap_cache_name="control",
                     ): "control",
                 }
                 for fut in as_completed(remap_futs):
@@ -16495,7 +16822,14 @@ def annotate_candidate_loci_with_mei(
             f"[mei-annotate] added BAM-depth controlization for family-consistent, junk-clean loci "
             f"(elapsed={time.monotonic() - emp_t0:.1f}s)"
         )
-    elif not empirical_stage:
+    elif disease_bam_path is not None and control_bam_path is not None:
+        click.echo("[mei-annotate] empirical p-value stage disabled (--no-empirical-stage)")
+        candidate = _annotate_local_peak_depth(
+            candidate,
+            disease_bam_path=disease_bam_path,
+            control_bam_path=control_bam_path,
+        )
+    else:
         click.echo("[mei-annotate] empirical stage disabled (--no-empirical-stage)")
     if disease_bam_path is not None:
         del_t0 = time.monotonic()
