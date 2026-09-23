@@ -12,9 +12,9 @@ The score is the binomial z of the clustered count:
     z = (k - n * p) / sqrt(n * p * (1 - p))
 
 This uses the split-read count, so 0 clustered reads out of 60 is a stronger
-departure than 0 out of 8. It is a ranking score. Split reads in a window are
-not independent draws, and silver windows are overdispersed relative to a
-binomial, so the numerical z is not a calibrated tail probability.
+departure than 0 out of 8. Gold drops calls below z = -2. Split reads in a
+window are not independent draws, and silver windows are overdispersed
+relative to a binomial, so the numerical z is not a calibrated tail probability.
 """
 
 from __future__ import annotations

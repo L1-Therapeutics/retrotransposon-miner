@@ -59,6 +59,10 @@ _MIN_MEI_ANCHOR_BP_RELAXED = 15
 # Right tail of the silver peak-depth distribution. A normal z of 2 is the
 # 97.7th percentile; these depths are skewed, so this cutoff is higher.
 _PEAK_DEPTH_Z_CUTOFF = 2.0
+# Left tail of the silver split-cluster binomial z. Windows whose split reads
+# do not share a junction fall here; 0 of 8 is about -1.6 and stays, while
+# 0 of 43 and rank 109 (3 of 38) fall below -2.
+_SPLIT_CLUSTER_Z_CUTOFF = -2.0
 _MIN_REPORTABLE_MEI_SPAN_BP = 20
 
 
@@ -13100,6 +13104,19 @@ def _assign_gold_stage(
         out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
         out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
 
+    cluster_z = pd.to_numeric(
+        _df_col_series(out, "split_cluster_binomial_z", float("nan")), errors="coerce"
+    )
+    low_cluster = silver & cluster_z.notna() & cluster_z.lt(_SPLIT_CLUSTER_Z_CUTOFF)
+    if low_cluster.any():
+        out.loc[low_cluster, "gold_stage_pass"] = False
+        prev = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
+        fail_tag = "split_cluster_low_z"
+        need_append = low_cluster & prev.ne("")
+        need_set = low_cluster & prev.eq("")
+        out.loc[need_set, "gold_stage_fail_reason"] = fail_tag
+        out.loc[need_append, "gold_stage_fail_reason"] = prev.loc[need_append] + ";" + fail_tag
+
     stage_fail_reason = _df_col_series(out, "stage_fail_reason", "").fillna("").astype(str)
     gold_fail_reason = _df_col_series(out, "gold_stage_fail_reason", "").fillna("").astype(str)
     silver_failed_gold = silver & (~out["gold_stage_pass"]) & gold_fail_reason.ne("")
@@ -13112,6 +13129,8 @@ def _assign_gold_stage(
     stage_fail_reason.loc[out["gold_stage_pass"]] = ""
     out["stage_fail_reason"] = stage_fail_reason
 
+    failed_silver = silver & ~out["gold_stage_pass"]
+    out.loc[failed_silver, "analysis_stage_tier"] = "silver"
     out.loc[out["gold_stage_pass"], "analysis_stage_tier"] = "gold"
     click.echo(
         "[mei-annotate] stage counts "
@@ -16859,12 +16878,12 @@ def annotate_candidate_loci_with_mei(
         discordant_control=control_disc_hits,
     )
     candidate = annotate_mei_overlap_piles(candidate, supporting_reads_detail)
-    candidate = _assign_gold_stage(candidate, empirical_stage=empirical_stage)
     cluster_t0 = time.monotonic()
     candidate = annotate_split_cluster_binomial_z(candidate, split_disease_raw)
     click.echo(
         f"[mei-annotate] split-cluster binomial z elapsed={time.monotonic() - cluster_t0:.1f}s"
     )
+    candidate = _assign_gold_stage(candidate, empirical_stage=empirical_stage)
 
     candidate = _apply_breakpoint_motif_report_gating(candidate)
     candidate = _prioritize_mei_candidates(candidate, stage_first=True)
