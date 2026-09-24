@@ -1,7 +1,8 @@
 """Concatenate per-chromosome gold-review tables and re-rank them as one genome.
 
-Used at the end of ``--chr all``. The sort is ``_prioritize_mei_candidates``,
-the same order a single chromosome already writes.
+Last step of ``--chr all``, after every chromosome has finished annotation and
+while staged alignments are still on disk. The sort is
+``_prioritize_mei_candidates``, the same order a single chromosome already writes.
 """
 
 from __future__ import annotations
@@ -51,6 +52,29 @@ def merge_gold_review_tables(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
     return ranked
 
 
+GOLD_REVIEW_NAME = "candidate_loci.mei.gold_review.tsv"
+
+
+def annotation_done_marker(chrom: str) -> str:
+    """Log line ``run_annotate_mei_support`` prints when a chromosome finishes."""
+    return f"stage=annotate-mei-support done region={chrom}"
+
+
+def incomplete_chromosomes(base_outdir: Path, chroms: Sequence[str]) -> list[str]:
+    """Chromosomes whose gold-review table or finished annotation log is missing."""
+    missing: list[str] = []
+    for chrom in chroms:
+        gold = base_outdir / chrom / GOLD_REVIEW_NAME
+        log = base_outdir / "logs" / f"{chrom}.log"
+        if not gold.is_file() or gold.stat().st_size == 0 or not log.is_file():
+            missing.append(chrom)
+            continue
+        text = log.read_text(errors="replace")
+        if annotation_done_marker(chrom) not in text:
+            missing.append(chrom)
+    return missing
+
+
 def write_merged_gold_review(inputs: Sequence[Path], output: Path) -> int:
     """Read per-chromosome TSVs, re-rank, and write one genome-wide table."""
     frames: list[pd.DataFrame] = []
@@ -71,12 +95,28 @@ def write_merged_gold_review(inputs: Sequence[Path], output: Path) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Re-rank per-chromosome gold reviews as one genome.")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("inputs", nargs="+", type=Path)
+    parser.add_argument(
+        "--base-outdir",
+        type=Path,
+        help="Sample directory. Positional arguments are chromosome names; every one must be finished.",
+    )
+    parser.add_argument("inputs", nargs="+")
     args = parser.parse_args(argv)
-    missing = [str(path) for path in args.inputs if not path.is_file()]
-    if missing:
-        raise SystemExit(f"gold review table not found: {missing[0]}")
-    n_rows = write_merged_gold_review(args.inputs, args.output)
+    if args.base_outdir is not None:
+        chroms = [str(item) for item in args.inputs]
+        missing = incomplete_chromosomes(args.base_outdir, chroms)
+        if missing:
+            joined = ", ".join(missing)
+            raise SystemExit(
+                f"refusing to aggregate gold review; chromosomes not complete: {joined}"
+            )
+        paths = [args.base_outdir / chrom / GOLD_REVIEW_NAME for chrom in chroms]
+    else:
+        paths = [Path(item) for item in args.inputs]
+        absent = [str(path) for path in paths if not path.is_file()]
+        if absent:
+            raise SystemExit(f"gold review table not found: {absent[0]}")
+    n_rows = write_merged_gold_review(paths, args.output)
     print(f"[gold-review-merge] rows={n_rows} output={args.output}")
     return 0
 

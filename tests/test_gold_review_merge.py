@@ -5,8 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from retro_miner.gold_review_merge import merge_gold_review_tables, write_merged_gold_review
+from retro_miner.gold_review_merge import (
+    incomplete_chromosomes,
+    main,
+    merge_gold_review_tables,
+    write_merged_gold_review,
+)
 
 
 def _row(
@@ -45,6 +51,26 @@ def test_merge_ranks_by_stage_then_support_across_chromosomes() -> None:
     assert ranked["chrom"].tolist() == ["chr22", "chr1", "chr1"]
     assert ranked["analysis_stage_tier"].tolist() == ["gold", "gold", "silver"]
     assert ranked["gold_stage_pass"].tolist() == [1, 1, 0]
+
+
+def _finish(base: Path, chrom: str, *, done: bool) -> None:
+    chrom_dir = base / chrom
+    chrom_dir.mkdir(parents=True)
+    (chrom_dir / "candidate_loci.mei.gold_review.tsv").write_text("chrom\twindow_start\n", encoding="utf-8")
+    log_dir = base / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    line = f"stage=annotate-mei-support done region={chrom}\n" if done else "stage=extract\n"
+    (log_dir / f"{chrom}.log").write_text(line, encoding="utf-8")
+
+
+def test_incomplete_chromosome_blocks_aggregation(tmp_path: Path) -> None:
+    _finish(tmp_path, "chr1", done=True)
+    _finish(tmp_path, "chr2", done=False)
+    assert incomplete_chromosomes(tmp_path, ["chr1", "chr2", "chr3"]) == ["chr2", "chr3"]
+    out = tmp_path / "genome.tsv"
+    with pytest.raises(SystemExit, match="chr2, chr3"):
+        main(["--output", str(out), "--base-outdir", str(tmp_path), "chr1", "chr2", "chr3"])
+    assert not out.exists()
 
 
 def test_write_merged_gold_review_reads_per_chrom_tables(tmp_path: Path) -> None:

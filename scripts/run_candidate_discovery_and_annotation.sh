@@ -614,22 +614,13 @@ consolidate_all_chrom_outputs() {
   shift
   local chr_list=("$@")
   local basename="candidate_loci.mei.gold_review.tsv"
-  local inputs=()
-  local chr=""
-  for chr in "${chr_list[@]}"; do
-    local p="${base_outdir}/${chr}/${basename}"
-    if [[ -f "${p}" ]]; then
-      inputs+=("${p}")
-    fi
-  done
-  if [[ "${#inputs[@]}" -eq 0 ]]; then
-    echo "[candidate-pipeline] no per-chrom gold review tables found to consolidate"
-    return 0
-  fi
   local out_path="${base_outdir}/${basename}"
-  # Same review sort as one chromosome, over every requested chromosome that
-  # has a gold-review table. Includes chromosomes skip-complete did not rerun.
-  run_python_module retro_miner.gold_review_merge --output "${out_path}" "${inputs[@]}"
+  # Every requested chromosome must have a finished annotation log and a
+  # gold-review table. A partial set is not aggregated.
+  run_python_module retro_miner.gold_review_merge \
+    --output "${out_path}" \
+    --base-outdir "${base_outdir}" \
+    "${chr_list[@]}"
   echo "[candidate-pipeline] consolidated ${basename} -> ${out_path}"
 }
 
@@ -942,6 +933,8 @@ done
 echo "[candidate-pipeline] done multi-chrom"
 echo "  per-chrom outputs under: ${BASE_OUTDIR}/chr*/"
 echo "  logs under: ${LOG_DIR}/"
+# Last step of --chr all, after every chromosome has finished and before any
+# later removal of staged CRAM/BAM files. Aggregation only reads the tables.
 if [[ "${CHR_ALL_MODE}" == "1" ]]; then
   echo "[candidate-pipeline] consolidating --chr all outputs into ${BASE_OUTDIR}"
   consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${REQUESTED_CHR_LIST[@]}"
