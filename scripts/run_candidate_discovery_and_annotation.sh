@@ -678,78 +678,13 @@ consolidate_all_chrom_outputs() {
   shift
   local chr_list=("$@")
   local basename="candidate_loci.mei.gold_review.tsv"
-  local inputs=()
-  local chr=""
-  for chr in "${chr_list[@]}"; do
-    local p="${base_outdir}/${chr}/${basename}"
-    if [[ -f "${p}" ]]; then
-      inputs+=("${p}")
-    fi
-  done
-  if [[ "${#inputs[@]}" -eq 0 ]]; then
-    echo "[candidate-pipeline] no per-chrom gold review tables found to consolidate"
-    return 0
-  fi
   local out_path="${base_outdir}/${basename}"
-  local inputs_joined
-  inputs_joined="$(printf "%s\n" "${inputs[@]}")"
-  export RTM_MERGE_INPUTS="${inputs_joined}"
-  export RTM_MERGE_OUTPUT="${out_path}"
-  if [[ "${RUN_IN_ENV}" == "1" ]]; then
-    micromamba run -n rtm-miner env PYTHONPATH=src "${PYTHON_BIN}" - <<'PY'
-import os
-from pathlib import Path
-import pandas as pd
-from retro_miner.mei_support import _prioritize_mei_candidates
-
-inputs = [p for p in os.environ.get("RTM_MERGE_INPUTS", "").splitlines() if p.strip()]
-out_path = Path(os.environ["RTM_MERGE_OUTPUT"])
-if not inputs:
-    raise SystemExit(0)
-
-frames = [pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False) for p in inputs]
-merged = pd.concat(frames, ignore_index=True)
-for col in merged.columns:
-    # Allow prioritizer to perform numeric coercions while preserving empty-string semantics.
-    merged[col] = merged[col].where(merged[col] != "", other=pd.NA)
-
-sorted_out = _prioritize_mei_candidates(merged, stage_first=True)
-for col in sorted_out.columns:
-    if sorted_out[col].dtype == bool:
-        sorted_out[col] = sorted_out[col].astype(int)
-sorted_out = sorted_out.fillna("")
-out_path.parent.mkdir(parents=True, exist_ok=True)
-sorted_out.to_csv(out_path, sep="\t", index=False)
-PY
-  else
-    PYTHONPATH=src "${PYTHON_BIN}" - <<'PY'
-import os
-from pathlib import Path
-import pandas as pd
-from retro_miner.mei_support import _prioritize_mei_candidates
-
-inputs = [p for p in os.environ.get("RTM_MERGE_INPUTS", "").splitlines() if p.strip()]
-out_path = Path(os.environ["RTM_MERGE_OUTPUT"])
-if not inputs:
-    raise SystemExit(0)
-
-frames = [pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False) for p in inputs]
-merged = pd.concat(frames, ignore_index=True)
-for col in merged.columns:
-    # Allow prioritizer to perform numeric coercions while preserving empty-string semantics.
-    merged[col] = merged[col].where(merged[col] != "", other=pd.NA)
-
-sorted_out = _prioritize_mei_candidates(merged, stage_first=True)
-for col in sorted_out.columns:
-    if sorted_out[col].dtype == bool:
-        sorted_out[col] = sorted_out[col].astype(int)
-sorted_out = sorted_out.fillna("")
-out_path.parent.mkdir(parents=True, exist_ok=True)
-sorted_out.to_csv(out_path, sep="\t", index=False)
-PY
-  fi
-  unset RTM_MERGE_INPUTS
-  unset RTM_MERGE_OUTPUT
+  # Every requested chromosome must have a finished annotation log and a
+  # gold-review table. A partial set is not aggregated.
+  run_python_module retro_miner.gold_review_merge \
+    --output "${out_path}" \
+    --base-outdir "${base_outdir}" \
+    "${chr_list[@]}"
   echo "[candidate-pipeline] consolidated ${basename} -> ${out_path}"
 }
 
@@ -921,6 +856,8 @@ if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
   echo "ERROR: resolved empty chromosome list from --chr '${CHR_ARG}'." >&2
   exit 1
 fi
+# Kept across skip-complete so --chr all still merges chromosomes that were not rerun.
+REQUESTED_CHR_LIST=("${CHR_LIST[@]}")
 ORIG_CHR_COUNT="${#CHR_LIST[@]}"
 if [[ -n "${CHR_ARG}" ]] && [[ "$(printf '%s' "${CHR_ARG}" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
   CHR_ALL_MODE="1"
@@ -960,7 +897,13 @@ if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; th
   fi
   CHR_LIST=("${filtered_chr_list[@]}")
   if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
-    echo "[candidate-pipeline] all requested chromosomes already complete in outdir; nothing to run"
+    if [[ "${CHR_ALL_MODE}" == "1" ]]; then
+      echo "[candidate-pipeline] all requested chromosomes already complete; consolidating gold review"
+      consolidate_all_chrom_outputs "${OUTDIR}" "${REQUESTED_CHR_LIST[@]}"
+      echo "  consolidated gold review written to: ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
+    else
+      echo "[candidate-pipeline] all requested chromosomes already complete in outdir; nothing to run"
+    fi
     exit 0
   fi
 fi
@@ -1059,8 +1002,10 @@ done
 echo "[candidate-pipeline] done multi-chrom"
 echo "  per-chrom outputs under: ${BASE_OUTDIR}/chr*/"
 echo "  logs under: ${LOG_DIR}/"
+# Last step of --chr all, after every chromosome has finished and before any
+# later removal of staged CRAM/BAM files. Aggregation only reads the tables.
 if [[ "${CHR_ALL_MODE}" == "1" ]]; then
   echo "[candidate-pipeline] consolidating --chr all outputs into ${BASE_OUTDIR}"
-  consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${CHR_LIST[@]}"
+  consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${REQUESTED_CHR_LIST[@]}"
   echo "  consolidated gold review written to: ${BASE_OUTDIR}/candidate_loci.mei.gold_review.tsv"
 fi
