@@ -620,9 +620,17 @@ def build_igv_batch_script(
     if control_index is None:
         raise FileNotFoundError(f"Missing BAM index for control BAM: {control_bam}")
 
+    # The first line must be an unquoted ``genome <fasta>``. ``new`` loads the
+    # hosted hg38 JSON before any later command, and a quoted genome path is
+    # not recognized, so the BAM load then runs with no reference.
+    genome_path = str(reference_fasta.resolve())
+    if any(ch.isspace() for ch in genome_path):
+        raise ValueError(
+            "IGV's genome command requires an unquoted FASTA path, but this path contains whitespace: "
+            f"{genome_path}"
+        )
     lines: list[str] = [
-        "new",
-        f"genome {_quote_igv_path(reference_fasta.resolve())}",
+        f"genome {genome_path}",
         f"snapshotDirectory {_quote_igv_path(snapshot_dir.resolve())}",
         "preference SAM.SHOW_SOFT_CLIPPED true",
         "setSleepInterval 2",
@@ -687,7 +695,7 @@ def _wrap_headless_command(launcher: Path, batch_script: Path) -> list[str]:
     return base
 
 
-_IGV_GENOME_LINE = re.compile(r'^genome\s+"([^"]+)"\s*$')
+_IGV_GENOME_LINE = re.compile(r'^genome\s+(?:"([^"]+)"|(\S+))\s*$')
 
 
 def _local_genome_from_batch(batch_script: Path) -> Path | None:
@@ -700,10 +708,23 @@ def _local_genome_from_batch(batch_script: Path) -> Path | None:
         match = _IGV_GENOME_LINE.match(line.strip())
         if match is None:
             continue
-        genome = Path(match.group(1))
+        genome = Path(match.group(1) or match.group(2))
         if genome.is_file():
             return genome
     return None
+
+
+def _igv_pref_roots(igv_dir: Path | None = None) -> list[Path]:
+    """Directories whose ``prefs.properties`` IGV may read at startup.
+
+    Current IGV uses ``~/igv`` whenever that directory exists, and falls back
+    to ``~/.igv`` only when ``~/igv`` is absent. Pinning only ``~/.igv`` leaves
+    a pre-existing ``~/igv`` on the hosted hg38 genome.
+    """
+    if igv_dir is not None:
+        return [Path(igv_dir)]
+    home = Path.home()
+    return [home / "igv", home / ".igv"]
 
 
 def _pin_igv_default_genome(reference_fasta: Path, igv_dir: Path | None = None) -> Path:
@@ -714,16 +735,18 @@ def _pin_igv_default_genome(reference_fasta: Path, igv_dir: Path | None = None) 
     local reference in the batch file; this keeps startup on that same file.
     """
     fasta = Path(reference_fasta).resolve()
-    root = Path(igv_dir) if igv_dir is not None else Path.home() / ".igv"
-    root.mkdir(parents=True, exist_ok=True)
-    prefs_path = root / "prefs.properties"
-    existing = prefs_path.read_text(encoding="utf-8") if prefs_path.exists() else ""
-    kept = [line for line in existing.splitlines() if line and not line.startswith("DEFAULT_GENOME=")]
-    prefs_path.write_text(
-        "\n".join([f"DEFAULT_GENOME={fasta}", *kept]) + "\n",
-        encoding="utf-8",
-    )
-    return prefs_path
+    written: list[Path] = []
+    for root in _igv_pref_roots(igv_dir):
+        root.mkdir(parents=True, exist_ok=True)
+        prefs_path = root / "prefs.properties"
+        existing = prefs_path.read_text(encoding="utf-8") if prefs_path.exists() else ""
+        kept = [line for line in existing.splitlines() if line and not line.startswith("DEFAULT_GENOME=")]
+        prefs_path.write_text(
+            "\n".join([f"DEFAULT_GENOME={fasta}", *kept]) + "\n",
+            encoding="utf-8",
+        )
+        written.append(prefs_path)
+    return written[0]
 
 
 def _verify_snapshot_pngs(index_rows: list[dict[str, object]]) -> int:

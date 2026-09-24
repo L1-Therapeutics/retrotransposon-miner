@@ -679,11 +679,12 @@ class TestIgvBatchPathQuoting:
                 _make_batch_variants("chr1"), **batch_setup
             )
 
-    def test_genome_line_is_quoted(self, batch_setup):
-        """The 'genome' batch command wraps the reference FASTA path in double quotes."""
+    def test_genome_line_is_unquoted_local_path(self, batch_setup):
+        """The genome command is an unquoted local FASTA path and is the first line."""
         batch = self._call(batch_setup)
         ref = str(batch_setup["reference_fasta"].resolve())
-        assert f'genome "{ref}"' in batch
+        assert batch.splitlines()[0] == f"genome {ref}"
+        assert "new" not in batch.splitlines()
 
     def test_snapshotdirectory_line_is_quoted(self, batch_setup):
         """The 'snapshotDirectory' batch command wraps the directory path in double quotes."""
@@ -697,8 +698,8 @@ class TestIgvBatchPathQuoting:
         disease_bam = str(batch_setup["disease_bam"].resolve())
         assert f'load "{disease_bam}"' in batch
 
-    def test_space_in_genome_path_survives_untruncated(self, tmp_path):
-        """A genome path containing spaces is quoted and the full path appears in the batch."""
+    def test_space_in_genome_path_is_rejected(self, tmp_path):
+        """A genome path containing spaces is rejected because IGV will not load a quoted genome path."""
         space_dir = tmp_path / "ref dir with spaces"
         space_dir.mkdir()
         ref = space_dir / "ref genome.fa"
@@ -718,9 +719,8 @@ class TestIgvBatchPathQuoting:
             "snapshot_dir": snap,
         }
         with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
-            batch = build_igv_batch_script(_make_batch_variants("chr1"), **setup)
-        ref_str = str(ref.resolve())
-        assert f'genome "{ref_str}"' in batch
+            with pytest.raises(ValueError, match="whitespace"):
+                build_igv_batch_script(_make_batch_variants("chr1"), **setup)
 
     def test_path_with_double_quote_raises_value_error(self):
         """A path containing a double-quote character is rejected with ValueError."""
@@ -898,6 +898,19 @@ class TestIgvDefaultGenomePin:
         assert "hgdownload" not in text
         assert "ncbiRefSeq" not in text
 
+    def test_pin_writes_both_igv_directories(self, tmp_path, monkeypatch):
+        fasta = tmp_path / "Homo_sapiens_assembly38.fasta"
+        fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+        legacy = tmp_path / ".igv"
+        legacy.mkdir()
+        (legacy / "prefs.properties").write_text("DEFAULT_GENOME=hg38\n", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        _pin_igv_default_genome(fasta)
+        for name in ("igv", ".igv"):
+            text = (tmp_path / name / "prefs.properties").read_text(encoding="utf-8")
+            assert f"DEFAULT_GENOME={fasta.resolve()}" in text
+            assert "DEFAULT_GENOME=hg38" not in text
+
     def test_local_genome_from_batch_ignores_missing_files(self, tmp_path):
         batch = tmp_path / "igv_batch.txt"
         missing = tmp_path / "nope.fasta"
@@ -906,4 +919,6 @@ class TestIgvDefaultGenomePin:
         fasta = tmp_path / "ref.fasta"
         fasta.write_text(">chr1\nA\n", encoding="utf-8")
         batch.write_text(f'new\ngenome "{fasta}"\n', encoding="utf-8")
+        assert _local_genome_from_batch(batch) == fasta
+        batch.write_text(f"genome {fasta}\n", encoding="utf-8")
         assert _local_genome_from_batch(batch) == fasta
