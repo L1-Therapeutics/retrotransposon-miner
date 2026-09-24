@@ -148,6 +148,8 @@ Convert the CRAM to one coordinate-sorted BAM before the run (`samtools view -@ 
 
 Run a full genome with `--chr all --chr_concurrency 16`. `--chr all` expands to chrX, chrY, then chr1 through chr22, so chromosome X starts in the first 16 slots. Chromosome X is about the length of chromosome 8. Each chromosome is mostly one thread, so extra cores past the chromosome count do not shorten the longest chromosome. Sixteen leaves memory for the jobs and for caching the BAM; 24 is the chromosome count and the useful ceiling. A larger instance does not finish faster than chromosome 1.
 
+One 30× genome on this machine took **1 hour 45 minutes** after the BAM was indexed. Chromosome 2 was the longest chromosome and set that time. The 24-thread CRAM-to-BAM conversion took 4 minutes, so the job from the start of conversion was **1 hour 49 minutes**.
+
 A 64-vCPU on-demand instance uses the whole default standard-family vCPU quota (64) on a new account. Stop other A/C/D/H/I/M/R/T/Z instances before launch.
 
 A disease and normal pair (two different alignments) wants the same 64 vCPU / 256 GiB shape and a **300 GB** gp3 volume at the same 16000 IOPS and 1000 MB/s. Budget two ~40 GB BAMs plus the reference and two evidence tables. Use `--chr_concurrency 12` so both BAMs can stay cached next to the chromosome jobs.
