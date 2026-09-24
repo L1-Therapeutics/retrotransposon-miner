@@ -123,12 +123,15 @@ resolve_chr_list() {
   local chr_arg_lower
   chr_arg_lower="$(printf '%s' "${chr_arg}" | tr '[:upper:]' '[:lower:]')"
   if [[ "${chr_arg_lower}" == "all" ]]; then
-    local i
-    for i in $(seq 22 -1 1); do
-      echo "chr${i}"
-    done
+    # chrX is about the length of chr8. Start sex chromosomes first so both
+    # occupy a slot in the first concurrency wave (16 on a full genome)
+    # instead of waiting until chr1–chr16 finish.
     echo "chrX"
     echo "chrY"
+    local i
+    for i in $(seq 1 22); do
+      echo "chr${i}"
+    done
     return 0
   fi
   IFS=',' read -r -a raw_tokens <<< "${chr_arg}"

@@ -46,7 +46,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 
 ## Current Limitations
 
-- Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. For larger runs, `m7i.8xlarge` or greater is recommended, and local assembly/candidate processing support parallel execution.
+- Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. A single full genome wants about 64 vCPU and 256 GiB of memory (see the EC2 section). Local assembly and candidate processing support parallel execution.
 - Artificial intelligence/machine learning (AI/ML) genotyping confidence models are still under active development.
 - Reverse-transcribed pseudogene insertion support is not yet added.
 - Support for species other than *Homo sapiens* (for example, *Mus musculus*) is not yet implemented.
@@ -131,7 +131,28 @@ Soft-clips and discordant clipped ends remap to the Dfam Alu/LINE-1/SVA panel wi
 
 ## Getting Started on Amazon EC2 (Elastic Compute Cloud)
 
-For whole-genome runs, use at least `m7i.8xlarge`.
+### Whole-genome machine and disk
+
+One 30× short-read genome (disease and control pointed at the same alignment) fits on a **64 vCPU / 256 GiB** machine with a **200 GB gp3** root volume. The example used here is an on-demand `m7i.16xlarge` in `us-east-1`: 64 vCPU, 256 GiB, up to 20 Gbps to EBS. The volume is 200 GB, 16000 IOPS, and 1000 MB/s throughput (gp3's throughput cap; 1000 MB/s requires at least 4000 IOPS).
+
+```bash
+INSTANCE_TYPE=m7i.16xlarge \
+ROOT_VOLUME_GB=200 \
+ROOT_VOLUME_IOPS=16000 \
+ROOT_VOLUME_THROUGHPUT_MB=1000 \
+S3_BUCKET=s3://<your-bucket> \
+./scripts/ec2_jlab.sh bootstrap
+```
+
+Convert the CRAM to one coordinate-sorted BAM before the run (`samtools view -@ 24 -b -T ref.fa -o sample.bam sample.cram`, then `samtools index -@ 24`). Pass that BAM as both `--disease-bam` and `--control-bam`. Extract, mate fetch, peak-depth, and IGV then read it in place. IGV converts a path only when it ends in `.cram`. A 30× CRAM of about 15 GB becomes a BAM of about 40 GB. With the reference (~12 GB) and per-chromosome tables, 200 GB still has room to keep the CRAM until the BAM is indexed.
+
+Run a full genome with `--chr all --chr_concurrency 16`. `--chr all` expands to chrX, chrY, then chr1 through chr22, so chromosome X starts in the first 16 slots. Chromosome X is about the length of chromosome 8. Each chromosome is mostly one thread, so extra cores past the chromosome count do not shorten the longest chromosome. Sixteen leaves memory for the jobs and for caching the BAM; 24 is the chromosome count and the useful ceiling. A larger instance does not finish faster than chromosome 1.
+
+One 30× genome on this machine took **1 hour 45 minutes** after the BAM was indexed. Chromosome 2 was the longest chromosome and set that time. The 24-thread CRAM-to-BAM conversion took 4 minutes, so the job from the start of conversion was **1 hour 49 minutes**.
+
+A 64-vCPU on-demand instance uses the whole default standard-family vCPU quota (64) on a new account. Stop other A/C/D/H/I/M/R/T/Z instances before launch.
+
+A disease and normal pair (two different alignments) wants the same 64 vCPU / 256 GiB shape and a **300 GB** gp3 volume at the same 16000 IOPS and 1000 MB/s. Budget two ~40 GB BAMs plus the reference and two evidence tables. Use `--chr_concurrency 12` so both BAMs can stay cached next to the chromosome jobs.
 
 The EC2 helper script (`scripts/ec2_jlab.sh`) works with **any existing EC2 instance** in your AWS account. Instance IDs and names are **not hardcoded in the repository**; each user binds their own instance locally to `.ec2-instance.env` (gitignored).
 
@@ -166,7 +187,7 @@ After the instance is running:
 
 Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab). On a shared AWS account, each IAM user gets their own key pair (`retrotransposon-miner-<region>-<iam-user>`). If `~/.ssh/id_ed25519.pub` or `id_rsa.pub` exists, that public key is imported — bootstrap does not reuse another user’s PEM.
 
-`bootstrap` launches an **on-demand** `m7i.4xlarge` by default (16 vCPU / 64 GiB). `INSTANCE_TYPE=m7i.8xlarge` is the larger shape for whole-genome runs. `SPOT=1` switches to cheaper Spot (one-time, stop-on-interruption: reclaim keeps the EBS disk and does not start the instance again). Bring it back with `start-instance`. Launch does **not** pin an AZ; AWS places the instance in a default-VPC zone that has capacity. `SUBNET_ID` pins a subnet (and therefore an AZ). `start-instance` cannot change AZ; if start fails for capacity, retry later or `bootstrap` a new VM.
+`bootstrap` launches an **on-demand** `m7i.4xlarge` by default (16 vCPU / 64 GiB). A full genome uses `INSTANCE_TYPE=m7i.16xlarge` with the disk settings in the section above. `SPOT=1` switches to cheaper Spot (one-time, stop-on-interruption: reclaim keeps the EBS disk and does not start the instance again). Bring it back with `start-instance`. Launch does **not** pin an AZ; AWS places the instance in a default-VPC zone that has capacity. `SUBNET_ID` pins a subnet (and therefore an AZ). `start-instance` cannot change AZ; if start fails for capacity, retry later or `bootstrap` a new VM.
 
 ```bash
 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap

@@ -48,6 +48,24 @@ bash scripts/git_app_push.sh --base main --title "…" --body "…"
 - Never pushes directly to `main` / `master`. If `--branch` is protected, falls back to a fresh timestamped branch.
 - Does **not** use `git push -u` with the tokenized URL (avoids storing the token in git config); sets upstream to `origin/<branch>` after push.
 
+## Editing an existing PR title or body
+
+`gh pr edit` fails here. The CLI queries classic Projects (`repository.pullRequest.projectCards`) and GitHub returns that GraphQL error. Update the PR with the REST API instead:
+
+```bash
+gh api -X PATCH repos/L1-Therapeutics/retrotransposon-miner/pulls/NUMBER \
+  -f body="$(cat <<'EOF'
+## Summary
+- …
+
+## Test plan
+- [ ] …
+EOF
+)"
+```
+
+`gh pr view` and `gh pr create` still work. Do not retry `gh pr edit` after the `projectCards` error. Details: `.cursor/skills/github-pr-edit/SKILL.md`.
+
 ## Do not
 
 - Retry `git push origin HEAD` / `gh pr create` after deploy-key denial — use this script instead.
