@@ -680,7 +680,8 @@ consolidate_all_chrom_outputs() {
   local basename="candidate_loci.mei.gold_review.tsv"
   local out_path="${base_outdir}/${basename}"
   # Every requested chromosome must have a finished annotation log and a
-  # gold-review table. A partial set is not aggregated.
+  # gold-review table. A partial set is not aggregated. The genome file
+  # keeps analysis_stage_tier gold only.
   run_python_module retro_miner.gold_review_merge \
     --output "${out_path}" \
     --base-outdir "${base_outdir}" \
