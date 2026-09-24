@@ -144,6 +144,67 @@ resolve_chr_list() {
   done
 }
 
+# BEGIN drop_chry_when_female
+# chrX mapped-per-base / chr1 mapped-per-base from samtools idxstats.
+# Males are near 0.5 and females near 1. Unknown results keep chrY.
+drop_chry_when_female() {
+  local chr=""
+  local has_y=0
+  for chr in "${CHR_LIST[@]}"; do
+    if [[ "${chr}" == "chrY" ]]; then
+      has_y=1
+    fi
+  done
+  if [[ "${has_y}" -ne 1 ]]; then
+    return 0
+  fi
+  if is_remote_alignment "${DISEASE_BAM}"; then
+    echo "[candidate-pipeline] sex-check keeping chrY: disease BAM is remote"
+    return 0
+  fi
+  if [[ ! -f "${DISEASE_BAM}" ]]; then
+    echo "[candidate-pipeline] sex-check keeping chrY: disease BAM is not a local file"
+    return 0
+  fi
+  local stats_file=""
+  stats_file="$(mktemp)"
+  if ! samtools idxstats "${DISEASE_BAM}" > "${stats_file}"; then
+    echo "[candidate-pipeline] sex-check keeping chrY: idxstats failed"
+    rm -f "${stats_file}"
+    return 0
+  fi
+  local decision=""
+  if ! decision="$(run_python_module retro_miner.sample_sex "${stats_file}")"; then
+    echo "[candidate-pipeline] sex-check keeping chrY: sex classifier failed"
+    rm -f "${stats_file}"
+    return 0
+  fi
+  rm -f "${stats_file}"
+  local label="${decision%% *}"
+  local ratio="${decision#* }"
+  if [[ "${label}" == "female" ]]; then
+    local kept=()
+    for chr in "${CHR_LIST[@]}"; do
+      if [[ "${chr}" != "chrY" ]]; then
+        kept+=("${chr}")
+      fi
+    done
+    echo "[candidate-pipeline] sex-check chrX/chr1=${ratio} female; skipping chrY"
+    if [[ "${#kept[@]}" -eq 0 ]]; then
+      CHR_LIST=()
+    else
+      CHR_LIST=("${kept[@]}")
+    fi
+    return 0
+  fi
+  if [[ "${label}" == "male" ]]; then
+    echo "[candidate-pipeline] sex-check chrX/chr1=${ratio} male; keeping chrY"
+    return 0
+  fi
+  echo "[candidate-pipeline] sex-check keeping chrY: ${decision}"
+}
+# END drop_chry_when_female
+
 set_reference_build_defaults() {
   case "${REFERENCE_BUILD}" in
     hg38)
@@ -909,6 +970,11 @@ fi
 
 stage_remote_bams_if_needed
 resolve_sliced_mate_bams
+drop_chry_when_female
+if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
+  echo "[candidate-pipeline] no chromosomes left to run"
+  exit 0
+fi
 
 if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   REGION="${CHR_LIST[0]}"
