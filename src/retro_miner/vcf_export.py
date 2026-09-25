@@ -394,7 +394,7 @@ def lookup_reference_build(start: Path) -> tuple[str, str]:
 
 
 def vcf_header_lines(reference_build: str | None = None) -> list[str]:
-    """Header lines, with ``##reference`` and contig assembly when the build is known."""
+    """Header lines, with ``##reference`` and one ``##assembly`` when the build is known."""
     build = (reference_build or "").strip()
     if build == "":
         return list(VCF_HEADER_LINES)
@@ -404,8 +404,8 @@ def vcf_header_lines(reference_build: str | None = None) -> list[str]:
         lines.append(line)
         if line.startswith("##source="):
             lines.append(f"##reference={build}")
-        elif assembly and line.startswith("##contig=<ID=") and line.endswith(">"):
-            lines[-1] = line[:-1] + f",assembly={assembly}>"
+            if assembly:
+                lines.append(f"##assembly={assembly}")
     return lines
 
 

@@ -119,8 +119,8 @@ def test_aggregated_gold_table_writes_vcf_from_pipeline_params(tmp_path: Path) -
     assert main(["--output", str(out), *(str(p) for p in inputs)]) == 0
     text = out.with_suffix(".vcf").read_text(encoding="utf-8")
     assert "##reference=hg38\n" in text
-    assert "##contig=<ID=chr4,assembly=GRCh38>" in text
-    assert "##contig=<ID=chr10,assembly=GRCh38>" in text
+    assert "##assembly=GRCh38\n" in text
+    assert ",assembly=" not in text
     assert "L1TX-chr4-66240893-ALU" in text
     assert "L1TX-chr4-102422592-LINE1" in text
     assert "L1TX-chr10-3041566-SVA" in text
