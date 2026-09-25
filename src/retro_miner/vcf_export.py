@@ -170,13 +170,13 @@ VCF_HEADER_LINES = [
     '##INFO=<ID=MEI_SPAN,Number=1,Type=Integer,Description="Full-length span (bp) of the consensus MEI alignment">',
     '##INFO=<ID=MEI_5P,Number=1,Type=Integer,Description="5-prime coordinate of the consensus MEI alignment on the full-length reference">',
     '##INFO=<ID=MEI_3P,Number=1,Type=Integer,Description="3-prime coordinate of the consensus MEI alignment on the full-length reference">',
-    '##INFO=<ID=NSSV,Number=1,Type=String,Description="dbVar nssv accession of an overlapping known MEI">',
-    '##INFO=<ID=G1K,Number=1,Type=String,Description="1000 Genomes MELT identifier of an overlapping known MEI">',
+    '##INFO=<ID=G1K,Number=1,Type=String,Description="1000 Genomes MELT identifier of an overlapping known MEI. The MELT record id is the dbVar nssv accession">',
     '##INFO=<ID=LR,Number=1,Type=String,Description="Long-read SVAN identifier of an overlapping known MEI">',
     '##INFO=<ID=KNOWN_SRC,Number=1,Type=String,Description="Source database for the known-MEI overlap (e.g. melt_1kg, long_read_1kg_ont_vienna)">',
     '##INFO=<ID=SAMPLE_STATUS,Number=1,Type=String,Description="shared / disease_only / control_only support classification">',
-    '##INFO=<ID=CTRL_SUPPORT,Number=1,Type=String,Description="Raw control-sample supporting-read evidence string (pipe-delimited key=value pairs)">',
-    '##INFO=<ID=DISEASE_SUPPORT,Number=1,Type=String,Description="Raw disease-sample supporting-read evidence string (pipe-delimited key=value pairs)">',
+    '##INFO=<ID=SUPPORT,Number=1,Type=String,Description="Supporting-read evidence when disease and control are the same sample (pipe-delimited key:value pairs)">',
+    '##INFO=<ID=CTRL_SUPPORT,Number=1,Type=String,Description="Control-sample supporting-read evidence when it differs from the disease sample">',
+    '##INFO=<ID=DISEASE_SUPPORT,Number=1,Type=String,Description="Disease-sample supporting-read evidence when it differs from the control sample">',
     *[
         f'##INFO=<ID={info_id},Number=1,Type={_VCF_TYPE.get(kind, kind)},Description="{desc}">'
         for info_id, _column, kind, desc in _EXTRA_INFO_FIELDS
@@ -219,6 +219,22 @@ def _canonical_family(raw: str) -> str:
 def _alt_allele_for_family(family: str) -> str:
     alt_id = _MEI_FAMILY_ALT_ID.get(_canonical_family(family).upper(), "INS:ME")
     return f"<{alt_id}>"
+
+
+def _support_info_fields(row: dict[str, Any]) -> list[str | None]:
+    """One SUPPORT field when disease and control evidence are the same sample.
+
+    Germline runs pass the same BAM as disease and control, so the two
+    evidence strings match. A distinct disease sample keeps both fields.
+    """
+    ctrl = _vcf_safe(row.get("control_supporting_reads"))
+    disease = _vcf_safe(row.get("disease_supporting_reads"))
+    if ctrl != "" and ctrl == disease:
+        return [_info_field("SUPPORT", ctrl)]
+    return [
+        _info_field("CTRL_SUPPORT", ctrl),
+        _info_field("DISEASE_SUPPORT", disease),
+    ]
 
 
 def _info_field(key: str, value: str) -> str | None:
@@ -518,13 +534,11 @@ def build_vcf_record(row: dict[str, Any], *, mark_pass: bool = False) -> str:
         _info_int("MEI_SPAN", row.get("consensus_insertion_mei_span_full")),
         _info_int("MEI_5P", row.get("consensus_insertion_mei_5p_coord_full")),
         _info_int("MEI_3P", row.get("consensus_insertion_mei_3p_coord_full")),
-        _info_field("NSSV", _vcf_safe(known.get("nssv"))),
         _info_field("G1K", _vcf_safe(known.get("g1k"))),
         _info_field("LR", _vcf_safe(known.get("lr"))),
         _info_field("KNOWN_SRC", _vcf_safe(row.get("known_mei_polymorphism_source"))),
         _info_field("SAMPLE_STATUS", _vcf_safe(row.get("sample_status_label"))),
-        _info_field("CTRL_SUPPORT", _vcf_safe(row.get("control_supporting_reads"))),
-        _info_field("DISEASE_SUPPORT", _vcf_safe(row.get("disease_supporting_reads"))),
+        *_support_info_fields(row),
     ]
     for info_id, column, kind, _desc in _EXTRA_INFO_FIELDS:
         raw = row.get(column)

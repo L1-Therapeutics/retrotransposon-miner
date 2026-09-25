@@ -128,7 +128,7 @@ class TestBuildVcfRecord:
 
     def test_catalog_ids_are_split_into_their_own_info_fields(self):
         info_field = build_vcf_record(LINE1_ROW).split("\t")[7]
-        assert "NSSV=nssv14064681" in info_field
+        assert "NSSV=" not in info_field
         assert "G1K=nssv14064681" in info_field
         assert "LR=chr22-19600083-INS->s899391<s914453>s899392-6059" in info_field
         assert "KNOWN_ID=" not in info_field
@@ -138,9 +138,13 @@ class TestBuildVcfRecord:
                 assert ";" not in value
 
         sva_info = build_vcf_record(SVA_ROW).split("\t")[7]
-        assert "NSSV=nssv14064350" in sva_info
+        assert "NSSV=" not in sva_info
         assert "G1K=nssv14064350" in sva_info
         assert "LR=" not in sva_info
+        sva_keys = [kv.split("=", 1)[0] for kv in sva_info.split(";") if "=" in kv]
+        assert "CTRL_SUPPORT" in sva_keys
+        assert "DISEASE_SUPPORT" in sva_keys
+        assert "SUPPORT" not in sva_keys
 
     def test_comma_separated_evidence_string_is_sanitized(self):
         # Both ',' and internal '=' must be escaped: VCF INFO reserves '='
@@ -153,7 +157,6 @@ class TestBuildVcfRecord:
     def test_blank_optional_fields_are_omitted_from_info_not_padded(self):
         rec = build_vcf_record(BLANK_OPTIONAL_ROW)
         info_field = rec.split("\t")[7]
-        assert "NSSV=" not in info_field
         assert "G1K=" not in info_field
         assert "LR=" not in info_field
         assert "KNOWN_SRC=" not in info_field
@@ -361,17 +364,22 @@ def test_gold_review_export_has_no_rank_pct_without_classifier(tmp_path: Path):
     by_id = {rec.id: rec for rec in records}
     alu = by_id["L1TX-chr4-66240893-ALU"]
     assert alu.alts == ("<INS:ME:ALU>",)
-    assert alu.info["NSSV"] == "nssv14044437"
+    assert "NSSV" not in alu.info
     assert alu.info["G1K"] == "nssv14044437"
+    assert "CTRL_SUPPORT" not in alu.info
+    assert "DISEASE_SUPPORT" not in alu.info
+    assert "SUPPORT" in alu.info
     line1 = by_id["L1TX-chr4-102422592-LINE1"]
     assert line1.alts == ("<INS:ME:LINE1>",)
-    assert line1.info["NSSV"] == "nssv14080750"
+    assert "NSSV" not in line1.info
     assert line1.info["G1K"] == "nssv14080750"
     assert str(line1.info["LR"]).startswith("chr4-105736355-INS->")
+    assert "SUPPORT" in line1.info
     sva = by_id["L1TX-chr10-3041566-SVA"]
     assert sva.alts == ("<INS:ME:SVA>",)
-    assert sva.info["NSSV"] == "nssv14066958"
+    assert "NSSV" not in sva.info
     assert sva.info["G1K"] == "nssv14066958"
+    assert "SUPPORT" in sva.info
 
 
 class TestHg03086Tables:
@@ -443,8 +451,11 @@ class TestHg03086Tables:
             assert rec.alts == (expected[row["mei_family"]],)
         line1 = line_by_pos[102422592]
         line1_info = dict(part.split("=", 1) for part in line1[7].split(";") if "=" in part)
-        assert line1_info["NSSV"] == "nssv14080750"
+        assert "NSSV" not in line1_info
         assert line1_info["G1K"] == "nssv14080750"
+        assert "SUPPORT" in line1_info
+        assert "CTRL_SUPPORT" not in line1_info
+        assert "DISEASE_SUPPORT" not in line1_info
         assert line1_info["LR"].startswith("chr4-105736355-INS->")
         assert saw_distinct_breakpoint
 
