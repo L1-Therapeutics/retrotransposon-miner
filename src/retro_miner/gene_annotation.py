@@ -443,6 +443,9 @@ def annotate_vcf(
 # 6 kb L1 at chr22:19223382 evaluated as a point (intron_variant, CLTCL1) with
 # no SVLEN workaround. ``chr22`` input was mapped to database contig ``22``
 # and echoed back as ``chr22``. Default JVM heap OOMs on GRCh38 -> pass -Xmx.
+# ``-noHgvs`` is always set: an insertion has no codon change, and HGVS
+# protein notation is not part of this module's output. Computing it makes
+# snpEff load the reference sequence into the heap.
 #
 # ANN entries are NOT ordered by Ensembl severity (snpEff lists e.g.
 # upstream_gene_variant ahead of intron_variant for the same gene), so the
@@ -495,7 +498,7 @@ def snpeff_command(
     in_path: str | Path, genome: str, *, snpeff_bin: str = "snpEff",
     config: str | Path | None = None, xmx: str = "8g",
 ) -> list[str]:
-    cmd = [snpeff_bin, f"-Xmx{xmx}", "-noStats"]
+    cmd = [snpeff_bin, f"-Xmx{xmx}", "-noStats", "-noHgvs"]
     if config is not None:
         cmd += ["-c", str(config)]
     cmd += [genome, str(in_path)]

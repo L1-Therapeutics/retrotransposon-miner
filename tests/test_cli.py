@@ -250,5 +250,5 @@ def test_annotate_genes_snpeff_backend_offline(runner, tmp_path, monkeypatch):
                                  "--snpeff-xmx", "4g", "--vcf", str(src), "--out", str(out)])
     assert result.exit_code == 0, result.output
     assert "backend=snpeff records=30 annotated=30 with_gene=23 unmatched=0" in result.output
-    assert seen["cmd"][:3] == ["snpEff", "-Xmx4g", "-noStats"] and "GRCh38.115" in seen["cmd"]
+    assert seen["cmd"][:4] == ["snpEff", "-Xmx4g", "-noStats", "-noHgvs"] and "GRCh38.115" in seen["cmd"]
     assert "GENE=CLTCL1" in out.read_text()

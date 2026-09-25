@@ -141,6 +141,8 @@ rtm annotate-genes --vcf calls.vcf --out calls.annot.vcf --tsv calls.annot.tsv
 conda install -c bioconda -c conda-forge snpeff openjdk
 snpEff download -v GRCh38.115            # one-time, ~600 MB; use -v: silent mirror failures are common
 rtm annotate-genes --backend snpeff --snpeff-genome GRCh38.115 --vcf calls.vcf --out calls.annot.vcf
+# snpEff is invoked with -noHgvs: insertions have no protein change, and HGVS
+# would load the reference sequence into the JVM heap.
 ```
 
 Measured on the 30 chr22 GRCh38 calls in `tests/data/chr22_mei.vcf` (VEP release 116; snpEff 5.4c `GRCh38.99`): both backends annotate 30/30; VEP 24 in genes, snpEff 23; most-severe term concordant at 25/30 after ranking snpEff's `ANN` list with Ensembl's severity table, with the 5 differences all due to genes absent from the older release-99 database. VEP: 9–19 s per 30 variants. snpEff: 57 s wall, ~1 s of it annotation; needs `-Xmx8g` (default heap OOMs on GRCh38).

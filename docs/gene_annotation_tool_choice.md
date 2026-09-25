@@ -23,7 +23,7 @@ table, exported by `vcf_export` (symbolic `<INS:ME:*>` ALT, `SVTYPE=INS`, `SVLEN
 | Install | none (HTTPS only) | conda `snpeff` + `openjdk` (40.7 MB) — fine |
 | Reference data | none locally | `snpEff download GRCh38.99`: 610 MB. Silent no-op on first two attempts; with `-v`, mirrors `v5_4`–`v5_1` all fail to connect, `v5_0` succeeds |
 | Startup | none | 35 s database load + 7 s interval forest ≈ 55 s before the first variant (`-Xmx8g`) |
-| Memory | none | default JVM heap → `OutOfMemoryError` building the GRCh38 interval forest; `-Xmx8g` works |
+| Memory | none | default JVM heap → `OutOfMemoryError` building the GRCh38 interval forest; `-Xmx8g` works. `annotate-genes` passes `-noHgvs` so snpEff does not also load the reference sequence for protein notation |
 | `chr22` vs `22` contig naming | accepted as-is (verified) | mapped to database contig `22`, echoed back as `chr22` (verified) |
 | Symbolic `<INS:ME:*>` ALT | accepted; needs SVLEN dropped (see below) | evaluated as a point natively; 6 kb L1 at 19223382 → `intron_variant`, CLTCL1, 5 transcripts |
 | Time, 30 variants | 9.4 s and 18.6 s on two runs (0.31–0.62 s/var); 200-variant POST batches | 57.3 s wall, of which ~1 s is annotation (log resolution 1 s) |
