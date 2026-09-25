@@ -128,9 +128,9 @@ class TestBuildVcfRecord:
 
     def test_catalog_ids_are_split_into_their_own_info_fields(self):
         info_field = build_vcf_record(LINE1_ROW).split("\t")[7]
-        assert "L1TXNSSV=nssv14064681" in info_field
-        assert "L1TXG1K=nssv14064681" in info_field
-        assert "L1TXLR=chr22-19600083-INS->s899391<s914453>s899392-6059" in info_field
+        assert "NSSV=nssv14064681" in info_field
+        assert "G1K=nssv14064681" in info_field
+        assert "LR=chr22-19600083-INS->s899391<s914453>s899392-6059" in info_field
         assert "KNOWN_ID=" not in info_field
         for kv in info_field.split(";"):
             if "=" in kv:
@@ -138,9 +138,9 @@ class TestBuildVcfRecord:
                 assert ";" not in value
 
         sva_info = build_vcf_record(SVA_ROW).split("\t")[7]
-        assert "L1TXNSSV=nssv14064350" in sva_info
-        assert "L1TXG1K=nssv14064350" in sva_info
-        assert "L1TXLR=" not in sva_info
+        assert "NSSV=nssv14064350" in sva_info
+        assert "G1K=nssv14064350" in sva_info
+        assert "LR=" not in sva_info
 
     def test_comma_separated_evidence_string_is_sanitized(self):
         # Both ',' and internal '=' must be escaped: VCF INFO reserves '='
@@ -153,9 +153,9 @@ class TestBuildVcfRecord:
     def test_blank_optional_fields_are_omitted_from_info_not_padded(self):
         rec = build_vcf_record(BLANK_OPTIONAL_ROW)
         info_field = rec.split("\t")[7]
-        assert "L1TXNSSV=" not in info_field
-        assert "L1TXG1K=" not in info_field
-        assert "L1TXLR=" not in info_field
+        assert "NSSV=" not in info_field
+        assert "G1K=" not in info_field
+        assert "LR=" not in info_field
         assert "KNOWN_SRC=" not in info_field
 
     def test_no_info_field_ever_contains_a_raw_comma(self):
@@ -361,17 +361,17 @@ def test_gold_review_export_has_no_rank_pct_without_classifier(tmp_path: Path):
     by_id = {rec.id: rec for rec in records}
     alu = by_id["L1TX-chr4-66240893-ALU"]
     assert alu.alts == ("<INS:ME:ALU>",)
-    assert alu.info["L1TXNSSV"] == "nssv14044437"
-    assert alu.info["L1TXG1K"] == "nssv14044437"
+    assert alu.info["NSSV"] == "nssv14044437"
+    assert alu.info["G1K"] == "nssv14044437"
     line1 = by_id["L1TX-chr4-102422592-LINE1"]
     assert line1.alts == ("<INS:ME:LINE1>",)
-    assert line1.info["L1TXNSSV"] == "nssv14080750"
-    assert line1.info["L1TXG1K"] == "nssv14080750"
-    assert str(line1.info["L1TXLR"]).startswith("chr4-105736355-INS->")
+    assert line1.info["NSSV"] == "nssv14080750"
+    assert line1.info["G1K"] == "nssv14080750"
+    assert str(line1.info["LR"]).startswith("chr4-105736355-INS->")
     sva = by_id["L1TX-chr10-3041566-SVA"]
     assert sva.alts == ("<INS:ME:SVA>",)
-    assert sva.info["L1TXNSSV"] == "nssv14066958"
-    assert sva.info["L1TXG1K"] == "nssv14066958"
+    assert sva.info["NSSV"] == "nssv14066958"
+    assert sva.info["G1K"] == "nssv14066958"
 
 
 class TestHg03086Tables:
@@ -443,9 +443,9 @@ class TestHg03086Tables:
             assert rec.alts == (expected[row["mei_family"]],)
         line1 = line_by_pos[102422592]
         line1_info = dict(part.split("=", 1) for part in line1[7].split(";") if "=" in part)
-        assert line1_info["L1TXNSSV"] == "nssv14080750"
-        assert line1_info["L1TXG1K"] == "nssv14080750"
-        assert line1_info["L1TXLR"].startswith("chr4-105736355-INS->")
+        assert line1_info["NSSV"] == "nssv14080750"
+        assert line1_info["G1K"] == "nssv14080750"
+        assert line1_info["LR"].startswith("chr4-105736355-INS->")
         assert saw_distinct_breakpoint
 
     def test_classifier_export_inherits_reference_from_gold_table(self, tmp_path: Path):
