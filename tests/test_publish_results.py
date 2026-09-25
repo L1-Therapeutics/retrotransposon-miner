@@ -8,6 +8,7 @@ import pytest
 
 from retro_miner.publish_results import (
     GENOME_GOLD_NAME,
+    GENOME_VCF_NAME,
     IGV_DIR_NAME,
     READ_ARCH_DIR_NAME,
     bucket_uri,
@@ -64,6 +65,7 @@ def test_sync_keeps_root_gold_and_plots_only(tmp_path: Path) -> None:
     assert argv[:4] == ["s3", "sync", str(sample), dest]
     assert "--exclude" in argv and "*" in argv
     assert GENOME_GOLD_NAME in argv
+    assert GENOME_VCF_NAME in argv
     assert f"*/{IGV_DIR_NAME}/*" in argv
     assert f"*/{READ_ARCH_DIR_NAME}/*" in argv
     assert f"{IGV_DIR_NAME}/*" in argv

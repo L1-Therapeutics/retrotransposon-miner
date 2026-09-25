@@ -1139,5 +1139,96 @@ def annotate_mei_support_cmd(
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
 
 
+@cli.command("export-vcf")
+@click.option(
+    "--in-tsv",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help=(
+        "Gold review TSV (candidate_loci.mei.gold_review.tsv) or a "
+        "classifier-ranked TSV (hg*_gold_by_classifier_score.tsv)."
+    ),
+)
+@click.option(
+    "--out-vcf",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="Output VCF v4.3 path.",
+)
+@click.option(
+    "--breakpoint-tsv",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Genome-wide gold review TSV. Required when --in-tsv is a classifier "
+        "ranking, which has window coordinates but no insertion breakpoint. "
+        "Rows are joined on chrom, window_start, and window_end."
+    ),
+)
+@click.option(
+    "--min-score",
+    type=float,
+    default=None,
+    help="Keep rows whose --score-column is >= this value. Sets FILTER=PASS.",
+)
+@click.option(
+    "--score-column",
+    type=str,
+    default="gold_score",
+    show_default=True,
+    help="Column compared against --min-score. gold_score is the classifier probability.",
+)
+@click.option(
+    "--reference-build",
+    type=str,
+    default=None,
+    help=(
+        "Genome build passed to the pipeline as --reference-build (hg38, hg19, or hs1). "
+        "When omitted, export-vcf reads pipeline_params.env next to the input table."
+    ),
+)
+@click.option(
+    "--sample-name",
+    type=str,
+    default="SAMPLE",
+    show_default=True,
+    help=(
+        "Sample column name in the VCF header. If left as SAMPLE and the "
+        "table has a single sample column, that name is used. GT/GQ stay "
+        "missing either way."
+    ),
+)
+def export_vcf_cmd(
+    in_tsv: Path,
+    out_vcf: Path,
+    breakpoint_tsv: Path | None,
+    min_score: float | None,
+    score_column: str,
+    reference_build: str | None,
+    sample_name: str,
+) -> None:
+    """Convert a gold-review or classifier-ranked TSV to VCF v4.3.
+
+    Genotype (GT) and genotype quality (GQ) are always written as VCF
+    missing values (./. and .) -- see retro_miner.vcf_export module
+    docstring for why.
+    """
+    from retro_miner.vcf_export import export_vcf_from_tsv
+
+    try:
+        n = export_vcf_from_tsv(
+            in_tsv,
+            out_vcf,
+            sample_name=sample_name,
+            min_score=min_score,
+            score_column=score_column,
+            breakpoint_tsv=breakpoint_tsv,
+            reference_build=reference_build,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"[export-vcf] wrote {n} records to {out_vcf}")
+
+
 if __name__ == "__main__":
     cli()
