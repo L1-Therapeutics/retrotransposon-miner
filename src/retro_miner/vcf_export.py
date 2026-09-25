@@ -35,6 +35,8 @@ for MEI evidence (e.g. a pangenome/graph-based genotyper).
 from __future__ import annotations
 
 import csv
+import re
+from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -76,10 +78,10 @@ _FAMILY_ALIASES = {
 #: (INFO id, source column, VCF Number/Type, description)
 _EXTRA_INFO_FIELDS: tuple[tuple[str, str, str, str], ...] = (
     (
-        "GOLDSCORE",
+        "L1TXGOLDSCORE",
         "gold_score",
-        "Float",
-        "Classifier probability that the gold call is a true insertion",
+        "Sig4",
+        "Classifier probability that the gold call is a true insertion, 4 significant figures",
     ),
     (
         "CLASSIFIERRANK",
@@ -88,10 +90,10 @@ _EXTRA_INFO_FIELDS: tuple[tuple[str, str, str, str], ...] = (
         "Rank by classifier score; 1 is the highest score",
     ),
     (
-        "GOLDRANK",
-        "gold_rank",
+        "L1TXGOLDRANKPCT",
+        "l1tx_gold_rank_pct",
         "Integer",
-        "Rank in the genome-wide gold review table before classifier reordering",
+        "Percentile of gold_rank in the input table; 100 is the best call, rounded to the nearest integer",
     ),
     (
         "INSERTIONSCORE",
@@ -131,6 +133,12 @@ _EXTRA_INFO_FIELDS: tuple[tuple[str, str, str, str], ...] = (
 #: autosomes/sex/mito contigs that candidate loci are called against.
 _STANDARD_CONTIGS = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY", "chrM"]
 
+#: Internal kinds that are not VCF Types. Sig4 is a Float written at 4 significant figures.
+_VCF_TYPE = {"Sig4": "Float"}
+
+_KNOWN_ID_SPLIT = re.compile(r"[|;]")
+_NSSV_TOKEN = re.compile(r"nssv\d+")
+
 VCF_HEADER_LINES = [
     f"##fileformat={VCF_FILEFORMAT}",
     "##source=retrotransposon-miner:vcf_export",
@@ -152,13 +160,15 @@ VCF_HEADER_LINES = [
     '##INFO=<ID=MEI_SPAN,Number=1,Type=Integer,Description="Full-length span (bp) of the consensus MEI alignment">',
     '##INFO=<ID=MEI_5P,Number=1,Type=Integer,Description="5-prime coordinate of the consensus MEI alignment on the full-length reference">',
     '##INFO=<ID=MEI_3P,Number=1,Type=Integer,Description="3-prime coordinate of the consensus MEI alignment on the full-length reference">',
-    '##INFO=<ID=KNOWN_ID,Number=1,Type=String,Description="Matching known MEI polymorphism identifier, if any">',
-    '##INFO=<ID=KNOWN_SRC,Number=1,Type=String,Description="Source database for KNOWN_ID (e.g. melt_1kg, long_read_1kg_ont_vienna)">',
+    '##INFO=<ID=L1TXNSSV,Number=1,Type=String,Description="dbVar nssv accession of an overlapping known MEI">',
+    '##INFO=<ID=L1TXG1K,Number=1,Type=String,Description="1000 Genomes MELT identifier of an overlapping known MEI">',
+    '##INFO=<ID=L1TXLR,Number=1,Type=String,Description="Long-read SVAN identifier of an overlapping known MEI">',
+    '##INFO=<ID=KNOWN_SRC,Number=1,Type=String,Description="Source database for the known-MEI overlap (e.g. melt_1kg, long_read_1kg_ont_vienna)">',
     '##INFO=<ID=SAMPLE_STATUS,Number=1,Type=String,Description="shared / disease_only / control_only support classification">',
     '##INFO=<ID=CTRL_SUPPORT,Number=1,Type=String,Description="Raw control-sample supporting-read evidence string (pipe-delimited key=value pairs)">',
     '##INFO=<ID=DISEASE_SUPPORT,Number=1,Type=String,Description="Raw disease-sample supporting-read evidence string (pipe-delimited key=value pairs)">',
     *[
-        f'##INFO=<ID={info_id},Number=1,Type={kind},Description="{desc}">'
+        f'##INFO=<ID={info_id},Number=1,Type={_VCF_TYPE.get(kind, kind)},Description="{desc}">'
         for info_id, _column, kind, desc in _EXTRA_INFO_FIELDS
     ],
     '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype (unset: this table reports pooled disease-vs-control read support, not per-individual diploid genotypes)">',
@@ -227,6 +237,95 @@ def _info_float(key: str, raw: Any) -> str | None:
     except ValueError:
         return None
     return f"{key}={text}"
+
+
+def format_sigfigs(raw: Any, n: int = 4) -> str:
+    """Round ``raw`` to ``n`` significant figures and keep a fixed-point rendering."""
+    text = _vcf_safe(raw)
+    if text == "":
+        raise ValueError("empty")
+    ctx = Context(prec=n, rounding=ROUND_HALF_UP)
+    try:
+        dec = ctx.create_decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(text) from exc
+    return format(dec, "f")
+
+
+def _info_sigfigs(key: str, raw: Any, n: int = 4) -> str | None:
+    try:
+        return f"{key}={format_sigfigs(raw, n)}"
+    except ValueError:
+        return None
+
+
+def split_known_mei_ids(raw: Any) -> dict[str, str]:
+    """Split a combined polymorphism id into nssv, g1k, and long-read ids.
+
+    Combined rows look like ``g1k:nssv14058545|lr:chr5-43795330-INS->...``.
+    A bare ``nssv...`` value is the 1000 Genomes MELT id. A bare non-nssv
+    value is the long-read SVAN id.
+    """
+    text = "" if raw is None else str(raw).strip()
+    if text == "" or text.lower() == "nan":
+        return {}
+    found: dict[str, str] = {}
+    tagged = False
+    for part in _KNOWN_ID_SPLIT.split(text):
+        piece = part.strip()
+        if piece.startswith("g1k:"):
+            tagged = True
+            found["g1k"] = piece[4:]
+        elif piece.startswith("lr:"):
+            tagged = True
+            found["lr"] = piece[3:]
+    if not tagged:
+        if text.startswith("nssv"):
+            found["g1k"] = text
+        else:
+            found["lr"] = text
+    nssv = _NSSV_TOKEN.search(found.get("g1k", "")) or _NSSV_TOKEN.search(text)
+    if nssv is not None:
+        found["nssv"] = nssv.group(0)
+    return found
+
+
+def attach_gold_rank_percentile(rows: list[dict[str, Any]]) -> None:
+    """Write ``l1tx_gold_rank_pct`` from ``gold_rank``.
+
+    Rank 1 is the best call. The percentile is ``100 * (N - rank + 1) / N``,
+    rounded to the nearest integer, with ``N`` the largest rank in ``rows``.
+    """
+    ranks: list[int] = []
+    for row in rows:
+        text = _vcf_safe(row.get("gold_rank"))
+        if text == "":
+            continue
+        try:
+            ranks.append(int(float(text)))
+        except ValueError:
+            continue
+    if not ranks:
+        return
+    n = max(ranks)
+    for row in rows:
+        if _vcf_safe(row.get("l1tx_gold_rank_pct")) != "":
+            continue
+        text = _vcf_safe(row.get("gold_rank"))
+        if text == "":
+            continue
+        try:
+            rank = int(float(text))
+        except ValueError:
+            continue
+        pct = int(round(100.0 * (n - rank + 1) / n))
+        row["l1tx_gold_rank_pct"] = str(max(0, min(100, pct)))
+
+
+def locus_id(chrom: str, pos: str, family: str) -> str:
+    """``L1TX-<chrom>-<pos>-<family>`` using the canonical family token."""
+    fam = family if family in _MEI_FAMILY_ALT_ID else "ME"
+    return f"L1TX-{chrom}-{pos}-{fam}"
 
 
 def breakpoint_pos(row: dict[str, Any]) -> str:
@@ -324,13 +423,12 @@ def build_vcf_record(row: dict[str, Any], *, mark_pass: bool = False) -> str:
     chrom = _vcf_safe(row.get("chrom")) or "."
     pos = breakpoint_pos(row)
 
-    known_id = _vcf_safe(row.get("known_mei_polymorphism_id"))
-    vcf_id = known_id if known_id else "."
-
     ref = "N"  # No reference-genome lookup performed; POS marks the breakpoint, not a called base.
     family_raw = _row_value(row, "consensus_mei_family", "mei_family")
     family = _canonical_family(family_raw) if family_raw else ""
     alt = _alt_allele_for_family(family) if family else "<INS:ME>"
+    vcf_id = locus_id(chrom, pos, family) if chrom != "." and pos != "." else "."
+    known = split_known_mei_ids(row.get("known_mei_polymorphism_id"))
 
     qual = "."
     filt = "PASS" if mark_pass else "."
@@ -349,7 +447,9 @@ def build_vcf_record(row: dict[str, Any], *, mark_pass: bool = False) -> str:
         _info_int("MEI_SPAN", row.get("consensus_insertion_mei_span_full")),
         _info_int("MEI_5P", row.get("consensus_insertion_mei_5p_coord_full")),
         _info_int("MEI_3P", row.get("consensus_insertion_mei_3p_coord_full")),
-        _info_field("KNOWN_ID", known_id),
+        _info_field("L1TXNSSV", _vcf_safe(known.get("nssv"))),
+        _info_field("L1TXG1K", _vcf_safe(known.get("g1k"))),
+        _info_field("L1TXLR", _vcf_safe(known.get("lr"))),
         _info_field("KNOWN_SRC", _vcf_safe(row.get("known_mei_polymorphism_source"))),
         _info_field("SAMPLE_STATUS", _vcf_safe(row.get("sample_status_label"))),
         _info_field("CTRL_SUPPORT", _vcf_safe(row.get("control_supporting_reads"))),
@@ -361,6 +461,8 @@ def build_vcf_record(row: dict[str, Any], *, mark_pass: bool = False) -> str:
             info_parts.append(_info_int(info_id, raw))
         elif kind == "Float":
             info_parts.append(_info_float(info_id, raw))
+        elif kind == "Sig4":
+            info_parts.append(_info_sigfigs(info_id, raw, 4))
         else:
             info_parts.append(_info_field(info_id, _vcf_safe(raw)))
     info = ";".join(part for part in info_parts if part is not None)
@@ -413,6 +515,7 @@ def export_vcf(
 
     Returns the number of records written.
     """
+    attach_gold_rank_percentile(rows)
     header = list(VCF_HEADER_LINES)
     header.append(VCF_COLUMN_HEADER.format(sample=sample_name))
 
@@ -460,6 +563,8 @@ def export_vcf_from_tsv(
             "input has no consensus_insertion_breakpoint_pos; pass breakpoint_tsv "
             "pointing at the genome-wide gold review table"
         )
+    # Percentile uses the full input, including rows the score filter will drop.
+    attach_gold_rank_percentile(rows)
     if min_score is not None:
         rows = filter_min_score(rows, min_score, score_column)
     sample = resolve_sample_name(rows, sample_name)

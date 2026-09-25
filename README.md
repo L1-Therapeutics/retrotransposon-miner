@@ -414,9 +414,13 @@ python -m retro_miner.cli export-vcf \
   --out-vcf HG03086.classifier_ge_0.997.vcf
 ```
 
-`GOLDSCORE` and `CLASSIFIERRANK` are written to INFO when those columns
-exist. `SVLEN` is left unset so Ensembl VEP does not treat the insertion as a
-reference span; the element length stays in `MEI_SPAN`, and `END` equals `POS`.
+`L1TXGOLDSCORE` (4 significant figures) and `CLASSIFIERRANK` are written to
+INFO when those columns exist. `L1TXGOLDRANKPCT` is the `gold_rank` percentile
+in the input table (100 is best, nearest integer). The VCF ID is
+`L1TX-<chrom>-<pos>-<family>`. Overlapping catalog accessions are
+`L1TXNSSV`, `L1TXG1K`, and `L1TXLR` instead of the ID column. `SVLEN` is
+left unset so Ensembl VEP does not treat the insertion as a reference span;
+the element length stays in `MEI_SPAN`, and `END` equals `POS`.
 
 Records are coordinate-sorted, so the output can be compressed and indexed
 directly:

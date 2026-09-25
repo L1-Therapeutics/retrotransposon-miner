@@ -11,6 +11,7 @@ from retro_miner.vcf_export import (
     build_vcf_record,
     export_vcf,
     export_vcf_from_tsv,
+    format_sigfigs,
     VCF_HEADER_LINES,
     VCF_COLUMN_HEADER,
 )
@@ -104,11 +105,14 @@ class TestBuildVcfRecord:
         row = dict(SVA_ROW, consensus_mei_family="UNKNOWN_NEW_FAMILY")
         assert build_vcf_record(row).split("\t")[4] == "<INS:ME>"
 
-    def test_id_field_uses_known_polymorphism_id_when_present(self):
-        assert build_vcf_record(SVA_ROW).split("\t")[2] == "nssv14064350"
+    def test_id_is_l1tx_chrom_pos_family(self):
+        assert build_vcf_record(SVA_ROW).split("\t")[2] == "L1TX-chr22-49029650-SVA"
+        assert build_vcf_record(LINE1_ROW).split("\t")[2] == "L1TX-chr22-19223382-LINE1"
+        assert build_vcf_record(BLANK_OPTIONAL_ROW).split("\t")[2] == "L1TX-chr22-31355872-ALU"
 
-    def test_id_field_is_dot_when_absent(self):
-        assert build_vcf_record(BLANK_OPTIONAL_ROW).split("\t")[2] == "."
+    def test_id_is_dot_when_breakpoint_is_missing(self):
+        row = dict(SVA_ROW, consensus_insertion_breakpoint_pos="")
+        assert build_vcf_record(row).split("\t")[2] == "."
 
     def test_genotype_is_always_blank_missing_not_fabricated(self):
         for row in (SVA_ROW, LINE1_ROW, BLANK_OPTIONAL_ROW):
@@ -122,11 +126,21 @@ class TestBuildVcfRecord:
         assert fields[5] == "."  # QUAL
         assert fields[6] == "."  # FILTER
 
-    def test_semicolon_in_known_id_is_sanitized_not_left_raw(self):
-        rec = build_vcf_record(LINE1_ROW)
-        info_field = rec.split("\t")[7]
-        # A raw, un-sanitized ';' here would corrupt VCF INFO key=value parsing.
-        assert "KNOWN_ID=g1k:nssv14064681_lr:chr22-19600083-INS->s899391<s914453>s899392-6059" in info_field
+    def test_catalog_ids_are_split_into_their_own_info_fields(self):
+        info_field = build_vcf_record(LINE1_ROW).split("\t")[7]
+        assert "L1TXNSSV=nssv14064681" in info_field
+        assert "L1TXG1K=nssv14064681" in info_field
+        assert "L1TXLR=chr22-19600083-INS->s899391<s914453>s899392-6059" in info_field
+        assert "KNOWN_ID=" not in info_field
+        for kv in info_field.split(";"):
+            if "=" in kv:
+                _, value = kv.split("=", 1)
+                assert ";" not in value
+
+        sva_info = build_vcf_record(SVA_ROW).split("\t")[7]
+        assert "L1TXNSSV=nssv14064350" in sva_info
+        assert "L1TXG1K=nssv14064350" in sva_info
+        assert "L1TXLR=" not in sva_info
 
     def test_comma_separated_evidence_string_is_sanitized(self):
         # Both ',' and internal '=' must be escaped: VCF INFO reserves '='
@@ -139,7 +153,9 @@ class TestBuildVcfRecord:
     def test_blank_optional_fields_are_omitted_from_info_not_padded(self):
         rec = build_vcf_record(BLANK_OPTIONAL_ROW)
         info_field = rec.split("\t")[7]
-        assert "KNOWN_ID=" not in info_field
+        assert "L1TXNSSV=" not in info_field
+        assert "L1TXG1K=" not in info_field
+        assert "L1TXLR=" not in info_field
         assert "KNOWN_SRC=" not in info_field
 
     def test_no_info_field_ever_contains_a_raw_comma(self):
@@ -317,7 +333,7 @@ class TestPysamRoundTrip:
         # rather than assuming the input order is preserved.
         sva = next(r for r in records if r.pos == 49029650)
         assert sva.chrom == "chr22"
-        assert sva.id == "nssv14064350"
+        assert sva.id == "L1TX-chr22-49029650-SVA"
         assert sva.alts == ("<INS:ME:SVA>",)
         assert sva.samples[0]["GT"] == (None, None)  # ./. -- blank, not fabricated
         assert sva.samples[0]["GQ"] is None  # . -- blank, not fabricated
@@ -351,12 +367,10 @@ class TestHg03086Tables:
             (row["chrom"], row["window_start"], row["window_end"]): row
             for row in csv.DictReader(GOLD_SLICE.open(), delimiter="\t")
         }
-        kept = [
-            row
-            for row in csv.DictReader(CLASSIFIER_SLICE.open(), delimiter="\t")
-            if float(row["gold_score"]) >= 0.997
-        ]
+        classifier_rows = list(csv.DictReader(CLASSIFIER_SLICE.open(), delimiter="\t"))
+        kept = [row for row in classifier_rows if float(row["gold_score"]) >= 0.997]
         assert len(kept) == 3
+        rank_n = max(int(row["gold_rank"]) for row in classifier_rows)
 
         vf = pysam.VariantFile(str(out_path))
         assert list(vf.header.samples) == ["HG03086"]
@@ -368,6 +382,12 @@ class TestHg03086Tables:
             assert f"END={pos};" in line or line.split("\t")[7].endswith(f"END={pos}")
         assert len(records) == 3
         by_pos = {rec.pos: rec for rec in records}
+        line_by_pos = {
+            int(line.split("\t")[1]): line.split("\t")
+            for line in out_path.read_text().splitlines()
+            if not line.startswith("#")
+        }
+        family_token = {"Alu": "ALU", "L1": "LINE1", "SVA": "SVA"}
         saw_distinct_breakpoint = False
         for row in kept:
             locus = gold[(row["chrom"], row["window_start"], row["window_end"])]
@@ -375,15 +395,27 @@ class TestHg03086Tables:
             if pos != int(row["window_start"]):
                 saw_distinct_breakpoint = True
             rec = by_pos[pos]
+            fields = line_by_pos[pos]
+            info = dict(part.split("=", 1) for part in fields[7].split(";") if "=" in part)
             assert rec.chrom == row["chrom"]
             assert rec.info["SVTYPE"] == "INS"
             assert "SVLEN" not in rec.info
             assert list(rec.filter) == ["PASS"]
-            assert rec.info["GOLDSCORE"] == pytest.approx(float(row["gold_score"]))
+            assert fields[2] == f"L1TX-{row['chrom']}-{pos}-{family_token[row['mei_family']]}"
+            assert info["L1TXGOLDSCORE"] == format_sigfigs(row["gold_score"])
             assert rec.info["CLASSIFIERRANK"] == int(row["classifier_rank"])
+            pct = int(round(100.0 * (rank_n - int(row["gold_rank"]) + 1) / rank_n))
+            assert rec.info["L1TXGOLDRANKPCT"] == pct
+            assert "GOLDSCORE" not in info
+            assert "GOLDRANK" not in info
             assert rec.info["INSERTIONSCORE"] == pytest.approx(float(locus["insertion_model_score"]))
             expected = {"Alu": "<INS:ME:ALU>", "L1": "<INS:ME:LINE1>", "SVA": "<INS:ME:SVA>"}
             assert rec.alts == (expected[row["mei_family"]],)
+        line1 = line_by_pos[102422592]
+        line1_info = dict(part.split("=", 1) for part in line1[7].split(";") if "=" in part)
+        assert line1_info["L1TXNSSV"] == "nssv14080750"
+        assert line1_info["L1TXG1K"] == "nssv14080750"
+        assert line1_info["L1TXLR"].startswith("chr4-105736355-INS->")
         assert saw_distinct_breakpoint
 
     def test_gold_review_slice_exports_without_classifier_columns(self, tmp_path: Path):
@@ -394,7 +426,8 @@ class TestHg03086Tables:
         records = list(pysam.VariantFile(str(out_path)))
         assert len(records) == 4
         assert all("INSERTIONSCORE" in rec.info for rec in records)
-        assert all("GOLDSCORE" not in rec.info for rec in records)
+        assert all("L1TXGOLDSCORE" not in rec.info for rec in records)
+        assert all(rec.id.startswith("L1TX-") for rec in records)
         for line in out_path.read_text().splitlines():
             if line.startswith("#"):
                 continue
