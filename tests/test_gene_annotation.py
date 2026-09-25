@@ -158,6 +158,24 @@ def test_snpeff_svlen_locus_is_intronic_without_workaround():
     assert "coding_sequence_variant" not in ann.terms
 
 
+def test_load_gene_strands_from_gtf_strips_version(tmp_path):
+    gtf = tmp_path / "genes.gtf"
+    gtf.write_text(
+        '1\thavana\tgene\t1\t10\t.\t-\t.\tgene_id "ENSG00000093072"; gene_version "20";\n'
+        '1\thavana\texon\t1\t10\t.\t+\t.\tgene_id "ENSG00000093072";\n'
+    )
+    assert ga.load_gene_strands(gtf) == {"ENSG00000093072": "-"}
+    ann = ga.GeneAnnotation(("ADA2",), ("ENSG00000093072.20",), "intron_variant", ("intron_variant",), 1)
+    assert ann.info_fields(ga.load_gene_strands(gtf))["GENE_STRAND"] == "-"
+
+
+def test_bundled_gene_strands_match_chr22_genes():
+    strands = ga.bundled_gene_strands()
+    assert strands["ENSG00000093072"] == "-"  # ADA2
+    assert strands["ENSG00000182902"] == "+"  # SLC25A18
+    assert strands["ENSG00000286195"] == "-"
+
+
 def test_snpeff_command_shape():
     cmd = ga.snpeff_command("in.vcf", "GRCh38.99", config="/x/snpEff.config", xmx="4g")
     assert cmd == [
@@ -187,7 +205,13 @@ def test_annotate_vcf_snpeff_offline_with_canned_output(tmp_path):
 
     headers, recs = ga.read_vcf(out)
     assert any(h.startswith("##INFO=<ID=CSQ,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=GENE_STRAND,") for h in headers)
     assert _chr22_calls(recs) == CHR22_SNPEFF
+    ada2 = next(r for r in recs if r.pos == 17224410)
+    assert ada2.info["GENE_STRAND"] == "-"
+    both = next(r for r in recs if r.pos == 17567662)
+    assert both.info["GENE"] == "SLC25A18,ENSG00000286195"
+    assert both.info["GENE_STRAND"] == "+,-"
     assert all("ANN" not in r.info for r in recs)         # raw ANN not carried into the shared contract
     assert all("SVLEN" in r.info for r in recs)           # original INFO preserved
     assert tsv.read_text().count("\n") == 31

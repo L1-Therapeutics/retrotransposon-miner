@@ -131,7 +131,7 @@ Soft-clips and discordant clipped ends remap to the Dfam Alu/LINE-1/SVA panel wi
 
 ## Gene annotation (snpEff)
 
-`rtm annotate-genes` adds gene-level consequence fields to an MEI VCF (symbolic `<INS:ME:ALU|LINE1|SVA>` ALT alleles) with local snpEff. Each record gains `GENE` (symbols), `GENEID` (Ensembl IDs), `CSQ` (most severe Sequence Ontology term), `CSQ_TERMS` (all distinct terms), and `CSQ_NTX` (overlapping transcripts); `--tsv` also writes a flat table. snpEff does not order `ANN` by Ensembl severity, so the parser applies that ranking itself.
+`rtm annotate-genes` adds gene-level consequence fields to an MEI VCF (symbolic `<INS:ME:ALU|LINE1|SVA>` ALT alleles) with local snpEff. Each record gains `GENE` (symbols), `GENEID` (Ensembl IDs), `GENE_STRAND` (transcribed strand of each `GENEID`, same order), `CSQ` (most severe Sequence Ontology term), `CSQ_TERMS` (all distinct terms), and `CSQ_NTX` (overlapping transcripts); `--tsv` also writes a flat table. An insertion is sense when `ORIENT` matches `GENE_STRAND`. snpEff `ANN` has no strand column, so the strand comes from a bundled Ensembl GRCh38.115 gene table (`--gene-gtf` overrides it). snpEff does not order `ANN` by Ensembl severity, so the parser applies that ranking itself.
 
 ```bash
 conda install -c bioconda -c conda-forge snpeff openjdk

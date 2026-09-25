@@ -28,8 +28,9 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 # Ensembl "Calculated variant consequences" table, most severe first.
 CONSEQUENCE_SEVERITY: tuple[str, ...] = (
@@ -81,11 +82,12 @@ _SEVERITY_RANK = {term: i for i, term in enumerate(CONSEQUENCE_SEVERITY)}
 ANNOTATION_INFO_HEADERS: tuple[str, ...] = (
     '##INFO=<ID=GENE,Number=.,Type=String,Description="Gene symbols overlapped by the insertion breakpoint (snpEff)">',
     '##INFO=<ID=GENEID,Number=.,Type=String,Description="Ensembl gene IDs overlapped by the insertion breakpoint">',
+    '##INFO=<ID=GENE_STRAND,Number=.,Type=String,Description="Transcribed strand (+ or -) of each GENEID, in the same order. An insertion is sense when ORIENT matches this strand">',
     '##INFO=<ID=CSQ,Number=1,Type=String,Description="Most severe Sequence Ontology consequence term across overlapping transcripts (snpEff)">',
     '##INFO=<ID=CSQ_TERMS,Number=.,Type=String,Description="All distinct consequence terms across overlapping transcripts">',
     '##INFO=<ID=CSQ_NTX,Number=1,Type=Integer,Description="Number of transcripts overlapping the insertion breakpoint">',
 )
-ANNOTATION_INFO_KEYS: tuple[str, ...] = ("GENE", "GENEID", "CSQ", "CSQ_TERMS", "CSQ_NTX")
+ANNOTATION_INFO_KEYS: tuple[str, ...] = ("GENE", "GENEID", "GENE_STRAND", "CSQ", "CSQ_TERMS", "CSQ_NTX")
 
 
 @dataclass
@@ -118,12 +120,16 @@ class GeneAnnotation:
     terms: tuple[str, ...]
     n_transcripts: int
 
-    def info_fields(self) -> dict[str, str]:
+    def info_fields(self, gene_strands: Mapping[str, str] | None = None) -> dict[str, str]:
         out: dict[str, str] = {}
         if self.gene_symbols:
             out["GENE"] = ",".join(self.gene_symbols)
         if self.gene_ids:
             out["GENEID"] = ",".join(self.gene_ids)
+            if gene_strands is not None:
+                out["GENE_STRAND"] = ",".join(
+                    gene_strands.get(_gene_id_key(gid), ".") for gid in self.gene_ids
+                )
         out["CSQ"] = self.most_severe
         if self.terms:
             out["CSQ_TERMS"] = ",".join(self.terms)
@@ -252,6 +258,66 @@ SNPEFF_TERM_ALIASES: dict[str, str] = {
 
 ANN_ANNOTATION, ANN_GENE_NAME, ANN_GENE_ID, ANN_FEATURE_TYPE = 1, 3, 4, 5
 
+# snpEff ANN has no strand column. This table is Ensembl GRCh38.115 gene
+# features (gene_id, transcribed strand), bundled so annotate-genes writes
+# GENE_STRAND without a second database load.
+_BUNDLED_GENE_STRANDS = Path(__file__).resolve().parent / "data" / "grch38.115.gene_strand.tsv.gz"
+
+
+def _gene_id_key(gene_id: str) -> str:
+    """Drop an Ensembl version suffix so ``ENSG00000093072.20`` matches the table."""
+    return gene_id.split(".", 1)[0]
+
+
+def load_gene_strands(path: str | Path) -> dict[str, str]:
+    """Read gene_id -> ``+``/``-`` from a two-column TSV or an Ensembl GTF.
+
+    GTF input uses ``gene`` features only. Version suffixes on gene IDs are stripped.
+    """
+    path = Path(path)
+    opener = gzip.open if path.name.endswith(".gz") else open
+    strands: dict[str, str] = {}
+    with opener(path, "rt") as fh:
+        for line in fh:
+            if not line or line[0] == "#":
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) == 2 and cols[1] in {"+", "-"}:
+                strands[_gene_id_key(cols[0])] = cols[1]
+                continue
+            if len(cols) < 9 or cols[2] != "gene" or cols[6] not in {"+", "-"}:
+                continue
+            gid = ""
+            for attr in cols[8].split(";"):
+                attr = attr.strip()
+                if attr.startswith("gene_id "):
+                    gid = attr.split(" ", 1)[1].strip().strip('"')
+                    break
+            if gid:
+                strands[_gene_id_key(gid)] = cols[6]
+    if not strands:
+        raise ValueError(f"no gene strands in {path}")
+    return strands
+
+
+@lru_cache(maxsize=1)
+def bundled_gene_strands() -> dict[str, str]:
+    """Ensembl GRCh38.115 transcribed strand for each gene ID."""
+    if not _BUNDLED_GENE_STRANDS.is_file():
+        raise FileNotFoundError(f"bundled gene-strand table missing: {_BUNDLED_GENE_STRANDS}")
+    return load_gene_strands(_BUNDLED_GENE_STRANDS)
+
+
+def _resolve_gene_strands(
+    gene_strands: Mapping[str, str] | None,
+    gene_gtf: str | Path | None,
+) -> Mapping[str, str]:
+    if gene_gtf is not None:
+        return load_gene_strands(gene_gtf)
+    if gene_strands is not None:
+        return gene_strands
+    return bundled_gene_strands()
+
 # Size 0 makes snpEff skip splice-site interval allocation. See module comment above.
 SNPEFF_NO_SPLICE: tuple[str, ...] = (
     "-spliceSiteSize", "0",
@@ -313,13 +379,16 @@ def annotate_records(
     snpeff_bin: str = "snpEff",
     config: str | Path | None = None,
     xmx: str = "8g",
+    gene_strands: Mapping[str, str] | None = None,
+    gene_gtf: str | Path | None = None,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> tuple[list[VcfRecord], AnnotationStats]:
     """Run snpEff on ``records`` and translate its ``ANN`` field into the module's INFO fields.
 
     ``run`` is injectable (defaults to ``subprocess.run``) so tests can substitute
     a canned snpEff output. The raw ``ANN`` field is dropped; run snpEff directly
-    for the full per-transcript table.
+    for the full per-transcript table. ``GENE_STRAND`` is filled from the bundled
+    Ensembl GRCh38.115 table unless ``gene_strands`` or ``gene_gtf`` is passed.
     """
     if run is subprocess.run and shutil.which(snpeff_bin) is None:
         raise FileNotFoundError(f"snpEff launcher {snpeff_bin!r} not found on PATH")
@@ -333,6 +402,7 @@ def annotate_records(
             raise RuntimeError(f"snpEff exited {proc.returncode}: {proc.stderr[-2000:]}")
         _, out_records = _read_vcf_text(proc.stdout)
 
+    strands = _resolve_gene_strands(gene_strands, gene_gtf)
     by_key = {_record_key(r): r for r in out_records}
     out: list[VcfRecord] = []
     n_annot = n_gene = n_unmatched = 0
@@ -344,7 +414,7 @@ def annotate_records(
             n_unmatched += 1
         else:
             summary = parse_snpeff_ann(ann)
-            new_info.update(summary.info_fields())
+            new_info.update(summary.info_fields(strands))
             n_annot += 1
             n_gene += bool(summary.gene_symbols)
         out.append(VcfRecord(rec.chrom, rec.pos, rec.id, rec.ref, rec.alt, rec.qual, rec.filter, new_info, list(rec.rest)))
@@ -370,11 +440,17 @@ def annotate_vcf(
     snpeff_bin: str = "snpEff",
     config: str | Path | None = None,
     xmx: str = "8g",
+    gene_strands: Mapping[str, str] | None = None,
+    gene_gtf: str | Path | None = None,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> AnnotationStats:
     """Read ``in_path``, annotate with snpEff, write ``out_path`` (and optional flat TSV)."""
     headers, records = read_vcf(in_path)
-    annotated, stats = annotate_records(records, headers, genome, snpeff_bin=snpeff_bin, config=config, xmx=xmx, run=run)
+    annotated, stats = annotate_records(
+        records, headers, genome,
+        snpeff_bin=snpeff_bin, config=config, xmx=xmx,
+        gene_strands=gene_strands, gene_gtf=gene_gtf, run=run,
+    )
     write_vcf(out_path, add_info_headers(headers), annotated)
     if tsv_path is not None:
         write_annotation_tsv(tsv_path, annotated)
