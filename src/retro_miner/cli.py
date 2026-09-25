@@ -1230,5 +1230,40 @@ def export_vcf_cmd(
     click.echo(f"[export-vcf] wrote {n} records to {out_vcf}")
 
 
+@cli.command("annotate-genes")
+@click.option("--vcf", "vcf_path", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Input MEI VCF (symbolic <INS:ME:*> ALT alleles; .vcf or .vcf.gz).")
+@click.option("--out", "out_path", required=True, type=click.Path(dir_okay=False, path_type=Path),
+              help="Output VCF with GENE/GENEID/GENE_STRAND/CSQ/CSQ_TERMS/CSQ_NTX added to INFO.")
+@click.option("--tsv", "tsv_path", default=None, type=click.Path(dir_okay=False, path_type=Path),
+              help="Optional flat TSV (one row per record) alongside the VCF.")
+@click.option("--gene-gtf", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Override the bundled Ensembl GRCh38.115 gene-strand table (GTF gene features or gene_id/strand TSV).")
+@click.option("--snpeff-genome", default="GRCh38.99", show_default=True,
+              help="Database name as listed by `snpEff databases` (e.g. GRCh38.99, GRCh38.115, GRCh38.mane.1.2.ensembl).")
+@click.option("--snpeff-bin", default="snpEff", show_default=True, help="snpEff launcher on PATH or full path.")
+@click.option("--snpeff-config", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="snpEff.config path (conda installs: <env>/share/snpeff-<ver>/snpEff.config).")
+@click.option("--snpeff-xmx", default="8g", show_default=True,
+              help="JVM heap. Default heap runs out of memory building the GRCh38 interval forest.")
+def annotate_genes_cmd(
+    vcf_path: Path, out_path: Path, tsv_path: Path | None, gene_gtf: Path | None,
+    snpeff_genome: str, snpeff_bin: str, snpeff_config: Path | None, snpeff_xmx: str,
+) -> None:
+    """Add gene / consequence annotation to an MEI VCF with local snpEff."""
+    from retro_miner.gene_annotation import annotate_vcf
+
+    t0 = time.monotonic()
+    stats = annotate_vcf(vcf_path, out_path, snpeff_genome, tsv_path=tsv_path, gene_gtf=gene_gtf,
+                         snpeff_bin=snpeff_bin, config=snpeff_config, xmx=snpeff_xmx)
+    click.echo(
+        f"[annotate-genes] records={stats.n_records} annotated={stats.n_annotated} "
+        f"with_gene={stats.n_with_gene} unmatched={stats.n_unmatched} "
+        f"seconds={stats.seconds:.1f} elapsed={time.monotonic() - t0:.1f}s -> {out_path}"
+    )
+    if stats.n_unmatched:
+        click.echo(f"[annotate-genes] WARNING: {stats.n_unmatched} record(s) not returned by snpEff; left unannotated.", err=True)
+
+
 if __name__ == "__main__":
     cli()

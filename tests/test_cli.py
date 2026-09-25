@@ -169,3 +169,52 @@ def test_annotate_bam_depth_xor_raises(runner: CliRunner, tmp_path) -> None:
     )
     assert result.exit_code != 0
     assert "disease-bam-depth" in result.output or "control-bam-depth" in result.output
+
+
+# ---------------------------------------------------------------------------
+# annotate-genes
+# ---------------------------------------------------------------------------
+
+
+def test_annotate_genes_help_lists_options(runner):
+    result = runner.invoke(cli, ["annotate-genes", "--help"])
+    assert result.exit_code == 0
+    for opt in ("--vcf", "--out", "--tsv", "--snpeff-genome", "--snpeff-bin", "--snpeff-config", "--snpeff-xmx"):
+        assert opt in result.output
+    assert "--backend" not in result.output
+    assert "--batch-size" not in result.output
+
+
+def test_annotate_genes_requires_existing_vcf(runner, tmp_path):
+    result = runner.invoke(cli, ["annotate-genes", "--vcf", str(tmp_path / "nope.vcf"), "--out", str(tmp_path / "o.vcf")])
+    assert result.exit_code != 0
+    assert "does not exist" in result.output
+
+
+def test_annotate_genes_offline(runner, tmp_path, monkeypatch):
+    import functools
+    import subprocess
+    from pathlib import Path
+
+    from retro_miner import gene_annotation as ga
+
+    canned = (Path(__file__).parent / "data" / "chr22_mei.snpeff.vcf").read_text()
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=canned, stderr="")
+
+    monkeypatch.setattr(ga, "annotate_vcf", functools.partial(ga.annotate_vcf, run=fake_run))
+    src = Path(__file__).parent / "data" / "chr22_mei.vcf"
+    out = tmp_path / "out.vcf"
+    result = runner.invoke(cli, ["annotate-genes", "--snpeff-genome", "GRCh38.115",
+                                 "--snpeff-xmx", "4g", "--vcf", str(src), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert "records=30 annotated=30 with_gene=26 unmatched=0" in result.output
+    assert seen["cmd"][:12] == [
+        "snpEff", "-Xmx4g", "-noStats", "-noHgvs",
+        "-spliceSiteSize", "0", "-spliceRegionExonSize", "0",
+        "-spliceRegionIntronMin", "0", "-spliceRegionIntronMax", "0",
+    ] and "GRCh38.115" in seen["cmd"]
+    assert "GENE=CLTCL1" in out.read_text()
