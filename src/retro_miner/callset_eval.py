@@ -203,7 +203,7 @@ def rtm_breakpoint(row: dict[str, Any]) -> int:
     start = _as_int(row.get("window_start"), 0)
     end = _as_int(row.get("window_end"), start)
     if start > 0:
-        return (start + max(start, end)) // 2
+        return (start + end) // 2
     return 0
 
 
