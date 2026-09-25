@@ -19,7 +19,7 @@ def _row(
     chrom: str,
     mei_mapped: int,
     *,
-    gold: bool,
+    tier: str,
 ) -> dict[str, object]:
     support = f"SR_L=1,SR_R=1,DPE_L=0,DPE_R=0,MEI_MAPPED={mei_mapped},polyA_MAPPED=0,VNTR_MAPPED=0"
     return {
@@ -29,9 +29,9 @@ def _row(
         "consensus_insertion_breakpoint_pos": "10",
         "consensus_mei_family": "Alu",
         "known_mei_polymorphism": "False",
-        "analysis_stage_tier": "gold" if gold else "silver",
-        "gold_stage_pass": "True" if gold else "False",
-        "silver_stage_pass": "True",
+        "analysis_stage_tier": tier,
+        "gold_stage_pass": "True" if tier == "gold" else "False",
+        "silver_stage_pass": "True" if tier in {"gold", "silver"} else "False",
         "disease_supporting_reads": support,
         "control_supporting_reads": support,
         "coherence_score": "0.8",
@@ -39,18 +39,19 @@ def _row(
     }
 
 
-def test_merge_ranks_by_stage_then_support_across_chromosomes() -> None:
+def test_merge_keeps_gold_and_ranks_by_support() -> None:
     chr1 = pd.DataFrame(
         [
-            _row("chr1", mei_mapped=2, gold=True),
-            _row("chr1", mei_mapped=99, gold=False),
+            _row("chr1", mei_mapped=2, tier="gold"),
+            _row("chr1", mei_mapped=99, tier="silver"),
+            _row("chr1", mei_mapped=50, tier="bronze"),
         ]
     )
-    chr22 = pd.DataFrame([_row("chr22", mei_mapped=40, gold=True)])
+    chr22 = pd.DataFrame([_row("chr22", mei_mapped=40, tier="gold")])
     ranked = merge_gold_review_tables([chr1, chr22])
-    assert ranked["chrom"].tolist() == ["chr22", "chr1", "chr1"]
-    assert ranked["analysis_stage_tier"].tolist() == ["gold", "gold", "silver"]
-    assert ranked["gold_stage_pass"].tolist() == [1, 1, 0]
+    assert ranked["chrom"].tolist() == ["chr22", "chr1"]
+    assert ranked["analysis_stage_tier"].tolist() == ["gold", "gold"]
+    assert ranked["gold_stage_pass"].tolist() == [1, 1]
 
 
 def _finish(base: Path, chrom: str, *, done: bool) -> None:
@@ -76,8 +77,13 @@ def test_incomplete_chromosome_blocks_aggregation(tmp_path: Path) -> None:
 def test_write_merged_gold_review_reads_per_chrom_tables(tmp_path: Path) -> None:
     chr1 = tmp_path / "chr1.tsv"
     chr22 = tmp_path / "chr22.tsv"
-    pd.DataFrame([_row("chr1", mei_mapped=2, gold=True)]).to_csv(chr1, sep="\t", index=False)
-    pd.DataFrame([_row("chr22", mei_mapped=40, gold=True)]).to_csv(chr22, sep="\t", index=False)
+    pd.DataFrame(
+        [
+            _row("chr1", mei_mapped=2, tier="gold"),
+            _row("chr1", mei_mapped=99, tier="silver"),
+        ]
+    ).to_csv(chr1, sep="\t", index=False)
+    pd.DataFrame([_row("chr22", mei_mapped=40, tier="gold")]).to_csv(chr22, sep="\t", index=False)
     out = tmp_path / "candidate_loci.mei.gold_review.tsv"
     n_rows = write_merged_gold_review([chr1, chr22], out)
     assert n_rows == 2

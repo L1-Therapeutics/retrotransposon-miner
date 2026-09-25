@@ -12,6 +12,9 @@ set -euo pipefail
 # Remote BAMs (s3:// or http(s)://) are staged locally for multi-chrom /
 # --chr all / --chr_concurrency>1 runs. Single-chrom keeps streaming.
 # --bam-stage-dir / RTM_BAM_STAGE_DIR, --no-bam-stage / RTM_BAM_STAGE=0.
+# After the run, gold calls plus IGV and read-architecture plots are copied to
+# s3://<RTM_S3_BUCKET>/results/<outdir>. That upload is on by default.
+# --no-s3-results turns it off. --s3-bucket overrides the bucket.
 
 RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
 RTM_PUBLIC_DATA_DIR="${RTM_PUBLIC_DATA_DIR:-${RTM_WORKDIR}/data/public}"
@@ -51,6 +54,10 @@ SKIP_COMPLETE_EXISTING="1"
 # or RTM_BAM_STAGE=0. Override dest: --bam-stage-dir / RTM_BAM_STAGE_DIR.
 BAM_STAGE_DIR="${RTM_BAM_STAGE_DIR:-}"
 BAM_STAGE_ENABLED="${RTM_BAM_STAGE:-1}"
+# Copy the genome gold table, IGV snapshots, and read-architecture plots to
+# the bucket that holds public data. On unless --no-s3-results / RTM_S3_RESULTS=0.
+S3_RESULTS_UPLOAD="${RTM_S3_RESULTS:-1}"
+S3_RESULTS_BUCKET="${RTM_S3_BUCKET:-${S3_BUCKET:-}}"
 WINDOW_SIZE="200"
 G1K_SPLIT_PADDING_BP="200"
 G1K_DPE_PADDING_MIN_BP="200"
@@ -447,6 +454,18 @@ while [[ $# -gt 0 ]]; do
       BAM_STAGE_ENABLED="1"
       shift 1
       ;;
+    --s3-results|--s3_results)
+      S3_RESULTS_UPLOAD="1"
+      shift 1
+      ;;
+    --no-s3-results|--no_s3_results)
+      S3_RESULTS_UPLOAD="0"
+      shift 1
+      ;;
+    --s3-bucket|--s3_bucket)
+      S3_RESULTS_BUCKET="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -680,12 +699,46 @@ consolidate_all_chrom_outputs() {
   local basename="candidate_loci.mei.gold_review.tsv"
   local out_path="${base_outdir}/${basename}"
   # Every requested chromosome must have a finished annotation log and a
-  # gold-review table. A partial set is not aggregated.
+  # gold-review table. A partial set is not aggregated. The genome file
+  # keeps analysis_stage_tier gold only.
   run_python_module retro_miner.gold_review_merge \
     --output "${out_path}" \
     --base-outdir "${base_outdir}" \
     "${chr_list[@]}"
   echo "[candidate-pipeline] consolidated ${basename} -> ${out_path}"
+}
+
+s3_results_enabled() {
+  local raw
+  raw="$(printf '%s' "${S3_RESULTS_UPLOAD}" | tr '[:upper:]' '[:lower:]')"
+  case "${raw}" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+publish_results_to_s3() {
+  local base_outdir="$1"
+  if ! s3_results_enabled; then
+    echo "[candidate-pipeline] s3 results upload off"
+    return 0
+  fi
+  if [[ -z "${S3_RESULTS_BUCKET}" && -f "${HOME}/.config/rtm/s3.env" ]]; then
+    # shellcheck disable=SC1091
+    set -a
+    # shellcheck disable=SC1090
+    source "${HOME}/.config/rtm/s3.env"
+    set +a
+    S3_RESULTS_BUCKET="${RTM_S3_BUCKET:-${S3_BUCKET:-}}"
+  fi
+  if [[ -z "${S3_RESULTS_BUCKET}" ]]; then
+    echo "[candidate-pipeline] s3 results upload skipped: no bucket (set RTM_S3_BUCKET or pass --s3-bucket)"
+    return 0
+  fi
+  echo "[candidate-pipeline] uploading gold calls, IGV, and read-architecture plots from ${base_outdir}"
+  run_python_module retro_miner.publish_results \
+    --outdir "${base_outdir}" \
+    --bucket "${S3_RESULTS_BUCKET}"
 }
 
 run_annotate_mei_support() {
@@ -904,6 +957,7 @@ if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; th
     else
       echo "[candidate-pipeline] all requested chromosomes already complete in outdir; nothing to run"
     fi
+    publish_results_to_s3 "${OUTDIR}"
     exit 0
   fi
 fi
@@ -932,6 +986,7 @@ if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   echo "  ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
   echo "  ${OUTDIR}/candidate_loci.mei.gold_review.igv/ (when reference + BAMs provided)"
   echo "  ${OUTDIR}/candidate_loci.mei.read_architecture/ (gold-tier read-architecture PNGs)"
+  publish_results_to_s3 "${OUTDIR}"
   exit 0
 fi
 
@@ -1009,3 +1064,4 @@ if [[ "${CHR_ALL_MODE}" == "1" ]]; then
   consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${REQUESTED_CHR_LIST[@]}"
   echo "  consolidated gold review written to: ${BASE_OUTDIR}/candidate_loci.mei.gold_review.tsv"
 fi
+publish_results_to_s3 "${BASE_OUTDIR}"

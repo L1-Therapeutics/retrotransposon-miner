@@ -1,8 +1,10 @@
-"""Concatenate per-chromosome gold-review tables and re-rank them as one genome.
+"""Concatenate per-chromosome gold calls and re-rank them as one genome.
 
 Last step of ``--chr all``, after every chromosome has finished annotation and
-while staged alignments are still on disk. The sort is
-``_prioritize_mei_candidates``, the same order a single chromosome already writes.
+while staged alignments are still on disk. Only rows with
+``analysis_stage_tier`` gold are kept. Silver and bronze candidates stay in
+the per-chromosome tables. The sort is ``_prioritize_mei_candidates``, the
+same order a single chromosome already writes.
 """
 
 from __future__ import annotations
@@ -37,11 +39,21 @@ def _parse_bool(series: pd.Series) -> pd.Series:
     return text.isin({"1", "true", "t", "yes"})
 
 
+def _gold_tier_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep calls labeled gold. Silver and bronze are not genome-wide output."""
+    if "analysis_stage_tier" not in frame.columns:
+        raise ValueError("gold review table is missing analysis_stage_tier")
+    tier = frame["analysis_stage_tier"].fillna("").astype(str).str.strip().str.lower()
+    return frame.loc[tier.eq("gold")].copy()
+
+
 def merge_gold_review_tables(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
-    """Stack gold-review tables and sort them like one chromosome."""
+    """Stack gold-tier rows and sort them like one chromosome."""
     if not frames:
         return pd.DataFrame()
-    merged = pd.concat(list(frames), ignore_index=True)
+    merged = _gold_tier_rows(pd.concat(list(frames), ignore_index=True))
+    if merged.empty:
+        return merged
     for col in _BOOL_COLUMNS:
         if col in merged.columns:
             merged[col] = _parse_bool(merged[col])
