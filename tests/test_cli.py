@@ -179,8 +179,10 @@ def test_annotate_bam_depth_xor_raises(runner: CliRunner, tmp_path) -> None:
 def test_annotate_genes_help_lists_options(runner):
     result = runner.invoke(cli, ["annotate-genes", "--help"])
     assert result.exit_code == 0
-    for opt in ("--vcf", "--out", "--tsv", "--batch-size", "--keep-svlen"):
+    for opt in ("--vcf", "--out", "--tsv", "--snpeff-genome", "--snpeff-bin", "--snpeff-config", "--snpeff-xmx"):
         assert opt in result.output
+    assert "--backend" not in result.output
+    assert "--batch-size" not in result.output
 
 
 def test_annotate_genes_requires_existing_vcf(runner, tmp_path):
@@ -189,47 +191,7 @@ def test_annotate_genes_requires_existing_vcf(runner, tmp_path):
     assert "does not exist" in result.output
 
 
-def test_annotate_genes_rejects_batch_over_200(runner, tmp_path):
-    vcf = tmp_path / "in.vcf"
-    vcf.write_text("##fileformat=VCFv4.4\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
-    result = runner.invoke(cli, ["annotate-genes", "--vcf", str(vcf), "--out", str(tmp_path / "o.vcf"), "--batch-size", "201"])
-    assert result.exit_code != 0
-    assert "201" in result.output
-
-
-def test_annotate_genes_runs_offline_with_patched_transport(runner, tmp_path, monkeypatch):
-    """The command imports annotate_vcf at call time, so patching the module attribute injects a fake transport."""
-    import functools
-    import json
-
-    from retro_miner import gene_annotation as ga
-
-    def fake_post(url, body, timeout):
-        variants = json.loads(body)["variants"]
-        payload = [
-            {"input": v, "most_severe_consequence": "intron_variant",
-             "transcript_consequences": [{"gene_symbol": "GENEX", "gene_id": "ENSG0", "consequence_terms": ["intron_variant"]}]}
-            for v in variants
-        ]
-        return 200, json.dumps(payload).encode(), {}
-
-    monkeypatch.setattr(ga, "annotate_vcf", functools.partial(ga.annotate_vcf, post=fake_post))
-
-    src = tmp_path / "in.vcf"
-    src.write_text(
-        "##fileformat=VCFv4.4\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
-        "chr22\t19223382\t.\tN\t<INS:ME:LINE1>\t.\t.\tSVTYPE=INS;SVLEN=6018;END=19223382\n"
-    )
-    out = tmp_path / "out.vcf"
-    result = runner.invoke(cli, ["annotate-genes", "--vcf", str(src), "--out", str(out), "--tsv", str(tmp_path / "o.tsv")])
-    assert result.exit_code == 0, result.output
-    assert "backend=vep records=1 annotated=1 with_gene=1 unmatched=0" in result.output
-    body = out.read_text()
-    assert "GENE=GENEX" in body and "CSQ=intron_variant" in body and "SVLEN=6018" in body
-    assert (tmp_path / "o.tsv").read_text().count("\n") == 2
-
-
-def test_annotate_genes_snpeff_backend_offline(runner, tmp_path, monkeypatch):
+def test_annotate_genes_offline(runner, tmp_path, monkeypatch):
     import functools
     import subprocess
     from pathlib import Path
@@ -243,13 +205,13 @@ def test_annotate_genes_snpeff_backend_offline(runner, tmp_path, monkeypatch):
         seen["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, stdout=canned, stderr="")
 
-    monkeypatch.setattr(ga, "annotate_vcf_snpeff", functools.partial(ga.annotate_vcf_snpeff, run=fake_run))
+    monkeypatch.setattr(ga, "annotate_vcf", functools.partial(ga.annotate_vcf, run=fake_run))
     src = Path(__file__).parent / "data" / "chr22_mei.vcf"
     out = tmp_path / "out.vcf"
-    result = runner.invoke(cli, ["annotate-genes", "--backend", "snpeff", "--snpeff-genome", "GRCh38.115",
+    result = runner.invoke(cli, ["annotate-genes", "--snpeff-genome", "GRCh38.115",
                                  "--snpeff-xmx", "4g", "--vcf", str(src), "--out", str(out)])
     assert result.exit_code == 0, result.output
-    assert "backend=snpeff records=30 annotated=30 with_gene=26 unmatched=0" in result.output
+    assert "records=30 annotated=30 with_gene=26 unmatched=0" in result.output
     assert seen["cmd"][:12] == [
         "snpEff", "-Xmx4g", "-noStats", "-noHgvs",
         "-spliceSiteSize", "0", "-spliceRegionExonSize", "0",

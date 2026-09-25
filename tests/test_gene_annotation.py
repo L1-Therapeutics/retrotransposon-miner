@@ -1,11 +1,10 @@
-"""Unit tests for retro_miner.gene_annotation (offline; VEP transport is faked).
+"""Unit tests for retro_miner.gene_annotation.
 
-Set RTM_LIVE_VEP=1 to additionally run the live rest.ensembl.org check.
+Set RTM_LIVE_SNPEFF=1 to additionally run snpEff against the chr22 fixture.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -14,50 +13,6 @@ import pytest
 from retro_miner import gene_annotation as ga
 
 FIXTURE = Path(__file__).parent / "data" / "chr22_mei.vcf"
-
-
-# ----------------------------------------------------------------- helpers
-
-
-def _fixture_rec(pos: int = 19223382) -> ga.VcfRecord:
-    """One of the 30 real chr22 calls in tests/data/chr22_mei.vcf."""
-    _, records = ga.read_vcf(FIXTURE)
-    return next(r for r in records if r.pos == pos)
-
-
-def _vep_json(input_str, txs=None, most_severe=None):
-    rec = {"input": input_str, "transcript_consequences": txs or []}
-    if most_severe:
-        rec["most_severe_consequence"] = most_severe
-    return rec
-
-
-class FakeVep:
-    """Records POST bodies; answers every variant as intronic in a fixed gene unless overridden."""
-
-    def __init__(self, responder=None, statuses=None):
-        self.bodies: list[list[str]] = []
-        self.responder = responder
-        self.statuses = list(statuses or [])
-        self.sleeps: list[float] = []
-
-    def post(self, url, body, timeout):
-        variants = json.loads(body)["variants"]
-        self.bodies.append(variants)
-        status = self.statuses.pop(0) if self.statuses else 200
-        if status != 200:
-            return status, b"slow down", {"retry-after": "2"}
-        if self.responder:
-            payload = [self.responder(v) for v in variants]
-        else:
-            payload = [
-                _vep_json(v, [{"gene_symbol": "GENEX", "gene_id": "ENSG0", "consequence_terms": ["intron_variant"]}], "intron_variant")
-                for v in variants
-            ]
-        return 200, json.dumps(payload).encode(), {}
-
-    def sleep(self, s):
-        self.sleeps.append(s)
 
 
 # ----------------------------------------------------------------- VCF I/O
@@ -93,68 +48,6 @@ def test_add_info_headers_inserts_before_chrom_and_is_idempotent():
     assert twice == once
 
 
-# ----------------------------------------------------------------- SVLEN regression
-
-
-def test_vep_region_string_drops_svlen_and_pins_end_to_pos():
-    """Regression for the VEP span-widening bug: SVLEN must not reach VEP by default."""
-    rec = _fixture_rec(19223382)
-    assert rec.info["SVLEN"] == "6018"
-    s = ga.vep_region_string(rec)
-    assert s == "chr22 19223382 . N <INS:ME:LINE1> . . SVTYPE=INS;END=19223382"
-    assert "SVLEN" not in s
-
-
-def test_vep_region_string_keep_svlen_opt_in():
-    s = ga.vep_region_string(_fixture_rec(19223382), keep_svlen=True)
-    assert "SVLEN=6018" in s
-
-
-def test_vep_region_string_overrides_wrong_end_for_symbolic_ins():
-    rec = _fixture_rec(19223382)
-    rec.info = dict(rec.info)
-    rec.info["END"] = "19229400"  # END != POS is invalid for a symbolic INS
-    assert "END=19223382" in ga.vep_region_string(rec)
-
-
-def test_output_vcf_keeps_svlen_even_though_request_drops_it(tmp_path):
-    fake = FakeVep()
-    out = tmp_path / "o.vcf"
-    ga.annotate_vcf(FIXTURE, out, post=fake.post, sleep=fake.sleep)
-    _, recs = ga.read_vcf(out)
-    assert all("SVLEN" in r.info for r in recs)
-    assert all("SVLEN" not in v for batch in fake.bodies for v in batch)
-
-
-# ----------------------------------------------------------------- VEP client
-
-
-def test_query_vep_batches_at_200():
-    fake = FakeVep()
-    variants = [f"chr22 {1000 + i} . N <INS:ME:ALU> . . SVTYPE=INS" for i in range(201)]
-    out = ga.query_vep(variants, post=fake.post, sleep=fake.sleep)
-    assert [len(b) for b in fake.bodies] == [200, 1]
-    assert len(out) == 201
-
-
-def test_query_vep_rejects_bad_batch_size():
-    with pytest.raises(ValueError):
-        ga.query_vep(["x"], batch_size=201, post=FakeVep().post)
-
-
-def test_query_vep_honours_429_retry_after():
-    fake = FakeVep(statuses=[429, 429, 200])
-    out = ga.query_vep(["chr22 5 . N <INS:ME:ALU> . . SVTYPE=INS"], post=fake.post, sleep=fake.sleep)
-    assert fake.sleeps == [2.0, 2.0]
-    assert len(out) == 1
-
-
-def test_query_vep_raises_on_persistent_error():
-    fake = FakeVep(statuses=[500])
-    with pytest.raises(RuntimeError, match="HTTP 500"):
-        ga.query_vep(["chr22 5 . N <INS:ME:ALU> . . SVTYPE=INS"], post=fake.post, sleep=fake.sleep)
-
-
 # ----------------------------------------------------------------- consequence summary
 
 
@@ -171,32 +64,7 @@ def test_severity_table_has_no_duplicates_and_expected_endpoints():
     assert ga.CONSEQUENCE_SEVERITY[-1] == "sequence_variant"
 
 
-def test_annotate_records_counts_unmatched_instead_of_dropping():
-    fake = FakeVep(responder=lambda v: _vep_json("chrZ 1 . N <INS:ME:ALU> . . X"))  # never matches
-    _, recs = ga.read_vcf(FIXTURE)
-    out, stats = ga.annotate_records(recs, post=fake.post, sleep=fake.sleep)
-    assert len(out) == 30
-    assert stats.n_unmatched == 30 and stats.n_annotated == 0
-    assert all("CSQ" not in r.info for r in out)
-
-
-# ----------------------------------------------------------------- live (opt-in)
-
-
-@pytest.mark.skipif(os.environ.get("RTM_LIVE_VEP") != "1", reason="set RTM_LIVE_VEP=1 to hit rest.ensembl.org")
-def test_live_vep_chr22_svlen_regression(tmp_path):
-    """The measured 2026-09-18 behaviour: with SVLEN dropped, chr22:19223382 is intronic in CLTCL1."""
-    _, recs = ga.read_vcf(FIXTURE)
-    out, stats = ga.annotate_records(recs)
-    assert stats.n_unmatched == 0
-    by_pos = {r.pos: r for r in out}
-    assert "CLTCL1" in by_pos[19223382].info["GENE"]
-    assert by_pos[19223382].info["CSQ"] == "intron_variant"
-    assert "coding_sequence_variant" not in by_pos[19223382].info.get("CSQ_TERMS", "")
-    assert by_pos[49029650].info["CSQ"] == "intergenic_variant"
-
-
-# ----------------------------------------------------------------- snpEff backend
+# ----------------------------------------------------------------- snpEff
 
 SNPEFF_FIXTURE = Path(__file__).parent / "data" / "chr22_mei.snpeff.vcf"
 
@@ -252,10 +120,10 @@ def _chr22_calls(records: list[ga.VcfRecord]) -> dict[int, tuple[str, str]]:
 
 
 def test_snpeff_fixture_is_real_output_for_same_30_loci():
-    _, vep_in = ga.read_vcf(FIXTURE)
+    _, source = ga.read_vcf(FIXTURE)
     _, snp_out = ga.read_vcf(SNPEFF_FIXTURE)
     assert len(snp_out) == 30
-    assert [(r.chrom, r.pos, r.alt) for r in snp_out] == [(r.chrom, r.pos, r.alt) for r in vep_in]
+    assert [(r.chrom, r.pos, r.alt) for r in snp_out] == [(r.chrom, r.pos, r.alt) for r in source]
     assert all("ANN" in r.info for r in snp_out)
     assert snp_out[0].chrom == "chr22"  # snpEff echoed the chr prefix back
 
@@ -312,7 +180,7 @@ def test_annotate_vcf_snpeff_offline_with_canned_output(tmp_path):
         return subprocess.CompletedProcess(cmd, 0, stdout=canned, stderr="")
 
     out, tsv = tmp_path / "s.vcf", tmp_path / "s.tsv"
-    stats = ga.annotate_vcf_snpeff(FIXTURE, out, "GRCh38.99", tsv_path=tsv, run=fake_run)
+    stats = ga.annotate_vcf(FIXTURE, out, "GRCh38.99", tsv_path=tsv, run=fake_run)
     assert calls and calls[0][0] == "snpEff" and "GRCh38.99" in calls[0]
     assert stats.n_records == 30 and stats.n_annotated == 30 and stats.n_unmatched == 0
     assert stats.n_with_gene == 26
@@ -332,14 +200,14 @@ def test_annotate_vcf_snpeff_reports_nonzero_exit(tmp_path):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="java.lang.OutOfMemoryError: Java heap space")
 
     with pytest.raises(RuntimeError, match="OutOfMemoryError"):
-        ga.annotate_vcf_snpeff(FIXTURE, tmp_path / "o.vcf", "GRCh38.99", run=fake_run)
+        ga.annotate_vcf(FIXTURE, tmp_path / "o.vcf", "GRCh38.99", run=fake_run)
 
 
 @pytest.mark.skipif(os.environ.get("RTM_LIVE_SNPEFF") != "1", reason="set RTM_LIVE_SNPEFF=1 (and have snpEff on PATH) to run snpEff for real")
 def test_live_snpeff_chr22_matches_recorded_run(tmp_path):
     genome = os.environ.get("RTM_SNPEFF_GENOME", "GRCh38.115")
     out = tmp_path / "o.vcf"
-    stats = ga.annotate_vcf_snpeff(
+    stats = ga.annotate_vcf(
         FIXTURE, out, genome,
         config=os.environ.get("RTM_SNPEFF_CONFIG"),
         xmx=os.environ.get("RTM_SNPEFF_XMX", "3g"),
