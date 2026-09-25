@@ -34,16 +34,14 @@ def test_assert_markdown_table_shape_catches_pipe_split_rows():
         assert_markdown_table_shape(bad)
 
 
-def test_current_readme_example_table_has_stable_columns():
+def test_readme_example_is_the_chr22_classifier_vcf():
     from pathlib import Path
-
-    from retro_miner.readme_example_table import (
-        EXAMPLE_SECTION_END,
-        EXAMPLE_SECTION_START,
-    )
 
     readme = Path(__file__).resolve().parents[1] / "README.md"
     text = readme.read_text()
-    start = text.index(EXAMPLE_SECTION_START)
-    end = text.index(EXAMPLE_SECTION_END)
-    assert_markdown_table_shape(text[start:end])
+    start = text.index("## Example Variant Calls")
+    end = text.index("\n## Examples\n")
+    section = text[start:end]
+    assert "#CHROM\tPOS\tID\t" in section
+    assert section.count("\nchr22\t") == 21
+    assert "Gold-tier calls from the SEQC2" not in section
