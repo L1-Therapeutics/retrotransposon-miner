@@ -446,6 +446,10 @@ def annotate_vcf(
 # ``-noHgvs`` is always set: an insertion has no codon change, and HGVS
 # protein notation is not part of this module's output. Computing it makes
 # snpEff load the reference sequence into the heap.
+# Splice-site sizes are set to 0. ``Exon.createSpliceSiteRegionEnd`` returns
+# before allocating when the size is <= 0; the default sizes allocate a
+# splice interval on every exon and threw ``OutOfMemoryError`` in
+# ``buildForest`` at ``-Xmx3g``. An insertion is not a splice-site variant.
 #
 # ANN entries are NOT ordered by Ensembl severity (snpEff lists e.g.
 # upstream_gene_variant ahead of intron_variant for the same gene), so the
@@ -459,6 +463,14 @@ SNPEFF_TERM_ALIASES: dict[str, str] = {
 }
 
 ANN_ANNOTATION, ANN_GENE_NAME, ANN_GENE_ID, ANN_FEATURE_TYPE = 1, 3, 4, 5
+
+# Size 0 makes snpEff skip splice-site interval allocation. See module comment above.
+SNPEFF_NO_SPLICE: tuple[str, ...] = (
+    "-spliceSiteSize", "0",
+    "-spliceRegionExonSize", "0",
+    "-spliceRegionIntronMin", "0",
+    "-spliceRegionIntronMax", "0",
+)
 
 
 def parse_snpeff_ann(ann: str) -> GeneAnnotation:
@@ -498,7 +510,7 @@ def snpeff_command(
     in_path: str | Path, genome: str, *, snpeff_bin: str = "snpEff",
     config: str | Path | None = None, xmx: str = "8g",
 ) -> list[str]:
-    cmd = [snpeff_bin, f"-Xmx{xmx}", "-noStats", "-noHgvs"]
+    cmd = [snpeff_bin, f"-Xmx{xmx}", "-noStats", "-noHgvs", *SNPEFF_NO_SPLICE]
     if config is not None:
         cmd += ["-c", str(config)]
     cmd += [genome, str(in_path)]

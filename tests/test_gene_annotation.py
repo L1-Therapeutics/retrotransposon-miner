@@ -314,7 +314,12 @@ def test_snpeff_svlen_locus_is_intronic_without_workaround():
 
 def test_snpeff_command_shape():
     cmd = ga.snpeff_command("in.vcf", "GRCh38.99", config="/x/snpEff.config", xmx="4g")
-    assert cmd == ["snpEff", "-Xmx4g", "-noStats", "-noHgvs", "-c", "/x/snpEff.config", "GRCh38.99", "in.vcf"]
+    assert cmd == [
+        "snpEff", "-Xmx4g", "-noStats", "-noHgvs",
+        "-spliceSiteSize", "0", "-spliceRegionExonSize", "0",
+        "-spliceRegionIntronMin", "0", "-spliceRegionIntronMax", "0",
+        "-c", "/x/snpEff.config", "GRCh38.99", "in.vcf",
+    ]
     assert "-c" not in ga.snpeff_command("in.vcf", "GRCh38.99")
 
 
