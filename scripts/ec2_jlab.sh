@@ -4,11 +4,13 @@ set -euo pipefail
 APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-r6i.4xlarge}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-m7i.4xlarge}"
+# On-demand by default (stable first-run). SPOT=1 launches cheaper Spot instead.
+SPOT="${SPOT:-0}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
 # gp3 throughput/IOPS are independently provisioned, but AWS requires
 # throughput (MB/s) <= 0.25 * IOPS. 1000 MB/s therefore needs >= 4000 IOPS.
-# Default 125 MB/s is the WGS stage bottleneck on r6i.4xlarge (EBS max 1250).
+# Default 125 MB/s is the WGS stage bottleneck on m7i.8xlarge (EBS max 1250).
 ROOT_VOLUME_IOPS="${ROOT_VOLUME_IOPS:-4000}"
 ROOT_VOLUME_THROUGHPUT_MB="${ROOT_VOLUME_THROUGHPUT_MB:-1000}"
 S3_BUCKET="${S3_BUCKET:-}"
@@ -96,14 +98,6 @@ get_default_vpc() {
   awsq ec2 describe-vpcs \
     --filters Name=isDefault,Values=true \
     --query 'Vpcs[0].VpcId' --output text
-}
-
-get_default_subnet() {
-  local vpc_id
-  vpc_id="$(get_default_vpc)"
-  awsq ec2 describe-subnets \
-    --filters Name=vpc-id,Values="${vpc_id}" Name=default-for-az,Values=true \
-    --query 'Subnets[0].SubnetId' --output text
 }
 
 sanitize_key_token() {
@@ -621,6 +615,13 @@ default_create_instance_name() {
   echo "${APP_NAME}-${INSTANCE_TYPE}-$(date +%Y%m%d%H%M%S)"
 }
 
+want_spot() {
+  case "${SPOT}" in
+    0|false|False|no|NO|off|OFF|on-demand|ondemand) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 bind_instance() {
   local sel="${1:-${INSTANCE_ID:-}}" iid
   [[ -n "${sel}" ]] || {
@@ -643,15 +644,17 @@ bind_instance() {
 }
 
 create_instance() {
-  local instance_id ami subnet sg_id create_name bucket_name ud_file="" tags
+  local instance_id ami az sg_id create_name bucket_name ud_file="" tags market_tag=""
   local -a run_args
   ami="$(get_latest_al2023_ami)"
-  subnet="$(get_default_subnet)"
   sg_id="$(ensure_security_group)"
   ensure_key_pair
 
   create_name="$(default_create_instance_name)"
-  tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}}]"
+  if want_spot; then
+    market_tag=",{Key=Market,Value=spot}"
+  fi
+  tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}}${market_tag}]"
   if [[ -n "${S3_BUCKET}" ]]; then
     bucket_name="$(s3_bucket_name "${S3_BUCKET}")"
     S3_BUCKET="$(s3_bucket_uri "${S3_BUCKET}")"
@@ -661,15 +664,18 @@ create_instance() {
     ensure_iam_instance_profile_for_bucket "${bucket_name}"
     ud_file="$(mktemp)"
     build_s3_user_data > "${ud_file}"
-    tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}},{Key=S3Bucket,Value=${bucket_name}},{Key=S3CachePrefix,Value=${S3_CACHE_PREFIX}}]"
+    tags="[{Key=Name,Value=${create_name}},{Key=App,Value=${APP_NAME}},{Key=S3Bucket,Value=${bucket_name}},{Key=S3CachePrefix,Value=${S3_CACHE_PREFIX}}${market_tag}]"
   fi
 
-  log "Creating instance ${create_name} (${INSTANCE_TYPE})"
+  if want_spot; then
+    log "Creating Spot instance ${create_name} (${INSTANCE_TYPE}; one-time, stop on interruption, no automatic restart)"
+  else
+    log "Creating on-demand instance ${create_name} (${INSTANCE_TYPE})"
+  fi
   run_args=(
     --image-id "${ami}"
     --instance-type "${INSTANCE_TYPE}"
     --key-name "${KEY_BASENAME}"
-    --subnet-id "${subnet}"
     --security-group-ids "${sg_id}"
     --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${ROOT_VOLUME_GB},VolumeType=gp3,Iops=${ROOT_VOLUME_IOPS},Throughput=${ROOT_VOLUME_THROUGHPUT_MB},DeleteOnTermination=true}"
     --tag-specifications "ResourceType=instance,Tags=${tags}"
@@ -677,12 +683,29 @@ create_instance() {
     --query "Instances[0].InstanceId"
     --output text
   )
+  if [[ -n "${SUBNET_ID:-}" ]]; then
+    log "SUBNET_ID=${SUBNET_ID} (pinned AZ)"
+    run_args+=(--subnet-id "${SUBNET_ID}")
+  else
+    # No subnet/AZ: AWS places into a default-VPC AZ that has capacity.
+    # Pinning a subnet is what made bootstrap fail when that one AZ was empty.
+    log "Letting AWS choose AZ (no --subnet-id)"
+  fi
+  if want_spot; then
+    # One-time + stop: reclaim keeps the EBS root volume and closes the
+    # request. AWS does not start the instance again; start-instance is
+    # explicit user input. Omit MaxPrice so the cap is the on-demand price.
+    run_args+=(--instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"stop"}}')
+  fi
   if [[ -n "${S3_BUCKET}" ]]; then
     run_args+=(--iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}")
     run_args+=(--user-data "file://${ud_file}")
   fi
   instance_id="$(awsq ec2 run-instances "${run_args[@]}")"
   [[ -n "${ud_file}" ]] && rm -f "${ud_file}"
+  az="$(awsq ec2 describe-instances --instance-ids "${instance_id}" \
+    --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)"
+  log "Launched ${instance_id} in ${az}"
 
   INSTANCE_ID="${instance_id}"
   INSTANCE_NAME="${create_name}"
@@ -708,7 +731,10 @@ start_instance() {
   local iid
   iid="$(require_instance_id)"
   log "Starting instance ${iid}"
-  awsq ec2 start-instances --instance-ids "${iid}" >/dev/null 2>&1 || true
+  if ! awsq ec2 start-instances --instance-ids "${iid}" >/dev/null; then
+    log "Start failed. If this is a Spot instance, AWS may not have capacity in this instance's AZ (start cannot change AZ). Retry later or bootstrap a new VM."
+    exit 1
+  fi
   awsq ec2 wait instance-running --instance-ids "${iid}"
   awsq ec2 wait instance-status-ok --instance-ids "${iid}"
   log "Instance is running and healthy."
@@ -766,8 +792,23 @@ ensure_eip() {
   fi
 
   if [[ -z "${alloc_id}" || "${alloc_id}" == "None" ]]; then
+    # Account EIP quota counts unattached addresses. Reuse one left behind by
+    # a previous instance of this app instead of allocating a sixth.
+    alloc_id="$(awsq ec2 describe-addresses \
+      --filters "Name=tag:App,Values=${APP_NAME}" \
+      --query 'Addresses[?InstanceId==null] | [0].AllocationId' --output text 2>/dev/null || true)"
+    if [[ -n "${alloc_id}" && "${alloc_id}" != "None" ]]; then
+      log "Reusing unattached Elastic IP ${alloc_id}"
+      awsq ec2 create-tags --resources "${alloc_id}" --tags "Key=Name,Value=${eip_tag}" "Key=App,Value=${APP_NAME}" >/dev/null
+    fi
+  fi
+
+  if [[ -z "${alloc_id}" || "${alloc_id}" == "None" ]]; then
     log "Allocating Elastic IP"
-    alloc_id="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text)"
+    if ! alloc_id="$(awsq ec2 allocate-address --domain vpc --query 'AllocationId' --output text)"; then
+      log "Elastic IP quota is full. Release an unattached address, then rerun: $0 ensure-eip"
+      exit 1
+    fi
     awsq ec2 create-tags --resources "${alloc_id}" --tags "Key=Name,Value=${eip_tag}" "Key=App,Value=${APP_NAME}" >/dev/null
   fi
 
@@ -938,6 +979,11 @@ Host ${JLAB_ALIAS}
   StrictHostKeyChecking accept-new
 EOF
 
+  # ProxyCommand stores the key under the alias, so rebinding a new VM
+  # looks like a host-key change. Drop the stale alias keys.
+  ssh-keygen -R "${HOST_ALIAS}" >/dev/null 2>&1 || true
+  ssh-keygen -R "${JLAB_ALIAS}" >/dev/null 2>&1 || true
+
   log "Updated ${cfg} for ${iid} (${name}) using ${identity_file}."
 }
 
@@ -982,14 +1028,14 @@ status() {
   fi
   awsq ec2 describe-instances \
     --instance-ids "${iid}" \
-    --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress,Type:InstanceType,Name:Tags[?Key==`Name`]|[0].Value}' \
+    --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress,Type:InstanceType,Lifecycle:InstanceLifecycle,Name:Tags[?Key==`Name`]|[0].Value}' \
     --output table
 }
 
 list_instances() {
   awsq ec2 describe-instances \
     --filters Name=instance-state-name,Values=pending,running,stopping,stopped \
-    --query 'sort_by(Reservations[].Instances[], &LaunchTime)[].{InstanceId:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value,Type:InstanceType,PublicIp:PublicIpAddress,LaunchTime:LaunchTime}' \
+    --query 'sort_by(Reservations[].Instances[], &LaunchTime)[].{InstanceId:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value,Type:InstanceType,Lifecycle:InstanceLifecycle,PublicIp:PublicIpAddress,LaunchTime:LaunchTime}' \
     --output table
 }
 
@@ -1052,9 +1098,10 @@ Lifecycle:
 JupyterLab:
   start-jlab | stop-jlab | start-tunnel
 
-Create a new EC2 for this project:
+Create a new EC2 for this project (on-demand m7i.4xlarge by default):
   bootstrap
   S3_BUCKET=s3://<your-bucket> $0 bootstrap
+  SPOT=1 $0 bootstrap
   S3_BUCKET=s3://<your-bucket> $0 attach-s3
 
 If you can reach the instance via Instance Connect but not SSH:
@@ -1064,7 +1111,9 @@ If you can reach the instance via Instance Connect but not SSH:
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
-  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default 200)
+  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.4xlarge / 200)
+  SPOT (bootstrap only; default 0 = on-demand; 1 = Spot)
+  SUBNET_ID (bootstrap only; pin one subnet/AZ. Default: AWS chooses AZ)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)
   S3_BUCKET (e.g. s3://<your-bucket>) — grant the instance IAM access to this bucket
   S3_CACHE_PREFIX (default: s3://<bucket>/public)

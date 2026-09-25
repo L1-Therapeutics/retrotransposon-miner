@@ -1,0 +1,16 @@
+{
+  "catalog_id": "nssv14073986",
+  "sample": "HG00100",
+  "chrom": "chr22",
+  "expected_breakpoint": 49879732,
+  "discovery_window_start": 49878612,
+  "discovery_window_end": 49880399,
+  "fetch_start": 49877812,
+  "fetch_end": 49881199,
+  "bam": "HG00100.chr22_49877812_49881199.bam",
+  "n_bam_reads": 908,
+  "source_results": "/home/ec2-user/retrotransposon-workdir/results/hg00100_germline_chr22_main_wgs_mates",
+  "source_cram": "/home/ec2-user/retrotransposon-workdir/data/bam_stage/HG00100.final.cram",
+  "plot_rank": 19,
+  "expect_gold": true
+}

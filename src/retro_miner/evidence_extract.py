@@ -400,8 +400,8 @@ def extract_discordant_evidence(
     mate_seq_missing_interchrom_rows = 0
     region_list = _normalize_regions(regions)
     mate_bam_resolved = mate_bam_path if mate_bam_path is not None else bam_path
-    if fetch_mate_seq:
-        _validate_mate_fetch_bam(bam_path, mate_bam_path, region_list)
+    # Warn even when --no-fetch-mate-seq: annotate still needs a WGS mate BAM.
+    _validate_mate_fetch_bam(bam_path, mate_bam_path, region_list)
 
     # Mate BAM is only opened when fetch_mate_seq is enabled. Annotate can re-fetch
     # mates for candidate loci later; skipping here is the main extract speedup.
@@ -821,8 +821,8 @@ def extract_split_and_discordant_evidence(
     outdir.mkdir(parents=True, exist_ok=True)
     region_list = _normalize_regions(regions)
     mate_bam_resolved = mate_bam_path if mate_bam_path is not None else bam_path
-    if fetch_mate_seq:
-        _validate_mate_fetch_bam(bam_path, mate_bam_path, region_list)
+    # Warn even when --no-fetch-mate-seq: annotate still needs a WGS mate BAM.
+    _validate_mate_fetch_bam(bam_path, mate_bam_path, region_list)
 
     split_rows: list[dict[str, Any]] = []
     pending_disc: list[dict[str, Any]] = []

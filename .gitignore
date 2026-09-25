@@ -27,8 +27,13 @@ tmp/
 *.cram
 *.crai
 *.sam
+# Small real-locus pytest snippets (see tests/fixtures/loci/)
+!tests/fixtures/**/*.bam
+!tests/fixtures/**/*.bai
 *.fastq
 *.fq
 *.vcf
 *.vcf.gz
+# Chromosome-sized VCF examples linked from the README.
+!docs/examples/*.vcf
 *.tbi

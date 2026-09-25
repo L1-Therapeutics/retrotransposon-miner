@@ -81,6 +81,9 @@ _DETAIL_COLS = (
     "mei_end",
     "mate_mei_start",
     "mate_mei_end",
+    "mei_target",
+    "mate_mei_target",
+    "family",
     "mei_hit",
     "mate_mei_hit",
     "short_mei_seed_rescued",
@@ -264,6 +267,88 @@ def _target_family(target: str) -> str:
     return "OTHER"
 
 
+def _robust_coord_extent(lo_values: pd.Series, hi_values: pd.Series) -> tuple[float, float]:
+    """Outlier-resistant min/max MEI coords for one locus.
+
+    Tukey fences (k=3) on the pooled start/end endpoints when enough points
+    exist; otherwise raw min/max. Keeps a true full-length SVA/LINE1 footprint
+    while dropping a single off-target mate that would stretch a 550–573 pile
+    out to 1520.
+    """
+    pts = pd.concat(
+        [
+            pd.to_numeric(lo_values, errors="coerce"),
+            pd.to_numeric(hi_values, errors="coerce"),
+        ],
+        ignore_index=True,
+    )
+    pts = pts[pts.gt(0)].astype(float)
+    if pts.empty:
+        return float("nan"), float("nan")
+    if len(pts) < 8:
+        return float(pts.min()), float(pts.max())
+    q1 = float(pts.quantile(0.25))
+    q3 = float(pts.quantile(0.75))
+    iqr = max(q3 - q1, 1.0)
+    lo_fence = q1 - 3.0 * iqr
+    hi_fence = q3 + 3.0 * iqr
+    kept = pts[(pts >= lo_fence) & (pts <= hi_fence)]
+    if kept.empty:
+        return float(pts.min()), float(pts.max())
+    return float(kept.min()), float(kept.max())
+
+
+def _clustered_coord_extent(
+    lo_values: pd.Series,
+    hi_values: pd.Series,
+    read_names: pd.Series | None = None,
+    *,
+    merge_gap: int = 150,
+    min_cluster_reads: int = 3,
+) -> tuple[float, float]:
+    """Extent of supported MEI coordinate piles, not the min/max hull of all hits.
+
+    Merge overlapping / near-adjacent intervals (gap ≤ one read), keep piles
+    with at least ``min_cluster_reads`` unique reads, and take the hull of
+    those piles. A real two-ended SVA (strong 5′ and 3′) stays full-length.
+    Scattered singleton L1 seeds do not become a fake 6 kb insertion.
+    """
+    lo = pd.to_numeric(lo_values, errors="coerce")
+    hi = pd.to_numeric(hi_values, errors="coerce")
+    ok = lo.gt(0) & hi.ge(lo)
+    if not bool(ok.any()):
+        return float("nan"), float("nan")
+    lo = lo.loc[ok].astype(float)
+    hi = hi.loc[ok].astype(float)
+    if read_names is None:
+        names = pd.Series([f"r{i}" for i in range(len(lo))], index=lo.index)
+    else:
+        names = read_names.loc[ok].fillna("").astype(str)
+        missing = names.eq("")
+        if bool(missing.any()):
+            names = names.copy()
+            names.loc[missing] = [f"r{i}" for i in range(int(missing.sum()))]
+    rows = sorted(
+        zip(lo.tolist(), hi.tolist(), names.tolist()),
+        key=lambda item: (item[0], item[1]),
+    )
+    clusters: list[dict[str, object]] = []
+    for start, end, name in rows:
+        if clusters and start <= float(clusters[-1]["hi"]) + float(merge_gap):
+            clusters[-1]["hi"] = max(float(clusters[-1]["hi"]), float(end))
+            clusters[-1]["lo"] = min(float(clusters[-1]["lo"]), float(start))
+            clusters[-1]["reads"].add(name)
+        else:
+            clusters.append({"lo": float(start), "hi": float(end), "reads": {name}})
+    strong = [c for c in clusters if len(c["reads"]) >= int(min_cluster_reads)]
+    if not strong:
+        strong = [max(clusters, key=lambda c: (len(c["reads"]), float(c["hi"]) - float(c["lo"])))]
+    hull_lo = min(float(c["lo"]) for c in strong)
+    hull_hi = max(float(c["hi"]) for c in strong)
+    in_hull = (lo <= hull_hi) & (hi >= hull_lo)
+    return _robust_coord_extent(lo.loc[in_hull], hi.loc[in_hull])
+
+
 def _row_mei_family(row: pd.Series | None) -> str:
     if row is None:
         return ""
@@ -289,7 +374,9 @@ def _mei_coords_from_detail(
     When ``family`` is ALU/LINE1/SVA, ignore off-family hits (e.g. stray L1
     mates at an Alu locus) so the plot axis is not inflated to ~6 kb.
     """
-    coords: list[int] = []
+    start_parts: list[pd.Series] = []
+    end_parts: list[pd.Series] = []
+    name_parts: list[pd.Series] = []
     work = detail
     # PolyA-rescue mates use synthetic coords past MEI 3′; exclude from body span.
     if "polya_rescue" in detail.columns:
@@ -324,16 +411,48 @@ def _mei_coords_from_detail(
         if fam in {"ALU", "LINE1", "SVA"} and tcol in hits.columns:
             tfam = hits[tcol].fillna("").astype(str).map(_target_family)
             hits = hits.loc[tfam.eq(fam)]
-        starts = pd.to_numeric(hits[start_col], errors="coerce").fillna(0).astype(int)
-        ends = pd.to_numeric(hits[end_col], errors="coerce").fillna(0).astype(int)
-        for start, end in zip(starts.tolist(), ends.tolist()):
-            if start > 0:
-                coords.append(start)
-            if end > 0:
-                coords.append(end)
-    if len(coords) < 2:
+        starts = pd.to_numeric(hits[start_col], errors="coerce").fillna(0)
+        ends = pd.to_numeric(hits[end_col], errors="coerce").fillna(0)
+        ok = starts.gt(0) & ends.ge(starts)
+        start_parts.append(starts.loc[ok])
+        end_parts.append(ends.loc[ok])
+        if "read_name" in hits.columns:
+            name_parts.append(hits.loc[ok, "read_name"])
+        else:
+            name_parts.append(pd.Series("", index=starts.loc[ok].index))
+    if not start_parts:
         return None
-    return min(coords), max(coords)
+    lo, hi = _clustered_coord_extent(
+        pd.concat(start_parts, ignore_index=True),
+        pd.concat(end_parts, ignore_index=True),
+        pd.concat(name_parts, ignore_index=True),
+    )
+    if pd.isna(lo) or pd.isna(hi) or hi < lo:
+        return None
+    return int(lo), int(hi)
+
+
+def _zero_off_family_mei_coords(detail: pd.DataFrame, family: str) -> pd.DataFrame:
+    """Clear MEI consensus coords that belong to a different family.
+
+    Keeps the read for flank / polyA drawing. Used so an L1 mate at an SVA
+    locus cannot stretch or paint the MEI axis.
+    """
+    fam = (family or "").upper()
+    if detail.empty or fam not in {"ALU", "LINE1", "SVA"}:
+        return detail
+    out = detail.copy()
+    for start_col, end_col, tcol in (
+        ("mei_start", "mei_end", "mei_target"),
+        ("mate_mei_start", "mate_mei_end", "mate_mei_target"),
+    ):
+        if start_col not in out.columns or end_col not in out.columns or tcol not in out.columns:
+            continue
+        tfam = out[tcol].fillna("").astype(str).map(_target_family)
+        keep = tfam.eq(fam)
+        out[start_col] = pd.to_numeric(out[start_col], errors="coerce").where(keep, 0)
+        out[end_col] = pd.to_numeric(out[end_col], errors="coerce").where(keep, 0)
+    return out
 
 
 def _mate_polya_width_bp(row: pd.Series) -> int:
@@ -584,9 +703,6 @@ def _insertion_span_from_evidence(
             return mei_5p, mei_3p, span, "consensus_span"
         return None
 
-    # Family-plausible upper bounds for read-derived axes (guards residual noise).
-    max_plausible = {"ALU": 400, "SVA": 2000, "LINE1": 7000}.get(family, 7000)
-
     detail_extent = (
         _mei_coords_from_detail(detail, family=family)
         if detail is not None and not detail.empty
@@ -595,7 +711,7 @@ def _insertion_span_from_evidence(
     if detail_extent is not None:
         detail_5p, detail_3p = detail_extent
         detail_span = detail_3p - detail_5p + 1
-        if detail_span >= 1 and detail_span <= max_plausible:
+        if detail_span >= 1:
             return detail_5p, detail_3p, detail_span, "read_mei_coords"
 
     consensus = _consensus_span()
@@ -603,7 +719,7 @@ def _insertion_span_from_evidence(
         return consensus
 
     disc = _discordant_mei_axis(row, sample)
-    if disc is not None and disc[2] <= max_plausible:
+    if disc is not None:
         return disc[0], disc[1], disc[2], "discordant_mei_targets"
 
     melt_len = _row_int(row, "g1k_melt_insertion_length")
@@ -2556,6 +2672,7 @@ def plot_locus_architecture(
             detail_df=detail_df,
             split_df=split_df,
         )
+    detail = _zero_off_family_mei_coords(detail, _row_mei_family(row))
     flank_bp = _auto_flank_bp(detail, bp, min_flank=flank_bp)
     layout = _layout_from_row(row, sample=sample, detail=detail, flank_bp=flank_bp)
     pairs, pair_stats = _pair_segments(

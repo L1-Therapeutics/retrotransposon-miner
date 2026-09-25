@@ -693,12 +693,11 @@ def _annotate_junk_flags(
                 handle.write(f"{row.mate_chrom}\t{start0}\t{end0}\t{row.row_id}\n")
 
         if segdup_bed is not None and segdup_bed.exists():
-            _progress("annotating segdup overlaps")
+            # Locus flag_segdup waits until annotate has an inferred breakpoint.
+            # Mate positions are points, so they can be flagged here.
+            _progress("annotating mate segdup overlaps")
             segdup_norm = tmp / "segdup.norm.bed"
             _normalize_track_to_bed(segdup_bed, segdup_norm)
-            segdup_hits = _get_overlapping_row_ids_with_fraction(candidate_bed, segdup_norm, segdup_min_fraction)
-            out["flag_segdup"] = out["row_id"].isin(segdup_hits)
-            _progress(f"segdup hits={len(segdup_hits)}")
             if not mate_with_id.empty:
                 segdup_mate_hits = _get_overlapping_row_ids_with_fraction(mate_bed, segdup_norm, segdup_min_fraction)
                 out["flag_mate_in_segdup"] = out["row_id"].isin(segdup_mate_hits)
@@ -777,6 +776,93 @@ def _annotate_junk_flags(
     out["mate_junk_flag_count"] = out.loc[:, list(mate_flag_cols)].sum(axis=1)
     out = out.drop(columns=["row_id"])
     _progress("finished junk-region annotation")
+    return out
+
+
+_LOCUS_JUNK_FLAG_COLS = (
+    "flag_segdup",
+    "flag_low_mappability",
+    "flag_outside_giab_highconf",
+    "flag_gap_region",
+    "flag_encode_blacklist",
+)
+
+
+def _breakpoint_query_intervals(loci: pd.DataFrame) -> pd.DataFrame:
+    """Prefer the inferred breakpoint interval; else the point; else discovery."""
+    disc_lo = pd.to_numeric(
+        loci["discovery_window_start"] if "discovery_window_start" in loci.columns else loci["window_start"],
+        errors="coerce",
+    )
+    disc_hi = pd.to_numeric(
+        loci["discovery_window_end"] if "discovery_window_end" in loci.columns else loci["window_end"],
+        errors="coerce",
+    )
+    def _num(name: str) -> pd.Series:
+        if name in loci.columns:
+            return pd.to_numeric(loci[name], errors="coerce")
+        return pd.Series(-1.0, index=loci.index, dtype=float)
+
+    lo = _num("insertion_breakpoint_interval_start")
+    hi = _num("insertion_breakpoint_interval_end")
+    bp = _num("insertion_breakpoint_pos")
+    valid = lo.gt(0) & hi.gt(0) & hi.ge(lo)
+    use_bp = (~valid) & bp.gt(0)
+    out = pd.DataFrame(index=loci.index)
+    out["chrom"] = loci["chrom"].astype(str)
+    out["start"] = lo.where(valid, bp.where(use_bp, disc_lo)).astype(int)
+    out["end"] = hi.where(valid, bp.where(use_bp, disc_hi)).astype(int)
+    source = pd.Series("discovery_fallback", index=loci.index)
+    source = source.where(~use_bp, "breakpoint_point")
+    source = source.where(~valid, "breakpoint_interval")
+    out["segdup_query_source"] = source
+    return out
+
+
+def annotate_segdup_on_breakpoint_windows(
+    loci: pd.DataFrame,
+    segdup_bed: Path | None,
+    min_fraction: float = 0.1,
+) -> pd.DataFrame:
+    """Set flag_segdup from the inferred breakpoint window, not the discovery cluster.
+
+    Unresolved breakpoints fall back to the discovery window. ``junk_flag_count``
+    is recomputed from the locus junk flags.
+    """
+    out = loci.copy()
+    if "flag_segdup" not in out.columns:
+        out["flag_segdup"] = False
+    if segdup_bed is None or not Path(segdup_bed).exists() or out.empty:
+        out["segdup_query_source"] = "skipped"
+        return _recompute_locus_junk_flag_count(out)
+
+    query = _breakpoint_query_intervals(out)
+    out["segdup_query_source"] = query["segdup_query_source"]
+    with tempfile.TemporaryDirectory(prefix="rtm_bp_segdup_") as tmpdir:
+        tmp = Path(tmpdir)
+        query_bed = tmp / "breakpoint_windows.bed"
+        with query_bed.open("w", encoding="utf-8") as handle:
+            for row_id, row in enumerate(query.itertuples(index=False)):
+                start0 = max(0, int(row.start) - 1)
+                end0 = max(start0 + 1, int(row.end))
+                handle.write(f"{row.chrom}\t{start0}\t{end0}\t{row_id}\n")
+        segdup_norm = tmp / "segdup.norm.bed"
+        _normalize_track_to_bed(Path(segdup_bed), segdup_norm)
+        hits = _get_overlapping_row_ids_with_fraction(query_bed, segdup_norm, float(min_fraction))
+    out["flag_segdup"] = pd.Series(range(len(out)), index=out.index).isin(hits)
+    click.echo(
+        f"[mei-annotate] breakpoint-window segdup hits={int(out['flag_segdup'].sum())} / {len(out)}"
+    )
+    return _recompute_locus_junk_flag_count(out)
+
+
+def _recompute_locus_junk_flag_count(loci: pd.DataFrame) -> pd.DataFrame:
+    out = loci.copy()
+    for col in _LOCUS_JUNK_FLAG_COLS:
+        if col not in out.columns:
+            out[col] = False
+        out[col] = out[col].fillna(False).astype(bool)
+    out["junk_flag_count"] = out.loc[:, list(_LOCUS_JUNK_FLAG_COLS)].sum(axis=1).astype(int)
     return out
 
 

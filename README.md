@@ -46,8 +46,9 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 
 ## Current Limitations
 
-- Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. For larger runs, `r6i.4xlarge` or greater is recommended, and local assembly/candidate processing support parallel execution.
+- Designed primarily for Amazon Web Services (AWS) machines today; relatively straightforward to adapt to Google Cloud Platform (GCP), Azure, or local Linux. A single full genome wants about 64 vCPU and 256 GiB of memory (see the EC2 section). Local assembly and candidate processing support parallel execution.
 - Artificial intelligence/machine learning (AI/ML) genotyping confidence models are still under active development.
+- Genotyping is not supported: VCF output leaves `GT`/`GQ` blank. Calls are pooled disease-vs-control read support, not per-individual diploid genotypes, and a simple alt/ref read-ratio model is not valid here — split/discordant "alt" evidence and proper-pair "ref" evidence are structurally different read populations, and ploidy varies with chromosome (chrX), somatic copy-number context, and mosaicism. Reliable MEI genotyping would need haplotype-resolved/pangenome references or long reads.
 - Reverse-transcribed pseudogene insertion support is not yet added.
 - Support for species other than *Homo sapiens* (for example, *Mus musculus*) is not yet implemented.
 - Long-read native calling is not yet supported.
@@ -57,47 +58,40 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 
 ## Example Variant Calls (GRCh38)
 
-The table below lists candidate insertion calls from a tumor/normal chr22 run.  
-In the example table, `SR` denotes split-read evidence and `DPE` denotes discordant paired-end evidence.
+HG03086 chromosome 22, classifier `gold_score` >= 0.997 (21 calls).
 
-### Example output from sample tumor/normal data
-
-Gold-tier calls from the SEQC2 tumor/normal chr22 annotate run with polyA-trimmed MEI consensus remap, polyA-only (not MEI_MAPPED) junction clips, and polyA/T TSD filtering (top 30 of n=1042 by review rank; mix 22 Alu / 7 LINE1 / 1 SVA).
-
-| chrom | consensus_insertion_breakpoint_pos | window_start | window_end | control_supporting_reads | disease_supporting_reads | sample_status_label | consensus_tsd_seq | consensus_poly_at_min_bp | consensus_mei_family | consensus_mei_subfamily | known_mei_polymorphism_id | known_mei_polymorphism_source | consensus_insertion_orientation | nested_in_same_MEI | consensus_insertion_mei_span_full | consensus_insertion_mei_5p_coord_full | consensus_insertion_mei_3p_coord_full |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| chr22 | 49029650 | 49029645 | 49029656 | SR_L=0,SR_R=0,DPE_L=2,DPE_R=152,MEI_MAPPED=127,polyA_MAPPED=46,VNTR_MAPPED=0,polyA_side=L | SR_L=0,SR_R=0,DPE_L=8,DPE_R=373,MEI_MAPPED=306,polyA_MAPPED=92,VNTR_MAPPED=1,polyA_side=L | shared | AAGAAAACTCCT | 50 | SVA | SVA_D#Retroposon/SVA | nssv14064350 | melt_1kg | - | unnested | 1366 | 1 | 1366 |
-| chr22 | 31355872 | 31355858 | 31355887 | SR_L=12,SR_R=0,DPE_L=7,DPE_R=148,MEI_MAPPED=108,polyA_MAPPED=6 | SR_L=15,SR_R=0,DPE_L=19,DPE_R=273,MEI_MAPPED=188,polyA_MAPPED=16,polyA_side=R | shared | CCGCCTCGGCTTCCCAAAGTGCTGGGATTA | 71 | ALU | AluY_short_#SINE/Alu |  |  | - | nested | 281 | 1 | 281 |
-| chr22 | 37529127 | 37529108 | 37529146 | SR_L=0,SR_R=1,DPE_L=151,DPE_R=2,MEI_MAPPED=66,polyA_MAPPED=47,polyA_side=L | SR_L=0,SR_R=3,DPE_L=365,DPE_R=16,MEI_MAPPED=167,polyA_MAPPED=86,polyA_side=L | shared | GAAGCGGAGGTTGCAGTGAGCCGAGATTGCGCCACTGCA | 90 | ALU | AluYb8#SINE/Alu |  |  | + | nested | 288 | 1 | 288 |
-| chr22 | 17567662 | 17567655 | 17567669 | SR_L=6,SR_R=6,DPE_L=33,DPE_R=44,MEI_MAPPED=71,polyA_MAPPED=7,polyA_side=R | SR_L=23,SR_R=17,DPE_L=57,DPE_R=80,MEI_MAPPED=139,polyA_MAPPED=9,polyA_side=R | shared | TATCCTTGCTTTTAT | 61 | ALU | AluYb8#SINE/Alu | chr22-18235412-INS->s898803>s907604>s907605>s907606>s898804-358 | long_read_1kg_ont_vienna | - | unnested | 288 | 1 | 288 |
-| chr22 | 50495066 | 50494596 | 50495537 | SR_L=2,SR_R=0,DPE_L=59,DPE_R=82,MEI_MAPPED=71,polyA_MAPPED=34,polyA_side=R | SR_L=8,SR_R=1,DPE_L=102,DPE_R=174,MEI_MAPPED=138,polyA_MAPPED=49,polyA_side=R | shared |  | 14 | ALU | AluYa5#SINE/Alu |  |  | - | unnested | 280 | 2 | 281 |
-| chr22 | 45595784 | 45595639 | 45595930 | SR_L=0,SR_R=0,DPE_L=384,DPE_R=2,MEI_MAPPED=119,polyA_MAPPED=106,polyA_side=L | SR_L=0,SR_R=0,DPE_L=452,DPE_R=0,MEI_MAPPED=128,polyA_MAPPED=102,polyA_side=L | shared |  | 91 | ALU | AluJb_short_#SINE/Alu |  |  | - | unnested | 282 | 1 | 282 |
-| chr22 | 41050312 | 41050276 | 41050348 | SR_L=3,SR_R=0,DPE_L=1,DPE_R=85,MEI_MAPPED=65,polyA_MAPPED=27,polyA_side=R | SR_L=1,SR_R=0,DPE_L=4,DPE_R=166,MEI_MAPPED=125,polyA_MAPPED=44,polyA_side=R | shared |  | 34 | ALU | AluSq#SINE/Alu |  |  | - | nested | 283 | 1 | 283 |
-| chr22 | 20075438 | 20075432 | 20075444 | SR_L=12,SR_R=8,DPE_L=128,DPE_R=19,MEI_MAPPED=111,polyA_MAPPED=51,polyA_side=L | SR_L=7,SR_R=3,DPE_L=89,DPE_R=16,MEI_MAPPED=65,polyA_MAPPED=40,polyA_side=R | shared | AGATTTCTTTTCT | 39 | ALU | AluYk12#SINE/Alu |  |  | + | unnested | 281 | 1 | 281 |
-| chr22 | 40007330 | 40007328 | 40007332 | SR_L=0,SR_R=0,DPE_L=76,DPE_R=12,MEI_MAPPED=68,polyA_MAPPED=1,polyA_side=R | SR_L=4,SR_R=0,DPE_L=98,DPE_R=25,MEI_MAPPED=98,polyA_MAPPED=3,polyA_side=R | shared | CTCCT | 114 | ALU | AluYb8#SINE/Alu |  |  | - | unnested | 288 | 1 | 288 |
-| chr22 | 19223382 | 19223373 | 19223390 | SR_L=0,SR_R=14,DPE_L=60,DPE_R=27,MEI_MAPPED=91,polyA_MAPPED=17,polyA_side=L | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=0,polyA_MAPPED=0 | control_only | AAAAACCACCTATGCTGG | 66 | LINE1 | L1HS_5end#LINE/L1 | g1k:nssv14064681;lr:chr22-19600083-INS->s899391<s914453>s899392-6059 | melt_1kg,long_read_1kg_ont_vienna | + | unnested | 6018 | 1 | 6018 |
-| chr22 | 34034616 | 34034610 | 34034623 | SR_L=14,SR_R=2,DPE_L=62,DPE_R=1,MEI_MAPPED=61,polyA_MAPPED=14,polyA_side=R | SR_L=22,SR_R=6,DPE_L=92,DPE_R=2,MEI_MAPPED=90,polyA_MAPPED=32,polyA_side=R | shared | CAAATGGAACTTTT | 64 | ALU | AluYb8#SINE/Alu | nssv14071620 | melt_1kg | - | unnested | 288 | 1 | 288 |
-| chr22 | 50351083 | 50350826 | 50351340 | SR_L=0,SR_R=0,DPE_L=121,DPE_R=18,MEI_MAPPED=50,polyA_MAPPED=12,polyA_side=R | SR_L=0,SR_R=0,DPE_L=218,DPE_R=16,MEI_MAPPED=85,polyA_MAPPED=38,polyA_side=R | shared |  | 38 | ALU | AluSc5#SINE/Alu |  |  | - | nested | 264 | 1 | 264 |
-| chr22 | 33132520 | 33132513 | 33132527 | SR_L=0,SR_R=7,DPE_L=44,DPE_R=7,MEI_MAPPED=37,polyA_MAPPED=31,polyA_side=L | SR_L=1,SR_R=7,DPE_L=76,DPE_R=31,MEI_MAPPED=85,polyA_MAPPED=23,polyA_side=L | shared | AAAAGTCATTATTAG | 56 | ALU | AluYg6#SINE/Alu | nssv14075885 | melt_1kg | + | unnested | 281 | 1 | 281 |
-| chr22 | 36746494 | 36746492 | 36746495 | SR_L=0,SR_R=2,DPE_L=7,DPE_R=77,MEI_MAPPED=44,polyA_MAPPED=2 | SR_L=1,SR_R=11,DPE_L=11,DPE_R=157,MEI_MAPPED=85,polyA_MAPPED=2,polyA_side=R | shared | CTCC | 48 | ALU | AluSz#SINE/Alu |  |  | - | unnested | 221 | 10 | 230 |
-| chr22 | 29236892 | 29236685 | 29237100 | SR_L=0,SR_R=6,DPE_L=37,DPE_R=18,MEI_MAPPED=43,polyA_MAPPED=18,polyA_side=R | SR_L=0,SR_R=24,DPE_L=50,DPE_R=35,MEI_MAPPED=83,polyA_MAPPED=22,polyA_side=R | shared |  | 71 | LINE1 | L1MCa_5end#LINE/L1 |  |  | - | unnested | 1483 | 96 | 1578 |
-| chr22 | 20521112 | 20521097 | 20521126 | SR_L=0,SR_R=0,DPE_L=39,DPE_R=19,MEI_MAPPED=50,polyA_MAPPED=19,polyA_side=R | SR_L=0,SR_R=1,DPE_L=55,DPE_R=33,MEI_MAPPED=78,polyA_MAPPED=20,polyA_side=R | shared |  | 28 | ALU | AluYa5#SINE/Alu |  |  | + | unnested | 281 | 1 | 281 |
-| chr22 | 19919244 | 19919236 | 19919251 | SR_L=0,SR_R=5,DPE_L=21,DPE_R=117,MEI_MAPPED=78,polyA_MAPPED=16,polyA_side=L | SR_L=0,SR_R=5,DPE_L=17,DPE_R=97,MEI_MAPPED=63,polyA_MAPPED=3,polyA_side=L | shared | CCCAGGCTGGAGTGCA | 71 | ALU | AluSp#SINE/Alu | nssv14053291 | melt_1kg | - | nested | 273 | 1 | 273 |
-| chr22 | 20595738 | 20595139 | 20596336 | SR_L=0,SR_R=9,DPE_L=3,DPE_R=43,MEI_MAPPED=30,polyA_MAPPED=0 | SR_L=0,SR_R=26,DPE_L=5,DPE_R=77,MEI_MAPPED=78,polyA_MAPPED=0 | shared |  | 75 | ALU | AluSx3#SINE/Alu |  |  | - | nested | 67 | 69 | 135 |
-| chr22 | 41835230 | 41835229 | 41835232 | SR_L=27,SR_R=18,DPE_L=19,DPE_R=2,MEI_MAPPED=46,polyA_MAPPED=5,polyA_side=L | SR_L=50,SR_R=6,DPE_L=43,DPE_R=6,MEI_MAPPED=70,polyA_MAPPED=10,polyA_side=L | shared | ATAG | 84 | ALU | AluJo#SINE/Alu |  |  | - | nested | 238 | 44 | 281 |
-| chr22 | 36752165 | 36751652 | 36752678 | SR_L=0,SR_R=0,DPE_L=66,DPE_R=8,MEI_MAPPED=29,polyA_MAPPED=3,polyA_side=R | SR_L=1,SR_R=0,DPE_L=145,DPE_R=18,MEI_MAPPED=68,polyA_MAPPED=6,polyA_side=R | shared |  | 14 | ALU | AluSz#SINE/Alu |  |  | - | unnested | 210 | 10 | 219 |
-| chr22 | 42818644 | 42818163 | 42819124 | SR_L=0,SR_R=0,DPE_L=51,DPE_R=25,MEI_MAPPED=67,polyA_MAPPED=19,polyA_side=R | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=2,polyA_MAPPED=0 | control_only |  | 26 | ALU | AluYa5#SINE/Alu | chr22-43299733-INS->s903600<s909229>s903601-318 | long_read_1kg_ont_vienna | + | unnested | 281 | 1 | 281 |
-| chr22 | 29239707 | 29239402 | 29240012 | SR_L=1,SR_R=0,DPE_L=44,DPE_R=4,MEI_MAPPED=34,polyA_MAPPED=1,polyA_side=L | SR_L=4,SR_R=1,DPE_L=72,DPE_R=16,MEI_MAPPED=65,polyA_MAPPED=5,polyA_side=R | shared |  | 59 | LINE1 | L1MCa_5end#LINE/L1 |  |  | - | nested | 364 | 96 | 459 |
-| chr22 | 17224410 | 17224401 | 17224418 | SR_L=7,SR_R=0,DPE_L=31,DPE_R=50,MEI_MAPPED=63,polyA_MAPPED=27,polyA_side=R | SR_L=0,SR_R=0,DPE_L=0,DPE_R=0,MEI_MAPPED=1,polyA_MAPPED=0 | control_only | AACAAGTGCTAATAATTT | 68 | ALU | AluYb8#SINE/Alu | g1k:nssv14074719;lr:chr22-17900865-INS->s898731>s907592>s898732-334 | melt_1kg,long_read_1kg_ont_vienna | - | unnested | 288 | 1 | 288 |
-| chr22 | 42705164 | 42704870 | 42705458 | SR_L=0,SR_R=2,DPE_L=6,DPE_R=71,MEI_MAPPED=35,polyA_MAPPED=2 | SR_L=0,SR_R=5,DPE_L=21,DPE_R=121,MEI_MAPPED=63,polyA_MAPPED=6,polyA_side=L | shared |  | 48 | ALU | AluYm1#SINE/Alu |  |  | + | unnested | 280 | 2 | 281 |
-| chr22 | 33124372 | 33124353 | 33124392 | SR_L=1,SR_R=14,DPE_L=9,DPE_R=19,MEI_MAPPED=32,polyA_MAPPED=1,polyA_side=R | SR_L=15,SR_R=17,DPE_L=12,DPE_R=47,MEI_MAPPED=63,polyA_MAPPED=0 | shared | GAAAGAAGGAAGGAAGGAAGGAAGGAAGGAAGGGAGGAAG | 16 | LINE1 | L1M1_5end#LINE/L1 |  |  | + | unnested | 1462 | 72 | 1533 |
-| chr22 | 49760480 | 49760479 | 49760482 | SR_L=27,SR_R=10,DPE_L=3,DPE_R=7,MEI_MAPPED=39,polyA_MAPPED=0 | SR_L=27,SR_R=27,DPE_L=2,DPE_R=10,MEI_MAPPED=63,polyA_MAPPED=1,polyA_side=R | shared | CATG | 81 | LINE1 | L1M2a1_5end#LINE/L1 |  |  | + | nested | 189 | 149 | 337 |
-| chr22 | 31380162 | 31379890 | 31380433 | SR_L=0,SR_R=9,DPE_L=10,DPE_R=30,MEI_MAPPED=26,polyA_MAPPED=1,polyA_side=L | SR_L=0,SR_R=22,DPE_L=17,DPE_R=63,MEI_MAPPED=61,polyA_MAPPED=0 | shared |  | 66 | LINE1 | L1PREC2_orf2#LINE/L1 |  |  | - | unnested | 2154 | 2070 | 4223 |
-| chr22 | 23938127 | 23937906 | 23938348 | SR_L=0,SR_R=0,DPE_L=44,DPE_R=20,MEI_MAPPED=21,polyA_MAPPED=33,polyA_side=R | SR_L=0,SR_R=0,DPE_L=79,DPE_R=50,MEI_MAPPED=60,polyA_MAPPED=60,polyA_side=R | shared |  | 70 | ALU | AluYc#SINE/Alu |  |  | + | nested | 262 | 8 | 269 |
-| chr22 | 41051286 | 41050603 | 41051968 | SR_L=0,SR_R=0,DPE_L=67,DPE_R=0,MEI_MAPPED=36,polyA_MAPPED=19,polyA_side=R | SR_L=0,SR_R=0,DPE_L=96,DPE_R=4,MEI_MAPPED=59,polyA_MAPPED=30,polyA_side=R | shared |  | 31 | ALU | AluSp#SINE/Alu |  |  | - | unnested | 283 | 1 | 283 |
-| chr22 | 17289460 | 17289460 | 17289460 | SR_L=0,SR_R=11,DPE_L=0,DPE_R=38,MEI_MAPPED=45,polyA_MAPPED=0 | SR_L=0,SR_R=13,DPE_L=3,DPE_R=60,MEI_MAPPED=59,polyA_MAPPED=0 | shared |  | 74 | LINE1 | L1P2_5end#LINE/L1 |  |  | - | unnested | 499 | 1056 | 1554 |
+```
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	HG03086
+chr22	17567662	L1TX-chr22-17567662-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=17567662;WINDOWSTART=17567655;WINDOWEND=17567669;MEIFAMILY=ALU;MEISUBFAMILY=AluYb8#SINE/Alu;TSD=TATCCTTGCTTTTAT;POLYA_MIN_BP=119;ORIENT=-;NESTED=unnested;MEI_SPAN=288;MEI_5P=1;MEI_3P=288;LR=chr22-18235412-INS->s898803>s907604>s907605>s907606>s898804-358;KNOWN_SRC=long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:4|SR_R:3|DPE_L:35|DPE_R:9|MEI_MAPPED:47|polyA_MAPPED:17|polyA_side:R;L1TXGOLDSCORE=1.000;L1TXRANKPCT=98;INSERTIONSCORE=0.378;PEAKDEPTHZ=0.0804;SPLITCLUSTERZ=4.03;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	17577694	L1TX-chr22-17577694-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=17577694;WINDOWSTART=17577685;WINDOWEND=17577704;MEIFAMILY=ALU;MEISUBFAMILY=AluSc5#SINE/Alu;TSD=ATTCTCCTGCCTCAGCCTCC;POLYA_MIN_BP=94;ORIENT=-;NESTED=nested;MEI_SPAN=266;MEI_5P=10;MEI_3P=275;SAMPLE_STATUS=shared;SUPPORT=SR_L:0|SR_R:0|DPE_L:39|DPE_R:23|MEI_MAPPED:37|polyA_MAPPED:10|polyA_side:R;L1TXGOLDSCORE=0.9970;L1TXRANKPCT=90;INSERTIONSCORE=0.379;PEAKDEPTHZ=-0.00109;SPLITCLUSTERZ=2.03;CALLTIER=none;KNOWNMEI=False	GT:GQ	./.:.
+chr22	17653864	L1TX-chr22-17653864-SVA	N	<INS:ME:SVA>	.	PASS	SVTYPE=INS;END=17653864;WINDOWSTART=17653857;WINDOWEND=17653870;MEIFAMILY=SVA;MEISUBFAMILY=SVA_F#Retroposon/SVA;TSD=AAAAATTGTTTATC;POLYA_MIN_BP=71;ORIENT=+;NESTED=unnested;MEI_SPAN=693;MEI_5P=670;MEI_3P=1362;G1K=nssv14065494;LR=chr22-18321622-INS->s898844<s916635<s916634<s916633<s916632<s916631>s898845-1712;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:0|SR_R:6|DPE_L:11|DPE_R:18|MEI_MAPPED:35|polyA_MAPPED:12|VNTR_MAPPED:0|polyA_side:L;L1TXGOLDSCORE=0.9994;L1TXRANKPCT=91;INSERTIONSCORE=0.584;PEAKDEPTHZ=-0.0337;SPLITCLUSTERZ=5.3;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	19919244	L1TX-chr22-19919244-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=19919244;WINDOWSTART=19919236;WINDOWEND=19919251;MEIFAMILY=ALU;MEISUBFAMILY=AluSp#SINE/Alu;TSD=CCCAGGCTGGAGTGCA;POLYA_MIN_BP=69;ORIENT=-;NESTED=nested;MEI_SPAN=282;MEI_5P=1;MEI_3P=282;G1K=nssv14053291;KNOWN_SRC=melt_1kg;SAMPLE_STATUS=shared;SUPPORT=SR_L:0|SR_R:6|DPE_L:25|DPE_R:44|MEI_MAPPED:68|polyA_MAPPED:8|polyA_side:L;L1TXGOLDSCORE=1.000;L1TXRANKPCT=97;INSERTIONSCORE=0.422;PEAKDEPTHZ=0.0397;SPLITCLUSTERZ=11.7;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	20075438	L1TX-chr22-20075438-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=20075438;WINDOWSTART=20075432;WINDOWEND=20075444;MEIFAMILY=ALU;MEISUBFAMILY=AluYk12#SINE/Alu;POLYA_MIN_BP=109;ORIENT=-;NESTED=unnested;MEI_SPAN=281;MEI_5P=1;MEI_3P=281;SAMPLE_STATUS=shared;SUPPORT=SR_L:4|SR_R:14|DPE_L:3|DPE_R:99|MEI_MAPPED:93|polyA_MAPPED:52|polyA_side:R;L1TXGOLDSCORE=0.9999;L1TXRANKPCT=94;INSERTIONSCORE=0.459;PEAKDEPTHZ=0.602;SPLITCLUSTERZ=10.8;CALLTIER=none;KNOWNMEI=False	GT:GQ	./.:.
+chr22	22131981	L1TX-chr22-22131981-LINE1	N	<INS:ME:LINE1>	.	PASS	SVTYPE=INS;END=22131981;WINDOWSTART=22131976;WINDOWEND=22131986;MEIFAMILY=LINE1;MEISUBFAMILY=L1HS_5end#LINE/L1;TSD=GCATATTTCTT;POLYA_MIN_BP=82;ORIENT=-;NESTED=unnested;MEI_SPAN=6015;MEI_5P=4;MEI_3P=6018;G1K=nssv14066334;KNOWN_SRC=melt_1kg;SAMPLE_STATUS=shared;SUPPORT=SR_L:4|SR_R:0|DPE_L:15|DPE_R:19|MEI_MAPPED:38|polyA_MAPPED:10|polyA_side:R;L1TXGOLDSCORE=1.000;L1TXRANKPCT=99;INSERTIONSCORE=0.557;PEAKDEPTHZ=-0.0255;SPLITCLUSTERZ=6.35;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	23928268	L1TX-chr22-23928268-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=23928268;WINDOWSTART=23928262;WINDOWEND=23928275;MEIFAMILY=ALU;MEISUBFAMILY=AluYb8#SINE/Alu;TSD=AAGAGATGGACTGA;POLYA_MIN_BP=79;ORIENT=+;NESTED=unnested;MEI_SPAN=288;MEI_5P=1;MEI_3P=288;G1K=nssv14081199;LR=chr22-24372840-INS->s900600>s911750>s911751>s911752>s900601-338;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:0|SR_R:10|DPE_L:13|DPE_R:19|MEI_MAPPED:38|polyA_MAPPED:7|polyA_side:L;L1TXGOLDSCORE=1.000;L1TXRANKPCT=98;INSERTIONSCORE=0.618;PEAKDEPTHZ=-0.00109;SPLITCLUSTERZ=9.37;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	26557759	L1TX-chr22-26557759-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=26557759;WINDOWSTART=26557752;WINDOWEND=26557766;MEIFAMILY=ALU;MEISUBFAMILY=AluSx4#SINE/Alu;TSD=AGAAGAGAGATGGGG;POLYA_MIN_BP=100;ORIENT=+;NESTED=unnested;MEI_SPAN=69;MEI_5P=2;MEI_3P=70;LR=chr22-27020130-INS->s900992>s907497>s900993-322;KNOWN_SRC=long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:2|SR_R:8|DPE_L:11|DPE_R:23|MEI_MAPPED:43|polyA_MAPPED:8|polyA_side:L;L1TXGOLDSCORE=0.9999;L1TXRANKPCT=95;INSERTIONSCORE=0.447;PEAKDEPTHZ=0.0234;SPLITCLUSTERZ=8.53;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	27154836	L1TX-chr22-27154836-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=27154836;WINDOWSTART=27154829;WINDOWEND=27154842;MEIFAMILY=ALU;MEISUBFAMILY=AluYb8#SINE/Alu;TSD=AAGAATAGACACGT;POLYA_MIN_BP=82;ORIENT=+;NESTED=unnested;MEI_SPAN=288;MEI_5P=1;MEI_3P=288;G1K=nssv14073646;LR=chr22-27615738-INS->s901049<s911832<s911831<s911830>s901050-326;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:0|SR_R:5|DPE_L:27|DPE_R:22|MEI_MAPPED:53|polyA_MAPPED:9|polyA_side:L;L1TXGOLDSCORE=1.000;L1TXRANKPCT=96;INSERTIONSCORE=0.514;PEAKDEPTHZ=-0.0255;SPLITCLUSTERZ=4.77;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	28042280	L1TX-chr22-28042280-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=28042280;WINDOWSTART=28042272;WINDOWEND=28042288;MEIFAMILY=ALU;MEISUBFAMILY=AluY_short_#SINE/Alu;TSD=CATGCACACGTATTTTT;POLYA_MIN_BP=67;ORIENT=-;NESTED=unnested;MEI_SPAN=281;MEI_5P=1;MEI_3P=281;G1K=nssv14075695;LR=chr22-28503683-INS->s901149>s907506>s901150-322;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:6|SR_R:0|DPE_L:20|DPE_R:13|MEI_MAPPED:33|polyA_MAPPED:4;L1TXGOLDSCORE=0.9996;L1TXRANKPCT=92;INSERTIONSCORE=0.593;PEAKDEPTHZ=-0.0337;SPLITCLUSTERZ=2.63;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	28059921	L1TX-chr22-28059921-LINE1	N	<INS:ME:LINE1>	.	PASS	SVTYPE=INS;END=28059921;WINDOWSTART=28059914;WINDOWEND=28059928;MEIFAMILY=LINE1;MEISUBFAMILY=L1HS_5end#LINE/L1;TSD=TACCCATTTATTTTC;POLYA_MIN_BP=76;ORIENT=-;NESTED=nested;MEI_SPAN=6007;MEI_5P=12;MEI_3P=6018;LR=chr22-28521335-INS->s901150<s919771>s901151-6079;KNOWN_SRC=long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:4|SR_R:0|DPE_L:11|DPE_R:28|MEI_MAPPED:43|polyA_MAPPED:15|polyA_side:R;L1TXGOLDSCORE=1.000;L1TXRANKPCT=98;INSERTIONSCORE=0.599;PEAKDEPTHZ=-0.0337;SPLITCLUSTERZ=8.68;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	31355872	L1TX-chr22-31355872-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=31355872;WINDOWSTART=31355858;WINDOWEND=31355887;MEIFAMILY=ALU;MEISUBFAMILY=AluSx3#SINE/Alu;TSD=CCGCCTCGGCTTCCCAAAGTGCTGGGATTA;POLYA_MIN_BP=82;ORIENT=+;NESTED=unnested;MEI_SPAN=46;MEI_5P=58;MEI_3P=103;SAMPLE_STATUS=shared;SUPPORT=SR_L:8|SR_R:1|DPE_L:30|DPE_R:31|MEI_MAPPED:63|polyA_MAPPED:0;L1TXGOLDSCORE=0.9977;L1TXRANKPCT=90;INSERTIONSCORE=0.399;PEAKDEPTHZ=0.0478;SPLITCLUSTERZ=11.6;CALLTIER=none;KNOWNMEI=False	GT:GQ	./.:.
+chr22	35673763	L1TX-chr22-35673763-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=35673763;WINDOWSTART=35673757;WINDOWEND=35673769;MEIFAMILY=ALU;MEISUBFAMILY=AluYa5#SINE/Alu;TSD=AAAAAGGGGAGGC;POLYA_MIN_BP=49;ORIENT=+;NESTED=unnested;MEI_SPAN=281;MEI_5P=1;MEI_3P=281;G1K=nssv14074982;LR=chr22-36133492-INS->s902223>s916221>s916222>s916223>s902224-332;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:1|SR_R:7|DPE_L:18|DPE_R:9|MEI_MAPPED:28|polyA_MAPPED:6|polyA_side:L;L1TXGOLDSCORE=0.9989;L1TXRANKPCT=91;INSERTIONSCORE=0.646;PEAKDEPTHZ=-0.0337;SPLITCLUSTERZ=7.55;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	37529132	L1TX-chr22-37529132-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=37529132;WINDOWSTART=37529118;WINDOWEND=37529146;MEIFAMILY=ALU;MEISUBFAMILY=AluYb8#SINE/Alu;TSD=TTGCAGTGAGCCGAGATTGCGCCACTGCA;POLYA_MIN_BP=111;ORIENT=+;NESTED=nested;MEI_SPAN=266;MEI_5P=1;MEI_3P=266;SAMPLE_STATUS=shared;SUPPORT=SR_L:2|SR_R:4|DPE_L:42|DPE_R:14|MEI_MAPPED:42|polyA_MAPPED:15|polyA_side:R;L1TXGOLDSCORE=0.9994;L1TXRANKPCT=92;INSERTIONSCORE=0.57;PEAKDEPTHZ=-0.0255;SPLITCLUSTERZ=13.8;CALLTIER=none;KNOWNMEI=False	GT:GQ	./.:.
+chr22	41050312	L1TX-chr22-41050312-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=41050312;WINDOWSTART=41050276;WINDOWEND=41050348;MEIFAMILY=ALU;MEISUBFAMILY=AluSp#SINE/Alu;POLYA_MIN_BP=88;ORIENT=-;NESTED=nested;MEI_SPAN=278;MEI_5P=4;MEI_3P=281;SAMPLE_STATUS=shared;SUPPORT=SR_L:3|SR_R:1|DPE_L:29|DPE_R:37|MEI_MAPPED:62|polyA_MAPPED:21|polyA_side:R;L1TXGOLDSCORE=0.9997;L1TXRANKPCT=92;INSERTIONSCORE=0.411;PEAKDEPTHZ=0.121;SPLITCLUSTERZ=3.99;CALLTIER=none;KNOWNMEI=False	GT:GQ	./.:.
+chr22	41300515	L1TX-chr22-41300515-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=41300515;WINDOWSTART=41300511;WINDOWEND=41300519;MEIFAMILY=ALU;MEISUBFAMILY=AluSq2#SINE/Alu;TSD=GCCCAGGCT;POLYA_MIN_BP=65;ORIENT=-;NESTED=nested;MEI_SPAN=282;MEI_5P=1;MEI_3P=282;SAMPLE_STATUS=shared;SUPPORT=SR_L:1|SR_R:0|DPE_L:2|DPE_R:57|MEI_MAPPED:35|polyA_MAPPED:6|polyA_side:L;L1TXGOLDSCORE=0.9993;L1TXRANKPCT=91;INSERTIONSCORE=0.43;PEAKDEPTHZ=0.0234;SPLITCLUSTERZ=8.14;CALLTIER=none;KNOWNMEI=False	GT:GQ	./.:.
+chr22	41739555	L1TX-chr22-41739555-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=41739555;WINDOWSTART=41739549;WINDOWEND=41739561;MEIFAMILY=ALU;MEISUBFAMILY=AluYb8#SINE/Alu;TSD=AAAAATTGAAACA;POLYA_MIN_BP=100;ORIENT=+;NESTED=unnested;MEI_SPAN=288;MEI_5P=1;MEI_3P=288;G1K=nssv14070718;LR=chr22-42218501-INS->s903362>s913963>s913964>s913965>s903363-325;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:1|SR_R:4|DPE_L:13|DPE_R:21|MEI_MAPPED:35|polyA_MAPPED:9|polyA_side:L;L1TXGOLDSCORE=0.9999;L1TXRANKPCT=96;INSERTIONSCORE=0.343;PEAKDEPTHZ=0.0641;SPLITCLUSTERZ=4.0;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	46105398	L1TX-chr22-46105398-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=46105398;WINDOWSTART=46105391;WINDOWEND=46105406;MEIFAMILY=ALU;MEISUBFAMILY=AluYd8#SINE/Alu;TSD=AGTGTGTGCTTTTTCT;POLYA_MIN_BP=87;ORIENT=-;NESTED=unnested;MEI_SPAN=269;MEI_5P=1;MEI_3P=269;G1K=nssv14071372;LR=chr22-46590080-INS->s904510<s908699>s904511-316;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:15|SR_R:2|DPE_L:3|DPE_R:33|MEI_MAPPED:49|polyA_MAPPED:14|polyA_side:R;L1TXGOLDSCORE=1.000;L1TXRANKPCT=98;INSERTIONSCORE=0.549;PEAKDEPTHZ=0.154;SPLITCLUSTERZ=11.8;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	46843468	L1TX-chr22-46843468-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=46843468;WINDOWSTART=46843462;WINDOWEND=46843475;MEIFAMILY=ALU;MEISUBFAMILY=AluYb8#SINE/Alu;TSD=CATTCACTGTTATT;POLYA_MIN_BP=53;ORIENT=-;NESTED=unnested;MEI_SPAN=288;MEI_5P=1;MEI_3P=288;G1K=nssv14066827;LR=chr22-47331882-INS->s904797<s909378<s909377<s909376>s904798-324;KNOWN_SRC=melt_1kg|long_read_1kg_ont_vienna;SAMPLE_STATUS=shared;SUPPORT=SR_L:8|SR_R:1|DPE_L:13|DPE_R:13|MEI_MAPPED:30|polyA_MAPPED:11|polyA_side:R;L1TXGOLDSCORE=1.000;L1TXRANKPCT=99;INSERTIONSCORE=0.643;PEAKDEPTHZ=0.0478;SPLITCLUSTERZ=10.4;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	49029650	L1TX-chr22-49029650-SVA	N	<INS:ME:SVA>	.	PASS	SVTYPE=INS;END=49029650;WINDOWSTART=49029645;WINDOWEND=49029656;MEIFAMILY=SVA;MEISUBFAMILY=SVA_D#Retroposon/SVA;TSD=AAGAAAACTCCT;POLYA_MIN_BP=116;ORIENT=-;NESTED=unnested;MEI_SPAN=1366;MEI_5P=1;MEI_3P=1366;G1K=nssv14064350;KNOWN_SRC=melt_1kg;SAMPLE_STATUS=shared;SUPPORT=SR_L:0|SR_R:0|DPE_L:57|DPE_R:9|MEI_MAPPED:61|polyA_MAPPED:27|VNTR_MAPPED:0|polyA_side:L;L1TXGOLDSCORE=1.000;L1TXRANKPCT=99;INSERTIONSCORE=0.478;PEAKDEPTHZ=0.056;SPLITCLUSTERZ=13.3;CALLTIER=none;KNOWNMEI=True	GT:GQ	./.:.
+chr22	50495454	L1TX-chr22-50495454-ALU	N	<INS:ME:ALU>	.	PASS	SVTYPE=INS;END=50495454;WINDOWSTART=50495444;WINDOWEND=50495464;MEIFAMILY=ALU;MEISUBFAMILY=AluYa5#SINE/Alu;TSD=TCTCCTGCCTCACCCTCCCCA;POLYA_MIN_BP=94;ORIENT=-;NESTED=nested;MEI_SPAN=270;MEI_5P=12;MEI_3P=281;SAMPLE_STATUS=shared;SUPPORT=SR_L:3|SR_R:2|DPE_L:56|DPE_R:6|MEI_MAPPED:41|polyA_MAPPED:16|polyA_side:L;L1TXGOLDSCORE=0.9984;L1TXRANKPCT=90;INSERTIONSCORE=0.441;PEAKDEPTHZ=0.00706;SPLITCLUSTERZ=-0.228;CALLTIER=none;KNOWNMEI=False	GT:GQ	./.:.
+```
 
 ## Examples
+
+`docs/examples/HG03086_chr22_gold_review.vcf` is the raw gold-review output
+for this chromosome (410 calls).
+`docs/examples/HG03086_chr22_classifier_ge_0.997.vcf` keeps calls scored by a
+classifier trained on 1000 Genomes; that model is described in
+[pull request #69](https://github.com/L1-Therapeutics/retrotransposon-miner/pull/69).
 
 See [`docs/EXAMPLES.md`](docs/EXAMPLES.md) for additional annotated IGV review snapshots and read-architecture plots.
 
@@ -146,7 +140,28 @@ On the 30 chr22 GRCh38 calls in `tests/data/chr22_mei.vcf` (snpEff 5.4c, `GRCh38
 
 ## Getting Started on Amazon EC2 (Elastic Compute Cloud)
 
-For whole-genome runs, use at least `r6i.4xlarge`.
+### Whole-genome machine and disk
+
+One 30× short-read genome (disease and control pointed at the same alignment) fits on a **64 vCPU / 256 GiB** machine with a **200 GB gp3** root volume. The example used here is an on-demand `m7i.16xlarge` in `us-east-1`: 64 vCPU, 256 GiB, up to 20 Gbps to EBS. The volume is 200 GB, 16000 IOPS, and 1000 MB/s throughput (gp3's throughput cap; 1000 MB/s requires at least 4000 IOPS).
+
+```bash
+INSTANCE_TYPE=m7i.16xlarge \
+ROOT_VOLUME_GB=200 \
+ROOT_VOLUME_IOPS=16000 \
+ROOT_VOLUME_THROUGHPUT_MB=1000 \
+S3_BUCKET=s3://<your-bucket> \
+./scripts/ec2_jlab.sh bootstrap
+```
+
+Convert the CRAM to one coordinate-sorted BAM before the run (`samtools view -@ 24 -b -T ref.fa -o sample.bam sample.cram`, then `samtools index -@ 24`). Pass that BAM as both `--disease-bam` and `--control-bam`. Extract, mate fetch, peak-depth, and IGV then read it in place. IGV converts a path only when it ends in `.cram`. A 30× CRAM of about 15 GB becomes a BAM of about 40 GB. With the reference (~12 GB) and per-chromosome tables, 200 GB still has room to keep the CRAM until the BAM is indexed.
+
+Run a full genome with `--chr all --chr_concurrency 16`. `--chr all` expands to chrX, chrY, then chr1 through chr22, so chromosome X starts in the first 16 slots. Chromosome X is about the length of chromosome 8. Each chromosome is mostly one thread, so extra cores past the chromosome count do not shorten the longest chromosome. Sixteen leaves memory for the jobs and for caching the BAM; 24 is the chromosome count and the useful ceiling. A larger instance does not finish faster than chromosome 1.
+
+One 30× genome on this machine took **1 hour 45 minutes** after the BAM was indexed. Chromosome 2 was the longest chromosome and set that time. The 24-thread CRAM-to-BAM conversion took 4 minutes, so the job from the start of conversion was **1 hour 49 minutes**.
+
+A 64-vCPU on-demand instance uses the whole default standard-family vCPU quota (64) on a new account. Stop other A/C/D/H/I/M/R/T/Z instances before launch.
+
+A disease and normal pair (two different alignments) wants the same 64 vCPU / 256 GiB shape and a **300 GB** gp3 volume at the same 16000 IOPS and 1000 MB/s. Budget two ~40 GB BAMs plus the reference and two evidence tables. Use `--chr_concurrency 12` so both BAMs can stay cached next to the chromosome jobs.
 
 The EC2 helper script (`scripts/ec2_jlab.sh`) works with **any existing EC2 instance** in your AWS account. Instance IDs and names are **not hardcoded in the repository**; each user binds their own instance locally to `.ec2-instance.env` (gitignored).
 
@@ -181,8 +196,11 @@ After the instance is running:
 
 Use `bootstrap` only when you want the script to provision a new instance (key pair, security group, Elastic IP, JupyterLab). On a shared AWS account, each IAM user gets their own key pair (`retrotransposon-miner-<region>-<iam-user>`). If `~/.ssh/id_ed25519.pub` or `id_rsa.pub` exists, that public key is imported — bootstrap does not reuse another user’s PEM.
 
+`bootstrap` launches an **on-demand** `m7i.4xlarge` by default (16 vCPU / 64 GiB). A full genome uses `INSTANCE_TYPE=m7i.16xlarge` with the disk settings in the section above. `SPOT=1` switches to cheaper Spot (one-time, stop-on-interruption: reclaim keeps the EBS disk and does not start the instance again). Bring it back with `start-instance`. Launch does **not** pin an AZ; AWS places the instance in a default-VPC zone that has capacity. `SUBNET_ID` pins a subnet (and therefore an AZ). `start-instance` cannot change AZ; if start fails for capacity, retry later or `bootstrap` a new VM.
+
 ```bash
 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap
+SPOT=1 S3_BUCKET=s3://<your-bucket> ./scripts/ec2_jlab.sh bootstrap   # cheaper Spot
 ```
 
 That uses your **local** AWS CLI profile only on your laptop, to:
@@ -225,7 +243,9 @@ Optional environment variables:
 - `SSH_USER` — SSH login user (auto-detected from AMI if unset; e.g. `ec2-user`, `ubuntu`)
 - `KEY_PATH` — path to the private key for the instance (PEM or `~/.ssh/id_ed25519`)
 - `KEY_NAME` / `KEY_OWNER` — override the per-user EC2 key pair name (default: `retrotransposon-miner-<region>-<iam-user>`)
-- `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `r6i.4xlarge`)
+- `INSTANCE_TYPE` — instance type for `bootstrap` only (default: `m7i.4xlarge`)
+- `SPOT` — `0` (default) launches on-demand; `1` launches a Spot instance (`bootstrap` only)
+- `SUBNET_ID` — pin `bootstrap` to one subnet/AZ. Default: omit subnet so AWS chooses an AZ with capacity.
 - `ROOT_VOLUME_GB` — root EBS size for `bootstrap` only (default: `200`)
 - `ROOT_VOLUME_IOPS` / `ROOT_VOLUME_THROUGHPUT_MB` — gp3 IOPS and MB/s for `bootstrap` only (default: `4000` / `1000`). AWS requires throughput ≤ 0.25 × IOPS; 1000 MB/s needs at least 4000 IOPS. The gp3 baseline (3000 / 125) is the usual WGS stage bottleneck.
 - `S3_BUCKET` — bucket the instance may read/write (example: `s3://<your-bucket>`); creates/reuses an instance profile, does not copy local keys
@@ -275,7 +295,7 @@ Additional permissions for `bootstrap` (new instance provisioning):
 - Starts, stops, and reboots the bound instance without creating new ones.
 - Writes SSH aliases (`retro-ec2`, `jlab`) into local `~/.ssh/config`.
 - Refreshes SSH security group ingress for your current public IP on connect.
-- Optionally creates a new instance (`bootstrap`), a **per-IAM-user** key pair (or imports your laptop `id_ed25519.pub`), security group, and Elastic IP. Does not reuse another user's PEM.
+- Optionally creates a new instance (`bootstrap`), a **per-IAM-user** key pair (or imports your laptop `id_ed25519.pub`), security group, and Elastic IP. New instances are **on-demand** by default (`SPOT=1` for cheaper Spot). Does not reuse another user's PEM.
 - `install-my-key` pushes your laptop public key via EC2 Instance Connect and appends it to `authorized_keys`.
 - Optionally attaches an IAM instance profile for a user-specified `S3_BUCKET` and caches public data under `s3://<bucket>/public`.
 - Starts JupyterLab remotely and tunnels it locally.
@@ -375,6 +395,74 @@ python scripts/plot_locus_read_architecture.py \
   --all-gold \
   --out-dir "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/read_architecture"
 ```
+
+### Export to VCF
+
+Convert the annotated candidate-loci table into standard VCF v4.3 so the
+callset can be fed to downstream tools (`bcftools`, IGV, annotation
+pipelines):
+
+```bash
+python -m retro_miner.cli export-vcf \
+  --in-tsv "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/candidate_loci.mei.tsv" \
+  --out-vcf "${RTM_RESULTS_DIR:-$HOME/retrotransposon-workdir/results}/quickstart_seqc2_chr22/candidate_loci.mei.vcf" \
+  --sample-name seqc2_tumor_normal
+```
+
+The same command accepts a genome-wide gold review table. A classifier-ranked
+table has no breakpoint column (`mei_family` is `Alu`/`L1`/`SVA`, and
+`gold_score` is the classifier probability). Join it to the gold table and
+keep a score cutoff:
+
+```bash
+python -m retro_miner.cli export-vcf \
+  --in-tsv hg03086_gold_by_classifier_score.tsv \
+  --breakpoint-tsv candidate_loci.mei.gold_review.tsv \
+  --min-score 0.997 \
+  --out-vcf HG03086.classifier_ge_0.997.vcf
+```
+
+`L1TXGOLDSCORE` is the classifier probability at 4 significant figures.
+`L1TXRANKPCT` is the percentile of `classifier_rank` (100 is best, nearest
+integer). `L1TXGOLDRANKPCT` is written only when the table has no classifier
+rank. `--chr all` writes `candidate_loci.mei.gold_review.vcf` after the genome
+gold table is aggregated. `##reference` is the run's `--reference-build`
+value, read from `pipeline_params.env`, and `##assembly` names that build
+once (for example `GRCh38`). Contig lines stay `##contig=<ID=chr1>`. A
+classifier export inherits that header from the `--breakpoint-tsv` gold
+table when the classifier file is outside the run directory. The VCF ID is
+`L1TX-<chrom>-<pos>-<family>`. Overlapping catalog accessions are
+`G1K` (the 1000 Genomes MELT id, which is the dbVar nssv accession) and
+`LR` instead of the ID column. When disease and control support are the
+same string, the VCF writes `SUPPORT` and omits the duplicate disease
+field. Distinct disease and control samples keep `CTRL_SUPPORT` and
+`DISEASE_SUPPORT`. `SVLEN` is
+left unset so Ensembl VEP does not treat the insertion as a reference span;
+the element length stays in `MEI_SPAN`, and `END` equals `POS`.
+
+All 21 chromosome 22 classifier calls are listed under Example Variant Calls. The header and both chromosome 22 files are linked from Examples.
+
+Records are coordinate-sorted, so the output can be compressed and indexed
+directly:
+
+```bash
+bgzip -c candidate_loci.mei.vcf > candidate_loci.mei.vcf.gz
+bcftools index candidate_loci.mei.vcf.gz
+bcftools view -r chr22:19000000-32000000 candidate_loci.mei.vcf.gz
+```
+
+Insertions are emitted as symbolic ALT alleles (`<INS:ME:ALU>`,
+`<INS:ME:LINE1>`, `<INS:ME:SVA>`), following the 1000 Genomes MEI VCF
+convention; `REF` is `N` because `POS` marks the insertion breakpoint
+rather than a called reference base. MEI family/subfamily, TSD sequence,
+poly-A tail length, orientation, nesting status, full-length MEI
+span/coordinates, known-polymorphism cross-references, and the raw
+per-cohort supporting-read evidence strings are carried in `INFO`.
+
+**Genotype fields are intentionally left blank** (`GT=./.`, `GQ=.`). This
+table reports pooled disease-vs-control read support across a cohort
+comparison, not per-individual diploid genotypes, so there is no genotype
+to estimate. See "Current Limitations" below.
 
 HG0001-style germline/control chr22 quickstart (replace with your BAM path):
 

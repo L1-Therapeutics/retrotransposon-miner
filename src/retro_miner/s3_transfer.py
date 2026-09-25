@@ -1,6 +1,6 @@
 """High-concurrency S3 multipart copies (process-local AWS config).
 
-AWS CLI defaults (~10 × 8 MiB) cap an r6i.4xlarge near ~75 MiB/s. This helper
+AWS CLI defaults (~10 × 8 MiB) cap an m7i.8xlarge near ~75 MiB/s. This helper
 uses 64 concurrent 64 MiB parts instead. Override concurrency with
 ``RTM_S3_MAX_CONCURRENCY``. ``max_bandwidth`` is never set.
 """

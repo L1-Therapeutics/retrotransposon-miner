@@ -1,0 +1,30 @@
+---
+description: Features developed on sentinel examples must be tested with real locus fixtures, not cartoon read piles
+alwaysApply: true
+---
+
+# Sentinel-developed features use real-locus tests
+
+When a feature or filter is designed from named sentinels (gold-review ranks,
+nssv/catalog IDs, IGV loci, chr22/1KG overlap sites), tests for that feature
+must load `tests/fixtures/loci/<id>/`. Replace cartoon tests with those
+fixtures. Do not keep a parallel hand-built DataFrame of clips and DPE.
+
+This applies while writing the feature (`src/`, scripts) and the tests, not
+only when a test file is already open.
+
+## Required
+
+- Extract with `scripts/extract_locus_fixture.py` (BAM snippet + extract tables).
+- Run the real function on those tables (`_assign_gold_stage`, picker, etc.).
+- Assert the catalog breakpoint or the keep/drop the sentinel was meant to show.
+- Assert the BAM still contains a read named in `supporting_reads_detail.mei.tsv`.
+- Replay the old bug on the fixture before calling the test done.
+
+## Do not
+
+- Invent 4 clips and 17 DPE for a named site or for a rule taken from one.
+- Treat “this is just a scoring rule” as permission to skip extraction.
+- Ship cartoon tests that pass while the real sentinel still fails.
+
+Follow `.cursor/skills/real-locus-test-fixtures/SKILL.md`.

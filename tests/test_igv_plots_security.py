@@ -23,12 +23,16 @@ from retro_miner._utils import safe_locus_id
 from retro_miner.igv_plots import (
     _build_assembly_contig_track,
     _igv_singleton_lock,
+    _local_genome_from_batch,
     _materialize_alignment_for_igv,
+    _pin_igv_default_genome,
     _quote_igv_path,
+    _row_inferred_breakpoint_pos,
     _safe_snapshot_stem,
     _snapshot_png_looks_empty,
     _validate_igv_chrom,
     _verify_snapshot_pngs,
+    _write_inferred_breakpoint_bed,
     build_igv_batch_script,
 )
 
@@ -675,11 +679,12 @@ class TestIgvBatchPathQuoting:
                 _make_batch_variants("chr1"), **batch_setup
             )
 
-    def test_genome_line_is_quoted(self, batch_setup):
-        """The 'genome' batch command wraps the reference FASTA path in double quotes."""
+    def test_genome_line_is_unquoted_local_path(self, batch_setup):
+        """The genome command is an unquoted local FASTA path and is the first line."""
         batch = self._call(batch_setup)
         ref = str(batch_setup["reference_fasta"].resolve())
-        assert f'genome "{ref}"' in batch
+        assert batch.splitlines()[0] == f"genome {ref}"
+        assert "new" not in batch.splitlines()
 
     def test_snapshotdirectory_line_is_quoted(self, batch_setup):
         """The 'snapshotDirectory' batch command wraps the directory path in double quotes."""
@@ -693,8 +698,8 @@ class TestIgvBatchPathQuoting:
         disease_bam = str(batch_setup["disease_bam"].resolve())
         assert f'load "{disease_bam}"' in batch
 
-    def test_space_in_genome_path_survives_untruncated(self, tmp_path):
-        """A genome path containing spaces is quoted and the full path appears in the batch."""
+    def test_space_in_genome_path_is_rejected(self, tmp_path):
+        """A genome path containing spaces is rejected because IGV will not load a quoted genome path."""
         space_dir = tmp_path / "ref dir with spaces"
         space_dir.mkdir()
         ref = space_dir / "ref genome.fa"
@@ -714,9 +719,8 @@ class TestIgvBatchPathQuoting:
             "snapshot_dir": snap,
         }
         with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
-            batch = build_igv_batch_script(_make_batch_variants("chr1"), **setup)
-        ref_str = str(ref.resolve())
-        assert f'genome "{ref_str}"' in batch
+            with pytest.raises(ValueError, match="whitespace"):
+                build_igv_batch_script(_make_batch_variants("chr1"), **setup)
 
     def test_path_with_double_quote_raises_value_error(self):
         """A path containing a double-quote character is rejected with ValueError."""
@@ -827,3 +831,94 @@ class TestIgvCramMaterialize:
         with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
             batch = build_igv_batch_script(_make_batch_variants("chr22"), **batch_setup)
         assert "setSleepInterval 2" in batch
+
+
+class TestInferredBreakpointBed:
+    def test_prefers_consensus_breakpoint(self):
+        row = pd.DataFrame(
+            [
+                {
+                    "chrom": "chr22",
+                    "consensus_insertion_breakpoint_pos": 49879732,
+                    "insertion_breakpoint_pos": 49879574,
+                }
+            ]
+        ).iloc[0]
+        assert _row_inferred_breakpoint_pos(row) == 49879732
+
+    def test_writes_one_base_red_tick_and_batch_loads_it(self, batch_setup, tmp_path):
+        variants = pd.DataFrame(
+            [
+                {
+                    "chrom": "chr22",
+                    "window_start": 49878612,
+                    "window_end": 49880399,
+                    "discovery_window_start": 49878612,
+                    "discovery_window_end": 49880399,
+                    "insertion_breakpoint_pos": 49879732,
+                    "breakpoint_evidence_source": "polyA",
+                    "assembly_best_contig_id": "",
+                }
+            ]
+        )
+        bed = _write_inferred_breakpoint_bed(variants, tmp_path)
+        assert bed is not None
+        text = bed.read_text(encoding="utf-8")
+        assert text.startswith("chr22\t49879731\t49879732\t")
+        assert "220,20,60" in text
+        assert "polyA" in text
+        with patch("retro_miner.igv_plots._estimate_panel_height", return_value=250):
+            batch = build_igv_batch_script(variants, breakpoint_bed=bed, **batch_setup)
+        assert "inferred_breakpoints.bed" in batch
+
+    def test_skips_missing_breakpoint(self, tmp_path):
+        variants = pd.DataFrame(
+            [{"chrom": "chr22", "insertion_breakpoint_pos": 0, "assembly_best_contig_id": ""}]
+        )
+        assert _write_inferred_breakpoint_bed(variants, tmp_path) is None
+
+
+class TestIgvDefaultGenomePin:
+    """Startup must use the local FASTA, not the hosted hg38 genome and its RefSeq track."""
+
+    def test_pin_writes_local_fasta_and_keeps_other_prefs(self, tmp_path):
+        fasta = tmp_path / "Homo_sapiens_assembly38.fasta"
+        fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+        igv_dir = tmp_path / ".igv"
+        igv_dir.mkdir()
+        (igv_dir / "prefs.properties").write_text(
+            "DEFAULT_GENOME=hg38\nSAM.SHOW_SOFT_CLIPPED=true\n",
+            encoding="utf-8",
+        )
+        prefs = _pin_igv_default_genome(fasta, igv_dir=igv_dir)
+        text = prefs.read_text(encoding="utf-8")
+        assert f"DEFAULT_GENOME={fasta.resolve()}" in text
+        assert "DEFAULT_GENOME=hg38" not in text
+        assert "SAM.SHOW_SOFT_CLIPPED=true" in text
+        assert "hgdownload" not in text
+        assert "ncbiRefSeq" not in text
+
+    def test_pin_writes_both_igv_directories(self, tmp_path, monkeypatch):
+        fasta = tmp_path / "Homo_sapiens_assembly38.fasta"
+        fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+        legacy = tmp_path / ".igv"
+        legacy.mkdir()
+        (legacy / "prefs.properties").write_text("DEFAULT_GENOME=hg38\n", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        _pin_igv_default_genome(fasta)
+        for name in ("igv", ".igv"):
+            text = (tmp_path / name / "prefs.properties").read_text(encoding="utf-8")
+            assert f"DEFAULT_GENOME={fasta.resolve()}" in text
+            assert "DEFAULT_GENOME=hg38" not in text
+
+    def test_local_genome_from_batch_ignores_missing_files(self, tmp_path):
+        batch = tmp_path / "igv_batch.txt"
+        missing = tmp_path / "nope.fasta"
+        batch.write_text(f'genome "{missing}"\n', encoding="utf-8")
+        assert _local_genome_from_batch(batch) is None
+        fasta = tmp_path / "ref.fasta"
+        fasta.write_text(">chr1\nA\n", encoding="utf-8")
+        batch.write_text(f'new\ngenome "{fasta}"\n', encoding="utf-8")
+        assert _local_genome_from_batch(batch) == fasta
+        batch.write_text(f"genome {fasta}\n", encoding="utf-8")
+        assert _local_genome_from_batch(batch) == fasta

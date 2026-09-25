@@ -12,6 +12,9 @@ set -euo pipefail
 # Remote BAMs (s3:// or http(s)://) are staged locally for multi-chrom /
 # --chr all / --chr_concurrency>1 runs. Single-chrom keeps streaming.
 # --bam-stage-dir / RTM_BAM_STAGE_DIR, --no-bam-stage / RTM_BAM_STAGE=0.
+# After the run, gold calls plus IGV and read-architecture plots are copied to
+# s3://<RTM_S3_BUCKET>/results/<outdir>. That upload is on by default.
+# --no-s3-results turns it off. --s3-bucket overrides the bucket.
 
 RTM_WORKDIR="${RTM_WORKDIR:-${HOME}/retrotransposon-workdir}"
 RTM_PUBLIC_DATA_DIR="${RTM_PUBLIC_DATA_DIR:-${RTM_WORKDIR}/data/public}"
@@ -51,6 +54,10 @@ SKIP_COMPLETE_EXISTING="1"
 # or RTM_BAM_STAGE=0. Override dest: --bam-stage-dir / RTM_BAM_STAGE_DIR.
 BAM_STAGE_DIR="${RTM_BAM_STAGE_DIR:-}"
 BAM_STAGE_ENABLED="${RTM_BAM_STAGE:-1}"
+# Copy the genome gold table, IGV snapshots, and read-architecture plots to
+# the bucket that holds public data. On unless --no-s3-results / RTM_S3_RESULTS=0.
+S3_RESULTS_UPLOAD="${RTM_S3_RESULTS:-1}"
+S3_RESULTS_BUCKET="${RTM_S3_BUCKET:-${S3_BUCKET:-}}"
 WINDOW_SIZE="200"
 G1K_SPLIT_PADDING_BP="200"
 G1K_DPE_PADDING_MIN_BP="200"
@@ -60,11 +67,13 @@ EMPIRICAL_RANDOM_WINDOWS="1000"
 EMPIRICAL_RANDOM_SCOPE="chromosome"
 EMPIRICAL_RANDOM_SEED="13"
 EMPIRICAL_HIGHCONF_BED=""
-# Empirical BAM/context outlier gating is off by default (slow; little callset
-# impact). Pass --empirical-stage to enable.
+# Random-window empirical p-values stay off by default (slow; little callset
+# impact). Pass --empirical-stage to enable. The silver peak-depth z-score is
+# separate and runs whenever annotate has BAMs.
 EMPIRICAL_STAGE="0"
 LOCAL_ASSEMBLY="0"
 ANNOTATE_ONLY="0"
+ALLOW_MISSING_INTERCHROM_MATES="${ALLOW_MISSING_INTERCHROM_MATES:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_IN_ENV="${RUN_IN_ENV:-0}" # set RUN_IN_ENV=1 to use `micromamba run -n rtm-miner ...`
 
@@ -121,12 +130,15 @@ resolve_chr_list() {
   local chr_arg_lower
   chr_arg_lower="$(printf '%s' "${chr_arg}" | tr '[:upper:]' '[:lower:]')"
   if [[ "${chr_arg_lower}" == "all" ]]; then
-    local i
-    for i in $(seq 22 -1 1); do
-      echo "chr${i}"
-    done
+    # chrX is about the length of chr8. Start sex chromosomes first so both
+    # occupy a slot in the first concurrency wave (16 on a full genome)
+    # instead of waiting until chr1–chr16 finish.
     echo "chrX"
     echo "chrY"
+    local i
+    for i in $(seq 1 22); do
+      echo "chr${i}"
+    done
     return 0
   fi
   IFS=',' read -r -a raw_tokens <<< "${chr_arg}"
@@ -141,6 +153,67 @@ resolve_chr_list() {
     echo "${norm}"
   done
 }
+
+# BEGIN drop_chry_when_female
+# chrX mapped-per-base / chr1 mapped-per-base from samtools idxstats.
+# Males are near 0.5 and females near 1. Unknown results keep chrY.
+drop_chry_when_female() {
+  local chr=""
+  local has_y=0
+  for chr in "${CHR_LIST[@]}"; do
+    if [[ "${chr}" == "chrY" ]]; then
+      has_y=1
+    fi
+  done
+  if [[ "${has_y}" -ne 1 ]]; then
+    return 0
+  fi
+  if is_remote_alignment "${DISEASE_BAM}"; then
+    echo "[candidate-pipeline] sex-check keeping chrY: disease BAM is remote"
+    return 0
+  fi
+  if [[ ! -f "${DISEASE_BAM}" ]]; then
+    echo "[candidate-pipeline] sex-check keeping chrY: disease BAM is not a local file"
+    return 0
+  fi
+  local stats_file=""
+  stats_file="$(mktemp)"
+  if ! samtools idxstats "${DISEASE_BAM}" > "${stats_file}"; then
+    echo "[candidate-pipeline] sex-check keeping chrY: idxstats failed"
+    rm -f "${stats_file}"
+    return 0
+  fi
+  local decision=""
+  if ! decision="$(run_python_module retro_miner.sample_sex "${stats_file}")"; then
+    echo "[candidate-pipeline] sex-check keeping chrY: sex classifier failed"
+    rm -f "${stats_file}"
+    return 0
+  fi
+  rm -f "${stats_file}"
+  local label="${decision%% *}"
+  local ratio="${decision#* }"
+  if [[ "${label}" == "female" ]]; then
+    local kept=()
+    for chr in "${CHR_LIST[@]}"; do
+      if [[ "${chr}" != "chrY" ]]; then
+        kept+=("${chr}")
+      fi
+    done
+    echo "[candidate-pipeline] sex-check chrX/chr1=${ratio} female; skipping chrY"
+    if [[ "${#kept[@]}" -eq 0 ]]; then
+      CHR_LIST=()
+    else
+      CHR_LIST=("${kept[@]}")
+    fi
+    return 0
+  fi
+  if [[ "${label}" == "male" ]]; then
+    echo "[candidate-pipeline] sex-check chrX/chr1=${ratio} male; keeping chrY"
+    return 0
+  fi
+  echo "[candidate-pipeline] sex-check keeping chrY: ${decision}"
+}
+# END drop_chry_when_female
 
 set_reference_build_defaults() {
   case "${REFERENCE_BUILD}" in
@@ -353,6 +426,14 @@ while [[ $# -gt 0 ]]; do
       ANNOTATE_ONLY="1"
       shift 1
       ;;
+    --allow-missing-interchrom-mates)
+      ALLOW_MISSING_INTERCHROM_MATES="1"
+      shift 1
+      ;;
+    --no-allow-missing-interchrom-mates)
+      ALLOW_MISSING_INTERCHROM_MATES="0"
+      shift 1
+      ;;
     --python-bin)
       PYTHON_BIN="$2"
       shift 2
@@ -373,6 +454,18 @@ while [[ $# -gt 0 ]]; do
       BAM_STAGE_ENABLED="1"
       shift 1
       ;;
+    --s3-results|--s3_results)
+      S3_RESULTS_UPLOAD="1"
+      shift 1
+      ;;
+    --no-s3-results|--no_s3_results)
+      S3_RESULTS_UPLOAD="0"
+      shift 1
+      ;;
+    --s3-bucket|--s3_bucket)
+      S3_RESULTS_BUCKET="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -387,6 +480,12 @@ fi
 if [[ -z "${OUTDIR}" ]]; then
   OUTDIR="${RTM_RESULTS_DIR}/mei_step1_${REFERENCE_BUILD}_chr22"
 fi
+mkdir -p "${OUTDIR}"
+{
+  printf 'reference_build=%s\n' "${REFERENCE_BUILD}"
+  printf 'reference_fasta=%s\n' "${REFERENCE_FASTA}"
+} > "${OUTDIR}/pipeline_params.env"
+echo "[candidate-pipeline] reference_build=${REFERENCE_BUILD} fasta=${REFERENCE_FASTA}"
 validate_reference_path_consistency "reference FASTA" "${REFERENCE_FASTA}"
 validate_reference_path_consistency "RepeatMasker table" "${RMSK_TABLE}"
 validate_reference_path_consistency "1000G/MELT VCF" "${G1K_MEI_VCF}"
@@ -522,6 +621,46 @@ require_alignment_readable() {
   fi
 }
 
+resolve_sliced_mate_bams() {
+  # Chr-sliced HG00100 BAM has no off-chr mate sequences. Use the WGS CRAM if
+  # it is already on disk (bam_stage or the S3 full/ cache). Fail otherwise so
+  # annotate cannot silently drop remote DPE support.
+  if [[ -z "${BAM_STAGE_DIR}" ]]; then
+    BAM_STAGE_DIR="${RTM_WORKDIR}/data/bam_stage"
+  fi
+  if [[ -n "${DISEASE_MATE_BAM}" ]]; then
+    if [[ -z "${CONTROL_MATE_BAM}" ]]; then
+      CONTROL_MATE_BAM="${DISEASE_MATE_BAM}"
+    fi
+    return 0
+  fi
+  local bn
+  bn="$(basename "${DISEASE_BAM}")"
+  if [[ "${bn}" != "hg00100.shortread.chr22.hg38.bam" ]]; then
+    return 0
+  fi
+  local cand
+  for cand in \
+    "${BAM_STAGE_DIR}/HG00100.final.cram" \
+    "${RTM_PUBLIC_DATA_DIR}/test_data/full/hg00100_shortread_highcov_cram/HG00100.final.cram"
+  do
+    if [[ -f "${cand}" ]]; then
+      DISEASE_MATE_BAM="${cand}"
+      CONTROL_MATE_BAM="${CONTROL_MATE_BAM:-${cand}}"
+      echo "[candidate-pipeline] inferred full-genome mate BAM ${cand} (sliced disease BAM ${bn})"
+      return 0
+    fi
+  done
+  if [[ "${ALLOW_MISSING_INTERCHROM_MATES}" == "1" ]]; then
+    echo "[candidate-pipeline] warning: no WGS mate BAM for ${bn}; interchrom mates will be empty" >&2
+    return 0
+  fi
+  echo "ERROR: ${bn} is a chromosome slice. Off-chromosome discordant mates are not in that BAM." >&2
+  echo "Download HG00100.final.cram to ${BAM_STAGE_DIR}/ (s3://l1tx-data/public/test_data/full/hg00100_shortread_highcov_cram/) and re-run, or pass --disease-mate-bam." >&2
+  echo "Override with --allow-missing-interchrom-mates only if that loss is intentional." >&2
+  exit 1
+}
+
 stage_remote_bams_if_needed() {
   local envf="${OUTDIR}/.rtm_bam_stage.env"
   local extra=()
@@ -564,79 +703,48 @@ consolidate_all_chrom_outputs() {
   shift
   local chr_list=("$@")
   local basename="candidate_loci.mei.gold_review.tsv"
-  local inputs=()
-  local chr=""
-  for chr in "${chr_list[@]}"; do
-    local p="${base_outdir}/${chr}/${basename}"
-    if [[ -f "${p}" ]]; then
-      inputs+=("${p}")
-    fi
-  done
-  if [[ "${#inputs[@]}" -eq 0 ]]; then
-    echo "[candidate-pipeline] no per-chrom gold review tables found to consolidate"
+  local out_path="${base_outdir}/${basename}"
+  # Every requested chromosome must have a finished annotation log and a
+  # gold-review table. A partial set is not aggregated. The genome file
+  # keeps analysis_stage_tier gold only.
+  run_python_module retro_miner.gold_review_merge \
+    --output "${out_path}" \
+    --base-outdir "${base_outdir}" \
+    "${chr_list[@]}"
+  echo "[candidate-pipeline] consolidated ${basename} -> ${out_path}"
+}
+
+s3_results_enabled() {
+  local raw
+  raw="$(printf '%s' "${S3_RESULTS_UPLOAD}" | tr '[:upper:]' '[:lower:]')"
+  case "${raw}" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+publish_results_to_s3() {
+  local base_outdir="$1"
+  if ! s3_results_enabled; then
+    echo "[candidate-pipeline] s3 results upload off"
     return 0
   fi
-  local out_path="${base_outdir}/${basename}"
-  local inputs_joined
-  inputs_joined="$(printf "%s\n" "${inputs[@]}")"
-  export RTM_MERGE_INPUTS="${inputs_joined}"
-  export RTM_MERGE_OUTPUT="${out_path}"
-  if [[ "${RUN_IN_ENV}" == "1" ]]; then
-    micromamba run -n rtm-miner env PYTHONPATH=src "${PYTHON_BIN}" - <<'PY'
-import os
-from pathlib import Path
-import pandas as pd
-from retro_miner.mei_support import _prioritize_mei_candidates
-
-inputs = [p for p in os.environ.get("RTM_MERGE_INPUTS", "").splitlines() if p.strip()]
-out_path = Path(os.environ["RTM_MERGE_OUTPUT"])
-if not inputs:
-    raise SystemExit(0)
-
-frames = [pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False) for p in inputs]
-merged = pd.concat(frames, ignore_index=True)
-for col in merged.columns:
-    # Allow prioritizer to perform numeric coercions while preserving empty-string semantics.
-    merged[col] = merged[col].where(merged[col] != "", other=pd.NA)
-
-sorted_out = _prioritize_mei_candidates(merged, stage_first=True)
-for col in sorted_out.columns:
-    if sorted_out[col].dtype == bool:
-        sorted_out[col] = sorted_out[col].astype(int)
-sorted_out = sorted_out.fillna("")
-out_path.parent.mkdir(parents=True, exist_ok=True)
-sorted_out.to_csv(out_path, sep="\t", index=False)
-PY
-  else
-    PYTHONPATH=src "${PYTHON_BIN}" - <<'PY'
-import os
-from pathlib import Path
-import pandas as pd
-from retro_miner.mei_support import _prioritize_mei_candidates
-
-inputs = [p for p in os.environ.get("RTM_MERGE_INPUTS", "").splitlines() if p.strip()]
-out_path = Path(os.environ["RTM_MERGE_OUTPUT"])
-if not inputs:
-    raise SystemExit(0)
-
-frames = [pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False) for p in inputs]
-merged = pd.concat(frames, ignore_index=True)
-for col in merged.columns:
-    # Allow prioritizer to perform numeric coercions while preserving empty-string semantics.
-    merged[col] = merged[col].where(merged[col] != "", other=pd.NA)
-
-sorted_out = _prioritize_mei_candidates(merged, stage_first=True)
-for col in sorted_out.columns:
-    if sorted_out[col].dtype == bool:
-        sorted_out[col] = sorted_out[col].astype(int)
-sorted_out = sorted_out.fillna("")
-out_path.parent.mkdir(parents=True, exist_ok=True)
-sorted_out.to_csv(out_path, sep="\t", index=False)
-PY
+  if [[ -z "${S3_RESULTS_BUCKET}" && -f "${HOME}/.config/rtm/s3.env" ]]; then
+    # shellcheck disable=SC1091
+    set -a
+    # shellcheck disable=SC1090
+    source "${HOME}/.config/rtm/s3.env"
+    set +a
+    S3_RESULTS_BUCKET="${RTM_S3_BUCKET:-${S3_BUCKET:-}}"
   fi
-  unset RTM_MERGE_INPUTS
-  unset RTM_MERGE_OUTPUT
-  echo "[candidate-pipeline] consolidated ${basename} -> ${out_path}"
+  if [[ -z "${S3_RESULTS_BUCKET}" ]]; then
+    echo "[candidate-pipeline] s3 results upload skipped: no bucket (set RTM_S3_BUCKET or pass --s3-bucket)"
+    return 0
+  fi
+  echo "[candidate-pipeline] uploading gold calls, IGV, and read-architecture plots from ${base_outdir}"
+  run_python_module retro_miner.publish_results \
+    --outdir "${base_outdir}" \
+    --bucket "${S3_RESULTS_BUCKET}"
 }
 
 run_annotate_mei_support() {
@@ -674,9 +782,14 @@ run_annotate_mei_support() {
   if [[ -n "${CONTROL_MATE_BAM}" ]]; then
     annotate_cmd+=(--control-mate-bam "${CONTROL_MATE_BAM}")
   fi
+  if [[ "${ALLOW_MISSING_INTERCHROM_MATES}" == "1" ]]; then
+    annotate_cmd+=(--allow-missing-interchrom-mates)
+  fi
   annotate_cmd+=(
     --empirical-exclude-merged-bed "${JUNK_MERGED_BED}"
     --empirical-exclude-segdup-bed "${SEG_DUP_BED}"
+    --segdup-bed "${SEG_DUP_BED}"
+    --segdup-min-fraction 0.1
     --empirical-exclude-mappability-bedgraph "${MAPPABILITY_LOW_BED}"
     --empirical-exclude-mappability-threshold 0.5
     --empirical-exclude-gap-bed "${GAP_BED}"
@@ -802,6 +915,8 @@ if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
   echo "ERROR: resolved empty chromosome list from --chr '${CHR_ARG}'." >&2
   exit 1
 fi
+# Kept across skip-complete so --chr all still merges chromosomes that were not rerun.
+REQUESTED_CHR_LIST=("${CHR_LIST[@]}")
 ORIG_CHR_COUNT="${#CHR_LIST[@]}"
 if [[ -n "${CHR_ARG}" ]] && [[ "$(printf '%s' "${CHR_ARG}" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
   CHR_ALL_MODE="1"
@@ -841,7 +956,14 @@ if [[ "${SKIP_COMPLETE_EXISTING}" == "1" ]] && [[ "${#CHR_LIST[@]}" -gt 1 ]]; th
   fi
   CHR_LIST=("${filtered_chr_list[@]}")
   if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
-    echo "[candidate-pipeline] all requested chromosomes already complete in outdir; nothing to run"
+    if [[ "${CHR_ALL_MODE}" == "1" ]]; then
+      echo "[candidate-pipeline] all requested chromosomes already complete; consolidating gold review"
+      consolidate_all_chrom_outputs "${OUTDIR}" "${REQUESTED_CHR_LIST[@]}"
+      echo "  consolidated gold review written to: ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
+    else
+      echo "[candidate-pipeline] all requested chromosomes already complete in outdir; nothing to run"
+    fi
+    publish_results_to_s3 "${OUTDIR}"
     exit 0
   fi
 fi
@@ -853,6 +975,12 @@ if [[ "${#CHR_LIST[@]}" -gt 1 ]] && [[ "${LOCAL_ASSEMBLY}" == "1" ]] && [[ "${CH
 fi
 
 stage_remote_bams_if_needed
+resolve_sliced_mate_bams
+drop_chry_when_female
+if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
+  echo "[candidate-pipeline] no chromosomes left to run"
+  exit 0
+fi
 
 if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   REGION="${CHR_LIST[0]}"
@@ -864,6 +992,7 @@ if [[ "${#CHR_LIST[@]}" -eq 1 ]]; then
   echo "  ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
   echo "  ${OUTDIR}/candidate_loci.mei.gold_review.igv/ (when reference + BAMs provided)"
   echo "  ${OUTDIR}/candidate_loci.mei.read_architecture/ (gold-tier read-architecture PNGs)"
+  publish_results_to_s3 "${OUTDIR}"
   exit 0
 fi
 
@@ -934,8 +1063,11 @@ done
 echo "[candidate-pipeline] done multi-chrom"
 echo "  per-chrom outputs under: ${BASE_OUTDIR}/chr*/"
 echo "  logs under: ${LOG_DIR}/"
+# Last step of --chr all, after every chromosome has finished and before any
+# later removal of staged CRAM/BAM files. Aggregation only reads the tables.
 if [[ "${CHR_ALL_MODE}" == "1" ]]; then
   echo "[candidate-pipeline] consolidating --chr all outputs into ${BASE_OUTDIR}"
-  consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${CHR_LIST[@]}"
+  consolidate_all_chrom_outputs "${BASE_OUTDIR}" "${REQUESTED_CHR_LIST[@]}"
   echo "  consolidated gold review written to: ${BASE_OUTDIR}/candidate_loci.mei.gold_review.tsv"
 fi
+publish_results_to_s3 "${BASE_OUTDIR}"

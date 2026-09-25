@@ -359,9 +359,10 @@ datasets:
 
   - id: hg00100_shortread_highcov_cram
     category: test_bam
-    description: 1000G HG00100 high-coverage Illumina CRAM sliced to chr22 during download
+    description: 1000G HG00100 high-coverage Illumina CRAM sliced to chr22 plus interchrom discordant mates
     source: 1000 Genomes (high coverage short-read)
     url: https://1000genomes.s3.amazonaws.com/1000G_2504_high_coverage/data/ERR3240117/HG00100.final.cram
     target_path: test_data/1kg_hg00100/chr22/hg00100.shortread.chr22.hg38.bam
     region: chr22
+    include_discordant_mates: true
     required: true

@@ -13,8 +13,12 @@ Example (HG00100 chr22 on the VM):
     --melt-vcf $DATA/polymorphism/hg38/1kg/ALL.wgs.mergedSV.v8.20130502.svs.genotypes.GRCh38.vcf.gz \\
     --ont-svim $DATA/polymorphism/hg38/long_read_1kg_ont_vienna/svim.asm.hg38.bcf \\
     --ont-svan $DATA/polymorphism/hg38/long_read_1kg_ont_vienna/svim.asm.hg38.noGt.SVAN_1.3.bcf \\
-    --exclude-bed $DATA/annotation/hg38/junk/junk_exclusion_merged.bed \\
     --outdir ~/retrotransposon-workdir/results/hg00100_germline_chr22/callset_eval
+
+Junk sites are dropped by default. The bed is
+$RTM_PUBLIC_DATA_DIR/annotation/hg38/junk/junk_exclusion_merged.bed
+(segdup, low mappability, gaps, ENCODE blacklist), the same mask the caller
+uses before silver. Pass --no-junk-filter to score the unfiltered catalogs.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from retro_miner.callset_eval import (
     catalog_overlap,
     filter_variants_to_regions,
     label_rtm_calls,
+    resolve_exclude_beds,
     load_melt_sample_meis,
     load_ont_sample_meis,
     load_rtm_calls,
@@ -87,15 +92,23 @@ def main() -> None:
     p.add_argument("--ont-svim", type=Path, required=True, help="SVIM-asm multi-sample BCF/VCF")
     p.add_argument("--ont-svan", type=Path, required=True, help="SVAN noGt annotation BCF for those IDs")
     p.add_argument("--outdir", type=Path, required=True)
-    p.add_argument("--pad-bp", type=int, default=200, help="Overlap pad around the RTM breakpoint")
+    p.add_argument("--pad-bp", type=int, default=300, help="Overlap pad around the RTM breakpoint")
     p.add_argument("--require-family", action="store_true", help="Require ALU/LINE1/SVA to match")
     p.add_argument("--min-ont-recall", type=float, default=0.80)
     p.add_argument(
         "--exclude-bed",
         type=Path,
         action="append",
-        default=[],
-        help="Exclude this uncallable/junk BED from RTM, MELT, and ONT (repeatable)",
+        default=None,
+        help=(
+            "Drop RTM, MELT, and ONT sites inside this BED (repeatable). "
+            "Default: junk_exclusion_merged.bed for hg38."
+        ),
+    )
+    p.add_argument(
+        "--no-junk-filter",
+        action="store_true",
+        help="Do not apply the default caller junk mask.",
     )
     p.add_argument(
         "--callable-bed",
@@ -123,10 +136,17 @@ def main() -> None:
     raw_ont_count = len(ont)
     print(f"[callset-eval] ont_insertions_raw={raw_ont_count}", flush=True)
 
-    if args.callable_bed or args.exclude_bed:
+    try:
+        exclude_beds = resolve_exclude_beds(
+            args.exclude_bed,
+            apply_default_junk=not args.no_junk_filter,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    if args.callable_bed or exclude_beds:
         region_args = {
             "include_beds": args.callable_bed,
-            "exclude_beds": args.exclude_bed,
+            "exclude_beds": exclude_beds,
         }
         filtered = filter_variants_to_regions(calls + melt + ont, **region_args)
         calls = [variant for variant in filtered if variant.source == "rtm"]
@@ -170,7 +190,7 @@ def main() -> None:
         "pad_bp": args.pad_bp,
         "require_family": args.require_family,
         "callable_beds": [str(path) for path in args.callable_bed],
-        "exclude_beds": [str(path) for path in args.exclude_bed],
+        "exclude_beds": [str(path) for path in exclude_beds],
         "raw_counts": {
             "rtm": raw_rtm_count,
             "melt_insertions": raw_melt_count,

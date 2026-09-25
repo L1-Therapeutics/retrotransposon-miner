@@ -1,0 +1,17 @@
+{
+  "catalog_id": "SvimAsm00156362",
+  "sample": "HG00100",
+  "chrom": "chr19",
+  "expected_breakpoint": 9066898,
+  "discovery_window_start": 9065898,
+  "discovery_window_end": 9067898,
+  "fetch_start": 9065098,
+  "fetch_end": 9068698,
+  "bam": "HG00100.chr19_9065098_9068698.bam",
+  "n_bam_reads": 914,
+  "source_results": "/home/ec2-user/retrotransposon-workdir/results/hg00100_germline_chr19_main_wgs_mates",
+  "source_cram": "/home/ec2-user/retrotransposon-workdir/data/bam_stage/HG00100.final.cram",
+  "plot_rank": 2,
+  "expect_gold": true,
+  "expect_complex_ins": false
+}

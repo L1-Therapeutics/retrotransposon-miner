@@ -537,7 +537,10 @@ def extract_split_evidence_cmd(
     type=float,
     default=0.1,
     show_default=True,
-    help="Minimum fraction of candidate window required for segdup overlap flag.",
+    help=(
+        "Minimum overlap fraction for mate-in-segdup flags during locus build. "
+        "Locus flag_segdup is applied later, on the inferred breakpoint window."
+    ),
 )
 @click.option(
     "--mappability-bedgraph",
@@ -701,6 +704,15 @@ def build_candidate_loci_cmd(
     help="Optional full-genome control BAM for discordant mate-seq fallback during annotation.",
 )
 @click.option(
+    "--allow-missing-interchrom-mates/--no-allow-missing-interchrom-mates",
+    default=False,
+    show_default=True,
+    help=(
+        "Do not fail when off-chromosome discordant mates still have empty mate_seq. "
+        "Default is to fail so a chr-sliced BAM cannot silently drop remote DPE support."
+    ),
+)
+@click.option(
     "--rmsk-table",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
@@ -790,6 +802,22 @@ def build_candidate_loci_cmd(
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
     help="Optional segdup BED to exclude from empirical random-window sampling.",
+)
+@click.option(
+    "--segdup-bed",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Optional BED for locus flag_segdup on the inferred breakpoint window. "
+        "Defaults to --empirical-exclude-segdup-bed when omitted."
+    ),
+)
+@click.option(
+    "--segdup-min-fraction",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help="Minimum fraction of the breakpoint window required for flag_segdup.",
 )
 @click.option(
     "--empirical-exclude-mappability-bedgraph",
@@ -991,6 +1019,7 @@ def annotate_mei_support_cmd(
     control_bam_depth: Path | None,
     disease_mate_bam: Path | None,
     control_mate_bam: Path | None,
+    allow_missing_interchrom_mates: bool,
     rmsk_table: Path | None,
     g1k_mei_vcf: Path | None,
     lr_mei_vcf: Path | None,
@@ -1005,6 +1034,8 @@ def annotate_mei_support_cmd(
     empirical_highconf_bed: Path | None,
     empirical_exclude_merged_bed: Path | None,
     empirical_exclude_segdup_bed: Path | None,
+    segdup_bed: Path | None,
+    segdup_min_fraction: float,
     empirical_exclude_mappability_bedgraph: Path | None,
     empirical_exclude_mappability_threshold: float,
     empirical_exclude_gap_bed: Path | None,
@@ -1072,6 +1103,8 @@ def annotate_mei_support_cmd(
         empirical_highconf_bed=empirical_highconf_bed,
         empirical_exclude_merged_bed=empirical_exclude_merged_bed,
         empirical_exclude_segdup_bed=empirical_exclude_segdup_bed,
+        segdup_bed=segdup_bed,
+        segdup_min_fraction=segdup_min_fraction,
         empirical_exclude_mappability_bedgraph=empirical_exclude_mappability_bedgraph,
         empirical_exclude_mappability_threshold=empirical_exclude_mappability_threshold,
         empirical_exclude_gap_bed=empirical_exclude_gap_bed,
@@ -1101,8 +1134,100 @@ def annotate_mei_support_cmd(
         mei_full_fasta=mei_full_fasta,
         reuse_mei_annotate_dir=reuse_mei_annotate_dir,
         bwa_threads=bwa_threads,
+        allow_missing_interchrom_mates=allow_missing_interchrom_mates,
     )
     click.echo(f"[mei-annotate] done {out_path} elapsed={time.monotonic() - t0:.1f}s")
+
+
+@cli.command("export-vcf")
+@click.option(
+    "--in-tsv",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help=(
+        "Gold review TSV (candidate_loci.mei.gold_review.tsv) or a "
+        "classifier-ranked TSV (hg*_gold_by_classifier_score.tsv)."
+    ),
+)
+@click.option(
+    "--out-vcf",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="Output VCF v4.3 path.",
+)
+@click.option(
+    "--breakpoint-tsv",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Genome-wide gold review TSV. Required when --in-tsv is a classifier "
+        "ranking, which has window coordinates but no insertion breakpoint. "
+        "Rows are joined on chrom, window_start, and window_end."
+    ),
+)
+@click.option(
+    "--min-score",
+    type=float,
+    default=None,
+    help="Keep rows whose --score-column is >= this value. Sets FILTER=PASS.",
+)
+@click.option(
+    "--score-column",
+    type=str,
+    default="gold_score",
+    show_default=True,
+    help="Column compared against --min-score. gold_score is the classifier probability.",
+)
+@click.option(
+    "--reference-build",
+    type=str,
+    default=None,
+    help=(
+        "Genome build passed to the pipeline as --reference-build (hg38, hg19, or hs1). "
+        "When omitted, export-vcf reads pipeline_params.env next to the input table."
+    ),
+)
+@click.option(
+    "--sample-name",
+    type=str,
+    default="SAMPLE",
+    show_default=True,
+    help=(
+        "Sample column name in the VCF header. If left as SAMPLE and the "
+        "table has a single sample column, that name is used. GT/GQ stay "
+        "missing either way."
+    ),
+)
+def export_vcf_cmd(
+    in_tsv: Path,
+    out_vcf: Path,
+    breakpoint_tsv: Path | None,
+    min_score: float | None,
+    score_column: str,
+    reference_build: str | None,
+    sample_name: str,
+) -> None:
+    """Convert a gold-review or classifier-ranked TSV to VCF v4.3.
+
+    Genotype (GT) and genotype quality (GQ) are always written as VCF
+    missing values (./. and .) -- see retro_miner.vcf_export module
+    docstring for why.
+    """
+    from retro_miner.vcf_export import export_vcf_from_tsv
+
+    try:
+        n = export_vcf_from_tsv(
+            in_tsv,
+            out_vcf,
+            sample_name=sample_name,
+            min_score=min_score,
+            score_column=score_column,
+            breakpoint_tsv=breakpoint_tsv,
+            reference_build=reference_build,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"[export-vcf] wrote {n} records to {out_vcf}")
 
 
 @cli.command("annotate-genes")

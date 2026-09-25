@@ -557,6 +557,49 @@ def _write_contig_annotation_bed(variants: pd.DataFrame, snapshot_dir: Path) -> 
     return bed_path
 
 
+def _row_inferred_breakpoint_pos(row: object) -> int:
+    """Published insertion base, preferring consensus over the raw picker field."""
+    for attr in ("consensus_insertion_breakpoint_pos", "insertion_breakpoint_pos"):
+        raw = getattr(row, attr, 0)
+        try:
+            pos = int(raw or 0)
+        except (TypeError, ValueError):
+            pos = 0
+        if pos > 0:
+            return pos
+    return 0
+
+
+def _write_inferred_breakpoint_bed(variants: pd.DataFrame, snapshot_dir: Path) -> Path | None:
+    """One-base BED ticks so IGV snapshots show the inferred insertion coordinate."""
+    rows: list[str] = []
+    for rank, row in enumerate(variants.itertuples(index=False), start=1):
+        chrom = str(getattr(row, "chrom", "") or "")
+        pos = _row_inferred_breakpoint_pos(row)
+        if not chrom or pos <= 0:
+            continue
+        try:
+            _validate_igv_chrom(chrom)
+        except ValueError:
+            continue
+        source = re.sub(
+            r"[\t\n\r]+",
+            "_",
+            str(getattr(row, "breakpoint_evidence_source", "") or "") or "inferred_breakpoint",
+        )
+        label = re.sub(r"[\t\n\r]+", "_", f"rank{rank:03d}|{source}|{pos}")
+        start0 = pos - 1
+        # BED9 so IGV paints a red tick instead of the default feature color.
+        rows.append(
+            f"{chrom}\t{start0}\t{pos}\t{label}\t1000\t.\t{start0}\t{pos}\t220,20,60"
+        )
+    if not rows:
+        return None
+    bed_path = snapshot_dir / "inferred_breakpoints.bed"
+    bed_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return bed_path
+
+
 def build_igv_batch_script(
     variants: pd.DataFrame,
     *,
@@ -566,6 +609,7 @@ def build_igv_batch_script(
     snapshot_dir: Path,
     contig_annotation_bed: Path | None = None,
     contig_alignment_bam: Path | None = None,
+    breakpoint_bed: Path | None = None,
     panel_height_min: int = 250,
     panel_height_max: int = 8000,
 ) -> str:
@@ -576,9 +620,17 @@ def build_igv_batch_script(
     if control_index is None:
         raise FileNotFoundError(f"Missing BAM index for control BAM: {control_bam}")
 
+    # The first line must be an unquoted ``genome <fasta>``. ``new`` loads the
+    # hosted hg38 JSON before any later command, and a quoted genome path is
+    # not recognized, so the BAM load then runs with no reference.
+    genome_path = str(reference_fasta.resolve())
+    if any(ch.isspace() for ch in genome_path):
+        raise ValueError(
+            "IGV's genome command requires an unquoted FASTA path, but this path contains whitespace: "
+            f"{genome_path}"
+        )
     lines: list[str] = [
-        "new",
-        f"genome {_quote_igv_path(reference_fasta.resolve())}",
+        f"genome {genome_path}",
         f"snapshotDirectory {_quote_igv_path(snapshot_dir.resolve())}",
         "preference SAM.SHOW_SOFT_CLIPPED true",
         "setSleepInterval 2",
@@ -593,6 +645,8 @@ def build_igv_batch_script(
             )
     if contig_annotation_bed is not None and contig_annotation_bed.exists():
         lines.append(f"load {_quote_igv_path(contig_annotation_bed.resolve())}")
+    if breakpoint_bed is not None and breakpoint_bed.exists():
+        lines.append(f"load {_quote_igv_path(breakpoint_bed.resolve())}")
 
     for rank, row in enumerate(variants.itertuples(index=False), start=1):
         chrom, start, end = _row_discovery_window(row)
@@ -641,6 +695,60 @@ def _wrap_headless_command(launcher: Path, batch_script: Path) -> list[str]:
     return base
 
 
+_IGV_GENOME_LINE = re.compile(r'^genome\s+(?:"([^"]+)"|(\S+))\s*$')
+
+
+def _local_genome_from_batch(batch_script: Path) -> Path | None:
+    """Return the FASTA path from a batch ``genome`` line, when it is a local file."""
+    try:
+        lines = Path(batch_script).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = _IGV_GENOME_LINE.match(line.strip())
+        if match is None:
+            continue
+        genome = Path(match.group(1) or match.group(2))
+        if genome.is_file():
+            return genome
+    return None
+
+
+def _igv_pref_roots(igv_dir: Path | None = None) -> list[Path]:
+    """Directories whose ``prefs.properties`` IGV may read at startup.
+
+    Current IGV uses ``~/igv`` whenever that directory exists, and falls back
+    to ``~/.igv`` only when ``~/igv`` is absent. Pinning only ``~/.igv`` leaves
+    a pre-existing ``~/igv`` on the hosted hg38 genome.
+    """
+    if igv_dir is not None:
+        return [Path(igv_dir)]
+    home = Path.home()
+    return [home / "igv", home / ".igv"]
+
+
+def _pin_igv_default_genome(reference_fasta: Path, igv_dir: Path | None = None) -> Path:
+    """Point IGV's startup genome at the local FASTA.
+
+    With no prefs file, IGV loads genome id ``hg38`` from the hosted igv-genomes
+    JSON, and that JSON pulls the UCSC RefSeq track. Snapshots already load the
+    local reference in the batch file; this keeps startup on that same file.
+    """
+    fasta = Path(reference_fasta).resolve()
+    written: list[Path] = []
+    for root in _igv_pref_roots(igv_dir):
+        root.mkdir(parents=True, exist_ok=True)
+        prefs_path = root / "prefs.properties"
+        existing = prefs_path.read_text(encoding="utf-8") if prefs_path.exists() else ""
+        kept = [line for line in existing.splitlines() if line and not line.startswith("DEFAULT_GENOME=")]
+        prefs_path.write_text(
+            "\n".join([f"DEFAULT_GENOME={fasta}", *kept]) + "\n",
+            encoding="utf-8",
+        )
+        written.append(prefs_path)
+    return written[0]
+
+
 def _verify_snapshot_pngs(index_rows: list[dict[str, object]]) -> int:
     paths = [Path(str(row["snapshot_png"])) for row in index_rows if row.get("snapshot_png")]
     created = sum(1 for path in paths if path.exists() and path.stat().st_size > 0)
@@ -666,6 +774,10 @@ def run_igv_batch(
     bind_retry_sleep_sec: float = 2.0,
 ) -> None:
     igv = resolve_igv_launcher(launcher)
+    local_genome = _local_genome_from_batch(batch_script_path)
+    if local_genome is not None:
+        _pin_igv_default_genome(local_genome)
+        click.echo(f"[igv-plots] pinned default genome to local FASTA {local_genome}")
     cmd = _wrap_headless_command(igv, batch_script_path)
     if _needs_virtual_display() and not shutil.which("xvfb-run"):
         if _find_xvfb_binary() is None:
@@ -744,6 +856,7 @@ def generate_gold_review_igv_plots(
             reference_fasta,
         )
     contig_annotation_bed = _write_contig_annotation_bed(variants, snapshot_dir)
+    breakpoint_bed = _write_inferred_breakpoint_bed(variants, snapshot_dir)
     contig_alignment_bam: Path | None = None
     if assembly_cache_dir is not None and assembly_cache_dir.exists():
         contig_alignment_bam = _build_assembly_contig_track(
@@ -761,6 +874,7 @@ def generate_gold_review_igv_plots(
         snapshot_dir=snapshot_dir,
         contig_annotation_bed=contig_annotation_bed,
         contig_alignment_bam=contig_alignment_bam,
+        breakpoint_bed=breakpoint_bed,
         panel_height_min=panel_height_min,
         panel_height_max=panel_height_max,
     )

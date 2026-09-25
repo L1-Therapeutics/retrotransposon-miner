@@ -1,0 +1,19 @@
+{
+  "catalog_id": "rank010_chr19_3989864",
+  "sample": "HG00100",
+  "chrom": "chr19",
+  "expected_breakpoint": 3989878,
+  "discovery_window_start": 3988513,
+  "discovery_window_end": 3990244,
+  "fetch_start": 3987713,
+  "fetch_end": 3991044,
+  "bam": "HG00100.chr19_3987713_3991044.bam",
+  "n_bam_reads": 944,
+  "source_results": "/home/ec2-user/retrotransposon-workdir/results/hg00100_germline_chr19_main_wgs_mates",
+  "source_cram": "/home/ec2-user/retrotransposon-workdir/data/bam_stage/HG00100.final.cram",
+  "plot_rank": 10,
+  "family": "ALU",
+  "old_span": 5520,
+  "old_5p": 1,
+  "old_3p": 5520
+}
