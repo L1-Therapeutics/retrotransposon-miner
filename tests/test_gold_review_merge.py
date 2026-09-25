@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,10 @@ from retro_miner.gold_review_merge import (
     merge_gold_review_tables,
     write_merged_gold_review,
 )
+
+# Real HG03086 gold-review rows (ALU / LINE1 / SVA) for VCF + reference checks.
+_VCF_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "vcf"
+_GOLD_SLICE = _VCF_FIXTURE_DIR / "hg03086_gold_slice.tsv"
 
 
 def _row(
@@ -89,3 +94,33 @@ def test_write_merged_gold_review_reads_per_chrom_tables(tmp_path: Path) -> None
     assert n_rows == 2
     written = pd.read_csv(out, sep="\t")
     assert written["chrom"].tolist() == ["chr22", "chr1"]
+
+
+def test_aggregated_gold_table_writes_vcf_from_pipeline_params(tmp_path: Path) -> None:
+    """Aggregate a few real HG03086 gold rows and emit a ##reference VCF."""
+    rows = list(csv.DictReader(_GOLD_SLICE.open(), delimiter="\t"))
+    # Fixture order: Alu + L1 + SVA (high score) then a low-score L1; keep the first three.
+    selected = rows[:3]
+    assert [r["consensus_mei_family"] for r in selected] == ["ALU", "LINE1", "SVA"]
+    fieldnames = list(rows[0].keys())
+    inputs: list[Path] = []
+    for row in selected:
+        path = tmp_path / f"{row['chrom']}_{row['consensus_insertion_breakpoint_pos']}.tsv"
+        with path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            writer.writerow(row)
+        inputs.append(path)
+    (tmp_path / "pipeline_params.env").write_text(
+        "reference_build=hg38\nreference_fasta=/data/reference/hg38/Homo_sapiens_assembly38.fasta\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "candidate_loci.mei.gold_review.tsv"
+    assert main(["--output", str(out), *(str(p) for p in inputs)]) == 0
+    text = out.with_suffix(".vcf").read_text(encoding="utf-8")
+    assert "##reference=hg38\n" in text
+    assert "##contig=<ID=chr4,assembly=GRCh38>" in text
+    assert "##contig=<ID=chr10,assembly=GRCh38>" in text
+    assert "L1TX-chr4-66240893-ALU" in text
+    assert "L1TX-chr4-102422592-LINE1" in text
+    assert "L1TX-chr10-3041566-SVA" in text

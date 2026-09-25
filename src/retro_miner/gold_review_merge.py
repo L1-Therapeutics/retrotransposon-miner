@@ -16,6 +16,7 @@ from typing import Sequence
 import pandas as pd
 
 from retro_miner.mei_support import _prioritize_mei_candidates
+from retro_miner.vcf_export import export_vcf_from_tsv, lookup_reference_build
 
 # Columns the review sort treats as booleans. CSV re-reads them as strings,
 # and bool("False") is True, which would scramble stage and catalog flags.
@@ -65,6 +66,7 @@ def merge_gold_review_tables(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
 
 
 GOLD_REVIEW_NAME = "candidate_loci.mei.gold_review.tsv"
+GOLD_REVIEW_VCF_NAME = "candidate_loci.mei.gold_review.vcf"
 
 
 def annotation_done_marker(chrom: str) -> str:
@@ -130,6 +132,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"gold review table not found: {absent[0]}")
     n_rows = write_merged_gold_review(paths, args.output)
     print(f"[gold-review-merge] rows={n_rows} output={args.output}")
+    if n_rows:
+        vcf_path = args.output.with_suffix(".vcf")
+        build, _fasta = lookup_reference_build(args.output)
+        if build:
+            print(f"[gold-review-merge] reference_build={build}")
+        else:
+            print(
+                "[gold-review-merge] reference_build not found in pipeline_params.env; "
+                "VCF header will omit ##reference"
+            )
+        n_vcf = export_vcf_from_tsv(args.output, vcf_path, reference_build=build or None)
+        print(f"[gold-review-merge] vcf_rows={n_vcf} output={vcf_path}")
     return 0
 
 

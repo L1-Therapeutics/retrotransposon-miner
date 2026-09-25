@@ -480,6 +480,12 @@ fi
 if [[ -z "${OUTDIR}" ]]; then
   OUTDIR="${RTM_RESULTS_DIR}/mei_step1_${REFERENCE_BUILD}_chr22"
 fi
+mkdir -p "${OUTDIR}"
+{
+  printf 'reference_build=%s\n' "${REFERENCE_BUILD}"
+  printf 'reference_fasta=%s\n' "${REFERENCE_FASTA}"
+} > "${OUTDIR}/pipeline_params.env"
+echo "[candidate-pipeline] reference_build=${REFERENCE_BUILD} fasta=${REFERENCE_FASTA}"
 validate_reference_path_consistency "reference FASTA" "${REFERENCE_FASTA}"
 validate_reference_path_consistency "RepeatMasker table" "${RMSK_TABLE}"
 validate_reference_path_consistency "1000G/MELT VCF" "${G1K_MEI_VCF}"

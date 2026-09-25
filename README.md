@@ -414,9 +414,12 @@ python -m retro_miner.cli export-vcf \
   --out-vcf HG03086.classifier_ge_0.997.vcf
 ```
 
-`L1TXGOLDSCORE` (4 significant figures) and `CLASSIFIERRANK` are written to
-INFO when those columns exist. `L1TXGOLDRANKPCT` is the `gold_rank` percentile
-in the input table (100 is best, nearest integer). The VCF ID is
+`L1TXGOLDSCORE` is the classifier probability at 4 significant figures.
+`L1TXRANKPCT` is the percentile of `classifier_rank` (100 is best, nearest
+integer). `L1TXGOLDRANKPCT` is written only when the table has no classifier
+rank. `--chr all` writes `candidate_loci.mei.gold_review.vcf` after the genome
+gold table is aggregated. `##reference` is the run's `--reference-build`
+value, read from `pipeline_params.env` in the run directory. The VCF ID is
 `L1TX-<chrom>-<pos>-<family>`. Overlapping catalog accessions are
 `L1TXNSSV`, `L1TXG1K`, and `L1TXLR` instead of the ID column. `SVLEN` is
 left unset so Ensembl VEP does not treat the insertion as a reference span;
