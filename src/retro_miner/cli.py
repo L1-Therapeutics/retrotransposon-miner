@@ -1179,6 +1179,15 @@ def annotate_mei_support_cmd(
     help="Column compared against --min-score. gold_score is the classifier probability.",
 )
 @click.option(
+    "--reference-build",
+    type=str,
+    default=None,
+    help=(
+        "Genome build passed to the pipeline as --reference-build (hg38, hg19, or hs1). "
+        "When omitted, export-vcf reads pipeline_params.env next to the input table."
+    ),
+)
+@click.option(
     "--sample-name",
     type=str,
     default="SAMPLE",
@@ -1195,6 +1204,7 @@ def export_vcf_cmd(
     breakpoint_tsv: Path | None,
     min_score: float | None,
     score_column: str,
+    reference_build: str | None,
     sample_name: str,
 ) -> None:
     """Convert a gold-review or classifier-ranked TSV to VCF v4.3.
@@ -1213,6 +1223,7 @@ def export_vcf_cmd(
             min_score=min_score,
             score_column=score_column,
             breakpoint_tsv=breakpoint_tsv,
+            reference_build=reference_build,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc

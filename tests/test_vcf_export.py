@@ -345,6 +345,35 @@ CLASSIFIER_SLICE = FIXTURE_DIR / "hg03086_classifier_slice.tsv"
 GOLD_SLICE = FIXTURE_DIR / "hg03086_gold_slice.tsv"
 
 
+def test_gold_review_export_has_no_rank_pct_without_classifier(tmp_path: Path):
+    """Real gold tables have no classifier_rank (and no gold_rank); emit neither pct."""
+    pysam = pytest.importorskip("pysam")
+    out_path = tmp_path / "gold.vcf"
+    n = export_vcf_from_tsv(GOLD_SLICE, out_path, sample_name="HG03086")
+    assert n == 4
+    text = out_path.read_text()
+    assert "L1TXRANKPCT=" not in text
+    assert "L1TXGOLDRANKPCT=" not in text
+    assert "L1TX-chr4-66240893-ALU" in text
+    assert "L1TX-chr4-102422592-LINE1" in text
+    assert "L1TX-chr10-3041566-SVA" in text
+    records = list(pysam.VariantFile(str(out_path)))
+    by_id = {rec.id: rec for rec in records}
+    alu = by_id["L1TX-chr4-66240893-ALU"]
+    assert alu.alts == ("<INS:ME:ALU>",)
+    assert alu.info["L1TXNSSV"] == "nssv14044437"
+    assert alu.info["L1TXG1K"] == "nssv14044437"
+    line1 = by_id["L1TX-chr4-102422592-LINE1"]
+    assert line1.alts == ("<INS:ME:LINE1>",)
+    assert line1.info["L1TXNSSV"] == "nssv14080750"
+    assert line1.info["L1TXG1K"] == "nssv14080750"
+    assert str(line1.info["L1TXLR"]).startswith("chr4-105736355-INS->")
+    sva = by_id["L1TX-chr10-3041566-SVA"]
+    assert sva.alts == ("<INS:ME:SVA>",)
+    assert sva.info["L1TXNSSV"] == "nssv14066958"
+    assert sva.info["L1TXG1K"] == "nssv14066958"
+
+
 class TestHg03086Tables:
     """Rows sliced from the HG03086 gold review and classifier ranking."""
 
@@ -370,7 +399,7 @@ class TestHg03086Tables:
         classifier_rows = list(csv.DictReader(CLASSIFIER_SLICE.open(), delimiter="\t"))
         kept = [row for row in classifier_rows if float(row["gold_score"]) >= 0.997]
         assert len(kept) == 3
-        rank_n = max(int(row["gold_rank"]) for row in classifier_rows)
+        rank_n = max(int(row["classifier_rank"]) for row in classifier_rows)
 
         vf = pysam.VariantFile(str(out_path))
         assert list(vf.header.samples) == ["HG03086"]
@@ -403,9 +432,10 @@ class TestHg03086Tables:
             assert list(rec.filter) == ["PASS"]
             assert fields[2] == f"L1TX-{row['chrom']}-{pos}-{family_token[row['mei_family']]}"
             assert info["L1TXGOLDSCORE"] == format_sigfigs(row["gold_score"])
-            assert rec.info["CLASSIFIERRANK"] == int(row["classifier_rank"])
-            pct = int(round(100.0 * (rank_n - int(row["gold_rank"]) + 1) / rank_n))
-            assert rec.info["L1TXGOLDRANKPCT"] == pct
+            pct = int(round(100.0 * (rank_n - int(row["classifier_rank"]) + 1) / rank_n))
+            assert rec.info["L1TXRANKPCT"] == pct
+            assert "L1TXGOLDRANKPCT" not in info
+            assert "CLASSIFIERRANK" not in info
             assert "GOLDSCORE" not in info
             assert "GOLDRANK" not in info
             assert rec.info["INSERTIONSCORE"] == pytest.approx(float(locus["insertion_model_score"]))

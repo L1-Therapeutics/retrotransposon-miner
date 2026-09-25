@@ -14,6 +14,7 @@ from pathlib import Path
 from retro_miner.s3_transfer import _run_aws_cli, process_local_aws_config
 
 GENOME_GOLD_NAME = "candidate_loci.mei.gold_review.tsv"
+GENOME_VCF_NAME = "candidate_loci.mei.gold_review.vcf"
 IGV_DIR_NAME = "candidate_loci.mei.gold_review.igv"
 READ_ARCH_DIR_NAME = "candidate_loci.mei.read_architecture"
 
@@ -65,6 +66,8 @@ def sync_argv(outdir: Path, dest_prefix: str) -> list[str]:
         "*",
         "--include",
         GENOME_GOLD_NAME,
+        "--include",
+        GENOME_VCF_NAME,
         "--include",
         f"*/{IGV_DIR_NAME}/*",
         "--include",

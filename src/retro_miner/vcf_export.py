@@ -84,16 +84,16 @@ _EXTRA_INFO_FIELDS: tuple[tuple[str, str, str, str], ...] = (
         "Classifier probability that the gold call is a true insertion, 4 significant figures",
     ),
     (
-        "CLASSIFIERRANK",
-        "classifier_rank",
+        "L1TXRANKPCT",
+        "l1tx_rank_pct",
         "Integer",
-        "Rank by classifier score; 1 is the highest score",
+        "Percentile of classifier_rank in the input table; 100 is the best call, rounded to the nearest integer",
     ),
     (
         "L1TXGOLDRANKPCT",
         "l1tx_gold_rank_pct",
         "Integer",
-        "Percentile of gold_rank in the input table; 100 is the best call, rounded to the nearest integer",
+        "Percentile of gold_rank when the table has no classifier rank; 100 is the best call, rounded to the nearest integer",
     ),
     (
         "INSERTIONSCORE",
@@ -132,6 +132,16 @@ _EXTRA_INFO_FIELDS: tuple[tuple[str, str, str, str], ...] = (
 #: omitting them). Covers the standard GRCh38-style "chr"-prefixed
 #: autosomes/sex/mito contigs that candidate loci are called against.
 _STANDARD_CONTIGS = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY", "chrM"]
+
+#: Pipeline ``--reference-build`` value -> VCF contig assembly tag.
+_REFERENCE_ASSEMBLY = {
+    "hg38": "GRCh38",
+    "hg19": "GRCh37",
+    "hs1": "T2T-CHM13v2.0",
+}
+
+#: Written by the candidate pipeline next to the run directory.
+PIPELINE_PARAMS_NAME = "pipeline_params.env"
 
 #: Internal kinds that are not VCF Types. Sig4 is a Float written at 4 significant figures.
 _VCF_TYPE = {"Sig4": "Float"}
@@ -290,15 +300,15 @@ def split_known_mei_ids(raw: Any) -> dict[str, str]:
     return found
 
 
-def attach_gold_rank_percentile(rows: list[dict[str, Any]]) -> None:
-    """Write ``l1tx_gold_rank_pct`` from ``gold_rank``.
+def _has_value(rows: list[dict[str, Any]], column: str) -> bool:
+    return any(_vcf_safe(row.get(column)) != "" for row in rows)
 
-    Rank 1 is the best call. The percentile is ``100 * (N - rank + 1) / N``,
-    rounded to the nearest integer, with ``N`` the largest rank in ``rows``.
-    """
+
+def _fill_percentile(rows: list[dict[str, Any]], rank_column: str, out_column: str) -> None:
+    """Rank 1 is best. Percentile is ``100 * (N - rank + 1) / N``, nearest integer."""
     ranks: list[int] = []
     for row in rows:
-        text = _vcf_safe(row.get("gold_rank"))
+        text = _vcf_safe(row.get(rank_column))
         if text == "":
             continue
         try:
@@ -309,9 +319,7 @@ def attach_gold_rank_percentile(rows: list[dict[str, Any]]) -> None:
         return
     n = max(ranks)
     for row in rows:
-        if _vcf_safe(row.get("l1tx_gold_rank_pct")) != "":
-            continue
-        text = _vcf_safe(row.get("gold_rank"))
+        text = _vcf_safe(row.get(rank_column))
         if text == "":
             continue
         try:
@@ -319,7 +327,70 @@ def attach_gold_rank_percentile(rows: list[dict[str, Any]]) -> None:
         except ValueError:
             continue
         pct = int(round(100.0 * (n - rank + 1) / n))
-        row["l1tx_gold_rank_pct"] = str(max(0, min(100, pct)))
+        row[out_column] = str(max(0, min(100, pct)))
+
+
+def attach_rank_percentiles(rows: list[dict[str, Any]]) -> None:
+    """Percentile from the classifier rank, or from ``gold_rank`` when that is absent.
+
+    A classifier table also carries ``gold_rank``. That absolute rank is not
+    written once ``L1TXRANKPCT`` is available.
+    """
+    if _has_value(rows, "classifier_rank"):
+        if not _has_value(rows, "l1tx_rank_pct"):
+            _fill_percentile(rows, "classifier_rank", "l1tx_rank_pct")
+        return
+    if not _has_value(rows, "l1tx_gold_rank_pct"):
+        _fill_percentile(rows, "gold_rank", "l1tx_gold_rank_pct")
+
+
+def parse_pipeline_params(path: Path) -> dict[str, str]:
+    """Read ``key=value`` lines written by the candidate pipeline."""
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if text == "" or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def lookup_reference_build(start: Path) -> tuple[str, str]:
+    """Return ``(reference_build, reference_fasta)`` from ``pipeline_params.env``.
+
+    The file is the ``--reference-build`` choice that selected the FASTA
+    (``hg38`` -> ``Homo_sapiens_assembly38.fasta``). Search starts at ``start``
+    and walks up to the run directory.
+    """
+    current = start.resolve()
+    if current.is_file():
+        current = current.parent
+    for _ in range(6):
+        params = current / PIPELINE_PARAMS_NAME
+        if params.is_file():
+            values = parse_pipeline_params(params)
+            return values.get("reference_build", ""), values.get("reference_fasta", "")
+        if current.parent == current:
+            break
+        current = current.parent
+    return "", ""
+
+
+def vcf_header_lines(reference_build: str | None = None) -> list[str]:
+    """Header lines, with ``##reference`` and contig assembly when the build is known."""
+    build = (reference_build or "").strip()
+    if build == "":
+        return list(VCF_HEADER_LINES)
+    assembly = _REFERENCE_ASSEMBLY.get(build, "")
+    lines: list[str] = []
+    for line in VCF_HEADER_LINES:
+        lines.append(line)
+        if line.startswith("##source="):
+            lines.append(f"##reference={build}")
+        elif assembly and line.startswith("##contig=<ID=") and line.endswith(">"):
+            lines[-1] = line[:-1] + f",assembly={assembly}>"
+    return lines
 
 
 def locus_id(chrom: str, pos: str, family: str) -> str:
@@ -503,6 +574,7 @@ def export_vcf(
     sample_name: str = "SAMPLE",
     sort: bool = True,
     mark_pass: bool = False,
+    reference_build: str | None = None,
 ) -> int:
     """Write ``rows`` (annotated candidate loci) to ``out_path`` as VCF v4.3.
 
@@ -515,8 +587,8 @@ def export_vcf(
 
     Returns the number of records written.
     """
-    attach_gold_rank_percentile(rows)
-    header = list(VCF_HEADER_LINES)
+    attach_rank_percentiles(rows)
+    header = vcf_header_lines(reference_build)
     header.append(VCF_COLUMN_HEADER.format(sample=sample_name))
 
     ordered = sorted(rows, key=_sort_key) if sort else list(rows)
@@ -547,6 +619,7 @@ def export_vcf_from_tsv(
     min_score: float | None = None,
     score_column: str = "gold_score",
     breakpoint_tsv: Path | None = None,
+    reference_build: str | None = None,
 ) -> int:
     """Read a gold-review or classifier TSV and write VCF.
 
@@ -564,14 +637,18 @@ def export_vcf_from_tsv(
             "pointing at the genome-wide gold review table"
         )
     # Percentile uses the full input, including rows the score filter will drop.
-    attach_gold_rank_percentile(rows)
+    attach_rank_percentiles(rows)
     if min_score is not None:
         rows = filter_min_score(rows, min_score, score_column)
     sample = resolve_sample_name(rows, sample_name)
+    build = (reference_build or "").strip()
+    if build == "":
+        build, _fasta = lookup_reference_build(tsv_path)
     return export_vcf(
         rows,
         out_path,
         sample_name=sample,
         sort=sort,
         mark_pass=min_score is not None,
+        reference_build=build or None,
     )
