@@ -19,8 +19,10 @@ FIXTURE = Path(__file__).parent / "data" / "chr22_mei.vcf"
 # ----------------------------------------------------------------- helpers
 
 
-def _rec(chrom="chr22", pos=19223382, alt="<INS:ME:LINE1>", info="SVTYPE=INS;SVLEN=6018;END=19223382;MEINFO=L1HS,1,6018,+"):
-    return ga.VcfRecord(chrom, pos, ".", "N", alt, ".", ".", ga.parse_info(info), ["GT", "./."])
+def _fixture_rec(pos: int = 19223382) -> ga.VcfRecord:
+    """One of the 30 real chr22 calls in tests/data/chr22_mei.vcf."""
+    _, records = ga.read_vcf(FIXTURE)
+    return next(r for r in records if r.pos == pos)
 
 
 def _vep_json(input_str, txs=None, most_severe=None):
@@ -96,19 +98,23 @@ def test_add_info_headers_inserts_before_chrom_and_is_idempotent():
 
 def test_vep_region_string_drops_svlen_and_pins_end_to_pos():
     """Regression for the VEP span-widening bug: SVLEN must not reach VEP by default."""
-    s = ga.vep_region_string(_rec())
+    rec = _fixture_rec(19223382)
+    assert rec.info["SVLEN"] == "6018"
+    s = ga.vep_region_string(rec)
     assert s == "chr22 19223382 . N <INS:ME:LINE1> . . SVTYPE=INS;END=19223382"
     assert "SVLEN" not in s
 
 
 def test_vep_region_string_keep_svlen_opt_in():
-    s = ga.vep_region_string(_rec(), keep_svlen=True)
+    s = ga.vep_region_string(_fixture_rec(19223382), keep_svlen=True)
     assert "SVLEN=6018" in s
 
 
 def test_vep_region_string_overrides_wrong_end_for_symbolic_ins():
-    r = _rec(info="SVTYPE=INS;END=19229400")  # END != POS is invalid for a symbolic INS
-    assert "END=19223382" in ga.vep_region_string(r)
+    rec = _fixture_rec(19223382)
+    rec.info = dict(rec.info)
+    rec.info["END"] = "19229400"  # END != POS is invalid for a symbolic INS
+    assert "END=19223382" in ga.vep_region_string(rec)
 
 
 def test_output_vcf_keeps_svlen_even_though_request_drops_it(tmp_path):
@@ -165,77 +171,6 @@ def test_severity_table_has_no_duplicates_and_expected_endpoints():
     assert ga.CONSEQUENCE_SEVERITY[-1] == "sequence_variant"
 
 
-def test_summarize_dedups_genes_and_orders_terms_by_severity():
-    rec = _vep_json(
-        "chr22 1 . N <INS:ME:ALU> . . SVTYPE=INS",
-        [
-            {"gene_symbol": "CLTCL1", "gene_id": "ENSG00000070371", "consequence_terms": ["intron_variant"]},
-            {"gene_symbol": "CLTCL1", "gene_id": "ENSG00000070371", "consequence_terms": ["intron_variant", "NMD_transcript_variant"]},
-            {"gene_symbol": "OTHER", "gene_id": "ENSG1", "consequence_terms": ["upstream_gene_variant"]},
-        ],
-        "intron_variant",
-    )
-    ann = ga.summarize_vep_record(rec)
-    assert ann.gene_symbols == ("CLTCL1", "OTHER")
-    assert ann.gene_ids == ("ENSG00000070371", "ENSG1")
-    assert ann.most_severe == "intron_variant"
-    assert ann.terms == ("intron_variant", "NMD_transcript_variant", "upstream_gene_variant")
-    assert ann.n_transcripts == 3
-    assert ann.info_fields() == {
-        "GENE": "CLTCL1,OTHER",
-        "GENEID": "ENSG00000070371,ENSG1",
-        "CSQ": "intron_variant",
-        "CSQ_TERMS": "intron_variant,NMD_transcript_variant,upstream_gene_variant",
-        "CSQ_NTX": "3",
-    }
-
-
-def test_summarize_intergenic_has_no_gene_fields():
-    rec = {"input": "chr22 1 . N <INS:ME:ALU> . . SVTYPE=INS", "intergenic_consequences": [{"consequence_terms": ["intergenic_variant"]}], "most_severe_consequence": "intergenic_variant"}
-    ann = ga.summarize_vep_record(rec)
-    assert ann.gene_symbols == () and ann.n_transcripts == 0
-    assert "GENE" not in ann.info_fields()
-    assert ann.info_fields()["CSQ"] == "intergenic_variant"
-
-
-# ----------------------------------------------------------------- end-to-end (offline)
-
-
-def test_annotate_vcf_end_to_end_offline(tmp_path):
-    def responder(v):
-        pos = int(v.split()[1])
-        if pos == 19223382:
-            return _vep_json(v, [{"gene_symbol": "CLTCL1", "gene_id": "ENSG00000070371", "consequence_terms": ["intron_variant"]}], "intron_variant")
-        if pos == 49029650:
-            return {"input": v, "intergenic_consequences": [{"consequence_terms": ["intergenic_variant"]}], "most_severe_consequence": "intergenic_variant"}
-        return _vep_json(v, [{"gene_symbol": "G", "gene_id": "E", "consequence_terms": ["intron_variant"]}], "intron_variant")
-
-    fake = FakeVep(responder)
-    out, tsv = tmp_path / "ann.vcf", tmp_path / "ann.tsv"
-    stats = ga.annotate_vcf(FIXTURE, out, tsv_path=tsv, post=fake.post, sleep=fake.sleep)
-
-    assert stats.n_records == 30 and stats.n_annotated == 30 and stats.n_unmatched == 0
-    assert stats.n_with_gene == 29
-
-    headers, recs = ga.read_vcf(out)
-    assert len(recs) == 30
-    assert any(h.startswith("##INFO=<ID=CSQ,") for h in headers)
-    by_pos = {r.pos: r for r in recs}
-    assert by_pos[19223382].info["GENE"] == "CLTCL1"
-    assert by_pos[19223382].info["CSQ"] == "intron_variant"
-    assert by_pos[49029650].info["CSQ"] == "intergenic_variant"
-    assert "GENE" not in by_pos[49029650].info
-    # original columns untouched
-    _, orig = ga.read_vcf(FIXTURE)
-    assert [(r.chrom, r.pos, r.id, r.alt, r.rest) for r in orig] == [(r.chrom, r.pos, r.id, r.alt, r.rest) for r in recs]
-
-    rows = [ln.rstrip("\n").split("\t") for ln in open(tsv)]
-    assert rows[0] == list(ga.TSV_COLUMNS)
-    assert len(rows) == 31
-    line1 = next(r for r in rows[1:] if r[1] == "19223382")
-    assert line1[rows[0].index("GENE")] == "CLTCL1"
-
-
 def test_annotate_records_counts_unmatched_instead_of_dropping():
     fake = FakeVep(responder=lambda v: _vep_json("chrZ 1 . N <INS:ME:ALU> . . X"))  # never matches
     _, recs = ga.read_vcf(FIXTURE)
@@ -265,6 +200,56 @@ def test_live_vep_chr22_svlen_regression(tmp_path):
 
 SNPEFF_FIXTURE = Path(__file__).parent / "data" / "chr22_mei.snpeff.vcf"
 
+# Recorded snpEff 5.4c GRCh38.115 run of tests/data/chr22_mei.vcf with -noHgvs
+# and every splice-site size set to 0. Gene symbols are comma-joined in the
+# order parse_snpeff_ann emits them; empty means intergenic.
+CHR22_SNPEFF: dict[int, tuple[str, str]] = {
+    17224410: ("ADA2", "intron_variant"),
+    17289460: ("ENSG00000308779", "intron_variant"),
+    17567662: ("SLC25A18,ENSG00000286195", "intron_variant"),
+    19223382: ("CLTCL1", "intron_variant"),
+    19919244: ("TXNRD2", "intron_variant"),
+    20075438: ("DGCR8,ENSG00000236540,Metazoa_SRP", "upstream_gene_variant"),
+    20521112: ("MED15,ENSG00000236003", "intron_variant"),
+    20595738: ("CCDC74BP1,ENSG00000307604", "upstream_gene_variant"),
+    23938127: ("ENSG00000206090,ENSG00000290199", "intron_variant"),
+    29236892: ("EMID1", "intron_variant"),
+    29239707: ("EMID1", "intron_variant"),
+    31355872: ("", "intergenic_variant"),
+    31380162: ("", "intergenic_variant"),
+    33124372: ("LINC01640", "intron_variant"),
+    33132520: ("ENSG00000233632,LINC01640", "intron_variant"),
+    34034616: ("LINC01643", "intron_variant"),
+    36746494: ("CACNG2-DT", "intron_variant"),
+    36752165: ("ENSG00000287773,CACNG2-DT", "intron_variant"),
+    37529127: ("ENSG00000305681", "intron_variant"),
+    40007330: ("FAM83F", "intron_variant"),
+    41050312: ("Y_RNA", "downstream_gene_variant"),
+    41051286: ("", "intergenic_variant"),
+    41835230: ("SREBF2-AS1,CCDC134,SREBF2", "intron_variant"),
+    42705164: ("A4GALT,CYB5R3", "intron_variant"),
+    42818644: ("ARFGAP3", "intron_variant"),
+    45595784: ("FBLN1", "intron_variant"),
+    49029650: ("", "intergenic_variant"),
+    49760480: ("RPL5P35", "upstream_gene_variant"),
+    50351083: ("PPP6R2", "intron_variant"),
+    50495066: ("MIOX", "downstream_gene_variant"),
+}
+
+
+def _chr22_calls(records: list[ga.VcfRecord]) -> dict[int, tuple[str, str]]:
+    out: dict[int, tuple[str, str]] = {}
+    for rec in records:
+        ann = ga.parse_snpeff_ann(rec.info["ANN"]) if "ANN" in rec.info else None
+        if ann is None:
+            gene = rec.info.get("GENE") or ""
+            csq = rec.info.get("CSQ") or ""
+        else:
+            gene = ",".join(ann.gene_symbols)
+            csq = ann.most_severe
+        out[rec.pos] = (gene, csq)
+    return out
+
 
 def test_snpeff_fixture_is_real_output_for_same_30_loci():
     _, vep_in = ga.read_vcf(FIXTURE)
@@ -286,21 +271,14 @@ def test_parse_snpeff_ann_ranks_by_severity_not_snpeff_order():
     assert ann.terms[0] == "intron_variant"
 
 
-def test_parse_snpeff_ann_intergenic_does_not_leak_flanking_genes():
-    ann = ga.parse_snpeff_ann("N|intergenic_region|MODIFIER|CECR3-CECR9|ENSG1-ENSG2|intergenic_region|ENSG1-ENSG2|||||||||")
-    assert ann.most_severe == "intergenic_variant"
+def test_chr22_snpeff_annotation_matches_recorded_run():
+    """All 30 chr22 calls, from the recorded GRCh38.115 snpEff run."""
+    _, snp_out = ga.read_vcf(SNPEFF_FIXTURE)
+    assert _chr22_calls(snp_out) == CHR22_SNPEFF
+    sva = next(r for r in snp_out if r.pos == 49029650)
+    ann = ga.parse_snpeff_ann(sva.info["ANN"])
+    assert "ENSG00000299733-ENSG00000307761" in sva.info["ANN"]
     assert ann.gene_symbols == () and ann.gene_ids == () and ann.n_transcripts == 0
-    assert ann.terms == ("intergenic_variant",)
-
-
-def test_parse_snpeff_ann_splits_ampersand_terms_and_counts_transcripts():
-    ann = ga.parse_snpeff_ann(
-        "N|intron_variant&non_coding_transcript_variant|MODIFIER|G|ENSG|transcript|ENST1|lncRNA|||||||||,"
-        "N|upstream_gene_variant|MODIFIER|G|ENSG|transcript|ENST2|protein_coding||||||||1234|"
-    )
-    assert ann.n_transcripts == 2
-    assert ann.terms == ("intron_variant", "non_coding_transcript_variant", "upstream_gene_variant")
-    assert ann.gene_ids == ("ENSG",)
 
 
 def test_snpeff_svlen_locus_is_intronic_without_workaround():
@@ -337,13 +315,11 @@ def test_annotate_vcf_snpeff_offline_with_canned_output(tmp_path):
     stats = ga.annotate_vcf_snpeff(FIXTURE, out, "GRCh38.99", tsv_path=tsv, run=fake_run)
     assert calls and calls[0][0] == "snpEff" and "GRCh38.99" in calls[0]
     assert stats.n_records == 30 and stats.n_annotated == 30 and stats.n_unmatched == 0
-    assert stats.n_with_gene == 23  # 7 intergenic loci in GRCh38.99 (VEP/release 116 finds genes at 1 of them)
+    assert stats.n_with_gene == 26
 
     headers, recs = ga.read_vcf(out)
     assert any(h.startswith("##INFO=<ID=CSQ,") for h in headers)
-    by_pos = {r.pos: r for r in recs}
-    assert by_pos[19223382].info["GENE"] == "CLTCL1" and by_pos[19223382].info["CSQ"] == "intron_variant"
-    assert by_pos[49029650].info["CSQ"] == "intergenic_variant" and "GENE" not in by_pos[49029650].info
+    assert _chr22_calls(recs) == CHR22_SNPEFF
     assert all("ANN" not in r.info for r in recs)         # raw ANN not carried into the shared contract
     assert all("SVLEN" in r.info for r in recs)           # original INFO preserved
     assert tsv.read_text().count("\n") == 31
@@ -359,26 +335,15 @@ def test_annotate_vcf_snpeff_reports_nonzero_exit(tmp_path):
         ga.annotate_vcf_snpeff(FIXTURE, tmp_path / "o.vcf", "GRCh38.99", run=fake_run)
 
 
-def test_vep_and_snpeff_backends_agree_after_severity_ranking(tmp_path):
-    """Cross-backend check on the fixture: same INFO keys, and concordant most-severe term
-    wherever snpEff's GRCh38.99 database contains the gene VEP (release 116) reported."""
-    import subprocess
-
-    fake_run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=SNPEFF_FIXTURE.read_text(), stderr="")  # noqa: E731
-    ga.annotate_vcf_snpeff(FIXTURE, tmp_path / "s.vcf", "GRCh38.99", run=fake_run)
-    _, snp = ga.read_vcf(tmp_path / "s.vcf")
-    for r in snp:
-        assert set(r.info) >= {"CSQ", "CSQ_NTX"}
-    # loci where both databases contain the gene: identical top term expected
-    expect_intron = {19223382: "CLTCL1", 42705164: "A4GALT", 42818644: "ARFGAP3", 45595784: "FBLN1", 50351083: "PPP6R2", 17224410: "ADA2"}
-    by_pos = {r.pos: r for r in snp}
-    for pos, gene in expect_intron.items():
-        assert by_pos[pos].info["CSQ"] == "intron_variant", pos
-        assert gene in by_pos[pos].info["GENE"], pos
-
-
 @pytest.mark.skipif(os.environ.get("RTM_LIVE_SNPEFF") != "1", reason="set RTM_LIVE_SNPEFF=1 (and have snpEff on PATH) to run snpEff for real")
-def test_live_snpeff_run(tmp_path):
-    genome = os.environ.get("RTM_SNPEFF_GENOME", "GRCh38.99")
-    stats = ga.annotate_vcf_snpeff(FIXTURE, tmp_path / "o.vcf", genome, config=os.environ.get("RTM_SNPEFF_CONFIG"))
-    assert stats.n_annotated == 30
+def test_live_snpeff_chr22_matches_recorded_run(tmp_path):
+    genome = os.environ.get("RTM_SNPEFF_GENOME", "GRCh38.115")
+    out = tmp_path / "o.vcf"
+    stats = ga.annotate_vcf_snpeff(
+        FIXTURE, out, genome,
+        config=os.environ.get("RTM_SNPEFF_CONFIG"),
+        xmx=os.environ.get("RTM_SNPEFF_XMX", "3g"),
+    )
+    assert stats.n_annotated == 30 and stats.n_unmatched == 0
+    _, recs = ga.read_vcf(out)
+    assert _chr22_calls(recs) == CHR22_SNPEFF

@@ -249,7 +249,7 @@ def test_annotate_genes_snpeff_backend_offline(runner, tmp_path, monkeypatch):
     result = runner.invoke(cli, ["annotate-genes", "--backend", "snpeff", "--snpeff-genome", "GRCh38.115",
                                  "--snpeff-xmx", "4g", "--vcf", str(src), "--out", str(out)])
     assert result.exit_code == 0, result.output
-    assert "backend=snpeff records=30 annotated=30 with_gene=23 unmatched=0" in result.output
+    assert "backend=snpeff records=30 annotated=30 with_gene=26 unmatched=0" in result.output
     assert seen["cmd"][:12] == [
         "snpEff", "-Xmx4g", "-noStats", "-noHgvs",
         "-spliceSiteSize", "0", "-spliceRegionExonSize", "0",
