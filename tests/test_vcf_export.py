@@ -1,5 +1,6 @@
 """Tests for vcf_export, built against real rows from the README gold-tier example table."""
 
+import csv
 import shutil
 import subprocess
 from pathlib import Path
@@ -306,6 +307,12 @@ class TestPysamRoundTrip:
 
         records = list(vf)
         assert len(records) == 3
+        assert "SVLEN" not in records[0].info
+        assert records[0].info["SVTYPE"] == "INS"
+        data_lines = [ln for ln in out_path.read_text().splitlines() if not ln.startswith("#")]
+        for line in data_lines:
+            pos = line.split("\t")[1]
+            assert f"END={pos}" in line.split("\t")[7]
         # Output is coordinate-sorted, so look the record up by position
         # rather than assuming the input order is preserved.
         sva = next(r for r in records if r.pos == 49029650)
@@ -315,3 +322,92 @@ class TestPysamRoundTrip:
         assert sva.samples[0]["GT"] == (None, None)  # ./. -- blank, not fabricated
         assert sva.samples[0]["GQ"] is None  # . -- blank, not fabricated
         assert [r.pos for r in records] == sorted(r.pos for r in records)
+
+
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "vcf"
+CLASSIFIER_SLICE = FIXTURE_DIR / "hg03086_classifier_slice.tsv"
+GOLD_SLICE = FIXTURE_DIR / "hg03086_gold_slice.tsv"
+
+
+class TestHg03086Tables:
+    """Rows sliced from the HG03086 gold review and classifier ranking."""
+
+    def test_classifier_without_breakpoint_table_is_rejected(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="consensus_insertion_breakpoint_pos"):
+            export_vcf_from_tsv(CLASSIFIER_SLICE, tmp_path / "out.vcf")
+
+    def test_high_score_classifier_rows_use_gold_breakpoints(self, tmp_path: Path):
+        pysam = pytest.importorskip("pysam")
+        out_path = tmp_path / "out.vcf"
+        n = export_vcf_from_tsv(
+            CLASSIFIER_SLICE,
+            out_path,
+            min_score=0.997,
+            breakpoint_tsv=GOLD_SLICE,
+        )
+        assert n == 3
+
+        gold = {
+            (row["chrom"], row["window_start"], row["window_end"]): row
+            for row in csv.DictReader(GOLD_SLICE.open(), delimiter="\t")
+        }
+        kept = [
+            row
+            for row in csv.DictReader(CLASSIFIER_SLICE.open(), delimiter="\t")
+            if float(row["gold_score"]) >= 0.997
+        ]
+        assert len(kept) == 3
+
+        vf = pysam.VariantFile(str(out_path))
+        assert list(vf.header.samples) == ["HG03086"]
+        records = list(vf)
+        for line in out_path.read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            pos = line.split("\t")[1]
+            assert f"END={pos};" in line or line.split("\t")[7].endswith(f"END={pos}")
+        assert len(records) == 3
+        by_pos = {rec.pos: rec for rec in records}
+        saw_distinct_breakpoint = False
+        for row in kept:
+            locus = gold[(row["chrom"], row["window_start"], row["window_end"])]
+            pos = int(locus["consensus_insertion_breakpoint_pos"])
+            if pos != int(row["window_start"]):
+                saw_distinct_breakpoint = True
+            rec = by_pos[pos]
+            assert rec.chrom == row["chrom"]
+            assert rec.info["SVTYPE"] == "INS"
+            assert "SVLEN" not in rec.info
+            assert list(rec.filter) == ["PASS"]
+            assert rec.info["GOLDSCORE"] == pytest.approx(float(row["gold_score"]))
+            assert rec.info["CLASSIFIERRANK"] == int(row["classifier_rank"])
+            assert rec.info["INSERTIONSCORE"] == pytest.approx(float(locus["insertion_model_score"]))
+            expected = {"Alu": "<INS:ME:ALU>", "L1": "<INS:ME:LINE1>", "SVA": "<INS:ME:SVA>"}
+            assert rec.alts == (expected[row["mei_family"]],)
+        assert saw_distinct_breakpoint
+
+    def test_gold_review_slice_exports_without_classifier_columns(self, tmp_path: Path):
+        pysam = pytest.importorskip("pysam")
+        out_path = tmp_path / "gold.vcf"
+        n = export_vcf_from_tsv(GOLD_SLICE, out_path, sample_name="HG03086")
+        assert n == 4
+        records = list(pysam.VariantFile(str(out_path)))
+        assert len(records) == 4
+        assert all("INSERTIONSCORE" in rec.info for rec in records)
+        assert all("GOLDSCORE" not in rec.info for rec in records)
+        for line in out_path.read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            pos = line.split("\t")[1]
+            assert f"END={pos}" in line.split("\t")[7]
+            assert "SVLEN=" not in line
+
+    def test_unmatched_classifier_window_raises(self, tmp_path: Path):
+        bad = tmp_path / "bad.tsv"
+        bad.write_text(
+            CLASSIFIER_SLICE.read_text().splitlines()[0]
+            + "\n"
+            + "1\tHG03086\tchr1\t1\tAlu\tpositive\tTrue\tTrue\t0.999\t1\t10\n"
+        )
+        with pytest.raises(ValueError, match="did not match the breakpoint table"):
+            export_vcf_from_tsv(bad, tmp_path / "out.vcf", breakpoint_tsv=GOLD_SLICE)

@@ -401,6 +401,23 @@ python -m retro_miner.cli export-vcf \
   --sample-name seqc2_tumor_normal
 ```
 
+The same command accepts a genome-wide gold review table. A classifier-ranked
+table has no breakpoint column (`mei_family` is `Alu`/`L1`/`SVA`, and
+`gold_score` is the classifier probability). Join it to the gold table and
+keep a score cutoff:
+
+```bash
+python -m retro_miner.cli export-vcf \
+  --in-tsv hg03086_gold_by_classifier_score.tsv \
+  --breakpoint-tsv candidate_loci.mei.gold_review.tsv \
+  --min-score 0.997 \
+  --out-vcf HG03086.classifier_ge_0.997.vcf
+```
+
+`GOLDSCORE` and `CLASSIFIERRANK` are written to INFO when those columns
+exist. `SVLEN` is left unset so Ensembl VEP does not treat the insertion as a
+reference span; the element length stays in `MEI_SPAN`, and `END` equals `POS`.
+
 Records are coordinate-sorted, so the output can be compressed and indexed
 directly:
 
