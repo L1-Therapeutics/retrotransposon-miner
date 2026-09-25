@@ -419,7 +419,9 @@ python -m retro_miner.cli export-vcf \
 integer). `L1TXGOLDRANKPCT` is written only when the table has no classifier
 rank. `--chr all` writes `candidate_loci.mei.gold_review.vcf` after the genome
 gold table is aggregated. `##reference` is the run's `--reference-build`
-value, read from `pipeline_params.env` in the run directory. The VCF ID is
+value, read from `pipeline_params.env`. A classifier export inherits that
+header from the `--breakpoint-tsv` gold table when the classifier file is
+outside the run directory. The VCF ID is
 `L1TX-<chrom>-<pos>-<family>`. Overlapping catalog accessions are
 `L1TXNSSV`, `L1TXG1K`, and `L1TXLR` instead of the ID column. `SVLEN` is
 left unset so Ensembl VEP does not treat the insertion as a reference span;
