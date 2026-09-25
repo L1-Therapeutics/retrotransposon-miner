@@ -423,7 +423,7 @@ value, read from `pipeline_params.env`. A classifier export inherits that
 header from the `--breakpoint-tsv` gold table when the classifier file is
 outside the run directory. The VCF ID is
 `L1TX-<chrom>-<pos>-<family>`. Overlapping catalog accessions are
-`L1TXNSSV`, `L1TXG1K`, and `L1TXLR` instead of the ID column. `SVLEN` is
+`NSSV`, `G1K`, and `LR` instead of the ID column. `SVLEN` is
 left unset so Ensembl VEP does not treat the insertion as a reference span;
 the element length stays in `MEI_SPAN`, and `END` equals `POS`.
 
