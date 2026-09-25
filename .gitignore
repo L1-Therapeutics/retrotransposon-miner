@@ -34,4 +34,6 @@ tmp/
 *.fq
 *.vcf
 *.vcf.gz
+# Chromosome-sized VCF examples linked from the README.
+!docs/examples/*.vcf
 *.tbi
