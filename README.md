@@ -59,9 +59,6 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 ## Example Variant Calls (GRCh38)
 
 HG03086 chromosome 22, classifier `gold_score` >= 0.997 (21 calls).
-The block below is the VCF itself: the `#CHROM` line and one record per call.
-A fenced block is the format that displays here. A markdown table splits on
-the `|` inside long-read IDs, and these records are too wide to wrap.
 
 ```
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	HG03086
