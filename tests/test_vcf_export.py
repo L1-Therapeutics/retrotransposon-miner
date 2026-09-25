@@ -448,6 +448,36 @@ class TestHg03086Tables:
         assert line1_info["L1TXLR"].startswith("chr4-105736355-INS->")
         assert saw_distinct_breakpoint
 
+    def test_classifier_export_inherits_reference_from_gold_table(self, tmp_path: Path):
+        """Classifier file sits outside the run dir; ##reference comes from the gold table."""
+        ranked = tmp_path / "classifier" / CLASSIFIER_SLICE.name
+        run = tmp_path / "run"
+        gold = run / GOLD_SLICE.name
+        ranked.parent.mkdir()
+        run.mkdir()
+        ranked.write_text(CLASSIFIER_SLICE.read_text(), encoding="utf-8")
+        gold.write_text(GOLD_SLICE.read_text(), encoding="utf-8")
+        (run / "pipeline_params.env").write_text(
+            "reference_build=hg38\n"
+            "reference_fasta=/data/reference/hg38/Homo_sapiens_assembly38.fasta\n",
+            encoding="utf-8",
+        )
+        out_path = tmp_path / "classifier.vcf"
+        n = export_vcf_from_tsv(
+            ranked,
+            out_path,
+            min_score=0.997,
+            breakpoint_tsv=gold,
+        )
+        assert n == 3
+        text = out_path.read_text(encoding="utf-8")
+        assert "##reference=hg38\n" in text
+        assert "##contig=<ID=chr4,assembly=GRCh38>" in text
+        assert "##contig=<ID=chr10,assembly=GRCh38>" in text
+        assert "L1TX-chr4-66240893-ALU" in text
+        assert "L1TX-chr4-102422592-LINE1" in text
+        assert "L1TX-chr10-3041566-SVA" in text
+
     def test_gold_review_slice_exports_without_classifier_columns(self, tmp_path: Path):
         pysam = pytest.importorskip("pysam")
         out_path = tmp_path / "gold.vcf"

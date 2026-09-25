@@ -624,9 +624,11 @@ def export_vcf_from_tsv(
     """Read a gold-review or classifier TSV and write VCF.
 
     ``breakpoint_tsv`` is the genome-wide gold table used to fill the
-    insertion breakpoint when ``tsv_path`` is a classifier ranking. When
-    ``min_score`` is set, only rows with ``score_column >= min_score`` are
-    written and FILTER is PASS.
+    insertion breakpoint when ``tsv_path`` is a classifier ranking. The VCF
+    ``##reference`` is taken from that gold table's ``pipeline_params.env``
+    when the classifier file is outside the run directory. When ``min_score``
+    is set, only rows with ``score_column >= min_score`` are written and
+    FILTER is PASS.
     """
     rows = load_tsv_rows(tsv_path)
     if breakpoint_tsv is not None:
@@ -643,7 +645,14 @@ def export_vcf_from_tsv(
     sample = resolve_sample_name(rows, sample_name)
     build = (reference_build or "").strip()
     if build == "":
-        build, _fasta = lookup_reference_build(tsv_path)
+        # The classifier ranking often lives outside the run directory. The
+        # gold table it joins to is the callset, so inherit that run's build.
+        for start in (breakpoint_tsv, tsv_path):
+            if start is None:
+                continue
+            build, _fasta = lookup_reference_build(start)
+            if build:
+                break
     return export_vcf(
         rows,
         out_path,
