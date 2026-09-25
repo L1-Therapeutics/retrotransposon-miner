@@ -1,0 +1,5 @@
+classifier_rank	sample	chrom	gold_rank	mei_family	train_role	in_top_cluster	known_mei_polymorphism	gold_score	window_start	window_end
+1	HG03086	chr4	197	Alu	positive	True	True	0.9999945206699908	66240888	66240898
+9	HG03086	chr4	191	L1	positive	True	True	0.9999927538702296	102422589	102422595
+17	HG03086	chr10	332	SVA	positive	True	True	0.9999920892262186	3041562	3041571
+17677	HG03086	chr8	10070	L1	negative_pool	False	False	3.7303502855980496e-06	38507915	38507940
