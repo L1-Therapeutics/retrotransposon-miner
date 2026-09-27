@@ -15930,7 +15930,10 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             f"elapsed={time.monotonic() - inter_t0:.1f}s"
         )
 
-        # a(8) + b(9): pick best same-family hit (prefer same-orient, then longer).
+        # a(8) + b(9): pick the longest same-family hit, tie-broken on genomic start.
+        # Selection must not consider orientation: choosing by it would bias any
+        # downstream measure of opposite-orientation nesting toward same-orientation
+        # elements. Orientation is reported after the winner is chosen.
         post_t0 = time.monotonic()
         best: dict[int, tuple[tuple[int, int], dict[str, object]]] = {}
         for line in proc.stdout.splitlines():
@@ -15951,6 +15954,10 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
                 length = int(parts[12])
             except ValueError:
                 length = max(0, int(parts[10]) - int(parts[9]))
+            try:
+                rep_start = int(parts[9])
+            except ValueError:
+                rep_start = 0
             rep_name, strand = parts[11], parts[13]
             rep_class, rep_family, norm_fam = parts[14], parts[15], parts[16]
             if not event_fam or norm_fam != event_fam:
@@ -15958,7 +15965,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             same_orient = int(
                 event_orient in {"+", "-"} and strand in {"+", "-"} and strand == event_orient
             )
-            score = (same_orient, length)
+            score = (length, -rep_start)
             rec: dict[str, object] = {
                 "nested_repeat_overlap": True,
                 "nested_repeat_name": rep_name,

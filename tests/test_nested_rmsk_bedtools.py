@@ -203,6 +203,45 @@ def test_opposite_and_same_orientation_nesting_are_distinguished(tmp_path: Path)
     assert out.loc[0, "nested_same_class_orientation"] != out.loc[1, "nested_same_class_orientation"]
 
 
+# ------------------------------------------------------------------ orientation-blind selection
+# The winning element must be chosen on length alone. Ranking by orientation first
+# would make any downstream count of opposite-orientation nesting partly a measure
+# of the tie-break rather than of the biology.
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_overlapping_hit_is_selected_by_length_not_orientation(tmp_path: Path):
+    """A longer opposite-orientation element must beat a shorter same-orientation one."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t100\t800\t.\t0\t-\tAluLong\tSINE\tAlu\n"   # 700 bp, opposite to a + insertion
+        "chr22\t120\t250\t.\t0\t+\tAluShort\tSINE\tAlu\n", # 130 bp, same as a + insertion
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "+")])  # inside both elements
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_repeat_name"] == "AluLong"      # longest wins
+    assert out.loc[0, "nested_repeat_strand"] == "-"
+    assert bool(out.loc[0, "nested_same_orientation"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_opposite_orientation"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_equal_length_overlapping_hits_tie_break_on_genomic_start(tmp_path: Path):
+    """Same length must still resolve deterministically, to the leftmost element."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t200\t400\t.\t0\t+\tAluRight\tSINE\tAlu\n"  # 200 bp, starts later
+        "chr22\t100\t300\t.\t0\t-\tAluLeft\tSINE\tAlu\n",   # 200 bp, starts earlier
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame([_candidate("chr22", 250, "AluY", "+")])  # inside both elements
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_repeat_name"] == "AluLeft"
+
+
 def test_nested_rmsk_requires_bedtools(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("retro_miner.mei_support.shutil.which", lambda _name: None)
     rmsk = tmp_path / "rmsk.txt"
