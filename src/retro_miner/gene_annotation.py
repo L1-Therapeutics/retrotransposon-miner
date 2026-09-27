@@ -334,8 +334,8 @@ def parse_snpeff_ann(ann: str) -> GeneAnnotation:
     so intergenic entries -- whose Gene_Name is ``GENE1-GENE2`` -- do not leak
     flanking genes into ``GENE``.
     """
-    symbols: list[str] = []
     gene_ids: list[str] = []
+    gid_to_symbol: dict[str, str] = {}
     terms: list[str] = []
     n_tx = 0
     for entry in ann.split(","):
@@ -349,10 +349,11 @@ def parse_snpeff_ann(ann: str) -> GeneAnnotation:
         if cols[ANN_FEATURE_TYPE] == "transcript":
             n_tx += 1
             sym, gid = cols[ANN_GENE_NAME], cols[ANN_GENE_ID]
-            if sym and sym not in symbols:
-                symbols.append(sym)
             if gid and gid not in gene_ids:
                 gene_ids.append(gid)
+            if gid and sym and gid not in gid_to_symbol:
+                gid_to_symbol[gid] = sym
+    symbols = [gid_to_symbol.get(gid, gid) for gid in gene_ids]
     ranked = sorted(terms, key=lambda t: _SEVERITY_RANK.get(t, len(CONSEQUENCE_SEVERITY)))
     return GeneAnnotation(
         gene_symbols=tuple(symbols), gene_ids=tuple(gene_ids),
