@@ -239,3 +239,106 @@ def test_live_snpeff_chr22_matches_recorded_run(tmp_path):
     assert stats.n_annotated == 30 and stats.n_unmatched == 0
     _, recs = ga.read_vcf(out)
     assert _chr22_calls(recs) == CHR22_SNPEFF
+
+
+# ------------------------------------------------------- GENE / GENEID register alignment
+# GENE, GENEID and GENE_STRAND are positionally paired: the Nth symbol describes the
+# Nth gene ID. snpEff can emit a transcript with a Gene_ID but an empty Gene_Name, so
+# symbols are keyed to their gene ID rather than deduplicated independently.
+
+
+def _ann_entry(
+    gene: str,
+    gene_id: str,
+    *,
+    term: str = "intron_variant",
+    feature: str = "transcript",
+    transcript: str = "ENST00000000001.1",
+) -> str:
+    cols = ["<INS:ME:LINE1>", term, "MODIFIER", gene, gene_id, feature, transcript]
+    return "|".join(cols + [""] * 9)  # snpEff's -noHgvs ANN has 16 columns
+
+
+def _ann(*entries: str) -> str:
+    return ",".join(entries)
+
+
+def test_gene_without_a_symbol_falls_back_to_its_id_instead_of_shortening_gene():
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902"),
+        _ann_entry("", "ENSG00000286195"),
+    )
+    parsed = ga.parse_snpeff_ann(ann)
+    assert parsed.gene_ids == ("ENSG00000182902", "ENSG00000286195")
+    assert len(parsed.gene_symbols) == len(parsed.gene_ids)
+    assert parsed.gene_symbols[1] == "ENSG00000286195"  # gap position holds the gene ID
+
+
+def test_nameless_second_gene_does_not_shift_the_first_genes_symbol():
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902"),
+        _ann_entry("", "ENSG00000286195"),
+    )
+    parsed = ga.parse_snpeff_ann(ann)
+    assert parsed.gene_symbols[0] == "SLC25A18"
+    assert parsed.gene_symbols[1] == "ENSG00000286195"
+    assert parsed.gene_symbols == ("SLC25A18", "ENSG00000286195")
+
+
+def test_symbol_after_a_nameless_gene_still_describes_its_own_gene():
+    """The real callset: GENE=2 against GENEID=3 once an unnamed gene preceded the third."""
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902"),
+        _ann_entry("", "ENSG00000286195"),
+        _ann_entry("CLTCL1", "ENSG00000213123"),
+    )
+    parsed = ga.parse_snpeff_ann(ann)
+    assert parsed.gene_symbols == ("SLC25A18", "ENSG00000286195", "CLTCL1")
+    assert parsed.gene_ids == ("ENSG00000182902", "ENSG00000286195", "ENSG00000213123")
+    assert len(parsed.gene_symbols) == len(parsed.gene_ids) == 3
+
+
+def test_every_symbol_present_is_unchanged_by_the_register_fix():
+    """Regression guard: the normal path keeps its dedup, order and count behaviour."""
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902", transcript="ENST00000497401.1"),
+        _ann_entry("SLC25A18", "ENSG00000182902", transcript="ENST00000399813.1"),
+        _ann_entry("CLTCL1", "ENSG00000213123", transcript="ENST00000275493.2"),
+    )
+    parsed = ga.parse_snpeff_ann(ann)
+    assert parsed.gene_symbols == ("SLC25A18", "CLTCL1")
+    assert parsed.gene_ids == ("ENSG00000182902", "ENSG00000213123")
+    assert parsed.n_transcripts == 3
+
+
+def test_recorded_chr22_run_stays_aligned_and_unchanged():
+    """Regression guard over the 30 recorded calls from the GRCh38.115 snpEff run."""
+    _, snp_out = ga.read_vcf(SNPEFF_FIXTURE)
+    for rec in snp_out:
+        parsed = ga.parse_snpeff_ann(rec.info["ANN"])
+        assert len(parsed.gene_symbols) == len(parsed.gene_ids), rec.pos
+        assert ",".join(parsed.gene_symbols) == CHR22_SNPEFF[rec.pos][0], rec.pos
+
+
+def test_gene_geneid_and_gene_strand_have_equal_lengths_with_a_nameless_gene():
+    strands = {"ENSG00000182902": "+", "ENSG00000286195": "-", "ENSG00000213123": "-"}
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902"),
+        _ann_entry("", "ENSG00000286195"),
+        _ann_entry("CLTCL1", "ENSG00000213123"),
+    )
+    info = ga.parse_snpeff_ann(ann).info_fields(strands)
+    assert info["GENE"] == "SLC25A18,ENSG00000286195,CLTCL1"
+    assert info["GENEID"] == "ENSG00000182902,ENSG00000286195,ENSG00000213123"
+    assert info["GENE_STRAND"] == "+,-,-"
+    lengths = {len(v.split(",")) for v in (info["GENE"], info["GENEID"], info["GENE_STRAND"])}
+    assert lengths == {3}
+
+
+def test_intergenic_record_emits_none_of_the_three_gene_fields():
+    ann = _ann_entry("LINC01521-RNU6-338P", "ENSG00000213888-ENSG00000206615",
+                     term="intergenic_region", feature="intergenic_region", transcript="")
+    parsed = ga.parse_snpeff_ann(ann)
+    info = parsed.info_fields({"ENSG00000182902": "+"})
+    assert parsed.gene_symbols == () and parsed.gene_ids == () and parsed.n_transcripts == 0
+    assert "GENE" not in info and "GENEID" not in info and "GENE_STRAND" not in info
