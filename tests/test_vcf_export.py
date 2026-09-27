@@ -78,7 +78,7 @@ BLANK_OPTIONAL_ROW = {
     "known_mei_polymorphism_id": "",
     "known_mei_polymorphism_source": "",
     "consensus_insertion_orientation": "-",
-    "nested_in_same_MEI": "nested",
+    "nested_in_same_MEI": "nested_same_orientation",
     "consensus_insertion_mei_span_full": "281",
     "consensus_insertion_mei_5p_coord_full": "1",
     "consensus_insertion_mei_3p_coord_full": "281",

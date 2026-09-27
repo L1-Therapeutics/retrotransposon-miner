@@ -123,6 +123,86 @@ def test_nested_rmsk_bedtools_flags_same_family_hits(tmp_path: Path):
     assert out.loc[2, "nested_same_class_orientation"] == "unnested"
 
 
+# ------------------------------------------------------- three-valued nesting vocabulary
+# "unnested" means no same-family element overlaps the breakpoint. An insertion
+# inside a same-family element in the opposite orientation is still nested, so it
+# gets its own value rather than borrowing "unnested" from the no-overlap case.
+
+
+def _candidate(chrom: str, pos: int, subfamily: str, orientation: str) -> dict:
+    return {
+        "chrom": chrom,
+        "window_start": pos - 60,
+        "window_end": pos + 60,
+        "insertion_breakpoint_pos": pos,
+        "consensus_insertion_orientation": orientation,
+        "disease_L_mei_subfamily": subfamily,
+        "disease_L_mei_supported_reads": 5,
+    }
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_opposite_orientation_nesting_is_not_reported_as_unnested(tmp_path: Path):
+    """An opposite-orientation call is nested in the element; only the strand differs."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "-")])  # insertion - inside a + AluY
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert bool(out.loc[0, "nested_same_class"]) is True
+    assert bool(out.loc[0, "nested_same_orientation"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_opposite_orientation"
+    # The exact contradiction this fixes: an overlapping call was labelled unnested.
+    assert out.loc[0, "nested_same_class_orientation"] != "unnested"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_same_orientation_nesting_is_labelled_nested_same_orientation(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "+")])  # insertion + inside a + AluY
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert bool(out.loc[0, "nested_same_orientation"]) is True
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_same_orientation"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_no_overlapping_element_stays_unnested(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 9000, "AluY", "-")])  # far from the element
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is False
+    assert bool(out.loc[0, "nested_same_class"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "unnested"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_opposite_and_same_orientation_nesting_are_distinguished(tmp_path: Path):
+    """The two overlapping cases must not collapse onto the same value."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n"
+        "chr22\t1000\t1500\t.\t0\t-\tAluYb\tSINE\tAlu\n",
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame(
+        [
+            _candidate("chr22", 150, "AluY", "-"),    # opposite to the + element
+            _candidate("chr22", 1200, "AluYb", "-"),  # same as the - element
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_opposite_orientation"
+    assert out.loc[1, "nested_same_class_orientation"] == "nested_same_orientation"
+    assert out.loc[0, "nested_same_class_orientation"] != out.loc[1, "nested_same_class_orientation"]
+
+
 def test_nested_rmsk_requires_bedtools(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("retro_miner.mei_support.shutil.which", lambda _name: None)
     rmsk = tmp_path / "rmsk.txt"
