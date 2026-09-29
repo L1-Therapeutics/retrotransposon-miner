@@ -334,3 +334,44 @@ def test_null_chrom_does_not_report_an_rmsk_format_error(tmp_path: Path):
     # Previously raised ValueError telling the user to supply a full rmsk table.
     out = _annotate_nested_retrotransposon(cand, rmsk)
     assert out.loc[0, "nested_same_class_orientation"] == "unnested"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_unresolvable_orientation_is_nested_unknown_not_antisense(tmp_path: Path):
+    """An undetermined orientation must not be counted as antisense."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "")])  # no resolvable orientation
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert out.loc[0, "nested_insertion_orientation"] == ""
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_unknown"
+    assert out.loc[0, "nested_same_class_orientation"] not in {"nested_sense", "nested_antisense"}
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_sense_and_antisense_exclude_unknown_from_both_counts(tmp_path: Path):
+    """nested_unknown belongs to neither class, so the two counts stay clean."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n"
+        "chr22\t1000\t1500\t.\t0\t-\tAluYb\tSINE\tAlu\n",
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame(
+        [
+            _candidate("chr22", 150, "AluY", "+"),    # sense
+            _candidate("chr22", 1200, "AluYb", "-"),  # sense
+            _candidate("chr22", 1250, "AluYb", ""),   # orientation undetermined
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    labels = list(out["nested_same_class_orientation"])
+    assert labels == ["nested_sense", "nested_sense", "nested_unknown"]
+    assert sum(1 for v in labels if v == "nested_sense") == 2
+    assert sum(1 for v in labels if v == "nested_antisense") == 0
+    # The unknown case is nested, but it is in neither bucket.
+    assert sum(1 for v in labels if v in {"nested_sense", "nested_antisense"}) == 2
+    assert int(out["nested_repeat_overlap"].sum()) == 3

@@ -15861,11 +15861,13 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
     Uses ``bedtools intersect`` against an MEI-filtered rmsk BED (chrom-restricted
     to the candidate set). Requires ``bedtools`` on PATH.
 
-    ``nested_same_class_orientation`` is three-valued: ``unnested`` when no
+    ``nested_same_class_orientation`` is four-valued: ``unnested`` when no
     same-family element overlaps the breakpoint, ``nested_sense`` when the
-    insertion orientation matches the element's strand, and ``nested_antisense``
-    when it differs. Both nested classes are reported so sense and antisense
-    insertions can be counted and compared against each other.
+    insertion orientation matches the element's strand, ``nested_antisense``
+    when it differs, and ``nested_unknown`` when the call is nested but
+    orientation could not be resolved on either side. Sense and antisense
+    insertions can be counted and compared against each other; ``nested_unknown``
+    belongs to neither and should be excluded from both counts.
     """
     out = candidates.copy().reset_index(drop=True)
     out["nested_repeat_overlap"] = False
@@ -15990,6 +15992,14 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             same_orient = int(
                 event_orient in {"+", "-"} and strand in {"+", "-"} and strand == event_orient
             )
+            if event_orient in {"+", "-"} and strand in {"+", "-"}:
+                label = "nested_sense" if same_orient else "nested_antisense"
+            else:
+                # Orientation undetermined on either side: the call is nested,
+                # but sense vs antisense is not knowable. Reporting it as
+                # antisense would inflate the antisense count, so it gets its
+                # own value and callers can exclude it from either side.
+                label = "nested_unknown"
             score = (length, -rep_start)
             rec: dict[str, object] = {
                 "nested_repeat_overlap": True,
@@ -16001,9 +16011,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
                 "nested_insertion_orientation": event_orient,
                 "nested_same_class": True,
                 "nested_same_orientation": bool(same_orient),
-                "nested_same_class_orientation": (
-                    "nested_sense" if same_orient else "nested_antisense"
-                ),
+                "nested_same_class_orientation": label,
             }
             prev = best.get(idx)
             if prev is None or score > prev[0]:
