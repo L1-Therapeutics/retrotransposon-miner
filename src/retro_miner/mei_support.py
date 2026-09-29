@@ -15848,10 +15848,10 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
     to the candidate set). Requires ``bedtools`` on PATH.
 
     ``nested_same_class_orientation`` is three-valued: ``unnested`` when no
-    same-family element overlaps the breakpoint, ``nested_same_orientation`` when
-    the insertion orientation matches the element's strand, and
-    ``nested_opposite_orientation`` when it differs. An opposite-orientation
-    insertion is still nested -- only the orientation differs.
+    same-family element overlaps the breakpoint, ``nested_sense`` when the
+    insertion orientation matches the element's strand, and ``nested_antisense``
+    when it differs. Both nested classes are reported so sense and antisense
+    insertions can be counted and compared against each other.
     """
     out = candidates.copy().reset_index(drop=True)
     out["nested_repeat_overlap"] = False
@@ -15977,7 +15977,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
                 "nested_same_class": True,
                 "nested_same_orientation": bool(same_orient),
                 "nested_same_class_orientation": (
-                    "nested_same_orientation" if same_orient else "nested_opposite_orientation"
+                    "nested_sense" if same_orient else "nested_antisense"
                 ),
             }
             prev = best.get(idx)

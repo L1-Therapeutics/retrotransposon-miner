@@ -142,8 +142,8 @@ def _candidate(chrom: str, pos: int, subfamily: str, orientation: str) -> dict:
 
 
 @pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
-def test_opposite_orientation_nesting_is_not_reported_as_unnested(tmp_path: Path):
-    """An opposite-orientation call is nested in the element; only the strand differs."""
+def test_opposite_orientation_nesting_is_labelled_nested_antisense(tmp_path: Path):
+    """An antisense call is nested in the element it overlaps."""
     rmsk = tmp_path / "rmsk.txt"
     rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
     cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "-")])  # insertion - inside a + AluY
@@ -152,13 +152,12 @@ def test_opposite_orientation_nesting_is_not_reported_as_unnested(tmp_path: Path
     assert bool(out.loc[0, "nested_repeat_overlap"]) is True
     assert bool(out.loc[0, "nested_same_class"]) is True
     assert bool(out.loc[0, "nested_same_orientation"]) is False
-    assert out.loc[0, "nested_same_class_orientation"] == "nested_opposite_orientation"
-    # The exact contradiction this fixes: an overlapping call was labelled unnested.
-    assert out.loc[0, "nested_same_class_orientation"] != "unnested"
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_antisense"
+    assert out.loc[0, "nested_same_class_orientation"] in {"nested_sense", "nested_antisense"}
 
 
 @pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
-def test_same_orientation_nesting_is_labelled_nested_same_orientation(tmp_path: Path):
+def test_same_orientation_nesting_is_labelled_nested_sense(tmp_path: Path):
     rmsk = tmp_path / "rmsk.txt"
     rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
     cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "+")])  # insertion + inside a + AluY
@@ -166,7 +165,7 @@ def test_same_orientation_nesting_is_labelled_nested_same_orientation(tmp_path: 
     out = _annotate_nested_retrotransposon(cand, rmsk)
     assert bool(out.loc[0, "nested_repeat_overlap"]) is True
     assert bool(out.loc[0, "nested_same_orientation"]) is True
-    assert out.loc[0, "nested_same_class_orientation"] == "nested_same_orientation"
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_sense"
 
 
 @pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
@@ -198,8 +197,8 @@ def test_opposite_and_same_orientation_nesting_are_distinguished(tmp_path: Path)
     )
 
     out = _annotate_nested_retrotransposon(cand, rmsk)
-    assert out.loc[0, "nested_same_class_orientation"] == "nested_opposite_orientation"
-    assert out.loc[1, "nested_same_class_orientation"] == "nested_same_orientation"
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_antisense"
+    assert out.loc[1, "nested_same_class_orientation"] == "nested_sense"
     assert out.loc[0, "nested_same_class_orientation"] != out.loc[1, "nested_same_class_orientation"]
 
 
@@ -224,7 +223,7 @@ def test_overlapping_hit_is_selected_by_length_not_orientation(tmp_path: Path):
     assert out.loc[0, "nested_repeat_name"] == "AluLong"      # longest wins
     assert out.loc[0, "nested_repeat_strand"] == "-"
     assert bool(out.loc[0, "nested_same_orientation"]) is False
-    assert out.loc[0, "nested_same_class_orientation"] == "nested_opposite_orientation"
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_antisense"
 
 
 @pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
