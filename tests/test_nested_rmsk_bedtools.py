@@ -259,3 +259,78 @@ def test_nested_rmsk_requires_bedtools(monkeypatch, tmp_path: Path):
     )
     with pytest.raises(RuntimeError, match="requires bedtools"):
         _annotate_nested_retrotransposon(cand, rmsk)
+
+
+# ------------------------------------------------- null-tolerant coordinate handling
+# NaN is truthy, so `value or 0` does not catch it and int(nan) raises.
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_null_breakpoint_falls_back_to_window_midpoint(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 90,
+                "window_end": 210,  # midpoint 150 sits inside the element
+                "insertion_breakpoint_pos": float("nan"),
+                "consensus_insertion_orientation": "+",
+                "disease_L_mei_subfamily": "AluY",
+                "disease_L_mei_supported_reads": 5,
+            }
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_sense"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_null_window_bounds_do_not_raise(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": float("nan"),
+                "window_end": float("nan"),
+                "insertion_breakpoint_pos": 0,
+                "consensus_insertion_orientation": "+",
+                "disease_L_mei_subfamily": "AluY",
+                "disease_L_mei_supported_reads": 5,
+            }
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    # No usable coordinate, so nothing can be shown to overlap.
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "unnested"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_null_chrom_does_not_report_an_rmsk_format_error(tmp_path: Path):
+    """A null chrom must not be blamed on the rmsk table's field layout."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame(
+        [
+            {
+                "chrom": float("nan"),
+                "window_start": 90,
+                "window_end": 210,
+                "insertion_breakpoint_pos": 150,
+                "consensus_insertion_orientation": "+",
+                "disease_L_mei_subfamily": "AluY",
+                "disease_L_mei_supported_reads": 5,
+            }
+        ]
+    )
+
+    # Previously raised ValueError telling the user to supply a full rmsk table.
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_same_class_orientation"] == "unnested"

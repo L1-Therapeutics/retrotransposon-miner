@@ -15761,6 +15761,20 @@ def _choose_event_orientation(row: pd.Series) -> str:
     return ""
 
 
+def _to_int_or(value: object, default: int = 0) -> int:
+    """Coerce to int, treating NaN/None/unparseable as ``default``.
+
+    ``value or default`` is not sufficient: NaN is truthy, so a null
+    ``insertion_breakpoint_pos`` reaches ``int()`` and raises.
+    """
+    try:
+        if value is None or pd.isna(value):
+            return int(default)
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _bed_field(value: object, *, default: str = ".") -> str:
     """Format one BED column for bedtools.
 
@@ -15870,6 +15884,16 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
     chroms = set(out["chrom"].fillna("").astype(str))
     chroms.discard("")
 
+    if not chroms:
+        # Nothing to intersect against. Do not fall through: an empty chrom set
+        # makes the rmsk BED empty too, which would surface as the
+        # "rmsk table lacks repName/repClass" error below and point at the
+        # wrong input.
+        click.echo(
+            "[mei-annotate] nested-rmsk skipped: no candidate carries a usable chrom"
+        )
+        return out
+
     bedtools_bin = shutil.which("bedtools")
     if bedtools_bin is None:
         raise RuntimeError(
@@ -15900,11 +15924,12 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             for i, row in enumerate(out.itertuples(index=False)):
                 as_row = pd.Series(row._asdict())
                 chrom = str(getattr(row, "chrom"))
-                pos_1based = int(getattr(row, "insertion_breakpoint_pos", 0) or 0)
+                pos_1based = _to_int_or(getattr(row, "insertion_breakpoint_pos", 0), 0)
                 if pos_1based <= 0:
-                    pos_1based = int(
-                        (int(getattr(row, "window_start", 1)) + int(getattr(row, "window_end", 1))) // 2
-                    )
+                    pos_1based = (
+                        _to_int_or(getattr(row, "window_start", 1), 1)
+                        + _to_int_or(getattr(row, "window_end", 1), 1)
+                    ) // 2
                 pos0 = max(0, pos_1based - 1)
                 event_family = _choose_event_family(as_row)
                 event_orientation = _choose_event_orientation(as_row)
