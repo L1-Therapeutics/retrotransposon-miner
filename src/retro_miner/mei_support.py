@@ -10491,8 +10491,12 @@ def _series_flag(df: pd.DataFrame, *names: str) -> pd.Series:
 
 def _row_is_polya_evidence(df: pd.DataFrame) -> pd.Series:
     out = _series_flag(df, "polya_rescue", "poly_tail_rescued", "poly_tail_anchor_rescued")
-    if "clip_poly_at_run" in df.columns:
-        out = out | (pd.to_numeric(df["clip_poly_at_run"], errors="coerce").fillna(0).astype(int) >= 8)
+    # Split evidence carries clip_poly_at_run, discordant evidence carries
+    # anchor_poly_at_run for the same concept. Checking only the first would
+    # silently skip the run-length rule for every discordant row.
+    for run_col in ("clip_poly_at_run", "anchor_poly_at_run"):
+        if run_col in df.columns:
+            out = out | (pd.to_numeric(df[run_col], errors="coerce").fillna(0).astype(int) >= 8)
     return out
 
 

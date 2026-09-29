@@ -405,7 +405,10 @@ def _mei_coords_from_detail(
             continue
         hits = work
         if hit_col in work.columns:
-            hits = work.loc[work[hit_col].astype(bool)]
+            # fillna(False) first: NaN is truthy under astype(bool), so a
+            # missing hit flag would be counted as a hit. Matches the
+            # mei_support span path.
+            hits = work.loc[work[hit_col].fillna(False).astype(bool)]
         # Per-hit family gate using the column that owns these coords.
         tcol = "mei_target" if start_col.startswith("mei_") and not start_col.startswith("mate_") else "mate_mei_target"
         if fam in {"ALU", "LINE1", "SVA"} and tcol in hits.columns:
