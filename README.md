@@ -138,6 +138,70 @@ rtm annotate-genes --snpeff-genome GRCh38.115 --vcf calls.vcf --out calls.annot.
 
 On the 30 chr22 GRCh38 calls in `tests/data/chr22_mei.vcf` (snpEff 5.4c, `GRCh38.115`), 30/30 are annotated and 26 overlap a gene. The 6,018 bp L1 at chr22:19223382 is an `intron_variant` in CLTCL1. A 1,852-call classifier VCF finished in about a minute at `-Xmx3g` after those flags; the default JVM heap runs out of memory building the GRCh38 interval forest, so the command passes `--snpeff-xmx` (default `8g`).
 
+## Nested insertion annotation
+
+An MEI that lands inside an already-annotated reference copy of its own family is a
+nested insertion: the breakpoint sits within an older Alu/LINE-1/SVA element rather
+than in unique sequence, which changes how a call should be read (it may be
+re-mobilized rather than de novo, and the reference copy constrains the target site).
+`rtm annotate-mei-support --rmsk-table` labels every candidate that way and records
+the strand of the reference copy relative to the inserting event, so sense and
+antisense nestings stay distinguishable. The flag is off by default; without it the
+columns keep their empty defaults and the VCF `NESTED` INFO field is omitted.
+
+The table is the UCSC RepeatMasker dump for the build you are calling against, pinned
+in `resources/public_datasets.yaml` as `hg38_repeatmasker_rmsk` (GRCh37 is
+`hg19_repeatmasker_rmsk`) and fetched by `scripts/download_public_data.py`:
+
+```bash
+python3 scripts/download_public_data.py \
+  --dataset-ids hg38_repeatmasker_rmsk \
+  --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}"
+```
+
+```bash
+rtm annotate-mei-support \
+  --evidence-dir evidence \
+  --candidate-loci candidate_loci.tsv \
+  --mei-fasta mei_panel.fa \
+  --out-tsv candidate_loci.mei.tsv \
+  --rmsk-table "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}/annotation/hg38/repeats/rmsk.txt.gz"
+```
+
+`.gz` is read directly. The table is filtered to Alu/LINE-1/SVA families, restricted
+to the candidate chromosomes, and intersected against the calls as single-base BED
+points with `bedtools intersect -wa -wb`; when several elements cover one breakpoint
+the winner is the same-strand hit, then the longer element. **`bedtools` must be on
+`PATH`** — the annotation raises `RuntimeError` rather than degrade without it, and
+`environment.yml` already pins `bedtools>=2.31`, so `conda activate rtm-miner`
+supplies it. A table whose rows carry no MEI family is rejected with a message asking
+for a real UCSC `rmsk.txt.gz` rather than a stripped 3–4 column BED, so a wrong file
+fails loudly instead of reporting everything as `unnested`.
+
+Emitted columns:
+
+| Column | Meaning |
+| --- | --- |
+| `nested_repeat_overlap` | A same-family reference copy covers the breakpoint. |
+| `nested_repeat_name` | Its `repName`, e.g. `AluY`, `L1HS`. |
+| `nested_repeat_class` | Its UCSC `repClass`, e.g. `SINE`. |
+| `nested_repeat_family` | Its UCSC `repFamily`. |
+| `nested_repeat_strand` | Strand of the reference copy, `+` or `-`. |
+| `nested_mei_family` | Normalized family of the call itself: `ALU`, `LINE1`, or `SVA`. |
+| `nested_insertion_orientation` | Orientation of the inserting event; empty when unresolved. |
+| `nested_same_class` | The overlapping copy belongs to the call's own family. |
+| `nested_same_orientation` | That copy is on the same strand as the insertion. |
+| `nested_same_class_orientation` | Summary: `nested` when same family *and* same strand, `unnested` otherwise. |
+| `nested_in_same_MEI` | Copy of the summary column; this is what the VCF `NESTED` INFO field carries. |
+
+A hit is recorded only when the overlapping copy is in the call's own family, so
+`nested_repeat_overlap` and `nested_same_class` are set together and never differ. The
+summary is coarser than its parts: an opposite-strand same-family hit also reports
+`unnested`, so it does not separate "not nested" from "nested antisense". Read
+`nested_same_orientation` against `nested_repeat_strand` when that distinction matters.
+In VCF, `NESTED` is `Number=1,Type=String` carrying the same two values, and is
+omitted rather than written as `.` when no annotation was run.
+
 ## Getting Started on Amazon EC2 (Elastic Compute Cloud)
 
 ### Whole-genome machine and disk
@@ -580,6 +644,20 @@ This project is licensed under the Apache License 2.0.
 
 - Full text: [`LICENSE`](LICENSE)
 - SPDX identifier: `Apache-2.0`
+
+## Running the tests
+
+`bedtools` is required for the full suite. `environment.yml` pins `bedtools>=2.31`,
+so `conda activate rtm-miner` is enough; outside that env install it with
+`conda install -c bioconda -c conda-forge bedtools`.
+
+The gap is worth knowing about: every bedtools-backed test in
+`tests/test_nested_rmsk_bedtools.py` is guarded by
+`@pytest.mark.skipif(shutil.which("bedtools") is None)`. With `bedtools` absent they
+**skip silently** and the suite still reports green, so a passing run that never had
+bedtools on `PATH` verified none of the nested-insertion behaviour. Confirm
+`bedtools --version` before treating a green suite as coverage of
+[nested insertion annotation](#nested-insertion-annotation).
 
 ## Contributing
 
