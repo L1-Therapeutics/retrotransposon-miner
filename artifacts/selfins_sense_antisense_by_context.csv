@@ -1,0 +1,5 @@
+family,context,n_nested,n_sense,n_antisense,sense_frac
+ALU,genic,202,172,30,0.8514851485148515
+ALU,intergenic,37,30,7,0.8108108108108109
+LINE1,genic,42,32,10,0.7619047619047619
+LINE1,intergenic,30,21,9,0.7

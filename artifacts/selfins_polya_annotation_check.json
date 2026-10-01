@@ -1,0 +1,7 @@
+{
+ "chrom": "chr1",
+ "n_alu": 98824,
+ "n_with_adjacent_polyA": 814,
+ "pct_with_adjacent_polyA": 0.8236865538735529,
+ "gap_tolerance_bp": 5
+}
