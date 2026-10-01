@@ -26,7 +26,6 @@ from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import (
     _clustered_coord_extent,
-    _robust_coord_extent,
     generate_gold_read_architecture_plots,
 )
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
@@ -2204,7 +2203,7 @@ def _hydrate_sample_mei_hits_from_detail(
                     m[c] = strand.where(strand.isin(["+", "-"]), "")
             for c in ("mei_hit", "mate_mei_hit", "vntr_rescue", "polya_rescue"):
                 if c in m.columns:
-                    m[c] = m[c].fillna(False).infer_objects(copy=False).astype(bool)
+                    m[c] = m[c].fillna(False).infer_objects().astype(bool)
             if "mei_hit_source" in m.columns:
                 m["mei_hit_source"] = m["mei_hit_source"].fillna("").astype(str)
             m["mei_score"] = (
@@ -2217,7 +2216,7 @@ def _hydrate_sample_mei_hits_from_detail(
             )
             for c in ("mei_hit", "mate_mei_hit", "vntr_rescue", "polya_rescue"):
                 if c in disc_hits.columns:
-                    disc_hits[c] = disc_hits[c].fillna(False).infer_objects(copy=False).astype(bool)
+                    disc_hits[c] = disc_hits[c].fillna(False).infer_objects().astype(bool)
             disc_hits["target"] = disc_hits["target"].fillna("").astype(str)
             disc_hits["mate_mei_target"] = disc_hits.get(
                 "mate_mei_target", pd.Series("", index=disc_hits.index)
@@ -4546,7 +4545,7 @@ def _split_polya_member_mask(split_df: pd.DataFrame) -> pd.Series:
         return pd.Series(dtype=bool)
     mask = pd.Series(False, index=split_df.index)
     if "poly_tail_rescued" in split_df.columns:
-        mask = mask | split_df["poly_tail_rescued"].fillna(False).infer_objects(copy=False).astype(bool)
+        mask = mask | split_df["poly_tail_rescued"].fillna(False).infer_objects().astype(bool)
     if "clip_poly_at_run" in split_df.columns:
         mask = mask | (
             pd.to_numeric(split_df["clip_poly_at_run"], errors="coerce").fillna(0).astype(int) >= 8
@@ -4805,9 +4804,9 @@ def _build_supporting_reads_detail_table(
             out[col] = default
     out["mei_strand"] = out["mei_strand"].fillna("").astype(str)
     out["mate_mei_strand"] = out["mate_mei_strand"].fillna("").astype(str)
-    out["short_mei_seed_rescued"] = out["short_mei_seed_rescued"].fillna(False).infer_objects(copy=False).astype(bool)
+    out["short_mei_seed_rescued"] = out["short_mei_seed_rescued"].fillna(False).infer_objects().astype(bool)
     out["polya_rescue"] = out["polya_rescue"].fillna(False).astype(bool)
-    out["poly_tail_rescued"] = out["poly_tail_rescued"].fillna(False).infer_objects(copy=False).astype(bool)
+    out["poly_tail_rescued"] = out["poly_tail_rescued"].fillna(False).infer_objects().astype(bool)
     return out
 
 
@@ -5526,8 +5525,8 @@ def _poly_at_artifact_tsd_mask(tsd_seq: pd.Series) -> pd.Series:
     """True for sequences that are polyA/polyT tails, not real TSDs."""
     tsd_seq_s = tsd_seq.fillna("").astype(str).str.upper()
     tsd_len_s = tsd_seq_s.str.len().astype(int)
-    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects(copy=False).astype(float)
-    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects(copy=False).astype(float)
+    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects().astype(float)
+    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects().astype(float)
     dominant_poly_fraction = pd.concat([a_fraction, t_fraction], axis=1).max(axis=1)
     longest_at_run = tsd_seq_s.str.findall(r"[AT]+").map(
         lambda parts: max((len(p) for p in parts), default=0)
@@ -6494,7 +6493,7 @@ def _add_candidate_support_info_fields(
         else pd.Series(False, index=locus_gate.index)
     )
     control_gate_series = (
-        locus_gate["control_has_mei_support"].fillna(False).infer_objects(copy=False).astype(bool)
+        locus_gate["control_has_mei_support"].fillna(False).infer_objects().astype(bool)
         if "control_has_mei_support" in locus_gate.columns
         else pd.Series(False, index=locus_gate.index)
     )
@@ -6623,12 +6622,12 @@ def _add_candidate_support_info_fields(
         other_has_mei_col = f"{other_prefix}_has_mei_support"
         status_tbl = locus_gate.loc[:, key_cols].copy()
         status_tbl["sample_has_mei_support"] = (
-            locus_gate[sample_has_mei_col].fillna(False).infer_objects(copy=False).astype(bool)
+            locus_gate[sample_has_mei_col].fillna(False).infer_objects().astype(bool)
             if sample_has_mei_col in locus_gate.columns
             else pd.Series(False, index=locus_gate.index)
         )
         status_tbl["other_has_mei_support"] = (
-            locus_gate[other_has_mei_col].fillna(False).infer_objects(copy=False).astype(bool)
+            locus_gate[other_has_mei_col].fillna(False).infer_objects().astype(bool)
             if other_has_mei_col in locus_gate.columns
             else pd.Series(False, index=locus_gate.index)
         )
@@ -10697,6 +10696,13 @@ def _genomic_flank_evidence_table(
 
 
 def _event_orientation_series(df: pd.DataFrame) -> pd.Series:
+    """Return the insertion orientation for each locus.
+
+    Preference order: ``consensus_insertion_orientation``,
+    ``insertion_orientation``, ``disease_insertion_orientation``,
+    ``control_insertion_orientation``. Values are normalized to ``"+"``,
+    ``"-"``, or ``""`` when unknown.
+    """
     ori = pd.Series("", index=df.index, dtype="object")
     for col in (
         "consensus_insertion_orientation",
@@ -10711,6 +10717,16 @@ def _event_orientation_series(df: pd.DataFrame) -> pd.Series:
     return ori.where(ori.isin(["+", "-"]), "")
 
 
+def _flank_count(df: pd.DataFrame, prefix: str, col: str) -> pd.Series:
+    """Return a flank-count column as a clean integer Series.
+
+    Missing columns are treated as 0. Non-numeric values are coerced
+    to NaN then filled with 0.
+    """
+    raw = _df_col_series(df, f"{prefix}_{col}", 0)
+    return pd.to_numeric(raw, errors="coerce").fillna(0).astype(int)
+
+
 def _sample_orientation_consistent_sidepair(df: pd.DataFrame, prefix: str) -> pd.Series:
     """Two-sided genomic-flank support with orientation-consistent MEI.
 
@@ -10723,10 +10739,10 @@ def _sample_orientation_consistent_sidepair(df: pd.DataFrame, prefix: str) -> pd
       side (+ → right-flank polyA; − → left-flank polyA).
     """
     min_mei = int(_GOLD_MIN_FLANK_MEI_READS)
-    l_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_mei_reads", 0), errors="coerce").fillna(0)
-    r_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_mei_reads", 0), errors="coerce").fillna(0)
-    l_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_polya_reads", 0), errors="coerce").fillna(0)
-    r_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_polya_reads", 0), errors="coerce").fillna(0)
+    l_mei_n = _flank_count(df, prefix, "left_flank_mei_reads")
+    r_mei_n = _flank_count(df, prefix, "right_flank_mei_reads")
+    l_poly_n = _flank_count(df, prefix, "left_flank_polya_reads")
+    r_poly_n = _flank_count(df, prefix, "right_flank_polya_reads")
     l_mei = l_mei_n >= min_mei
     r_mei = r_mei_n >= min_mei
     l_poly = l_poly_n >= 1
