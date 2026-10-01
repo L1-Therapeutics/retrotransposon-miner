@@ -1737,7 +1737,7 @@ def _dedupe_detail_rows(detail: pd.DataFrame) -> pd.DataFrame:
         s = out.get(col, False)
         if not isinstance(s, pd.Series):
             return pd.Series(False, index=out.index)
-        return s.fillna(False).infer_objects(copy=False).astype(bool)
+        return s.fillna(False).infer_objects().astype(bool)
 
     out["_mei_rank"] = (
         _flag("mate_mei_hit").astype(int) * 4
@@ -1759,7 +1759,7 @@ def _detail_support_mask(detail: pd.DataFrame) -> pd.Series:
         s = detail.get(col, False)
         if not isinstance(s, pd.Series):
             return pd.Series(False, index=detail.index)
-        return s.fillna(False).infer_objects(copy=False).astype(bool)
+        return s.fillna(False).infer_objects().astype(bool)
 
     poly_run = pd.Series(False, index=detail.index)
     if "clip_poly_at_run" in detail.columns:
