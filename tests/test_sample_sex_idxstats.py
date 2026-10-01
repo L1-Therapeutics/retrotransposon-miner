@@ -67,9 +67,11 @@ set -euo pipefail
 is_remote_alignment() {{ return 1; }}
 run_python_module() {{ python -m "$@"; }}
 CHR_LIST=(chrX chrY chr1)
+REQUESTED_CHR_LIST=(chrX chrY chr1)
 DISEASE_BAM={bam}
 drop_chry_when_female
 printf '%s\\n' "${{CHR_LIST[@]}}"
+printf 'REQ %s\\n' "${{REQUESTED_CHR_LIST[@]}}"
 """
     result = subprocess.run(
         ["bash", "-c", script],
@@ -87,7 +89,12 @@ printf '%s\\n' "${{CHR_LIST[@]}}"
         for line in result.stdout.splitlines()
         if line.startswith("chr")
     ]
-    return result.stdout, chroms
+    requested = [
+        line.split(" ", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("REQ ")
+    ]
+    return result.stdout, chroms, requested
 
 
 def test_hg03172_male_index_keeps_chry():
@@ -96,9 +103,10 @@ def test_hg03172_male_index_keeps_chry():
     label, ratio = classify_sex(stats)
     assert label == "male"
     assert ratio is not None and ratio < 0.75
-    log, chroms = _shell_chroms(MALE_BAM)
+    log, chroms, requested = _shell_chroms(MALE_BAM)
     assert "male; keeping chrY" in log
     assert chroms == ["chrX", "chrY", "chr1"]
+    assert requested == ["chrX", "chrY", "chr1"]
 
 
 def test_hg00100_female_index_skips_chry():
@@ -107,9 +115,10 @@ def test_hg00100_female_index_skips_chry():
     label, ratio = classify_sex(stats)
     assert label == "female"
     assert ratio is not None and ratio >= 0.75
-    log, chroms = _shell_chroms(FEMALE_BAM)
+    log, chroms, requested = _shell_chroms(FEMALE_BAM)
     assert "female; skipping chrY" in log
     assert chroms == ["chrX", "chr1"]
+    assert requested == ["chrX", "chr1"]
 
 
 def test_missing_chrx_keeps_the_decision_unknown():

@@ -205,6 +205,21 @@ drop_chry_when_female() {
     else
       CHR_LIST=("${kept[@]}")
     fi
+    # chrY was never run. Do not require it when the genome-wide table is merged.
+    # Leave chromosomes removed only by skip-complete in REQUESTED_CHR_LIST.
+    if [[ -n "${REQUESTED_CHR_LIST+x}" ]]; then
+      local requested_kept=()
+      for chr in "${REQUESTED_CHR_LIST[@]}"; do
+        if [[ "${chr}" != "chrY" ]]; then
+          requested_kept+=("${chr}")
+        fi
+      done
+      if [[ "${#requested_kept[@]}" -eq 0 ]]; then
+        REQUESTED_CHR_LIST=()
+      else
+        REQUESTED_CHR_LIST=("${requested_kept[@]}")
+      fi
+    fi
     return 0
   fi
   if [[ "${label}" == "male" ]]; then
@@ -978,6 +993,13 @@ stage_remote_bams_if_needed
 resolve_sliced_mate_bams
 drop_chry_when_female
 if [[ "${#CHR_LIST[@]}" -eq 0 ]]; then
+  if [[ "${CHR_ALL_MODE}" == "1" ]] && [[ "${#REQUESTED_CHR_LIST[@]}" -gt 0 ]]; then
+    echo "[candidate-pipeline] consolidating --chr all outputs into ${OUTDIR}"
+    consolidate_all_chrom_outputs "${OUTDIR}" "${REQUESTED_CHR_LIST[@]}"
+    echo "  consolidated gold review written to: ${OUTDIR}/candidate_loci.mei.gold_review.tsv"
+    publish_results_to_s3 "${OUTDIR}"
+    exit 0
+  fi
   echo "[candidate-pipeline] no chromosomes left to run"
   exit 0
 fi
