@@ -166,7 +166,7 @@ VCF_HEADER_LINES = [
     '##INFO=<ID=TSD,Number=1,Type=String,Description="Consensus target site duplication sequence">',
     '##INFO=<ID=POLYA_MIN_BP,Number=1,Type=Integer,Description="Minimum observed poly-A/T tail length in bp">',
     '##INFO=<ID=ORIENT,Number=1,Type=String,Description="Consensus insertion orientation relative to reference (+/-)">',
-    '##INFO=<ID=NESTED,Number=1,Type=String,Description="Whether the insertion is nested within another copy of the same MEI">',
+    '##INFO=<ID=NESTED,Number=1,Type=String,Description="Relationship to an overlapping reference copy of the same MEI family: unnested (no same-family element overlaps the breakpoint), nested_sense (overlaps, insertion orientation matches the element strand), nested_antisense (overlaps, orientations differ), or nested_unknown (overlaps, but orientation could not be resolved)">',
     '##INFO=<ID=MEI_SPAN,Number=1,Type=Integer,Description="Full-length span (bp) of the consensus MEI alignment">',
     '##INFO=<ID=MEI_5P,Number=1,Type=Integer,Description="5-prime coordinate of the consensus MEI alignment on the full-length reference">',
     '##INFO=<ID=MEI_3P,Number=1,Type=Integer,Description="3-prime coordinate of the consensus MEI alignment on the full-length reference">',

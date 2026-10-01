@@ -67,7 +67,7 @@ def _evidence_frames(catalog_id: str, chrom: str, window_start: int, window_end:
 def _score_locus(catalog_id: str, *, use_discovery_midpoint: bool) -> pd.DataFrame:
     manifest = _load_manifest(catalog_id)
     locus = pd.read_csv(_fixture_dir(catalog_id) / "gold_locus.tsv", sep="\t")
-    assert not locus.empty
+    assert not locus.empty, f"empty gold_locus.tsv for {catalog_id}"
     chrom = str(manifest["chrom"])
     window_start = int(manifest["discovery_window_start"])
     window_end = int(manifest["discovery_window_end"])
@@ -156,9 +156,13 @@ def test_inferred_breakpoint_prefers_junction_not_discovery_mid():
     )
     inferred = int(_inferred_flank_breakpoint_series(row).iloc[0])
     mid = (int(manifest["discovery_window_start"]) + int(manifest["discovery_window_end"])) // 2
-    assert inferred == int(manifest["expected_breakpoint"])
+    assert inferred == int(manifest["expected_breakpoint"]), (
+        f"inferred breakpoint {inferred} != expected {manifest['expected_breakpoint']}"
+    )
     row["consensus_insertion_breakpoint_pos"] = -1
-    assert int(_inferred_flank_breakpoint_series(row).iloc[0]) == mid
+    assert int(_inferred_flank_breakpoint_series(row).iloc[0]) == mid, (
+        f"fallback breakpoint {int(_inferred_flank_breakpoint_series(row).iloc[0])} != midpoint {mid}"
+    )
 
 
 @pytest.mark.parametrize("catalog_id", MIDPOINT_DROP_LOCI)
@@ -168,22 +172,34 @@ def test_discovery_midpoint_still_drops_the_five_1kg_sites(catalog_id: str):
         empirical_stage=False,
         min_mei_mapped=3,
     )
-    assert bool(gold.loc[0, "gold_stage_pass"]) is False
-    assert "one_sided_or_inconsistent_flank_support" in str(gold.loc[0, "gold_stage_fail_reason"])
+    assert bool(gold.loc[0, "gold_stage_pass"]) is False, (
+        f"expected gold_stage_pass=False, got fail_reason={gold.loc[0, 'gold_stage_fail_reason']}"
+    )
+    assert "one_sided_or_inconsistent_flank_support" in str(gold.loc[0, "gold_stage_fail_reason"]), (
+        f"expected one_sided_or_inconsistent_flank_support, got: {gold.loc[0, 'gold_stage_fail_reason']}"
+    )
     left = int(gold.loc[0, "disease_left_flank_mei_reads"])
     right = int(gold.loc[0, "disease_right_flank_mei_reads"])
-    assert min(left, right) < _GOLD_MIN_FLANK_MEI_READS
+    assert min(left, right) < _GOLD_MIN_FLANK_MEI_READS, (
+        f"weaker flank has {min(left, right)} MEI reads, expected < {_GOLD_MIN_FLANK_MEI_READS}"
+    )
 
 
 @pytest.mark.parametrize("catalog_id", REAL_LOCI)
 def test_inferred_breakpoint_flanks_restore_gold(catalog_id: str):
     manifest = _load_manifest(catalog_id)
     gold = _score_locus(catalog_id, use_discovery_midpoint=False)
-    assert bool(manifest.get("expect_gold")) is True
-    assert bool(gold.loc[0, "gold_stage_pass"]) is True
+    assert bool(manifest.get("expect_gold")) is True, (
+        f"manifest expect_gold should be True for {catalog_id}"
+    )
+    assert bool(gold.loc[0, "gold_stage_pass"]) is True, (
+        f"expected gold_stage_pass=True, got fail_reason={gold.loc[0, 'gold_stage_fail_reason']}"
+    )
     left = int(gold.loc[0, "disease_left_flank_mei_reads"])
     right = int(gold.loc[0, "disease_right_flank_mei_reads"])
-    assert min(left, right) >= _GOLD_MIN_FLANK_MEI_READS
+    assert min(left, right) >= _GOLD_MIN_FLANK_MEI_READS, (
+        f"weaker flank has {min(left, right)} MEI reads, expected >= {_GOLD_MIN_FLANK_MEI_READS}"
+    )
 
 
 @pytest.mark.parametrize("catalog_id", REAL_LOCI)
@@ -197,4 +213,4 @@ def test_fixture_bam_contains_named_detail_read(catalog_id: str):
         names = {read.query_name for read in bam.fetch()}
     finally:
         bam.close()
-    assert read_name in names
+    assert read_name in names, f"read {read_name} not found in BAM {bam_path}"

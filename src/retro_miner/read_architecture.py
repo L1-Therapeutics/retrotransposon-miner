@@ -405,7 +405,10 @@ def _mei_coords_from_detail(
             continue
         hits = work
         if hit_col in work.columns:
-            hits = work.loc[work[hit_col].astype(bool)]
+            # fillna(False) first: NaN is truthy under astype(bool), so a
+            # missing hit flag would be counted as a hit. Matches the
+            # mei_support span path.
+            hits = work.loc[work[hit_col].fillna(False).astype(bool)]
         # Per-hit family gate using the column that owns these coords.
         tcol = "mei_target" if start_col.startswith("mei_") and not start_col.startswith("mate_") else "mate_mei_target"
         if fam in {"ALU", "LINE1", "SVA"} and tcol in hits.columns:
@@ -1734,7 +1737,7 @@ def _dedupe_detail_rows(detail: pd.DataFrame) -> pd.DataFrame:
         s = out.get(col, False)
         if not isinstance(s, pd.Series):
             return pd.Series(False, index=out.index)
-        return s.fillna(False).infer_objects(copy=False).astype(bool)
+        return s.fillna(False).infer_objects().astype(bool)
 
     out["_mei_rank"] = (
         _flag("mate_mei_hit").astype(int) * 4
@@ -1756,7 +1759,7 @@ def _detail_support_mask(detail: pd.DataFrame) -> pd.Series:
         s = detail.get(col, False)
         if not isinstance(s, pd.Series):
             return pd.Series(False, index=detail.index)
-        return s.fillna(False).infer_objects(copy=False).astype(bool)
+        return s.fillna(False).infer_objects().astype(bool)
 
     poly_run = pd.Series(False, index=detail.index)
     if "clip_poly_at_run" in detail.columns:
