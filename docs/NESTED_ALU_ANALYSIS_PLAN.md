@@ -17,6 +17,15 @@ this document and a script docstring disagree, the script docstring wins and
 this file is corrected — it is the plan of record for *cross-sample* decisions
 only.
 
+**Version-control provenance.** The plan first entered version control in
+commit `387eff3` (2026-10-01), bundled with the concurrent boundary-perturbation
+falsification work because both staging trees shared one index. The
+pre-registration date stands regardless of that bundling: the cross-sample
+design decisions below were written and frozen **2026-10-01, before any new
+per-sample genome was processed**, and the matching rule was frozen before
+new-sample data existed. This note only records how the commit came to be
+shared; it does not alter the freeze.
+
 ---
 
 ## Phase 0 — cohort build (complete)
