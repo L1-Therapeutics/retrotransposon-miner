@@ -103,6 +103,60 @@ def test_select_host_rules_disagree_so_phase2a_can_perturb():
     )
 
 
+def test_assign_hosts_finds_every_containing_interval(tmp_path):
+    """Containment must be exact, including at interval boundaries.
+
+    The bisect is over one position-ordered list. An earlier version indexed a
+    sorted list but sliced a file-ordered one, which silently dropped 15 real
+    hosts out of 3,622 on the real cohort because the BCF is coordinate-sorted
+    only by accident of how it was written. These cases pin the boundaries.
+    """
+    rmsk = tmp_path / "rmsk.txt.gz"
+    # UCSC layout: chrom=col5, start0=col6, end0=col7, strand=col9, name=col10
+    rows = [
+        ("chr1", 100, 400, "+", "AluY"),    # contains 101..400
+        ("chr1", 900, 1300, "+", "AluSx"),  # contains 901..1300
+        ("chr2", 50, 350, "-", "AluJb"),
+    ]
+    with gzip.open(rmsk, "wt") as fh:
+        for chrom, start0, end0, strand, name in rows:
+            f = [""] * 13
+            f[5], f[6], f[7], f[9], f[10] = chrom, str(start0), str(end0), strand, name
+            f[11], f[12] = "SINE", "Alu"
+            fh.write("\t".join(f) + "\n")
+
+    # Deliberately UNSORTED input, including exact interval edges.
+    recs = [
+        {"chrom": "chr1", "pos": 1100},
+        {"chrom": "chr1", "pos": 901},    # first base of the second interval
+        {"chrom": "chr1", "pos": 400},    # last base of the first interval
+        {"chrom": "chr1", "pos": 101},    # first base of the first interval
+        {"chrom": "chr2", "pos": 200},
+        {"chrom": "chr1", "pos": 5000},   # outside everything
+    ]
+    out = m.assign_hosts(recs, rmsk, rules=["longest_span"])["longest_span"]
+    assert set(out) == {
+        ("chr1", 101), ("chr1", 400), ("chr1", 901), ("chr1", 1100), ("chr2", 200)
+    }
+    assert out[("chr1", 400)] == (100, 400, "+", "AluY")
+    assert out[("chr1", 901)] == (900, 1300, "+", "AluSx")
+
+
+def test_assign_hosts_input_order_does_not_matter(tmp_path):
+    """The result must not depend on the order records arrive in."""
+    rmsk = tmp_path / "rmsk.txt.gz"
+    with gzip.open(rmsk, "wt") as fh:
+        f = [""] * 13
+        f[5], f[6], f[7], f[9], f[10] = "chr1", "100", "2000", "+", "AluY"
+        f[11], f[12] = "SINE", "Alu"
+        fh.write("\t".join(f) + "\n")
+    recs = [{"chrom": "chr1", "pos": p} for p in (1500, 200, 900, 101)]
+    a = m.assign_hosts(recs, rmsk, rules=["longest_span"])["longest_span"]
+    b = m.assign_hosts(list(reversed(recs)), rmsk, rules=["longest_span"])["longest_span"]
+    assert a == b
+    assert len(a) == 4
+
+
 def test_select_host_empty_returns_none():
     assert m.select_host([], "longest_span") is None
 

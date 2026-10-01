@@ -839,12 +839,16 @@ def assign_hosts(
     result, which is how "nested" is expressed without a second boolean.
     """
     rules = list(rules)
+    # Index per chromosome in *position* order, and bisect that same list. An
+    # earlier version sliced a file-ordered list using indices derived from a
+    # sorted one, which worked only because the BCF happens to be
+    # coordinate-sorted; it would silently drop hosts on any unsorted input.
     by_chrom: dict[str, list[tuple[int, dict[str, str]]]] = collections.defaultdict(list)
     for rec in records:
         by_chrom[rec["chrom"]].append((rec["pos"], rec))
-    sorted_starts = {
-        c: sorted(p for p, _ in v) for c, v in by_chrom.items()
-    }
+    for chrom in by_chrom:
+        by_chrom[chrom].sort(key=lambda item: item[0])
+    positions_by_chrom = {c: [p for p, _ in v] for c, v in by_chrom.items()}
 
     hits: dict[tuple[str, int], list[tuple[int, int, str, str]]] = (
         collections.defaultdict(list)
@@ -863,10 +867,11 @@ def assign_hosts(
             if end0 <= start0:
                 continue
             strand, name = fields[9], fields[10]
-            positions = sorted_starts[chrom]
+            ordered = by_chrom[chrom]
+            positions = positions_by_chrom[chrom]
             lo = bisect.bisect_left(positions, start0)
-            hi = bisect.bisect_left(positions, end0)
-            for pos, _ in by_chrom[chrom][lo:hi]:
+            hi = bisect.bisect_right(positions, end0)
+            for pos, _ in ordered[lo:hi]:
                 if start0 < pos <= end0:
                     hits[(chrom, pos)].append((start0, end0, strand, name))
 
