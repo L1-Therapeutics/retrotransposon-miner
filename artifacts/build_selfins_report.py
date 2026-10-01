@@ -14,7 +14,6 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-import numpy as np
 import pandas as pd
 from scipy import stats
 
@@ -72,7 +71,7 @@ CONS = {"ALU": "uniform", "LINE1": "GC-matched", "SVA": "GC-matched"}
 E  = {f: enr[(enr.family == f) & (enr.null == CONS[f])].iloc[0] for f in NICE}
 EA = {(f, n): enr[(enr.family == f) & (enr.null == n)].iloc[0]
       for f in NICE for n in ("GC-matched", "uniform")}
-O  = {f: ori[ori.family == f].iloc[0] for f in NICE}
+ORI = {f: ori[ori.family == f].iloc[0] for f in NICE}
 S  = {(r.family, r.subset): r for r in sens.itertuples()}
 D  = {r.family: r for r in diag.itertuples()}
 DF = {r.family: r for r in dgf.itertuples()}
@@ -177,11 +176,11 @@ would have folded the tie-break into the measurement.
 |---|---|---|---|---|---|---|
 """
 for f in NICE:
-    o = O[f]
+    o = ORI[f]
     md += (f"| {NICE[f]} | {int(o.n_nested)} | {int(o.n_same)} | **{o.same_frac:.3f}** "
            f"| {o.ci_lo:.3f}–{o.ci_hi:.3f} | {orf(o.odds_ratio)} | {pv(o.p_fisher)} |\n")
 
-md += f"""
+md += """
 Splitting the two classes and testing each against the null separately is where the single
 rate turns out to be hiding something:
 
@@ -199,10 +198,10 @@ Against the orientation-blind placement simulations, Alu antisense nesting is be
 selected null ({SA[('ALU','nested_antisense')].enrichment:.2f}×, p = {pv(SA[('ALU','nested_antisense')].p_two_sided)}), whereas LINE-1 antisense is compatible with its null
 ({SA[('LINE1','nested_antisense')].enrichment:.2f}×, p = {pv(SA[('LINE1','nested_antisense')].p_two_sided)}). These are category-vs-placement tests, not a direct sense-vs-antisense
 contrast among nested calls. The conditional same-orientation fractions and their binomial
-tests are reported separately above; Alu's marginal-based expectation ({O['ALU'].exp_indep:.3f}) is close to,
+tests are reported separately above; Alu's marginal-based expectation ({ORI['ALU'].exp_indep:.3f}) is close to,
 but not conceptually identical with, the 0.5 binomial baseline.
 
-**The chance baseline is close to the marginal-based expectation, but the tests are distinct.** For Alu, new insertions are {O['ALU'].ins_plus_frac:.3f} `+` and reference hosts are {O['ALU'].ref_plus_frac:.3f} `+`, giving an independence-expected same-orientation rate of {O['ALU'].exp_indep:.3f}. The saved conditional exact-binomial test uses 0.5; the saved Fisher test uses the actual orientation marginals. These are similar here, not the same model in general.
+**The chance baseline is close to the marginal-based expectation, but the tests are distinct.** For Alu, new insertions are {ORI['ALU'].ins_plus_frac:.3f} `+` and reference hosts are {ORI['ALU'].ref_plus_frac:.3f} `+`, giving an independence-expected same-orientation rate of {ORI['ALU'].exp_indep:.3f}. The saved conditional exact-binomial test uses 0.5; the saved Fisher test uses the actual orientation marginals. These are similar here, not the same model in general.
 
 ### A limited subfamily negative control
 
