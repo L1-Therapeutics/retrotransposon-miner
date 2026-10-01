@@ -11,7 +11,6 @@ import argparse
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
