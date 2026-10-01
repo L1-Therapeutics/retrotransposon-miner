@@ -11,7 +11,6 @@ import argparse
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -80,7 +79,7 @@ def _aws_region() -> str:
             if line.startswith("[") and line.endswith("]"):
                 in_default = line.lower() in {"[default]", "[profile default]"}
                 continue
-            if in_default and line.lower().startswith("region"):
+            if in_default and line.lower().partition("=")[0].strip() == "region":
                 _, _, value = line.partition("=")
                 value = value.strip()
                 if value:

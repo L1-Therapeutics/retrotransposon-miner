@@ -91,8 +91,12 @@ def test_sentinel_split_pile_beats_heavier_dpe_pile():
         [_dpe_row(LEFT_PILE, f"dpe{i}") for i in range(17)]
     )
     picked = _pick(_candidate(), split=split, disc=disc)
-    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE
-    assert picked.iloc[0]["breakpoint_evidence_source"] == "split_mei"
+    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE, (
+        f"expected breakpoint {RIGHT_PILE}, got {picked.iloc[0]['insertion_breakpoint_pos']}"
+    )
+    assert picked.iloc[0]["breakpoint_evidence_source"] == "split_mei", (
+        f"expected split_mei evidence, got {picked.iloc[0]['breakpoint_evidence_source']}"
+    )
 
 
 def test_few_polya_reads_do_not_beat_heavier_dpe_pile():
@@ -121,8 +125,12 @@ def test_few_polya_reads_do_not_beat_heavier_dpe_pile():
         split=split,
         disc=disc,
     )
-    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == 1500
-    assert picked.iloc[0]["breakpoint_evidence_source"] == "dpe_mei"
+    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == 1500, (
+        f"expected breakpoint 1500, got {picked.iloc[0]['insertion_breakpoint_pos']}"
+    )
+    assert picked.iloc[0]["breakpoint_evidence_source"] == "dpe_mei", (
+        f"expected dpe_mei evidence, got {picked.iloc[0]['breakpoint_evidence_source']}"
+    )
 
 
 def test_dpe_smear_does_not_replace_junction_breakpoint():
@@ -136,8 +144,12 @@ def test_dpe_smear_does_not_replace_junction_breakpoint():
         [_dpe_row(pos, f"dpe{i}") for i, pos in enumerate(smear * 3)]
     )
     picked = _pick(_candidate(), split=split, disc=disc)
-    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE
-    assert picked.iloc[0]["breakpoint_evidence_source"] == "polyA"
+    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE, (
+        f"expected breakpoint {RIGHT_PILE}, got {picked.iloc[0]['insertion_breakpoint_pos']}"
+    )
+    assert picked.iloc[0]["breakpoint_evidence_source"] == "polyA", (
+        f"expected polyA evidence, got {picked.iloc[0]['breakpoint_evidence_source']}"
+    )
 
 
 def test_sentinel_left_polya_loses_to_catalog_insertion_pile():
@@ -161,8 +173,12 @@ def test_sentinel_left_polya_loses_to_catalog_insertion_pile():
         split=split,
         disc=disc,
     )
-    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE + 7
-    assert picked.iloc[0]["breakpoint_evidence_source"] == "tsd_disease"
+    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE + 7, (
+        f"expected TSD midpoint {RIGHT_PILE + 7}, got {picked.iloc[0]['insertion_breakpoint_pos']}"
+    )
+    assert picked.iloc[0]["breakpoint_evidence_source"] == "tsd_disease", (
+        f"expected tsd_disease evidence, got {picked.iloc[0]['breakpoint_evidence_source']}"
+    )
 
 
 def test_few_left_split_mei_lose_to_catalog_dpe_pile():
@@ -173,8 +189,12 @@ def test_few_left_split_mei_lose_to_catalog_dpe_pile():
         [_dpe_row(RIGHT_PILE, f"dpe{i}") for i in range(44)]
     )
     picked = _pick(_candidate(), split=split, disc=disc)
-    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE
-    assert picked.iloc[0]["breakpoint_evidence_source"] == "dpe_mei"
+    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == RIGHT_PILE, (
+        f"expected breakpoint {RIGHT_PILE}, got {picked.iloc[0]['insertion_breakpoint_pos']}"
+    )
+    assert picked.iloc[0]["breakpoint_evidence_source"] == "dpe_mei", (
+        f"expected dpe_mei evidence, got {picked.iloc[0]['breakpoint_evidence_source']}"
+    )
 
 
 def test_tsd_bonus_breaks_near_tie_but_not_a_veto():
@@ -275,10 +295,16 @@ def test_derive_interval_stays_on_chosen_pile_not_distant_mode():
     lo = int(out.iloc[0]["insertion_breakpoint_interval_start"])
     hi = int(out.iloc[0]["insertion_breakpoint_interval_end"])
     bp = int(out.iloc[0]["insertion_breakpoint_pos"])
-    assert bp == RIGHT_PILE
-    assert abs(lo - RIGHT_PILE) <= _WINDOW_BREAKPOINT_PILE_GAP_BP
-    assert abs(hi - RIGHT_PILE) <= _WINDOW_BREAKPOINT_PILE_GAP_BP
-    assert (hi - lo) < abs(RIGHT_PILE - LEFT_PILE)
+    assert bp == RIGHT_PILE, f"expected breakpoint {RIGHT_PILE}, got {bp}"
+    assert abs(lo - RIGHT_PILE) <= _WINDOW_BREAKPOINT_PILE_GAP_BP, (
+        f"interval start {lo} is too far from breakpoint {RIGHT_PILE}"
+    )
+    assert abs(hi - RIGHT_PILE) <= _WINDOW_BREAKPOINT_PILE_GAP_BP, (
+        f"interval end {hi} is too far from breakpoint {RIGHT_PILE}"
+    )
+    assert (hi - lo) < abs(RIGHT_PILE - LEFT_PILE), (
+        f"interval width {hi - lo} should be narrower than pile separation {abs(RIGHT_PILE - LEFT_PILE)}"
+    )
 
 
 def _attach_discovery_window(df: pd.DataFrame) -> pd.DataFrame:
@@ -308,8 +334,13 @@ def test_nssv14073986_real_extract_publishes_catalog_breakpoint():
         ignore_index=True,
     )
     picked = _pick(cand, split=split, disc=disc)
-    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == int(manifest["expected_breakpoint"])
-    assert picked.iloc[0]["breakpoint_evidence_source"] == "polyA"
+    expected_bp = int(manifest["expected_breakpoint"])
+    assert int(picked.iloc[0]["insertion_breakpoint_pos"]) == expected_bp, (
+        f"expected catalog breakpoint {expected_bp}, got {picked.iloc[0]['insertion_breakpoint_pos']}"
+    )
+    assert picked.iloc[0]["breakpoint_evidence_source"] == "polyA", (
+        f"expected polyA evidence for sentinel, got {picked.iloc[0]['breakpoint_evidence_source']}"
+    )
 
 
 def test_nssv14073986_bam_snippet_contains_catalog_polya_read():
@@ -319,4 +350,6 @@ def test_nssv14073986_bam_snippet_contains_catalog_polya_read():
         names = {read.query_name for read in bam.fetch("chr22", 49879720, 49879740)}
     finally:
         bam.close()
-    assert SENTINEL_POLYA_READ in names
+    assert SENTINEL_POLYA_READ in names, (
+        f"sentinel polyA read {SENTINEL_POLYA_READ} not found in BAM {bam_path}"
+    )
