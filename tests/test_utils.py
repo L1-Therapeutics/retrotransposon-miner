@@ -10,20 +10,23 @@ from retro_miner._utils import _iter_fasta_records, _open_textmaybe_gz, safe_loc
 
 class TestSafeLocusId:
     def test_standard_chrom_produces_expected_string(self):
-        assert safe_locus_id("chr22", 100, 200) == "chr22_100_200"
+        assert safe_locus_id("chr22", 100, 200) == "chr22_100_200", (
+            "standard chrom should produce chr22_100_200"
+        )
 
     def test_start_and_end_cast_to_int(self):
-        # floats must be rounded-down via int()
-        assert safe_locus_id("chr1", 1000.9, 2000.1) == "chr1_1000_2000"
+        assert safe_locus_id("chr1", 1000.9, 2000.1) == "chr1_1000_2000", (
+            "floats should be truncated to ints"
+        )
 
     def test_chrom_with_space_replaced_by_underscore(self):
         result = safe_locus_id("chr 1", 10, 20)
-        assert " " not in result
-        assert result == "chr_1_10_20"
+        assert " " not in result, "spaces should be replaced"
+        assert result == "chr_1_10_20", f"expected chr_1_10_20, got {result}"
 
     def test_chrom_with_slash_replaced_by_underscore(self):
         result = safe_locus_id("chr1/alt", 10, 20)
-        assert "/" not in result
+        assert "/" not in result, "slashes should be replaced"
 
     def test_chrom_with_multiple_special_chars_collapsed(self):
         # consecutive special chars become a single underscore
