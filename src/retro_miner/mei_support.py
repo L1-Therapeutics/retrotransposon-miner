@@ -15729,6 +15729,11 @@ def _choose_event_family_and_subfamily(row: pd.Series) -> tuple[str, str]:
         "known_mei_polymorphism_family",
         "g1k_melt_id",
         "lr_svan_id",
+        # Consensus columns come last: they are less specific than the
+        # per-side disease/control winners above, but they are the only family
+        # label populated on rows that carry no discordant vote maps.
+        "consensus_mei_family",
+        "mei_family",
     ):
         fam = _normalize_mei_family_token(str(row.get(col, "") or ""))
         if fam:

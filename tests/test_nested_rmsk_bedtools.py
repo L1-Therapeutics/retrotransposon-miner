@@ -375,3 +375,35 @@ def test_sense_and_antisense_exclude_unknown_from_both_counts(tmp_path: Path):
     # The unknown case is nested, but it is in neither bucket.
     assert sum(1 for v in labels if v in {"nested_sense", "nested_antisense"}) == 2
     assert int(out["nested_repeat_overlap"].sum()) == 3
+
+
+def test_choose_event_family_falls_back_to_consensus_column():
+    """consensus_mei_family is the only family label on most candidates.
+
+    Rows without discordant vote maps previously resolved to an empty family,
+    which made the nested annotator silently skip them.
+    """
+    from retro_miner.mei_support import _choose_event_family
+
+    assert _choose_event_family(pd.Series({"consensus_mei_family": "ALU"})) == "ALU"
+    assert _choose_event_family(pd.Series({"consensus_mei_family": "L1"})) == "LINE1"
+    assert _choose_event_family(pd.Series({"mei_family": "SVA"})) == "SVA"
+    # Subfamily labels still normalise.
+    assert _choose_event_family(pd.Series({"consensus_mei_family": "AluYb8"})) == "ALU"
+    # Absent / empty / unknown tokens stay unresolved.
+    assert _choose_event_family(pd.Series({"consensus_mei_family": ""})) == ""
+    assert _choose_event_family(pd.Series({"consensus_mei_family": float("nan")})) == ""
+    assert _choose_event_family(pd.Series({})) == ""
+
+
+def test_choose_event_family_prefers_specific_columns_over_consensus():
+    """Per-side winners must outrank the consensus column."""
+    from retro_miner.mei_support import _choose_event_family
+
+    row = pd.Series(
+        {
+            "known_mei_polymorphism_family": "SVA",
+            "consensus_mei_family": "ALU",
+        }
+    )
+    assert _choose_event_family(row) == "SVA"
