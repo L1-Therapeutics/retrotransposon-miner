@@ -12,5 +12,5 @@
   "source_results": "/home/ec2-user/retrotransposon-workdir/results/hg00100_germline_chr22_main_wgs_mates",
   "source_cram": "/home/ec2-user/retrotransposon-workdir/data/bam_stage/HG00100.final.cram",
   "plot_rank": 23,
-  "expect_gold": false
+  "expect_gold": true
 }

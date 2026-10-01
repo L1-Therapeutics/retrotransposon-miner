@@ -84,14 +84,24 @@ def test_real_locus_complex_ins_rule(catalog_id: str, expect_complex: bool, expe
     manifest, gold = _score_complex_ins_only(catalog_id)
     klass = str(gold.loc[0, "insertion_event_class"])
     if expect_complex:
-        assert klass == "COMPLEX_INS"
-        assert bool(gold.loc[0, "gold_stage_pass"]) is False
-        assert "complex_ins_non_mei" in str(gold.loc[0, "gold_stage_fail_reason"])
+        assert klass == "COMPLEX_INS", f"expected COMPLEX_INS, got {klass}"
+        assert bool(gold.loc[0, "gold_stage_pass"]) is False, (
+            f"expected gold_stage_pass=False, got fail_reason={gold.loc[0, 'gold_stage_fail_reason']}"
+        )
+        assert "complex_ins_non_mei" in str(gold.loc[0, "gold_stage_fail_reason"]), (
+            f"expected complex_ins_non_mei in fail_reason, got: {gold.loc[0, 'gold_stage_fail_reason']}"
+        )
     else:
-        assert klass != "COMPLEX_INS"
-        assert "complex_ins_non_mei" not in str(gold.loc[0, "gold_stage_fail_reason"])
-        assert bool(gold.loc[0, "gold_stage_pass"]) is expect_gold
-        assert bool(manifest.get("expect_complex_ins", True)) is False
+        assert klass != "COMPLEX_INS", f"expected non-COMPLEX_INS, got {klass}"
+        assert "complex_ins_non_mei" not in str(gold.loc[0, "gold_stage_fail_reason"]), (
+            f"expected no complex_ins_non_mei, got: {gold.loc[0, 'gold_stage_fail_reason']}"
+        )
+        assert bool(gold.loc[0, "gold_stage_pass"]) is expect_gold, (
+            f"expected gold_stage_pass={expect_gold}, got fail_reason={gold.loc[0, 'gold_stage_fail_reason']}"
+        )
+        assert bool(manifest.get("expect_complex_ins", True)) is False, (
+            f"manifest expect_complex_ins should be False for {catalog_id}"
+        )
 
 
 @pytest.mark.parametrize("catalog_id,expect_complex,expect_gold", _discover_loci())
@@ -101,4 +111,4 @@ def test_real_locus_bam_has_named_support_read(catalog_id: str, expect_complex: 
     bam_path = _fixture_dir(catalog_id) / manifest["bam"]
     read_name, _read_pos = _named_detail_read(catalog_id, int(manifest["expected_breakpoint"]))
     names = {aln.query_name for aln in pysam.AlignmentFile(str(bam_path), "rb")}
-    assert read_name in names
+    assert read_name in names, f"read {read_name} not found in BAM {bam_path}"
