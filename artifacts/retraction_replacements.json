@@ -1,0 +1,132 @@
+[
+  {
+    "id": "panel-delta",
+    "description": "Retire low-replication panel deltas; the 1,500-replicate hit-rate comparison shows no advantage within noise.",
+    "retracted": [
+      "−0.8 pp",
+      "-0.8 pp",
+      "−3.6 pp",
+      "-3.6 pp",
+      "70.4% vs 68.2% is a significant disadvantage",
+      "70.4% versus 68.2% shows an advantage"
+    ],
+    "replacement": "no advantage within noise",
+    "required_files": [
+      "panel.py"
+    ]
+  },
+  {
+    "id": "ttc28-locus-count",
+    "description": "Count addressable intronic loci directly from the saved catalog; TTC28 has 7 of 15.",
+    "retracted": [
+      "ten of the 15 intronic",
+      "ten of 15 intronic",
+      "10 of the 15 intronic",
+      "10 of 15 intronic",
+      "ten out of fifteen intronic",
+      "TTC28 ten",
+      "TTC28 has ten",
+      "TTC28: 10"
+    ],
+    "replacement": "TTC28 {observed} of {denominator} addressable intronic loci",
+    "required_files": [],
+    "derived_assertion": {
+      "kind": "csv_count",
+      "source": "l1_locus_catalog_chr22.csv",
+      "column": "host_gene",
+      "value": "TTC28",
+      "filters": {
+        "genic_context": "intronic",
+        "addressable": "True"
+      },
+      "expected": 7,
+      "denominator": 15,
+      "denominator_filters": {
+        "genic_context": "intronic",
+        "addressable": "True"
+      }
+    }
+  },
+  {
+    "id": "age-enrichment-default",
+    "description": "The shipped age-enrichment default is 1.0. 8.0× may remain only as an explicitly labeled falsified assumption.",
+    "retracted": [
+      "age_enrichment=8.0",
+      "age_enrichment = 8.0",
+      "age_enrichment: float = 8.0",
+      "age_enrichment: float = 8.0×",
+      "age_enrichment=8.0×",
+      "age_enrichment = 8.0×",
+      "default age_enrichment: 8.0",
+      "default age_enrichment=8.0",
+      "default age_enrichment is 8.0",
+      "8.0× default age_enrichment",
+      "default is 8.0×",
+      "default of 8.0×",
+      "age_enrichment default is 8.0"
+    ],
+    "replacement": "age_enrichment: float = 1.0",
+    "required_files": [
+      "panel.py"
+    ]
+  },
+  {
+    "id": "levy-category-ratio",
+    "description": "Levy's approximately 4.45 ratio is counts of over- vs underrepresented insertion-type categories, not events.",
+    "retracted": [
+      "~4-fold more events",
+      "4-fold more events",
+      "four-fold more events",
+      "~4-fold more insertions",
+      "4-fold more insertions",
+      "four-fold more insertions",
+      "fourfold more events",
+      "4.45:1 event ratio",
+      "4.45:1 ratio of events",
+      "516/116 event ratio",
+      "516-to-116 event ratio",
+      "4.45-fold event ratio",
+      "~4-fold event ratio",
+      "total-event ratio of ~4.45",
+      "~4-fold ratio of events",
+      "4-fold ratio of events",
+      "four-fold ratio of events",
+      "516/116 events",
+      "516 versus 116 events",
+      "516 overrepresented and 116 underrepresented events",
+      "event-ratio",
+      "event ratio of events"
+    ],
+    "replacement": "516 overrepresented versus 116 underrepresented insertion-type categories out of 36,478 tested",
+    "required_files": [
+      "selfins_report.md",
+      "nested_orientation_literature.csv"
+    ]
+  },
+  {
+    "id": "conley-jordan-authors",
+    "description": "Replace the mistaken Faulkner attribution with the Europe PMC-verified Conley and Jordan author names.",
+    "source": "https://europepmc.org/article/MED/23020800",
+    "retracted": [
+      "Faulkner-adjacent / Conley & Jordan 2012",
+      "Faulkner-adjacent"
+    ],
+    "replacement": "Andrew B Conley; I King Jordan",
+    "required_files": [
+      "alu_mechanism_literature.csv"
+    ]
+  },
+  {
+    "id": "tajaddod-authors",
+    "description": "Replace the mistaken Schmid-lab/Hoffmann attribution with the Europe PMC-verified Tajaddod author list.",
+    "source": "https://europepmc.org/article/MED/27782844",
+    "retracted": [
+      "Schmid-lab / Hoffmann et al. 2016",
+      "Schmid-lab / Hoffmann"
+    ],
+    "replacement": "Mansoureh Tajaddod; Andrea Tanzer; Konstantin Licht; Michael T Wolfinger; Stefan Badelt; Florian Huber; Oliver Pusch; Sandy Schopoff; Michael Janisiw; Ivo Hofacker; Michael F Jantsch",
+    "required_files": [
+      "alu_mechanism_literature.csv"
+    ]
+  }
+]
