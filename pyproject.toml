@@ -24,6 +24,7 @@ dependencies = [
   "intervaltree>=3.1",
   "pyyaml>=6.0",        # scripts/download_public_data.py
   "rich>=13.7",
+  "scikit-learn>=1.4",  # gold-call gradient boosting
 ]
 
 [project.scripts]
