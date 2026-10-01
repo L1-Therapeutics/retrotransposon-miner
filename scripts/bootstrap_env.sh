@@ -105,6 +105,12 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 echo
+echo "Installing snpEff 5.4c from the S3 cache when it is already there..."
+SNPEFF_PREFIX="${RTM_PUBLIC_DATA_DIR:-${HOME}/retrotransposon-workdir/data/public}/tools/snpeff" \
+  bash "${ROOT_DIR}/scripts/install_snpeff.sh" || \
+  echo "WARN: snpEff was not installed. Re-run: bash scripts/install_snpeff.sh" >&2
+
+echo
 echo "Environment ready."
 echo "Activate it with one of:"
 echo "  micromamba activate ${ENV_NAME}"

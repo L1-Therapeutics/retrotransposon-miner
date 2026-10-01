@@ -3067,6 +3067,18 @@ def main() -> int:
         pulled["step"] = "pull"
         manifest["s3_cache"].append(pulled)
 
+    snpeff_script = Path(__file__).resolve().parent / "install_snpeff.sh"
+    snpeff_prefix = outdir / "tools" / "snpeff"
+    print(f"[snpeff] install prefix {snpeff_prefix}", file=sys.stderr)
+    snpeff_ok, snpeff_msg = _run_cmd(["bash", str(snpeff_script), str(snpeff_prefix)], required=False)
+    manifest["postprocess"].append(
+        {
+            "step": "install_snpeff",
+            "status": "installed" if snpeff_ok else "failed",
+            "detail": snpeff_msg,
+        }
+    )
+
     print(
         "Storage note: full-BAM workflows (whole disease+control remap) may require ~300GB free disk. "
         "This downloader uses chromosome remote slicing for test BAMs by default. "
