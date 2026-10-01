@@ -10701,6 +10701,13 @@ def _genomic_flank_evidence_table(
 
 
 def _event_orientation_series(df: pd.DataFrame) -> pd.Series:
+    """Return the insertion orientation for each locus.
+
+    Preference order: ``consensus_insertion_orientation``,
+    ``insertion_orientation``, ``disease_insertion_orientation``,
+    ``control_insertion_orientation``. Values are normalized to ``"+"``,
+    ``"-"``, or ``""`` when unknown.
+    """
     ori = pd.Series("", index=df.index, dtype="object")
     for col in (
         "consensus_insertion_orientation",
@@ -10715,6 +10722,16 @@ def _event_orientation_series(df: pd.DataFrame) -> pd.Series:
     return ori.where(ori.isin(["+", "-"]), "")
 
 
+def _flank_count(df: pd.DataFrame, prefix: str, col: str) -> pd.Series:
+    """Return a flank-count column as a clean integer Series.
+
+    Missing columns are treated as 0. Non-numeric values are coerced
+    to NaN then filled with 0.
+    """
+    raw = _df_col_series(df, f"{prefix}_{col}", 0)
+    return pd.to_numeric(raw, errors="coerce").fillna(0).astype(int)
+
+
 def _sample_orientation_consistent_sidepair(df: pd.DataFrame, prefix: str) -> pd.Series:
     """Two-sided genomic-flank support with orientation-consistent MEI.
 
@@ -10727,10 +10744,10 @@ def _sample_orientation_consistent_sidepair(df: pd.DataFrame, prefix: str) -> pd
       side (+ → right-flank polyA; − → left-flank polyA).
     """
     min_mei = int(_GOLD_MIN_FLANK_MEI_READS)
-    l_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_mei_reads", 0), errors="coerce").fillna(0)
-    r_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_mei_reads", 0), errors="coerce").fillna(0)
-    l_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_polya_reads", 0), errors="coerce").fillna(0)
-    r_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_polya_reads", 0), errors="coerce").fillna(0)
+    l_mei_n = _flank_count(df, prefix, "left_flank_mei_reads")
+    r_mei_n = _flank_count(df, prefix, "right_flank_mei_reads")
+    l_poly_n = _flank_count(df, prefix, "left_flank_polya_reads")
+    r_poly_n = _flank_count(df, prefix, "right_flank_polya_reads")
     l_mei = l_mei_n >= min_mei
     r_mei = r_mei_n >= min_mei
     l_poly = l_poly_n >= 1
