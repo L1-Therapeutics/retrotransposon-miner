@@ -48,6 +48,22 @@ def test_guard_rejects_fixture_containing_retracted_phrase_with_file_and_line():
         validate_sources({**_sources(), fixture: text})
 
 
+def test_derived_ttc28_replacement_is_explicit_and_required(tmp_path):
+    sources = _sources()
+    registry_path = ARTIFACTS / "retraction_replacements.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    ttc28 = next(entry for entry in registry if entry["id"] == "ttc28-locus-count")
+    corrected = ttc28["replacement"].format(observed=7, denominator=15)
+    assert corrected in ttc28["description"]
+    validate_sources(sources)
+
+    ttc28["description"] = ttc28["description"].replace(corrected, "catalog count correction")
+    broken_registry = tmp_path / "registry.json"
+    broken_registry.write_text(json.dumps(registry), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"ttc28-locus-count: corrected claim missing"):
+        validate_sources(sources, broken_registry)
+
+
 def test_registry_is_json_and_covers_required_claim_families():
     raw = json.loads((ARTIFACTS / "retraction_replacements.json").read_text(encoding="utf-8"))
     ids = {entry["id"] for entry in raw}
