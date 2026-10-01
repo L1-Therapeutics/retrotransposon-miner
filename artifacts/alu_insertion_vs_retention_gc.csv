@@ -1,0 +1,6 @@
+set,subfamily,n,gc_mean
+new polymorphic insertions (this genome),AluY (young),1371,0.3851283734500364
+new polymorphic insertions (this genome),AluS/J (old label),184,0.4284728260869565
+fixed reference elements (hg38),AluY (young),14997,0.4412480752260167
+fixed reference elements (hg38),AluS/J (old),15000,0.4379915703703704
+genome-wide random baseline,-,384216,0.408904479753551
