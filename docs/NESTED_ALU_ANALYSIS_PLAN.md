@@ -166,9 +166,60 @@ analysis set. Under the §1 estimand the audit operates on unique sites per §2.
 measured, and offset drift is stratified rather than assumed away. TSD length is
 not treated as continuous until sentinels are excluded.
 
-## Phase 3 — genotype concordance (revised §5)
+## Phase 3 — genotype concordance (revised §5; complete)
 
-Per-sample callsets only, under the §4 assignment and the §5 revision.
+`scripts/score_genotype_concordance.py`; results in
+`nested_analysis/results_longread/genotype_concordance.md` / `.json`, with the
+per-site table in `phase3_site_genotypes.csv`.
+
+Two pre-registered requirements were measured and found unsatisfiable, and both
+are recorded as gate verdicts rather than worked around:
+
+- **The per-sample callset §4 assumes does not exist on GRCh38.** The
+  `final-vcf.unphased.SVAN_1.3.vcf.gz` under the hg38 polymorphism directory is
+  a symlink into `hs1/` and is therefore CHM13. The genotyped SVIM pooled BCF
+  (`svim.asm.hg38.bcf`, 908 samples) is the usable substrate, and §5
+  anticipated it: independent individuals, one method.
+- **The pre-registered concordance design is not executable.** The callset has no
+  missingness channel, so a `0/0` cannot be separated from a genotyping failure
+  and §5's "demonstrated callable" requirement cannot be met (Gate 3b).
+
+Phase 3 therefore measures **recurrence across two independent halves of the 908
+genomes**, split by sorted sample name, with the hallmark as exposure and
+recurrence as outcome. That ordering is a deliberate reversal of Phase 2b: a
+site with one carrier cannot be cross-half supported by arithmetic, so exposing
+recurrence reduces the reference arm to singletons and every ladder rung fails
+its minimum-reference floor. Allele frequency is excluded from the covariates
+for the same reason.
+
+New gates, all executable and all in the JSON:
+
+- **Gate 3a** — the site and genotype callsets declare different lengths for 24
+  of 25 shared contigs, with the sign flipping across chromosomes. The join is
+  verified by exact-coordinate containment (0 of 1,335 analysis sites absent)
+  rather than trusted from the headers, and the header disagreement is reported
+  because a join that had trusted it would have been wrong.
+- **Gate 3b** — no missingness channel; 0 missing genotypes of 1,212,180.
+- **Gate 3c** — samples joined by name. The cross-method callset orders its
+  samples differently, so an index join would transpose genotypes silently.
+- **Gate 3d** — the cross-method floor. An independent short-read 1KG callset
+  covers 0.90% of nested-Alu sites against 41.33% of non-nested Alu sites from
+  the same cohort (Fisher exact p = 5.8e-12). A short read cannot span an Alu
+  inserted into an Alu, so the comparator is structurally blind rather than
+  noisy. This is the measured evidence for §5's refusal to use the word
+  "validated", and it replaces an assumption with a number.
+
+Result: **no TPRT hallmark predicts cross-genome recurrence.** Seven of nine
+pre-declared hallmark exposures were estimable; all matched. The one nominal
+signal, long poly(A) (≥20 nt) being *less* recurrent, is MH RD −0.122 at raw
+p = 0.0073 and **BH p = 0.051** across exposures, so it does not survive
+multiplicity. This is consistent with Phase 2b's finding that the triad does not
+separate nested from non-nested calls.
+
+Accumulation (deliverable 9) over the 908 genomes: 1,328 unique nested sites
+backed by 103,196 carrier observations, 77.7 carriers per unique site; half the
+final unique-site count is reached at 253 genomes, 90% at 687. Site counts and
+carrier counts are reported side by side and never summed.
 
 ---
 
@@ -179,13 +230,13 @@ Per-sample callsets only, under the §4 assignment and the §5 revision.
 | 1 | `per_call_longread_nested.csv` — one row per Alu insertion site | Phase 0 | pooled BCF |
 | 2 | `provenance_manifest.json` — verdict of every gate | Phase 0 (Gate 0c updated per §5) | pooled BCF + per-sample (0c) |
 | 3 | `position_enrichment.md` / `.json` — Phase 1 primary + sensitivities | Phase 1 | pooled BCF (unique sites) |
-| 4 | `unique_sites` table — deduplicated sites per the §2 matching rule, per-sample call counts side by side | cross-sample dedup (§1–§2) | pooled BCF + per-sample callsets |
-| 5 | `matching_audit.md` — per-source caller offsets, calibration sites, full ±5/±20 sweep | §2 calibration (before new-sample matching) | already-processed shared sites |
+| 4 | `unique_sites` table — deduplicated sites per the §2 matching rule, per-sample call counts side by side | cross-sample dedup (§1–§2); *produced at n=2 callsets by the sibling `rtm-nested-analysis` project, not yet at 908* | pooled BCF + per-sample callsets |
+| 5 | `matching_audit.md` — per-source caller offsets, calibration sites, full ±5/±20 sweep | §2 calibration (before new-sample matching); *same n=2 caveat* | already-processed shared sites |
 | 6 | tail-cluster TPRT-hallmark audit (tail + comparison bins, blind) | Phase 2a | pooled BCF (unique sites) |
 | 7 | sentinel-excluded TSD distribution + drift stratification | Phase 2b | pooled BCF |
-| 8 | recurrence and carrier-count table (per-sample call counts side by side with unique sites) | §4 assignment | per-sample callsets |
-| 9 | **accumulation curves** — unique nested sites vs genomes added, with marginal yield; basis for genome-count decisions (§3) | §3 procedure | per-sample callsets + pooled BCF |
-| 10 | genotype concordance report (callability inference labeled) + private-site exploratory analysis | revised Phase 3 | per-sample callsets |
+| 8 | recurrence and carrier-count table (per-sample call counts side by side with unique sites) | Phase 3 — `phase3_site_genotypes.csv`, carrier names listed per site | genotyped BCF (908) |
+| 9 | **accumulation curves** — unique nested sites vs genomes added, with marginal yield; basis for genome-count decisions (§3) | Phase 3 — `genotype_concordance.md` §Accumulation | genotyped BCF (908) |
+| 10 | genotype concordance report (callability inference labeled) + private-site exploratory analysis | Phase 3 — `genotype_concordance.md` / `.json` | genotyped BCF (908) |
 
 ---
 
@@ -203,3 +254,13 @@ Per-sample callsets only, under the §4 assignment and the §5 revision.
 - **Shared polymorphism dedup is pre-registered; matching window sensitivity
   reported in full.** Deviations from the §2 rule are reported as deviations,
   with dates.
+- **Output-directory collision (operational).** `nested_analysis/` sits at the
+  workspace root rather than inside any one worktree, and both this worktree and
+  the sibling `rtm-nested-analysis` project write into
+  `nested_analysis/results_longread/`. Filenames do not currently overlap, but
+  the two projects are one directory apart with no coordination, so a future
+  filename reuse would silently overwrite the other project's result. Each
+  producer should own a subdirectory.
+- **Phase 0 is byte-reproducible.** Re-running `build_longread_nested_cohort.py`
+  from scratch reproduced `per_call_longread_nested.csv` with an identical MD5,
+  so cohort differences between runs are not a source of variation here.
