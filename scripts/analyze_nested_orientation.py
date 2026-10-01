@@ -49,6 +49,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--outdir", required=True, type=Path)
     p.add_argument("--min-confidence", default="high", choices=["high", "high,medium", "all"])
     p.add_argument("--knownmei-only", action="store_true")
+    p.add_argument(
+        "--twobit",
+        type=Path,
+        help="hg38.2bit; enables the GC-matched self-insertion null",
+    )
+    p.add_argument("--gc-bin", type=int, default=200, help="GC bin size in bp")
+    p.add_argument(
+        "--gc-tolerance", type=float, default=0.05, help="half-width of the GC match window"
+    )
+    p.add_argument("--n-matched", type=int, default=2000, help="matched bins sampled per call")
+    p.add_argument("--seed", type=int, default=20260930)
     return p.parse_args()
 
 
@@ -212,10 +223,255 @@ def mei_base_content(rmsk: Path, chroms: set[str]) -> dict[tuple[str, str], int]
     return content
 
 
+def mei_intervals_by_family_chrom(
+    rmsk: Path, chroms: set[str]
+) -> dict[str, list[tuple[int, int]]]:
+    """Sorted, per-family, per-chromosome rmsk intervals keyed "FAM|chr"."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    with gzip_open(rmsk) as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 13 or not parts[5].startswith("chr"):
+                continue
+            chrom = parts[5]
+            if chrom not in chroms:
+                continue
+            try:
+                start0, end0 = int(parts[6]), int(parts[7])
+            except ValueError:
+                continue
+            if end0 <= start0:
+                continue
+            fam = _normalize_mei_family_token(f"{parts[10]} {parts[11]} {parts[12]}")
+            if not fam:
+                continue
+            out.setdefault(f"{fam}|{chrom}", []).append((start0, end0))
+    for key in out:
+        out[key].sort()
+    return out
+
+
 def gzip_open(path: Path):
     import gzip
 
     return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+
+
+def build_gc_bins(
+    twobit: Path,
+    chrom_sizes: dict[str, int],
+    mei_intervals: dict[str, list[tuple[int, int]]],
+    bin_size: int,
+    chunk_bp: int = 20_000_000,
+) -> pd.DataFrame:
+    """Bin the genome and record GC plus same-family MEI coverage per bin.
+
+    Each bin gets the GC fraction of its sequence and, per family, the number
+    of bases in that bin covered by a same-family rmsk interval. Bins with no
+    acgt (all N, or centromere-heavy) are dropped, since their GC is not
+    informative and they cannot host an insertion anyway.
+    """
+    import py2bit
+
+    tb = py2bit.open(str(twobit))
+    rows: list[tuple[str, int, float, int, int, int, int]] = []
+
+    known = set(tb.chroms())
+
+    for chrom in sorted(chrom_sizes):
+        length = chrom_sizes[chrom]
+        if chrom not in known:
+            continue
+
+        starts = np.arange(0, length, bin_size, dtype=np.int64)
+        ends = np.minimum(starts + bin_size, length)
+        spans = (ends - starts).astype(np.int64)
+
+        # Same-family coverage per bin, via a merged sweep over sorted
+        # intervals. Scanning the interval list per bin is O(bins x intervals)
+        # and does not finish on 3.1 Gb, so intervals are merged once and then
+        # walked once alongside the bins.
+        cov: dict[str, np.ndarray] = {}
+        for fam in FAMILY_ORDER:
+            ivs = mei_intervals.get(f"{fam}|{chrom}", [])
+            cov[fam] = _coverage_per_bin(starts, ends, _merge_intervals(ivs))
+
+        # GC per bin from whole-chromosome sequence in one read.
+        seq = tb.sequence(chrom, 0, length).upper()
+        if not seq:
+            continue
+        n_bases = len(seq)
+
+        # Per-bin GC and acgt counts, computed in chunks with reduceat.
+        # A whole-chromosome cumsum would materialise a multi-GB int64
+        # array per chromosome; reduceat reads each base once and only
+        # allocates the output.
+        gc_arr = np.zeros(len(starts), dtype=np.float64)
+        at_arr = np.zeros(len(starts), dtype=np.float64)
+        for c0, c1 in _chunk_bounds(len(starts), bin_size, chunk_bp):
+            cs = int(starts[c0])
+            ce = int(ends[c1 - 1])
+            sub = seq[cs:ce]
+            if not sub:
+                continue
+            arr = np.frombuffer(sub.encode("ascii", "replace"), dtype=np.uint8)
+            offs = (starts[c0:c1] - cs).astype(np.intp)
+            offs = offs[(offs >= 0) & (offs < len(arr))]
+            if offs.size == 0:
+                continue
+            gc_mask = (arr == _G) | (arr == _C)
+            at_mask = gc_mask | (arr == _A) | (arr == _T)
+            gc_sum = np.add.reduceat(gc_mask, offs, dtype=np.int64)
+            at_sum = np.add.reduceat(at_mask, offs, dtype=np.int64)
+            m = c1 - c0
+            span_c = spans[c0:c1].astype(np.float64)
+            gc_arr[c0 : c0 + m] = gc_sum / np.maximum(1, span_c)
+            at_arr[c0 : c0 + m] = at_sum / np.maximum(1, span_c)
+
+        keep = at_arr >= 0.5
+        for i in np.nonzero(keep)[0]:
+            rows.append(
+                (
+                    chrom,
+                    int(starts[i]),
+                    float(gc_arr[i]),
+                    int(spans[i]),
+                    int(cov["ALU"][i]),
+                    int(cov["LINE1"][i]),
+                    int(cov["SVA"][i]),
+                )
+            )
+
+    tb.close()
+    return pd.DataFrame(
+        rows, columns=["chrom", "start", "gc", "span", "ALU", "LINE1", "SVA"]
+    )
+
+
+def _merge_intervals(ivs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping intervals so coverage is not double counted."""
+    merged: list[tuple[int, int]] = []
+    for s, e in sorted(ivs):
+        if merged and s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _coverage_per_bin(
+    starts: np.ndarray, ends: np.ndarray, merged: list[tuple[int, int]]
+) -> np.ndarray:
+    """Bases of each bin covered by merged intervals, via one sweep."""
+    out = np.zeros(len(starts), dtype=np.int64)
+    if not merged:
+        return out
+    n_iv = len(merged)
+    j = 0
+    for i in range(len(starts)):
+        b_start, b_end = int(starts[i]), int(ends[i])
+        # Skip intervals that end before this bin.
+        while j < n_iv and merged[j][1] <= b_start:
+            j += 1
+        if j >= n_iv:
+            # No interval can reach any later bin; zero-fill the remainder.
+            break
+        k = j
+        total = 0
+        while k < n_iv and merged[k][0] < b_end:
+            total += min(merged[k][1], b_end) - max(merged[k][0], b_start)
+            k += 1
+        out[i] = total
+    return out
+
+
+_G, _C, _A, _T = ord("G"), ord("C"), ord("A"), ord("T")
+
+
+def _chunk_bounds(n_bins: int, bin_size: int, chunk_bp: int) -> list[tuple[int, int]]:
+    """Split bin indices into chunks spanning at most ``chunk_bp`` bases."""
+    per_chunk = max(1, chunk_bp // max(1, bin_size))
+    return [(i, min(i + per_chunk, n_bins)) for i in range(0, n_bins, per_chunk)]
+
+
+def _is_gc(seq: str) -> np.ndarray:
+    arr = np.frombuffer(seq.encode("ascii", "replace"), dtype=np.uint8)
+    return ((arr == 71) | (arr == 67)).astype(np.int64)
+
+
+def _is_at(seq: str) -> np.ndarray:
+    arr = np.frombuffer(seq.encode("ascii", "replace"), dtype=np.uint8)
+    return (
+        (arr == 65) | (arr == 67) | (arr == 71) | (arr == 84)
+    ).astype(np.int64)
+
+
+def gc_matched_null(
+    bins: pd.DataFrame,
+    df: pd.DataFrame,
+    n_matched: int,
+    gc_tolerance: float,
+    seed: int,
+) -> pd.DataFrame:
+    """Expected nested fraction when control positions match GC but not host.
+
+    For each call, take the GC fraction of its own bin and average the
+    same-family MEI coverage of every genome bin whose GC is within
+    ``gc_tolerance``. This asks the sharper question the uniform null cannot:
+    are these insertions landing in same-family elements more often than
+    chance would allow, once GC composition -- which drives where Alus sit --
+    is held fixed?
+    """
+    from scipy import stats
+
+    rng = np.random.default_rng(seed)
+
+    gcs = bins["gc"].to_numpy(dtype=float)
+    spans = bins["span"].to_numpy(dtype=float)
+    order = np.argsort(gcs)
+    sorted_gc = gcs[order]
+    fam_cols = {fam: bins[fam].to_numpy(dtype=float)[order] / spans[order] for fam in FAMILY_ORDER}
+
+    rows = []
+    for fam in FAMILY_ORDER:
+        sub = df[df["family"] == fam]
+        if sub.empty:
+            continue
+        frac = fam_cols[fam]
+
+        p_call = np.zeros(len(sub), dtype=float)
+        for i, gc_target in enumerate(sub["gc"].to_numpy(dtype=float)):
+            lo = np.searchsorted(sorted_gc, gc_target - gc_tolerance, side="left")
+            hi = np.searchsorted(sorted_gc, gc_target + gc_tolerance, side="right")
+            pool = frac[lo:hi]
+            if pool.size == 0:
+                pool = frac
+            if pool.size > n_matched:
+                pool = pool[rng.choice(pool.size, size=n_matched, replace=False)]
+            p_call[i] = float(pool.mean())
+
+        exp = float(p_call.sum())
+        n = len(sub)
+        n_nested = int((sub["nested_same_class_orientation"] != "unnested").sum())
+        obs = n_nested / n
+        p = float(stats.binomtest(n_nested, n, exp / n, alternative="greater").pvalue)
+        rows.append(
+            {
+                "family": fam,
+                "n_calls": n,
+                "n_nested": n_nested,
+                "observed_nested_fraction": obs,
+                "expected_nested_fraction_gc_matched": exp / n,
+                "expected_nested_count": exp,
+                "enrichment_gc_matched": (obs / (exp / n)) if exp > 0 else np.nan,
+                "p_greater_gc_matched": p,
+                "null": "gc_matched",
+                "gc_tolerance": gc_tolerance,
+                "n_matched_bins_per_call": n_matched,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def genome_sizes(path: Path) -> dict[str, int]:
@@ -387,6 +643,32 @@ def main() -> int:
     print(f"MEI content for {len(content)} (family, chrom) pairs", flush=True)
     nulls = selfinsertion_null(ann, content, chrom_sizes)
 
+    gc_null = pd.DataFrame()
+    if args.twobit:
+        print("binning genome for GC-matched null", flush=True)
+        # Annotate each call with its bin's GC so matching is per-call.
+        ivs = mei_intervals_by_family_chrom(args.rmsk, chroms)
+        # Only bin chromosomes that actually carry calls. Binning all 455 would
+        # add ~430 irrelevant chromosomes and dominate the runtime.
+        wanted = {c: s for c, s in chrom_sizes.items() if c in chroms}
+        print(f"binning {len(wanted)} chromosomes at {args.gc_bin}bp", flush=True)
+        bins = build_gc_bins(args.twobit, wanted, ivs, args.gc_bin)
+        print(f"{len(bins)} GC bins over {bins['chrom'].nunique()} chromosomes", flush=True)
+        key = bins.set_index(["chrom", "start"])["gc"]
+        ann = ann.copy()
+        ann["gc"] = [
+            float(key.get((str(c), int(p) // args.gc_bin * args.gc_bin), np.nan))
+            for c, p in zip(ann["chrom"], ann["insertion_breakpoint_pos"])
+        ]
+        keep = ann["gc"].notna()
+        dropped = int((~keep).sum())
+        if dropped:
+            print(f"warning: {dropped} calls fell in N-only bins and are dropped from the GC null")
+        gc_null = gc_matched_null(
+            bins, ann[keep].copy(), args.n_matched, args.gc_tolerance, args.seed
+        )
+        gc_null.to_csv(args.outdir / "selfinsertion_gc_matched.csv", index=False)
+
     ann.to_csv(args.outdir / "per_call_annotated.csv", index=False)
     counts.to_csv(args.outdir / "counts_by_family.csv", index=False)
     sva.to_csv(args.outdir / "sense_vs_antisense.csv", index=False)
@@ -410,6 +692,9 @@ def main() -> int:
     print(sva.to_string(index=False))
     print()
     print(nulls.to_string(index=False))
+    if not gc_null.empty:
+        print()
+        print(gc_null.to_string(index=False))
     return 0
 
 
