@@ -74,6 +74,9 @@ def validate_sources(
                         f"{target}: corrected denominator expected {assertion['denominator']}, found {denominator}"
                     )
                 replacement = replacement.format(observed=observed, denominator=denominator)
+                description = str(entry.get("description", ""))
+                if replacement not in description:
+                    errors.append(f"{entry['id']}: corrected claim missing from registry description: {replacement!r}")
         for required_file in entry["required_files"]:
             target = str(required_file)
             source_path = next((path for path in sources if path.as_posix().endswith(target)), None)
