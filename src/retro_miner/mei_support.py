@@ -26,7 +26,6 @@ from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import (
     _clustered_coord_extent,
-    _robust_coord_extent,
     generate_gold_read_architecture_plots,
 )
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
