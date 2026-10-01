@@ -962,6 +962,9 @@ def project_offset(
     out: dict[str, Any] = {
         "consensus_offset": None,
         "offset_drift_bp": None,
+        "consensus_span_bp": None,
+        "consensus_offset_min": None,
+        "consensus_offset_max": None,
         "alignment_identity": None,
         "alignment_score": None,
         "n_unaligned_host_bases": None,
@@ -1013,6 +1016,13 @@ def project_offset(
     out["alignment_score"] = float(alignment.score)
     out["n_unaligned_host_bases"] = len(host_seq) - len(mapping)
     out["max_indel_bp"] = int(max_indel)
+    # Consensus extent actually covered by the alignment. Phase 1's null needs
+    # this: resampling in host space and counting in consensus space would
+    # compare two geometries, because the projection does not preserve
+    # distance.
+    out["consensus_span_bp"] = (max(mapping.values()) - min(mapping.values()) + 1) if mapping else None
+    out["consensus_offset_min"] = min(mapping.values()) if mapping else None
+    out["consensus_offset_max"] = max(mapping.values()) if mapping else None
     out["consensus_match_name"] = None  # filled by caller
     if host_offset_0based in mapping:
         out["consensus_offset"] = mapping[host_offset_0based]
@@ -1124,7 +1134,8 @@ OUTPUT_COLUMNS = [
     "host_len", "host_offset_5p_0based", "host_offset_bin_20bp",
     "host_selection_rule",
     "consensus_match_name", "consensus_offset", "consensus_mapping",
-    "offset_drift_bp",
+    "offset_drift_bp", "consensus_span_bp", "consensus_offset_min",
+    "consensus_offset_max",
     "alignment_identity", "alignment_score", "n_unaligned_host_bases",
     "max_indel_bp",
     "tsd_len", "tsd_seq", "tsd_len_is_sentinel", "polya_len", "polya_seq",
