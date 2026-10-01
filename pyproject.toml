@@ -44,6 +44,9 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts   = ["-q", "--tb=short"]
+markers = [
+  "slow: exercises the real multi-hundred-megabyte local datasets; skip with -m 'not slow'",
+]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
