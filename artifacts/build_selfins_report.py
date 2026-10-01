@@ -5,6 +5,7 @@ interpretation are curated in this template and should be reviewed when upstream
 """
 import json
 import re
+import sys
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -19,6 +20,8 @@ from scipy import stats
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "notes" if (BASE / "notes").is_dir() else BASE
+sys.path.insert(0, str(BASE))
+from retraction_guard import validate_sources  # noqa: E402
 
 REPORT_PATH = BASE / "selfins_report.md"
 PDF_PATH = BASE / "selfins_report.pdf"
@@ -433,8 +436,16 @@ artifacts/requirements-pdf.txt`).
 | `nested_orientation_literature.csv` | prior work with per-paper bearing |
 """
 
+validate_sources(
+    {
+        REPORT_PATH: md,
+        DATA_DIR / "nested_orientation_literature.csv": (DATA_DIR / "nested_orientation_literature.csv").read_text(),
+        DATA_DIR / "alu_mechanism_literature.csv": (DATA_DIR / "alu_mechanism_literature.csv").read_text(),
+        DATA_DIR / "panel.py": (DATA_DIR / "panel.py").read_text(),
+        DATA_DIR / "l1_locus_catalog_chr22.csv": (DATA_DIR / "l1_locus_catalog_chr22.csv").read_text(),
+    }
+)
 REPORT_PATH.write_text(md, encoding="utf-8")
-
 
 
 def _markdown_structure(markdown: str) -> dict[str, object]:
