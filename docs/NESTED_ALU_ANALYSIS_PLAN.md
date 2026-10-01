@@ -264,3 +264,92 @@ carrier counts are reported side by side and never summed.
 - **Phase 0 is byte-reproducible.** Re-running `build_longread_nested_cohort.py`
   from scratch reproduced `per_call_longread_nested.csv` with an identical MD5,
   so cohort differences between runs are not a source of variation here.
+
+---
+
+## Phase 4 — joint signature and same-host recurrence (post-freeze extension)
+
+**This section was added after the 2026-10-01 freeze and changes nothing above
+it.** Everything above remains as frozen; this records work that extends the plan
+rather than revising it. Scripts: `scripts/joint_enrichment.py`,
+`scripts/recurrence_test.py`, shared inputs in
+`scripts/nested_multi_sample_common.py`. Results in
+`nested_analysis/results_phase4/`.
+
+### Substrate
+
+Consumes `nested_analysis/results_multi_sample/unique_sites.csv` (763 unique
+sites, 5 genomes) as the authoritative site grouping. The per-call table named as
+an input **does not exist**; per-call TSD and child subfamily are recovered by
+joining the dedup output back to the callsets by sample name within the frozen
+±10 bp rule. That join is a **gate**, not a diagnostic: it passes only if it
+reproduces dedup's own `n_carriers` for every site and agrees on nesting state and
+orientation. On the shipped data all 763 sites resolve, all 1,284 recovered calls
+match `sum(n_carriers)`, and there are zero disagreements.
+
+### Opportunity null — a measured deviation
+
+No mappability or gap track exists in this workspace. The RepeatMasker substitute
+was measured rather than assumed. A strict repeat mask is **degenerate**: the host
+element is itself a RepeatMasker annotation, so masking repeats deletes the entire
+opportunity. Once the host's own annotation is excluded, repeats *other* than the
+host intrude on **0.000** of the host interval for **all** 216 measured Alu hosts.
+The mappability-scaled variant therefore collapses onto the host-interval null —
+which is the plan's own designated primary — and is recorded as a deviation.
+
+### Joint enrichment
+
+Pre-specified cells only; the ~1.2M-cell table is not scanned. Host-stratified
+conditional randomization, no log-linear model, ≥10,000 replicates, MC
+p = (1 + #{sim ≥ obs})/(B+1), structural-zero bins excluded rather than
+pseudocounted.
+
+| cell | observed | expected | effect | 95% CI | MC p | Holm p |
+|---|---|---|---|---|---|---|
+| `{Alu, 120-140, sense}` (primary) | 22 | 7.97 | 2.76× | 1.85–4.00 | 9.999e-05 | n/a |
+| `{Alu, 280-300, sense}` | 14 | 4.92 | 2.85× | 1.58–4.33 | 9.999e-04 | 0.003 |
+| interaction 120-140 | 5 | −0.43 | unstable\* | — | 0.100 | 0.200 |
+| interaction 280-300 | −3 | 0.58 | unstable\* | — | 0.917 | 0.917 |
+
+\* expected within 1 of zero, so the ratio and its interval are not quotable.
+
+The primary cell **replicates the position-133 signal on an independent
+5-genome cohort**. Per §1, private sites are a separate exploratory analysis and
+no primary p-value is computed over them; they are reported for transparency
+(324 private sites, observed 31, expected 11.65).
+
+**Multiplication test.** The joint estimate (2.76×) exceeds the per-factor
+benchmark (2.48×) by 1.11×. No multiplied figure is reported. The excess is
+small and the pre-specified interaction cells — which test the same question
+directly — do not reject after Holm adjustment, so the excess must not be read as
+a detected interaction.
+
+### Same-host recurrence
+
+Definitions applied verbatim; **no pair is adjudicated in code**. One finding
+about the *definitions* came out of this and is recorded because it changes how
+the counts may be read:
+
+- The criterion ORs its discordance conditions, so a child-subfamily difference
+  is sufficient on its own. An earlier revision tested "is a TSD missing?" first,
+  which let absent data mask positive evidence already present. Fixed, with a
+  regression test.
+- **479 of 1,284 nested calls report no TSD at all.** A missing TSD is not a
+  TSD of length zero, so those pairs are `tsd_unevaluable` and enter neither
+  headline count.
+- At ±10 bp: **2 candidate-recurrent pairs, 1 unevaluable, 0 IBD** among 3
+  same-host pairs. Per family: Alu 37/514 host copies carry >1 event, L1 5/161,
+  SVA 2/27, other 1/11.
+- **The candidate count does not clear its chance expectation.** The positional
+  chance count is 4.31 against 3 observed. Worse, the definition is loose: two
+  genuinely independent insertions drawn from this cohort already satisfy the
+  candidate criterion with probability 0.949 (Alu). The converse matters as much —
+  two independent pairs satisfy the *IBD* definition with probability ≈0, because
+  the cohort carries 89 distinct child subfamilies. An empty IBD column is
+  therefore **not** evidence that no shared events exist.
+- Denominators are 5 genomes and are **not comparable** to the published pooled
+  SVAN 26/2,559 Alu-host figure; both are labelled rather than aligned.
+
+The honest reading: the test was run, candidate pairs exist, and it did not
+resolve the question, because child subfamily and TSD do not discriminate at this
+scale.
