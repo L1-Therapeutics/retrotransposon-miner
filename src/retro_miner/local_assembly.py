@@ -28,6 +28,13 @@ _MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
 _ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    """Safely convert a value to int, returning default on failure."""
+    if isinstance(value, (str, int, float)):
+        return int(float(value))
+    return default
+
+
 def _window_locus_id_from_row(row: pd.Series) -> str:
     chrom = str(row.get("chrom", ""))
     window_start = int(row.get("window_start", 1))
@@ -1549,21 +1556,21 @@ def _process_single_locus(
         "asm_consensus_breakpoint_pos": int(pick.get("breakpoint_pos", fallback_bp) if pick else fallback_bp),
         "asm_breakpoint_source": pick_source,
         "asm_tsd_seq": str(pick.get("tsd_seq", "") if pick else ""),
-        "asm_tsd_len": int(pick.get("tsd_len", 0) if pick else 0),
-        "asm_polyA_max_run": int(pick.get("polyA_max_run", 0) if pick else 0),
-        "asm_insertion_length": int(pick.get("insertion_length", 0) if pick else 0),
-        "asm_insertion_length_observed": int(pick.get("insertion_length_observed", 0) if pick else 0),
-        "asm_insertion_length_imputed": int(pick.get("insertion_length_imputed", 0) if pick else 0),
+        "asm_tsd_len": _safe_int(pick.get("tsd_len", 0) if pick else 0, 0),
+        "asm_polyA_max_run": _safe_int(pick.get("polyA_max_run", 0) if pick else 0, 0),
+        "asm_insertion_length": _safe_int(pick.get("insertion_length", 0) if pick else 0, 0),
+        "asm_insertion_length_observed": _safe_int(pick.get("insertion_length_observed", 0) if pick else 0, 0),
+        "asm_insertion_length_imputed": _safe_int(pick.get("insertion_length_imputed", 0) if pick else 0, 0),
         "asm_insertion_length_confidence_tier": str(pick.get("insertion_length_confidence_tier", "undetermined") if pick else "undetermined"),
-        "asm_insertion_mei_start": int(pick.get("insertion_mei_start", -1) if pick else -1),
-        "asm_insertion_mei_end": int(pick.get("insertion_mei_end", -1) if pick else -1),
+        "asm_insertion_mei_start": _safe_int(pick.get("insertion_mei_start", -1) if pick else -1, -1),
+        "asm_insertion_mei_end": _safe_int(pick.get("insertion_mei_end", -1) if pick else -1, -1),
         "asm_mei_family": str(pick.get("mei_family", "") if pick else ""),
         "asm_mei_subfamily": str(pick.get("mei_subfamily", "") if pick else ""),
-        "asm_mei_target_length": int(pick.get("mei_target_length", 0) if pick else 0),
+        "asm_mei_target_length": _safe_int(pick.get("mei_target_length", 0) if pick else 0, 0),
         "asm_insertion_orientation": str(pick.get("insertion_orientation", "") if pick else ""),
         "asm_complex_class": str(complex_pick.get("complex_class", "") if complex_pick else ""),
         "asm_non_mei_partner_chrom": str(complex_pick.get("non_mei_partner_chrom", "") if complex_pick else ""),
-        "asm_non_mei_partner_pos": int(complex_pick.get("non_mei_partner_pos", -1) if complex_pick else -1),
+        "asm_non_mei_partner_pos": _safe_int(complex_pick.get("non_mei_partner_pos", -1) if complex_pick else -1, -1),
         "asm_non_mei_partner_type": str(complex_pick.get("non_mei_partner_type", "") if complex_pick else ""),
         "asm_breakpoint_side_status": str(complex_pick.get("breakpoint_side_status", "none") if complex_pick else "none"),
         "asm_complexity_source": complex_source,
@@ -1571,16 +1578,16 @@ def _process_single_locus(
         "asm_mei_alignment_preset": str(pick.get("mei_alignment_preset", "") if pick else ""),
         "asm_left_support_contig_id": str(pick.get("left_support_contig_id", "") if pick else ""),
         "asm_right_support_contig_id": str(pick.get("right_support_contig_id", "") if pick else ""),
-        "asm_left_support_mei_start": int(pick.get("left_support_mei_start", -1) if pick else -1),
-        "asm_left_support_mei_end": int(pick.get("left_support_mei_end", -1) if pick else -1),
-        "asm_right_support_mei_start": int(pick.get("right_support_mei_start", -1) if pick else -1),
-        "asm_right_support_mei_end": int(pick.get("right_support_mei_end", -1) if pick else -1),
-        "asm_left_support_mei_aln_len": int(pick.get("left_support_mei_aln_len", 0) if pick else 0),
-        "asm_right_support_mei_aln_len": int(pick.get("right_support_mei_aln_len", 0) if pick else 0),
+        "asm_left_support_mei_start": _safe_int(pick.get("left_support_mei_start", -1) if pick else -1, -1),
+        "asm_left_support_mei_end": _safe_int(pick.get("left_support_mei_end", -1) if pick else -1, -1),
+        "asm_right_support_mei_start": _safe_int(pick.get("right_support_mei_start", -1) if pick else -1, -1),
+        "asm_right_support_mei_end": _safe_int(pick.get("right_support_mei_end", -1) if pick else -1, -1),
+        "asm_left_support_mei_aln_len": _safe_int(pick.get("left_support_mei_aln_len", 0) if pick else 0, 0),
+        "asm_right_support_mei_aln_len": _safe_int(pick.get("right_support_mei_aln_len", 0) if pick else 0, 0),
         "asm_microhomology_sequence": str(pick.get("microhomology_sequence", "") if pick else ""),
         "asm_junction_overlap_sequence": str(pick.get("junction_overlap_sequence", "") if pick else ""),
         "asm_coord_model": str(pick.get("coord_model", "") if pick else ""),
-        "asm_coord_logic_version": int(pick.get("coord_logic_version", 0) if pick else 0),
+        "asm_coord_logic_version": _safe_int(pick.get("coord_logic_version", 0) if pick else 0, 0),
         "asm_adaptive_read_cap_rerun": bool(adaptive_rerun_used),
         "asm_adaptive_read_cap_target": int(escalated_max_reads),
         "asm_disease_recruited_evidence_read_names": ",".join(sorted(d_recruited_evidence_read_names)),

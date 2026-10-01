@@ -194,6 +194,8 @@ def rtm_breakpoint(row: dict[str, Any]) -> int:
         "window_start",
     ):
         raw = row.get(col)
+        if raw is None:
+            continue
         try:
             pos = int(float(raw))
         except (TypeError, ValueError, OverflowError):
@@ -227,19 +229,20 @@ def load_rtm_calls(path: Path, chrom: str | None = None) -> tuple[list[Variant],
     rows: list[dict[str, Any]] = []
     variants: list[Variant] = []
     for i, rec in enumerate(df.to_dict(orient="records")):
-        row_chrom = normalize_chrom(str(rec.get("chrom", "") or ""))
+        row: dict[str, Any] = {str(key): value for key, value in rec.items()}
+        row_chrom = normalize_chrom(str(row.get("chrom", "") or ""))
         if want and row_chrom != want:
             continue
-        pos = rtm_breakpoint(rec)
+        pos = rtm_breakpoint(row)
         if pos <= 0:
             continue
-        vid = str(rec.get("locus_id") or rec.get("window_id") or f"rtm_{row_chrom}_{pos}_{i}")
+        vid = str(row.get("locus_id") or row.get("window_id") or f"rtm_{row_chrom}_{pos}_{i}")
         var = Variant(
             chrom=row_chrom,
             pos=pos,
             end=pos,
             variant_id=vid,
-            family=rtm_family(rec),
+            family=rtm_family(row),
             source="rtm",
             extra={
                 "insertion_call_tier": str(rec.get("insertion_call_tier") or "none"),
@@ -250,10 +253,10 @@ def load_rtm_calls(path: Path, chrom: str | None = None) -> tuple[list[Variant],
             },
         )
         variants.append(var)
-        rec["_rtm_key"] = var.key
-        rec["_rtm_pos"] = var.pos
-        rec["_rtm_family"] = var.family
-        rows.append(rec)
+        row["_rtm_key"] = var.key
+        row["_rtm_pos"] = var.pos
+        row["_rtm_family"] = var.family
+        rows.append(row)
     return variants, rows
 
 
@@ -478,7 +481,7 @@ def merge_unique_events(
         strands = sorted({variant.strand for variant in members if variant.strand})
         lengths = sorted(variant.svlen for variant in members if variant.svlen >= 0)
         sources = sorted({variant.source for variant in members})
-        source_ids = {source: [] for source in sources}
+        source_ids: dict[str, list[str]] = {source: [] for source in sources}
         for variant in ordered:
             source_ids[variant.source].append(variant.variant_id)
         event_id = "|".join(

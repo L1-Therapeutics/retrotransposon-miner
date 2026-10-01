@@ -43,6 +43,22 @@ COLOR_WHITE = "white"
 _MAX_POLYA_SINGLE_BP = 151
 _MAX_POLYA_COMBINED_BP = 280
 
+
+def _pair_float(pair: dict[str, object], key: str, default: float = 0.0) -> float:
+    """Safely read a float field from a pair dict."""
+    val = pair.get(key, default)
+    if isinstance(val, (str, int, float)):
+        return float(val)
+    return default
+
+
+def _pair_int(pair: dict[str, object], key: str, default: int = 0) -> int:
+    """Safely read an int field from a pair dict."""
+    val = pair.get(key, default)
+    if isinstance(val, (str, int, float)):
+        return int(float(val))
+    return default
+
 # Slim columns pulled from candidate_loci.mei.tsv when gold_review lacks them.
 _MEI_ENRICH_COLS = (
     "chrom",
@@ -1339,13 +1355,15 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
             if polya_base not in {"A", "T"}:
                 polya_base = "A"
         polya_label = _polya_tail_label(polya_width, polya_base)
-        mei = layout.polya_span_x(polya_width)
+        mei: tuple[float, float] | None = layout.polya_span_x(polya_width)
         remote_kind = "sr_polya"
     else:
         mei = _mei_span_x(int(getattr(rec, "mei_start", 0) or 0), int(getattr(rec, "mei_end", 0) or 0), layout)
         if mei is None:
             return None
         remote_kind = "sr_mei"
+    if mei is None:
+        return None
 
     pair: dict[str, object] = {
         "anchor_pos": junction,
@@ -1731,9 +1749,11 @@ class ReadArchitectureCache:
     mei_df: pd.DataFrame | None = None
     split_by_sample: dict[str, pd.DataFrame] = field(default_factory=dict)
     gold_tsv: Path | None = None
-    _window_index: dict[tuple[str, str, int, int], object] = field(default_factory=dict, repr=False)
-    _hit_gpos: dict[tuple[str, str], object] = field(default_factory=dict, repr=False)
-    _hit_rows: dict[tuple[str, str], object] = field(default_factory=dict, repr=False)
+    _window_index: dict[tuple[str, str, int, int], pd.Index] = field(default_factory=dict, repr=False)
+
+    _hit_gpos: dict[tuple[str, str], np.ndarray] = field(default_factory=dict, repr=False)
+
+    _hit_rows: dict[tuple[str, str], np.ndarray] = field(default_factory=dict, repr=False)
     _mei_index: dict[tuple[str, int, int], pd.Series] = field(default_factory=dict, repr=False)
     _indexed: bool = field(default=False, repr=False)
 
@@ -1759,8 +1779,8 @@ class ReadArchitectureCache:
 
         hit_mask = _detail_support_mask(detail).to_numpy()
         gpos = pd.to_numeric(detail["genomic_pos"], errors="coerce").fillna(-1).astype(int).to_numpy()
-        hit_gpos: dict[tuple[str, str], object] = {}
-        hit_rows: dict[tuple[str, str], object] = {}
+        hit_gpos: dict[tuple[str, str], np.ndarray] = {}
+        hit_rows: dict[tuple[str, str], np.ndarray] = {}
         if hit_mask.any():
             hit_idx = np.flatnonzero(hit_mask)
             hit_sample = sample_s[hit_idx]
@@ -2023,14 +2043,15 @@ def _pair_segments(
             chosen.extend(extra_sr)
         pairs = chosen
     # Stable visual order: left then right, SR before DPE, then genomic position.
-    pairs.sort(
-        key=lambda p: (
-            0 if p["side"] == "L" else 1,
-            0 if p.get("evidence_type") == "SR" else 1,
-            int(p.get("anchor_pos", 0)),
-            str(p.get("read_name", "")),
-        )
-    )
+    def _pair_sort_key(p: dict[str, object]) -> tuple[int, int, int, str]:
+        side_order = 0 if p["side"] == "L" else 1
+        type_order = 0 if p.get("evidence_type") == "SR" else 1
+        anchor_val = p.get("anchor_pos", 0)
+        anchor_order = int(float(anchor_val)) if isinstance(anchor_val, (str, int, float)) else 0
+        read_name = str(p.get("read_name", ""))
+        return (side_order, type_order, anchor_order, read_name)
+
+    pairs.sort(key=_pair_sort_key)
     stats["pairs_shown"] = len(pairs)
     stats["pairs_capped"] = max(0, stats["pairs_before_cap"] - len(pairs))
     return pairs, stats
@@ -2273,8 +2294,8 @@ def _draw_read_pair(
 
     if is_split and remote_kind in {"sr_mei", "sr_polya"}:
         clip_side = str(pair.get("clip_side", "L"))
-        clip_len = int(pair.get("clip_len", 0) or 0)
-        mapped_len = int(pair.get("mapped_len", 0) or 0)
+        clip_len = _pair_int(pair, "clip_len", 0)
+        mapped_len = _pair_int(pair, "mapped_len", 0)
         if mapped_len <= 0:
             mapped_len = max(1, int(read_width_bp) - max(1, clip_len))
         polya_clip = remote_kind == "sr_polya" or str(pair.get("rescue_kind", "")) == "polya"
@@ -2282,8 +2303,8 @@ def _draw_read_pair(
             clip_side=clip_side,
             clip_len=clip_len,
             mapped_len=mapped_len,
-            mei_x0=float(pair.get("remote_mei_x0", 0)),
-            mei_x1=float(pair.get("remote_mei_x1", 0)),
+            mei_x0=_pair_float(pair, "remote_mei_x0", 0.0),
+            mei_x1=_pair_float(pair, "remote_mei_x1", 0.0),
             layout=layout,
             polya_clip=polya_clip,
         )
@@ -2294,11 +2315,10 @@ def _draw_read_pair(
             label = str(pair.get("polya_label", "") or "")
             if not label:
                 label = _polya_tail_label(
-                    int(pair.get("polya_width", 0) or max(1, int(mei_span[1] - mei_span[0]))),
+                    _pair_int(pair, "polya_width", max(1, int(mei_span[1] - mei_span[0]))),
                     str(pair.get("polya_base", "A") or "A"),
                 )
             _draw_polya_label(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, label=label)
-        # Tick at the genomic junction the mapped portion abuts.
         j = layout.insertion_right_x if clip_side == "L" else layout.insertion_left_x
         ax.plot([j, j], [yi - 0.32, yi + 0.32], color=COLOR_BLACK, lw=2.2, zorder=4)
         c0, c1 = _connector_endpoints(mei_span, ref_span)
@@ -2309,31 +2329,31 @@ def _draw_read_pair(
     mate_mei = None
     if remote_kind in {"mate_mei", "anchor_mei"}:
         mate_mei = (
-            float(pair.get("remote_mei_x0", 0)),
-            float(pair.get("remote_mei_x1", 0)),
+            _pair_float(pair, "remote_mei_x0", 0.0),
+            _pair_float(pair, "remote_mei_x1", 0.0),
         )
     ref_span, overhang = _dpe_anchor_and_overhang(
-        anchor_pos=int(pair.get("anchor_pos", 0)),
+        anchor_pos=_pair_int(pair, "anchor_pos", 0),
         side=side,
         width_bp=read_width_bp,
         layout=layout,
-        mate_mei_x0=float(pair.get("remote_mei_x0", 0)),
-        mate_mei_x1=float(pair.get("remote_mei_x1", 0)),
+        mate_mei_x0=_pair_float(pair, "remote_mei_x0", 0.0),
+        mate_mei_x1=_pair_float(pair, "remote_mei_x1", 0.0),
     )
     _draw_bar_span(ax, x0=ref_span[0], x1=ref_span[1], yi=yi, color=COLOR_BLACK)
 
-    # Anchor softclip into polyA: orange from flank|polyA boundary into the polyA zone
-    # (SR-style), even when the mate is also a polyA rescue.
     anchor_polya = bool(pair.get("anchor_polya_clip"))
     anchor_polya_span: tuple[float, float] | None = None
     mate_is_polya = str(pair.get("rescue_kind", "")) == "polya"
     if anchor_polya and layout.polya_zone_bp > 0:
-        aw = int(pair.get("anchor_polya_width", 0) or 0)
+        aw = _pair_int(pair, "anchor_polya_width", 0)
         if aw <= 0:
-            aw = max(1, int(round(float(pair.get("anchor_polya_x1", 0)) - float(pair.get("anchor_polya_x0", 0)))))
+            x1 = _pair_float(pair, "anchor_polya_x1", 0.0)
+            x0 = _pair_float(pair, "anchor_polya_x0", 0.0)
+            aw = max(1, int(round(x1 - x0)))
         # Junction polyA clip + polyA mate → sum (minimum non-overlapping tail).
         if mate_is_polya:
-            mate_w = int(pair.get("polya_width", 0) or 0)
+            mate_w = _pair_int(pair, "polya_width", 0)
             # polya_width may already be the combined sum from pair-building;
             # if anchor_polya_width was also set to that sum, don't double-add.
             if mate_w > aw:
@@ -2364,23 +2384,21 @@ def _draw_read_pair(
         ax.plot([j, j], [yi - 0.32, yi + 0.32], color=COLOR_BLACK, lw=2.2, zorder=4)
 
     mei_color = COLOR_LIGHT_ORANGE if str(pair.get("rescue_kind", "")) else COLOR_DARK_ORANGE
-    mei_span = None
+    mei_span: tuple[float, float] | None = None  # type: ignore[no-redef]
     if mate_mei is not None:
         if mate_is_polya:
             if anchor_polya_span is not None:
-                # Already drew the polyA zone bar from the anchor clip (merged width).
                 mei_span = anchor_polya_span
             else:
-                # Mate-only polyA rescue (no anchor polyA clip).
                 mei_span = (
-                    min(float(mate_mei[0]), float(mate_mei[1])),
-                    max(float(mate_mei[0]), float(mate_mei[1])),
+                    mate_mei[0],
+                    mate_mei[1],
                 )
                 _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=mei_color)
                 label = str(pair.get("polya_label", "") or "")
                 if not label:
                     label = _polya_tail_label(
-                        int(pair.get("polya_width", 0) or max(1, int(mei_span[1] - mei_span[0]))),
+                        _pair_int(pair, "polya_width", max(1, int(mei_span[1] - mei_span[0]))),
                         str(pair.get("polya_base", "A") or "A"),
                     )
                 _draw_polya_label(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, label=label)
@@ -2415,8 +2433,8 @@ def _draw_read_pair(
 
     if pair.get("mate_in_mei"):
         mate_mei_span = _mei_read_bar(
-            mei_x0=float(pair.get("mate_mei_x0", 0)),
-            mei_x1=float(pair.get("mate_mei_x1", 0)),
+            mei_x0=_pair_float(pair, "mate_mei_x0", 0.0),
+            mei_x1=_pair_float(pair, "mate_mei_x1", 0.0),
             width_bp=read_width_bp,
             layout=layout,
         )

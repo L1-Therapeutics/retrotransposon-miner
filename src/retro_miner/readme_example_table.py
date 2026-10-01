@@ -142,7 +142,9 @@ def build_example_table_markdown(
         selected = selected.merge(f, on=keys, how="left", suffixes=("", "_fill"))
         for c in FILL_COLS:
             if c in selected.columns:
-                selected[c] = [_prefer(r, c) for _, r in selected.iterrows()]
+                selected[c] = pd.Series(
+                    [_prefer(r, c) for _, r in selected.iterrows()], index=selected.index
+                )
 
     for full_c, panel_c in (
         ("consensus_insertion_mei_span_full", "consensus_insertion_mei_span"),

@@ -32,8 +32,8 @@ def _open_textmaybe_gz(path: Path) -> IO[str]:
                 ...
     """
     if str(path).endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")  # type: ignore[return-value]
-    return path.open("r", encoding="utf-8")  # type: ignore[return-value]
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
 
 
 def _poly_at_stats(seq: str) -> tuple[int, float, str]:

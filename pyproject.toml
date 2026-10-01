@@ -41,6 +41,46 @@ ignore = [
   "E731",   # lambda aliases (s = lambda ...) are intentional shorthand in large pipeline functions
 ]
 
+[tool.mypy]
+# Type-checking policy (see README "Development -> Type checking"):
+# everything under src/retro_miner is checked by default; only the four
+# grandfathered legacy modules below are exempt. New modules must be clean.
+# Matches the runtime floor actually used (environment.yml pins python=3.12);
+# numpy's bundled stubs require 3.12 syntax.
+python_version = "3.12"
+files = ["src/retro_miner"]
+mypy_path = ["src"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Pre-existing pipeline modules with heavy dynamic-pandas usage; clean these
+# up incrementally and move them out of this list. Do not add new entries.
+module = [
+  "retro_miner.mei_support",
+  "retro_miner.local_assembly",
+  "retro_miner.candidate_loci",
+  "retro_miner.read_architecture",
+]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# Literature-anchored marker modules: held to a strict flag set.
+# NOTE: the shorthand `strict = true` here leaks those checks to other
+# modules under some mypy builds (observed on 2.3.1), so the strict flags
+# are spelled out individually instead.
+module = [
+  "retro_miner.mei_markers",
+  "retro_miner.transduction_tags",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = ["intervaltree.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths  = ["tests"]
 addopts    = ["-q", "--tb=short"]

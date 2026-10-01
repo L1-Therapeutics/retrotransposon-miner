@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 import time
 
 import click
@@ -369,7 +370,7 @@ def extract_split_evidence_cmd(
     results_by_sample: dict[str, _SampleExtractResult] = {}
     errors: list[str] = []
 
-    def _submit_kwargs(job: dict) -> dict:
+    def _submit_kwargs(job: dict[str, Any]) -> dict[str, Any]:
         return {
             "sample": str(job["sample"]),
             "bam": Path(job["bam"]),

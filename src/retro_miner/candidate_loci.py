@@ -178,14 +178,14 @@ def _build_loci_from_evidence(
         split_pos["pos"] = split_pos["pos"].astype(int)
         for chrom, chrom_df in split_pos.groupby("chrom", sort=False):
             positions = sorted(chrom_df["pos"].tolist())
-            for cluster in _cluster_sorted_positions(positions, max_gap_bp=int(split_cluster_bp)):
+            for cluster in _cluster_sorted_positions(positions, max_gap_bp=split_cluster_bp):
                 if not cluster:
                     continue
                 loci_by_chrom.setdefault(str(chrom), []).append(
                     {
                         "positions": list(cluster),
-                        "min_pos": int(cluster[0]),
-                        "max_pos": int(cluster[-1]),
+                        "min_pos": cluster[0],
+                        "max_pos": cluster[-1],
                         "seeded_by_split": True,
                     }
                 )
@@ -200,68 +200,68 @@ def _build_loci_from_evidence(
             seed_tree: IntervalTree | None = None
             if seeds:
                 seed_tree = IntervalTree()
-                radius = int(discordant_cluster_bp)
+                radius = discordant_cluster_bp
                 for idx, seed in enumerate(seeds):
-                    seed_start = int(seed["min_pos"])
-                    seed_end = int(seed["max_pos"])
+                    seed_start = seed["min_pos"]
+                    seed_end = seed["max_pos"]
                     seed_tree.addi(max(1, seed_start - radius), seed_end + radius + 1, idx)
             for pos in sorted(chrom_df["pos"].tolist()):
                 if not seeds:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
+                    unassigned_discordant.setdefault(chrom_key, []).append(pos)
                     continue
 
-                candidate_seed_idxs = list(seed_tree.at(int(pos))) if seed_tree is not None else []
+                candidate_seed_idxs = list(seed_tree.at(pos)) if seed_tree is not None else []
                 if not candidate_seed_idxs:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
+                    unassigned_discordant.setdefault(chrom_key, []).append(pos)
                     continue
 
                 best_idx = min(
-                    (int(iv.data) for iv in candidate_seed_idxs),
+                    (iv.data for iv in candidate_seed_idxs),
                     key=lambda idx: _distance_to_closed_interval(
-                        int(pos),
-                        int(seeds[idx]["min_pos"]),
-                        int(seeds[idx]["max_pos"]),
+                        pos,
+                        seeds[idx]["min_pos"],
+                        seeds[idx]["max_pos"],
                     ),
                 )
                 best_dist = _distance_to_closed_interval(
-                    int(pos),
-                    int(seeds[best_idx]["min_pos"]),
-                    int(seeds[best_idx]["max_pos"]),
+                    pos,
+                    seeds[best_idx]["min_pos"],
+                    seeds[best_idx]["max_pos"],
                 )
-                if best_dist <= int(discordant_cluster_bp):
+                if best_dist <= discordant_cluster_bp:
                     chosen = seeds[best_idx]
-                    chosen["positions"].append(int(pos))
+                    chosen["positions"].append(pos)
                 else:
-                    unassigned_discordant.setdefault(chrom_key, []).append(int(pos))
+                    unassigned_discordant.setdefault(chrom_key, []).append(pos)
 
     for chrom, positions in unassigned_discordant.items():
-        for cluster in _cluster_sorted_positions(sorted(positions), max_gap_bp=int(discordant_cluster_bp)):
+        for cluster in _cluster_sorted_positions(sorted(positions), max_gap_bp=discordant_cluster_bp):
             if not cluster:
                 continue
             loci_by_chrom.setdefault(chrom, []).append(
                 {
                     "positions": list(cluster),
-                    "min_pos": int(cluster[0]),
-                    "max_pos": int(cluster[-1]),
+                    "min_pos": cluster[0],
+                    "max_pos": cluster[-1],
                     "seeded_by_split": False,
                 }
             )
 
     rows: list[dict[str, int | str]] = []
-    valley_gap_bp = max(int(split_cluster_bp), min(int(discordant_cluster_bp), int(max_locus_span_bp)))
+    valley_gap_bp = max(split_cluster_bp, min(discordant_cluster_bp, max_locus_span_bp))
     for chrom in sorted(loci_by_chrom):
         for locus in loci_by_chrom[chrom]:
             segments = _split_cluster_positions(
-                positions=[int(p) for p in locus["positions"]],
+                positions=locus["positions"],
                 valley_gap_bp=valley_gap_bp,
-                max_locus_span_bp=int(max_locus_span_bp),
+                max_locus_span_bp=max_locus_span_bp,
             )
-            flank = int(split_cluster_bp) if bool(locus["seeded_by_split"]) else int(discordant_cluster_bp)
+            flank = split_cluster_bp if bool(locus["seeded_by_split"]) else discordant_cluster_bp
             for seg in segments:
                 if not seg:
                     continue
-                seg_start = int(min(seg))
-                seg_end = int(max(seg))
+                seg_start = min(seg)
+                seg_end = max(seg)
                 rows.append(
                     {
                         "chrom": chrom,
@@ -275,7 +275,7 @@ def _build_loci_from_evidence(
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
     out = pd.DataFrame(rows).drop_duplicates()
-    out = _merge_overlapping_loci(out, max_locus_span_bp=int(max_locus_span_bp))
+    out = _merge_overlapping_loci(out, max_locus_span_bp=max_locus_span_bp)
     out = out.sort_values(["chrom", "window_start", "window_end"], kind="mergesort").reset_index(drop=True)
     _progress(f"built {len(out)} candidate loci from {len(split_all)} split and {len(discordant_all)} discordant rows")
     return out
@@ -301,7 +301,7 @@ def _merge_overlapping_loci(
     if not required.issubset(loci.columns):
         return loci.copy()
 
-    max_span = max(1, int(max_locus_span_bp))
+    max_span = max(1, max_locus_span_bp)
     merged_rows: list[dict[str, object]] = []
     n_in = len(loci)
     for chrom, grp in loci.groupby("chrom", sort=False):
@@ -596,22 +596,7 @@ def _write_candidate_windows_bed(loci: pd.DataFrame, output_path: Path) -> None:
             handle.write(f"{row.chrom}\t{start0}\t{end0}\t{row.row_id}\n")
 
 
-def _get_overlapping_row_ids(a_bed: Path, b_bed: Path) -> set[int]:
-    cmd = ["bedtools", "intersect", "-a", str(a_bed), "-b", str(b_bed), "-wa", "-u"]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    row_ids: set[int] = set()
-    for line in proc.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        try:
-            row_ids.add(int(parts[3]))
-        except ValueError:
-            continue
-    return row_ids
-
-
-def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fraction: float) -> set[int]:
+def _get_overlapping_row_ids(a_bed: Path, b_bed: Path, min_fraction: float | None = None) -> set[int]:
     cmd = [
         "bedtools",
         "intersect",
@@ -621,9 +606,9 @@ def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fractio
         str(b_bed),
         "-wa",
         "-u",
-        "-f",
-        str(min_fraction),
     ]
+    if min_fraction is not None:
+        cmd.extend(["-f", str(min_fraction)])
     proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
     row_ids: set[int] = set()
     for line in proc.stdout.splitlines():
@@ -635,6 +620,11 @@ def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fractio
         except ValueError:
             continue
     return row_ids
+
+
+# Backwards-compatible alias kept for callers that pass the fraction explicitly.
+def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fraction: float) -> set[int]:
+    return _get_overlapping_row_ids(a_bed, b_bed, min_fraction=min_fraction)
 
 
 def _annotate_junk_flags(
@@ -857,15 +847,15 @@ def build_candidate_loci(
         merged = merged.fillna(0)
 
         int_cols = [
-        c
-        for c in merged.columns
-        if c.endswith("_rows")
-        or c.endswith("_unique_reads")
-        or c.endswith("_mapq_min")
-        or c.endswith("_clip_len_max")
-        or c.endswith("_run_max")
-        or c.endswith("_nm_max")
-    ]
+            c
+            for c in merged.columns
+            if c.endswith("_rows")
+            or c.endswith("_unique_reads")
+            or c.endswith("_mapq_min")
+            or c.endswith("_clip_len_max")
+            or c.endswith("_run_max")
+            or c.endswith("_nm_max")
+        ]
         for col in int_cols:
             merged[col] = merged[col].astype(int)
 

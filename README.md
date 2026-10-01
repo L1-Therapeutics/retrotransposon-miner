@@ -471,6 +471,19 @@ python3 scripts/download_public_data.py \
 - Locked out of an instance you created? `./scripts/ec2_jlab.sh use <instance-id>` then `./scripts/ec2_jlab.sh install-my-key` (needs `ec2-instance-connect:SendSSHPublicKey`). Do not share another user's PEM.
 - For production use, review security hardening, key lifecycle, and cost controls.
 
+## Development
+
+Run the standard checks before submitting changes:
+
+```bash
+conda activate rtm-miner || micromamba activate rtm-miner
+pytest                  # test suite (tests/)
+ruff check src tests    # lint
+mypy                    # static type checking (see pyproject [tool.mypy])
+```
+
+All new modules under `src/retro_miner` must type-check cleanly; see `CONTRIBUTING.md` ("Type checking") for the policy, including the grandfathered legacy modules and the strict flag set enforced on the marker modules.
+
 ## License
 
 This project is licensed under the Apache License 2.0.

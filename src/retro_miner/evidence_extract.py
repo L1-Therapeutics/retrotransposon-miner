@@ -737,7 +737,7 @@ def _split_rows_from_read(
         if clip_side == "L":
             pos_1based = read.reference_start + 1
         else:
-            pos_1based = read.reference_end
+            pos_1based = int(read.reference_end) if read.reference_end is not None else 0
         query_seq = read.query_sequence or ""
         clip_seq = ""
         if query_seq:

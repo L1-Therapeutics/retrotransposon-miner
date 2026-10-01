@@ -14,6 +14,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TypedDict, cast
 
 import pandas as pd
 import click
@@ -46,10 +47,26 @@ class ClipAlignmentSummary:
     paf_hits: int
 
 
+class _RemapResult(TypedDict):
+    sample: str
+    split_hits: pd.DataFrame
+    split_summary: ClipAlignmentSummary
+    disc_hits: pd.DataFrame
+    disc_summary: ClipAlignmentSummary
+    disc_mate_summary: ClipAlignmentSummary
+
+
 _MIN_MEI_ANCHOR_BP = 25
 _MIN_POLYA_RUN_FOR_END_IMPUTE = 12
 _MIN_MEI_ANCHOR_BP_RELAXED = 15
 _MIN_REPORTABLE_MEI_SPAN_BP = 20
+
+
+def _hit_field(hit: dict[str, object] | None, key: str, default: object) -> object:
+    """Safely read a field from a hit dict, returning *default* when missing."""
+    if hit is None:
+        return default
+    return hit.get(key, default)
 
 
 @dataclass(frozen=True)
@@ -1852,9 +1869,11 @@ def _fetch_mates_swept(
             continue
         remaining = len(wanted)
         for mate_read in bam.fetch(chrom, mstart, mend):
-            qname = mate_read.query_name
-            bounds = wanted.get(qname)
-            if bounds is None or qname in fetched:
+            mate_qname = mate_read.query_name
+            if mate_qname is None:
+                continue
+            bounds = wanted.get(mate_qname)
+            if bounds is None or mate_qname in fetched:
                 continue
             wstart, wend = bounds
             rs = mate_read.reference_start
@@ -1864,7 +1883,7 @@ def _fetch_mates_swept(
             tup = _mate_alignment_tuple(mate_read)
             if tup is None:
                 continue
-            fetched[qname] = tup
+            fetched[mate_qname] = tup
             remaining -= 1
             if remaining == 0:
                 break
@@ -2023,7 +2042,7 @@ def _hydrate_sample_mei_hits_from_detail(
     split_df: pd.DataFrame,
     discordant_df: pd.DataFrame,
     detail: pd.DataFrame,
-) -> dict[str, object]:
+) -> _RemapResult:
     """Rebuild per-read MEI hit frames from a prior supporting_reads_detail table.
 
     Skips MEI consensus remap and mate-BAM fetch. Non-hit evidence rows are retained so
@@ -2253,7 +2272,7 @@ def _remap_one_sample_mei_evidence(
     mate_bam_path: Path | None,
     mate_cache_path: Path | None = None,
     bwa_threads: int = 1,
-) -> dict[str, object]:
+) -> _RemapResult:
     """Split + discordant (anchor/mate) MEI remaps for one sample."""
     t0 = time.monotonic()
     click.echo(f"[mei-annotate] sample={sample} remap start bwa_threads={max(1, int(bwa_threads))}")
@@ -3027,8 +3046,8 @@ def _impute_rescue_mei_coords(
             & (out["window_end"].astype(int) == int(we))
         )
         mapped_locus = out.loc[locus & mapped_mask]
-        ends = []
-        starts = []
+        ends: list[int] = []
+        starts: list[int] = []
         for col in end_cols:
             vals = pd.to_numeric(mapped_locus[col], errors="coerce").fillna(0).astype(int)
             ends.extend(int(v) for v in vals.tolist() if int(v) > 0)
@@ -4305,7 +4324,9 @@ def _build_supporting_reads_detail_table(
         try:
             if val is None or (isinstance(val, float) and pd.isna(val)):
                 return default
-            return int(val)
+            if isinstance(val, (str, int, float)):
+                return int(val)
+            return default
         except (TypeError, ValueError):
             return default
 
@@ -7965,11 +7986,13 @@ def _infer_disease_insertion_metrics(
     ) -> tuple[int, int, int, str]:
         def _to_int_safe(value: object, default: int = 0) -> int:
             try:
-                if pd.isna(value):
-                    return int(default)
-                return int(float(value))
+                if value is None or (isinstance(value, float) and pd.isna(value)):
+                    return default
+                if isinstance(value, (str, int, float)):
+                    return int(float(value))
+                return default
             except (TypeError, ValueError):
-                return int(default)
+                return default
 
         if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
             return (
@@ -8068,11 +8091,13 @@ def _infer_disease_insertion_metrics(
     ) -> tuple[int, int, int, str]:
         def _to_int_safe(value: object, default: int = 0) -> int:
             try:
-                if pd.isna(value):
-                    return int(default)
-                return int(float(value))
+                if value is None or (isinstance(value, float) and pd.isna(value)):
+                    return default
+                if isinstance(value, (str, int, float)):
+                    return int(float(value))
+                return default
             except (TypeError, ValueError):
-                return int(default)
+                return default
 
         if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
             return (
@@ -8519,11 +8544,13 @@ def _infer_disease_insertion_metrics(
         ) -> tuple[int, int, int, str]:
             def _to_int_safe(value: object, default: int = 0) -> int:
                 try:
-                    if pd.isna(value):
-                        return int(default)
-                    return int(float(value))
+                    if value is None or (isinstance(value, float) and pd.isna(value)):
+                        return default
+                    if isinstance(value, (str, int, float)):
+                        return int(float(value))
+                    return default
                 except (TypeError, ValueError):
-                    return int(default)
+                    return default
 
             if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
                 return (
@@ -13721,11 +13748,16 @@ def _extract_float_from_info(value: object, default: float = -1.0) -> float:
         if not vals:
             return default
         try:
-            return float(max(vals))
+            numeric_vals = [float(v) for v in vals if isinstance(v, (str, int, float))]
+            if not numeric_vals:
+                return default
+            return float(max(numeric_vals))
         except (ValueError, TypeError):
             return default
     try:
-        return float(value)
+        if isinstance(value, (str, int, float)):
+            return float(value)
+        return default
     except (ValueError, TypeError):
         return default
 
@@ -13738,11 +13770,16 @@ def _extract_int_from_info(value: object, default: int = -1) -> int:
         if not vals:
             return default
         try:
-            return int(max(vals))
+            numeric_vals = [int(v) for v in vals if isinstance(v, (str, int, float))]
+            if not numeric_vals:
+                return default
+            return int(max(numeric_vals))
         except (ValueError, TypeError):
             return default
     try:
-        return int(value)
+        if isinstance(value, (str, int, float)):
+            return int(value)
+        return default
     except (ValueError, TypeError):
         return default
 
@@ -14024,7 +14061,7 @@ def _annotate_g1k_mei_overlap(
             if not event_family or g1k_family != event_family:
                 continue
             current = best_hits.get(row_id)
-            if (current is None) or (int(current.get("overlap_bp", -1)) < overlap_bp):
+            if (current is None) or (cast(int, current.get("overlap_bp", -1)) < overlap_bp):
                 best_hits[row_id] = {
                     "overlap_bp": overlap_bp,
                     "id": hit_id,
@@ -14036,16 +14073,16 @@ def _annotate_g1k_mei_overlap(
                 }
 
     if best_hits:
-        out["g1k_melt_id"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("id", "")))
-        out["g1k_melt_insertion_type"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("ins_type", "")))
+        out["g1k_melt_id"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "id", "")))
+        out["g1k_melt_insertion_type"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "ins_type", "")))
         out["g1k_melt_insertion_subfamily"] = out["row_id"].map(
-            lambda i: str(best_hits.get(i, {}).get("subfamily", ""))
+            lambda i: str(_hit_field(best_hits.get(i), "subfamily", ""))
         )
         out["g1k_melt_insertion_length"] = (
-            out["row_id"].map(lambda i: int(best_hits.get(i, {}).get("ins_len", -1))).fillna(-1).astype(int)
+            out["row_id"].map(lambda i: cast(int, _hit_field(best_hits.get(i), "ins_len", -1))).fillna(-1).astype(int)
         )
-        out["g1k_melt_tsd"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("tsd", "")))
-        out["g1k_melt_region_id"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("region_id", "")))
+        out["g1k_melt_tsd"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "tsd", "")))
+        out["g1k_melt_region_id"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "region_id", "")))
     return out.drop(columns=["row_id"])
 
 
@@ -14213,7 +14250,7 @@ def _annotate_lr_mei_overlap(
             if not event_family or lr_family != event_family:
                 continue
             current = best_hits.get(row_id)
-            if (current is None) or (int(current.get("overlap_bp", -1)) < overlap_bp):
+            if (current is None) or (cast(int, current.get("overlap_bp", -1)) < overlap_bp):
                 best_hits[row_id] = {
                     "overlap_bp": overlap_bp,
                     "id": hit_id,
@@ -14227,21 +14264,21 @@ def _annotate_lr_mei_overlap(
                 }
 
     if best_hits:
-        out["lr_svan_id"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("id", "")))
-        out["lr_svan_event_type"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("event_type", "")))
-        out["lr_svan_subfamily"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("subfamily", "")))
+        out["lr_svan_id"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "id", "")))
+        out["lr_svan_event_type"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "event_type", "")))
+        out["lr_svan_subfamily"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "subfamily", "")))
         out["lr_svan_insertion_length"] = (
-            out["row_id"].map(lambda i: int(best_hits.get(i, {}).get("ins_len", -1))).fillna(-1).astype(int)
+            out["row_id"].map(lambda i: cast(int, _hit_field(best_hits.get(i), "ins_len", -1))).fillna(-1).astype(int)
         )
         out["lr_svan_tsd_len"] = (
-            out["row_id"].map(lambda i: int(best_hits.get(i, {}).get("tsd_len", -1))).fillna(-1).astype(int)
+            out["row_id"].map(lambda i: cast(int, _hit_field(best_hits.get(i), "tsd_len", -1))).fillna(-1).astype(int)
         )
         out["lr_svan_polya_len"] = (
-            out["row_id"].map(lambda i: int(best_hits.get(i, {}).get("polya_len", -1))).fillna(-1).astype(int)
+            out["row_id"].map(lambda i: cast(int, _hit_field(best_hits.get(i), "polya_len", -1))).fillna(-1).astype(int)
         )
-        out["lr_svan_conformation"] = out["row_id"].map(lambda i: str(best_hits.get(i, {}).get("conformation", "")))
+        out["lr_svan_conformation"] = out["row_id"].map(lambda i: str(_hit_field(best_hits.get(i), "conformation", "")))
         out["lr_svan_not_canonical"] = (
-            out["row_id"].map(lambda i: bool(best_hits.get(i, {}).get("not_canonical", False))).fillna(False).astype(bool)
+            out["row_id"].map(lambda i: cast(bool, _hit_field(best_hits.get(i), "not_canonical", False))).fillna(False).astype(bool)
         )
     return out.drop(columns=["row_id"])
 
@@ -14696,14 +14733,16 @@ def _relabel_frame_sample(df: pd.DataFrame, dst_sample: str) -> pd.DataFrame:
     return out
 
 
-def _clone_remap_to_sample(remap: dict, dst_sample: str) -> dict:
-    cloned: dict = {}
+def _clone_remap_to_sample(remap: _RemapResult, dst_sample: str) -> _RemapResult:
+    cloned: dict[str, Any] = {}
     for key, val in remap.items():
         if isinstance(val, pd.DataFrame):
             cloned[key] = _relabel_frame_sample(val, dst_sample)
         else:
             cloned[key] = val
-    return cloned
+    if "sample" in cloned:
+        cloned["sample"] = dst_sample
+    return cast(_RemapResult, cloned)
 
 
 def annotate_candidate_loci_with_mei(
@@ -14803,7 +14842,7 @@ def annotate_candidate_loci_with_mei(
         indel_disease = pd.DataFrame()
         indel_control = pd.DataFrame()
         remap_t0 = time.monotonic()
-        remap_by_sample = {
+        remap_by_sample: dict[str, _RemapResult] = {  # type: ignore[no-redef]
             "disease": _hydrate_sample_mei_hits_from_detail(
                 sample="disease",
                 split_df=split_disease,
@@ -14823,11 +14862,11 @@ def annotate_candidate_loci_with_mei(
         # Re-apply sequence-based rescues (mate_seq is on discordant evidence; prior
         # detail often omitted polyA-only DPE rows, so hydrate alone cannot restore them).
         for sample in ("disease", "control"):
-            disc = remap_by_sample[sample]["disc_hits"]  # type: ignore[index]
+            disc = remap_by_sample[sample]["disc_hits"]
             if isinstance(disc, pd.DataFrame) and not disc.empty:
                 disc = _rescue_vntr_like_discordant_mei_hits(disc)
                 disc = _rescue_polya_like_discordant_mei_hits(disc)
-                remap_by_sample[sample]["disc_hits"] = disc  # type: ignore[index]
+                remap_by_sample[sample]["disc_hits"] = disc
     else:
         germline_same_bam = same_alignment_path(disease_bam_path, control_bam_path)
         if germline_same_bam:
@@ -14835,7 +14874,7 @@ def annotate_candidate_loci_with_mei(
         else:
             click.echo("[mei-annotate] running disease∥control indel + MEI remaps")
         indel_t0 = time.monotonic()
-        indel_jobs: dict[str, object] = {}
+        indel_jobs: dict[str, pd.DataFrame] = {}
         if germline_same_bam:
             src_bam = control_bam_path or disease_bam_path
             if src_bam is not None:
@@ -14901,7 +14940,7 @@ def annotate_candidate_loci_with_mei(
                 mate_cache_path=Path(evidence_dir) / "discordant_mate_cache.germline.parquet",
                 bwa_threads=per_sample_bwa_threads,
             )
-            remap_by_sample = {
+            remap_by_sample: dict[str, _RemapResult] = {  # type: ignore[no-redef]
                 "control": remap_control,
                 "disease": _clone_remap_to_sample(remap_control, "disease"),
             }
@@ -14913,7 +14952,7 @@ def annotate_candidate_loci_with_mei(
                 f"[mei-annotate] bwa_threads total={bwa_threads} "
                 f"per_sample={per_sample_bwa_threads} (disease∥control)"
             )
-            remap_by_sample = {}
+            remap_by_sample: dict[str, _RemapResult] = {}  # type: ignore[no-redef]
             with ThreadPoolExecutor(max_workers=2) as pool:
                 remap_futs = {
                     pool.submit(
@@ -14946,16 +14985,16 @@ def annotate_candidate_loci_with_mei(
                 f"[mei-annotate] disease∥control MEI remaps wall elapsed={time.monotonic() - remap_t0:.1f}s"
             )
 
-    disease_hits = remap_by_sample["disease"]["split_hits"]  # type: ignore[assignment]
-    control_hits = remap_by_sample["control"]["split_hits"]  # type: ignore[assignment]
-    disease_summary = remap_by_sample["disease"]["split_summary"]  # type: ignore[assignment]
-    control_summary = remap_by_sample["control"]["split_summary"]  # type: ignore[assignment]
-    disease_disc_hits = remap_by_sample["disease"]["disc_hits"]  # type: ignore[assignment]
-    control_disc_hits = remap_by_sample["control"]["disc_hits"]  # type: ignore[assignment]
-    disease_disc_summary = remap_by_sample["disease"]["disc_summary"]  # type: ignore[assignment]
-    control_disc_summary = remap_by_sample["control"]["disc_summary"]  # type: ignore[assignment]
-    disease_disc_mate_summary = remap_by_sample["disease"]["disc_mate_summary"]  # type: ignore[assignment]
-    control_disc_mate_summary = remap_by_sample["control"]["disc_mate_summary"]  # type: ignore[assignment]
+    disease_hits = remap_by_sample["disease"]["split_hits"]
+    control_hits = remap_by_sample["control"]["split_hits"]
+    disease_summary = remap_by_sample["disease"]["split_summary"]
+    control_summary = remap_by_sample["control"]["split_summary"]
+    disease_disc_hits = remap_by_sample["disease"]["disc_hits"]
+    control_disc_hits = remap_by_sample["control"]["disc_hits"]
+    disease_disc_summary = remap_by_sample["disease"]["disc_summary"]
+    control_disc_summary = remap_by_sample["control"]["disc_summary"]
+    disease_disc_mate_summary = remap_by_sample["disease"]["disc_mate_summary"]
+    control_disc_mate_summary = remap_by_sample["control"]["disc_mate_summary"]
     detail_t0 = time.monotonic()
     # Always rebuild from hit frames so short-MEI rescue / polyA split evidence is included
     # even when MEI hits were hydrated from a prior detail table (reuse mode).

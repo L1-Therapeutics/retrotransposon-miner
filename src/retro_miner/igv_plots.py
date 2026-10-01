@@ -433,7 +433,8 @@ def _build_assembly_contig_track(
         manifest = _read_json_dict(locus_dir / "assembly_manifest.json")
         if manifest is None:
             continue
-        pad_bp = int(manifest.get("interval", {}).get("pad_bp", 250)) if isinstance(manifest.get("interval", {}), dict) else 250
+        interval = manifest.get("interval")
+        pad_bp = int(interval.get("pad_bp", 250)) if isinstance(interval, dict) else 250
 
         candidate_fastas = [
             locus_dir / f"disease.spades.pad{pad_bp}" / "contigs.fasta",
