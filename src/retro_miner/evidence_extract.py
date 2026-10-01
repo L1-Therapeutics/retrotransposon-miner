@@ -163,7 +163,7 @@ def _longest_soft_clip_from_read(
         return ("", 0, 0, "")
     query_seq = read.query_sequence or ""
     pos_1based = int(read.reference_start) + 1 if read.reference_start is not None else 0
-    ref_end_1based = int(read.reference_end) + 1 if read.reference_end is not None else pos_1based
+    ref_end_1based = int(read.reference_end) if read.reference_end is not None else pos_1based
     first_op, first_len = read.cigartuples[0]
     last_op, last_len = read.cigartuples[-1]
     candidates: list[tuple[str, int, int]] = []
@@ -737,7 +737,7 @@ def _split_rows_from_read(
         if clip_side == "L":
             pos_1based = read.reference_start + 1
         else:
-            pos_1based = read.reference_end + 1
+            pos_1based = read.reference_end
         query_seq = read.query_sequence or ""
         clip_seq = ""
         if query_seq:

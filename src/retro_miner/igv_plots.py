@@ -575,9 +575,17 @@ def build_igv_batch_script(
     if control_index is None:
         raise FileNotFoundError(f"Missing BAM index for control BAM: {control_bam}")
 
+    # The first line must be an unquoted ``genome <fasta>``. ``new`` loads the
+    # hosted hg38 JSON before any later command, and a quoted genome path is
+    # not recognized, so the BAM load then runs with no reference.
+    genome_path = str(reference_fasta.resolve())
+    if any(ch.isspace() for ch in genome_path):
+        raise ValueError(
+            "IGV's genome command requires an unquoted FASTA path, but this path contains whitespace: "
+            f"{genome_path}"
+        )
     lines: list[str] = [
-        "new",
-        f"genome {_quote_igv_path(reference_fasta.resolve())}",
+        f"genome {genome_path}",
         f"snapshotDirectory {_quote_igv_path(snapshot_dir.resolve())}",
         "preference SAM.SHOW_SOFT_CLIPPED true",
         "setSleepInterval 2",
