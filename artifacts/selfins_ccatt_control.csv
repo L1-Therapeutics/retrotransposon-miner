@@ -1,0 +1,2 @@
+motif,set_a,k_a,bp_a,per_kb_a,set_b,k_b,bp_b,per_kb_b,rate_ratio,p,window_bp
+CCATT/AATGG,nested insertion sites,33,16000,2.0625,random inside same-family element,574,320000,1.79375,1.1498257839721255,0.44463137602391445,50
