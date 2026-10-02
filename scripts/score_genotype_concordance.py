@@ -564,16 +564,32 @@ def gate_3d_cross_method_floor(
         n_records += 1
     for chrom in index:
         index[chrom].sort()
+    # Start positions and longest record per contig, so the overlap scan below
+    # does not rebuild `starts` once per site (it was O(sites x records)).
+    starts_by_chrom = {c: [r[0] for r in recs] for c, recs in index.items()}
+    max_len_by_chrom = {
+        c: max((end - start for start, end, _ in recs), default=0)
+        for c, recs in index.items()
+    }
 
     def covered(sites: Sequence[tuple[str, int]]) -> int:
         n = 0
         for chrom, pos in sites:
-            records = index.get(normalise_contig(chrom))
+            key = normalise_contig(chrom)
+            records = index.get(key)
             if not records:
                 continue
-            starts = [r[0] for r in records]
-            lo = bisect.bisect_left(starts, pos - (tolerance + 300))
-            hi = bisect.bisect_right(starts, pos + tolerance + 300)
+            starts = starts_by_chrom[key]
+            # A record covers `pos` when start - tol <= pos <= end + tol, which
+            # needs start >= pos - tol - length. So the upper bound is every
+            # record starting at or before pos + tol, and the lower bound is
+            # every record whose start is still close enough that *some* record
+            # length could reach. The old code used a hardcoded 300 bp slack,
+            # which silently dropped every record longer than that: an SVA whose
+            # 2 kb span starts 1 kb left of the site genuinely covers it but was
+            # never examined, biasing this coverage measurement downward.
+            hi = bisect.bisect_right(starts, pos + tolerance)
+            lo = bisect.bisect_left(starts, pos - tolerance - max_len_by_chrom[key])
             for start, end, _ in records[lo:hi]:
                 if start - tolerance <= pos <= end + tolerance:
                     n += 1
@@ -652,6 +668,36 @@ def split_halves(samples: Sequence[str]) -> dict[str, Any]:
         "index_b": index_b,
         "order": order,
     }
+
+
+def carriers_in_sorted_order(
+    samples: Sequence[str], carriers: dict[tuple[str, int], np.ndarray]
+) -> tuple[list[str], dict[tuple[str, int], np.ndarray], dict[str, Any]]:
+    """Return samples sorted by name, with every carrier mask permuted to match.
+
+    `read_site_genotypes` builds each mask in the BCF's own sample order, but
+    `split_halves` assigns half membership by position in the *sorted* order, and
+    `accumulation_curve` walks the sorted order while indexing the masks by
+    column. Those agree only when the file happens to be stored sorted. The
+    shipped 908-sample BCF is (`HG00096, HG00099, HG00100, ...`), so this is a
+    no-op there and no published number moves -- but nothing enforced it, and a
+    cohort whose sample list is not already sorted would have every carrier
+    attributed to the wrong half, silently, with no gate to catch it.
+
+    Permuting here makes half membership and the accumulation curve correct for
+    any input. The module already refuses to mis-align a genotype array against a
+    short sample list (`read_site_genotypes`); this is the same hazard one level
+    up.
+    """
+    order = sorted(range(len(samples)), key=lambda i: samples[i])
+    if order == list(range(len(samples))):
+        return list(samples), carriers, {"reordered": False}
+    permutation = np.array(order, dtype=np.int64)
+    return (
+        [samples[i] for i in order],
+        {key: mask[permutation] for key, mask in carriers.items()},
+        {"reordered": True, "n_samples": len(samples)},
+    )
 
 
 def site_recurrence(
@@ -1314,6 +1360,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[gate 3a] {gates['3a']['verdict']}", flush=True)
 
     samples, carriers, counters = read_site_genotypes(args.genotype_bcf, keys)
+    # Half membership and the accumulation curve are both defined on the sorted
+    # order, so the masks have to be in it too. See `carriers_in_sorted_order`.
+    samples, carriers, order_info = carriers_in_sorted_order(samples, carriers)
+    if order_info["reordered"]:
+        print(
+            f"[order] genotype BCF sample list was not sorted; permuted "
+            f"{order_info['n_samples']} carrier masks to sorted order",
+            flush=True,
+        )
     gates["3b"] = gate_3b_genotype_channel(
         counters, n_sites=len(keys), n_samples=len(samples)
     )
@@ -1386,6 +1441,16 @@ def main(argv: list[str] | None = None) -> int:
         "gates": gates,
         "halves": {
             k: v for k, v in halves.items() if k not in ("index_a", "index_b", "order")
+        },
+        "sample_order": {
+            **order_info,
+            "carriers_follow_this_order": True,
+            "note": (
+                "half membership and the accumulation curve are both defined on "
+                "the sorted sample order; carrier masks are permuted into it, so "
+                "a BCF whose sample list is not already stored sorted cannot "
+                "mis-attribute carriers to the wrong half"
+            ),
         },
         "recurrence": summary,
         "accumulation": accumulation,

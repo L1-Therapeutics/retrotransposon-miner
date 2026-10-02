@@ -733,3 +733,151 @@ def test_the_prohibited_terms_list_matches_the_gate_0c_tier_language():
     gate = p3.gate_0c_independence(["HG03086"])
     assert gate["tier"] == "restricted_concordance_only"
     assert "no detection-performance metric is licensed" in gate["consequence"]
+
+
+# --------------------------------------------------------------------------
+# Gate 3d overlap: a record's length decides how far back to look
+# --------------------------------------------------------------------------
+
+
+def _gate_3d(monkeypatch, rows, nested, control, tolerance=50):
+    """Drive gate 3d off a canned bcftools table: (chrom, pos, svtype, svlen)."""
+    text = "".join("\t".join(str(f) for f in row) + "\n" for row in rows)
+    monkeypatch.setattr(p3, "_bcftools", lambda args: text)
+    return p3.gate_3d_cross_method_floor(
+        Path("canned.bcf"), nested, control, tolerance=tolerance
+    )
+
+
+def test_a_record_longer_than_300bp_that_spans_the_site_is_still_counted(
+    monkeypatch,
+):
+    """The old prefilter assumed no record exceeded 300 bp.
+
+    It bisected on start over `[pos - (tol + 300), pos + tol + 300]`, so a 2 kb
+    SVA whose span starts 1 kb to the left of the site was never examined even
+    though it plainly covers it. Gate 3d reports a *coverage* measurement, so
+    every miss biases it downward -- in the gate whose job is to establish that
+    the comparator cannot see these sites, a downward bias makes the conclusion
+    look better founded than it is.
+    """
+    pos, tol, length = 1_000_000, 50, 2000
+    start = pos - tol - 1000
+    gate = _gate_3d(
+        monkeypatch,
+        [("chr1", start, "SVA", length)],
+        nested=[("chr1", pos)],
+        control=[("chr1", 5_000_000)],
+        tolerance=tol,
+    )
+    assert gate["nested_arm"]["covered"] == 1
+    assert gate["nested_arm"]["fraction_covered"] == pytest.approx(1.0)
+
+
+def test_a_site_outside_every_record_span_is_not_covered(monkeypatch):
+    """The fix must not over-match: widening the scan cannot cover everything."""
+    gate = _gate_3d(
+        monkeypatch,
+        [("chr1", 1_000, "ALU", 300)],
+        nested=[("chr1", 9_000_000)],
+        control=[("chr1", 1_000)],
+        tolerance=50,
+    )
+    assert gate["nested_arm"]["covered"] == 0
+    assert gate["control_arm_non_nested_alu"]["covered"] == 1
+
+
+def test_coverage_respects_the_proximity_tolerance(monkeypatch):
+    """A site 49 bp past the end is covered; 51 bp past is not."""
+    start, tol, length = 1_000, 50, 300
+    end = start + length
+    rows = [("chr1", start, "ALU", length)]
+    inside = _gate_3d(monkeypatch, rows, [("chr1", end + tol - 1)], [], tolerance=tol)
+    outside = _gate_3d(monkeypatch, rows, [("chr1", end + tol + 1)], [], tolerance=tol)
+    assert inside["nested_arm"]["covered"] == 1
+    assert outside["nested_arm"]["covered"] == 0
+
+
+def test_a_missing_svlen_is_treated_as_a_point_not_as_unbounded(monkeypatch):
+    """SVLEN "." means unknown length; it must not become a whole-chromosome span."""
+    gate = _gate_3d(
+        monkeypatch,
+        [("chr1", 1_000, "INS", ".")],
+        nested=[("chr1", 1_040)],
+        control=[("chr1", 1_000_500)],
+        tolerance=50,
+    )
+    assert gate["nested_arm"]["covered"] == 1      # 40 bp from the point
+    assert gate["control_arm_non_nested_alu"]["covered"] == 0
+
+
+# --------------------------------------------------------------------------
+# Sample order: masks must live in the order the halves are defined on
+# --------------------------------------------------------------------------
+
+
+def test_an_already_sorted_sample_list_is_left_alone():
+    """The shipped 908-sample BCF is stored sorted, so this must be a no-op."""
+    samples = [f"S{i:03d}" for i in range(10)]
+    mask = np.array([i % 2 == 0 for i in range(10)])
+    out_samples, out_carriers, info = p3.carriers_in_sorted_order(
+        samples, {("chr1", 1): mask}
+    )
+    assert out_samples == samples
+    assert info["reordered"] is False
+    assert np.array_equal(out_carriers[("chr1", 1)], mask)
+
+
+def test_an_unsorted_sample_list_permutes_the_masks_to_match():
+    """Half membership is by position in the *sorted* order, so masks must be.
+
+    `read_site_genotypes` builds masks in the BCF's own sample order, while
+    `split_halves` assigns halves by position in the sorted order and
+    `accumulation_curve` walks the sorted order while indexing masks by column.
+    Without the permutation, an unsorted cohort attributes every carrier to the
+    wrong half -- silently, with no gate to catch it.
+    """
+    samples = ["S002", "S000", "S003", "S001"]
+    # File order: index 0 -> S002, 1 -> S000, 2 -> S003, 3 -> S001.
+    file_order_mask = np.array([True, False, False, True])
+    sorted_samples, carriers, info = p3.carriers_in_sorted_order(
+        samples, {("chr1", 7): file_order_mask}
+    )
+    assert info["reordered"] is True
+    assert sorted_samples == ["S000", "S001", "S002", "S003"]
+    # Sorted order is S000, S001, S002, S003 -> file indices 1, 3, 0, 2.
+    assert np.array_equal(
+        carriers[("chr1", 7)], np.array([False, True, True, False])
+    )
+
+
+def test_permuted_masks_land_in_the_half_the_sample_belongs_to():
+    """End to end: the carrier must count toward the half holding its name."""
+    samples = ["S002", "S000", "S003", "S001"]
+    only_S002_carries = np.array([True, False, False, False])  # index 0 == S002
+    sorted_samples, carriers, _ = p3.carriers_in_sorted_order(
+        samples, {("chr1", 1): only_S002_carries}
+    )
+    halves = p3.split_halves(sorted_samples)
+    rec = p3.site_recurrence([("chr1", 1)], carriers, halves)[("chr1", 1)]
+    # S002 sits at sorted index 2, which is half A.
+    assert rec["carriers_total"] == 1
+    assert rec["carriers_half_a"] == 1
+    assert rec["carriers_half_b"] == 0
+    assert rec["cross_half_supported"] is False
+
+
+def test_the_accumulation_curve_and_the_halves_agree_on_one_sample_order():
+    """`order` and the mask columns must be the same ordering, by construction."""
+    samples = ["S002", "S000", "S003", "S001"]
+    mask = np.array([True, False, True, False])
+    sorted_samples, carriers, _ = p3.carriers_in_sorted_order(
+        samples, {("chr1", i): mask for i in range(4)}
+    )
+    halves = p3.split_halves(sorted_samples)
+    curve = p3.accumulation_curve(
+        [("chr1", i) for i in range(4)], carriers, halves["order"]
+    )
+    assert curve["genome_order"] == "sorted_sample_name"
+    assert curve["n_genomes"] == len(sorted_samples)
+    assert curve["final_unique_sites"] == 4
