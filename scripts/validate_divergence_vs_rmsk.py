@@ -157,11 +157,12 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float | None:
 
 
 def _spearman(x: np.ndarray, y: np.ndarray) -> float | None:
-    from scipy.stats import spearmanr
     mask = np.isfinite(x) & np.isfinite(y)
     if mask.sum() < 3:
         return None
     try:
+        from scipy.stats import spearmanr
+
         r, _ = spearmanr(x[mask], y[mask])
         return float(r)
     except Exception:
