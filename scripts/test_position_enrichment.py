@@ -42,7 +42,6 @@ import argparse
 import collections
 import csv
 import json
-import random
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -185,6 +184,22 @@ def bin_index(offset: int, width: int = SCAN_BIN_BP, nbins: int = 16) -> int | N
 # --------------------------------------------------------------------------
 
 
+def window_opportunity(offset: int, span: int, lo: int, hi: int) -> int:
+    """Positions of the half-open window [lo, hi) that lie inside [0, span).
+
+    The single definition of "how much opportunity does this event's own
+    element give the window". Every null here -- A, B and C -- has to use this
+    one. They used to re-derive it, and they drifted: Null B skipped the clip
+    entirely, which let a window wider than an element contribute more than one
+    expected event. That is why the mappability-weighted expectation shipped at
+    47.51 against Null A's 22.85 while the median host mappable fraction was
+    1.0 -- a gap with nothing to do with mappability.
+    """
+    if span <= 0 or hi <= lo:
+        return 0
+    return len(range(max(lo - offset, 0), min(hi - offset, span)))
+
+
 def expected_uniform(
     call_offsets: Sequence[int],
     opportunities: Sequence[int],
@@ -198,14 +213,38 @@ def expected_uniform(
     same opportunity as one in a long element. `opportunities` is expressed in
     the same coordinate frame as `call_offsets`; see `host_opportunity`.
     """
-    total = 0.0
-    for offset, span in zip(call_offsets, opportunities):
-        width = hi - lo
-        if width <= 0 or span <= 0:
-            continue
-        inside = len(range(max(lo - offset, 0), min(hi - offset, span)))
-        total += inside / span
-    return total
+    return sum(
+        window_opportunity(offset, span, lo, hi) / span
+        for offset, span in zip(call_offsets, opportunities)
+        if span > 0
+    )
+
+
+def expected_weighted(
+    weights: Sequence[float],
+    call_offsets: Sequence[int],
+    opportunities: Sequence[int],
+    lo: int,
+    hi: int,
+) -> float:
+    """Null A's per-event window opportunity, scaled by a per-event weight.
+
+    This is what Null B and Null C are: the same opportunity as Null A, scaled
+    by how callable each element is according to an external track. They used to
+    re-derive that opportunity inline and Null B dropped the clip to the
+    element's own extent, so a window wider than an element contributed more
+    than one expected event. That is how a mappability-weighted expectation
+    shipped at 47.51 against Null A's 22.85 while the median host mappable
+    fraction was 1.0 -- a gap that had nothing to do with mappability.
+
+    At unit weights it reduces to `expected_uniform` exactly, which is the
+    invariant that pins Null B to Null A.
+    """
+    return sum(
+        weight * window_opportunity(offset, span, lo, hi) / span
+        for weight, offset, span in zip(weights, call_offsets, opportunities)
+        if span > 0
+    )
 
 
 def resample_offsets(
@@ -266,11 +305,11 @@ def leave_one_host_out(
     for host, offset in zip(hosts, offsets):
         by_host[host].append(offset)
     full = observed_count(offsets, lo, hi)
-    worst_host, worst = None, 0
-    for host, offs in by_host.items():
+    worst = 0
+    for offs in by_host.values():
         n = observed_count(offs, lo, hi)
         if n > worst:
-            worst_host, worst = host, n
+            worst = n
     return {
         "observed": full,
         "n_hosts": len(by_host),
@@ -613,10 +652,7 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
         lines += [
             f"- Expected under Null C: {c['expected_c']:.2f}.",
             f"- Enrichment under Null C: {c['enrichment_c']:.2f}x.",
-            "",
-            "Levy's hotspot sits after the A-rich linker, where the Alu "
-            "consensus lacks a canonical endonuclease site. Enrichment that "
-            "survives motif conditioning is the stronger result.",
+            f"- {c['note']}",
         ]
     else:
         lines.append("Not run: " + str(report["null_c"]["reason"]))
@@ -773,10 +809,10 @@ def main(argv: list[str] | None = None) -> int:
     null_b: dict[str, Any] = {"ran": False, "reason": "mapability bed not found"}
     if args.mapability_bed and Path(args.mapability_bed).exists():
         fracs = mappable_fractions(events, args.mapability_bed)
-        expected_b = sum(
-            (hi - lo) * f / span
-            for f, span in zip(fracs, opportunities)
-        )
+        # Same per-event window opportunity as Null A, scaled by mappability.
+        # This used to be `(hi - lo) * f / span`, which ignored the clip to the
+        # element's own extent and so was not Null A under a different weight.
+        expected_b = expected_weighted(fracs, offsets, opportunities, lo, hi)
         null_b = {
             "ran": True,
             "expected_b": expected_b,
@@ -801,15 +837,22 @@ def main(argv: list[str] | None = None) -> int:
         "reason": "no --en-motif-bed supplied; not fabricated",
     }
     if args.en_motif_bed and Path(args.en_motif_bed).exists():
+        # A motif-conditioned expectation uses the EN-motif coverage of each
+        # host's element in place of the mappability fraction.
         weights = [f or 1e-6 for f in mappable_fractions(events, args.en_motif_bed)]
-        expected_c = expected_uniform(offsets, opportunities, lo, hi)
-        null_counts = _null_window_counts(opportunities, lo, hi, args.replicates, rng)
-        hits = int((null_counts >= observed).sum())
+        expected_c = expected_weighted(weights, offsets, opportunities, lo, hi)
         null_c = {
             "ran": True,
             "expected_c": expected_c,
             "enrichment_c": (observed / expected_c) if expected_c else None,
-            "p_c": (hits + 1) / (args.replicates + 1),
+            "note": (
+                "Expectation only. No motif-conditioned Monte Carlo null is "
+                "implemented: the position null resamples breakpoints uniformly "
+                "within each element, which says nothing about which elements a "
+                "motif table would have made callable. The p-value reported "
+                "under Null A is not restated here as if it were motif-"
+                "conditioned."
+            ),
         }
 
     scan = _bin_table(offsets, n / len(SCAN_BINS) if n else 0.0)

@@ -25,7 +25,6 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import defaultdict
 from pathlib import Path
 
 

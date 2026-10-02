@@ -86,6 +86,32 @@ class NestedEnumError(ValueError):
     """A NESTED value outside the known enum. Never coerced, never defaulted."""
 
 
+class SchemaError(ValueError):
+    """The unique-sites file does not carry the columns these analyses read."""
+
+
+#: Every column `load_unique_sites` reads, and why each one is load-bearing.
+#: The host interval drives the geometry gate and `host_key`; the carrier list
+#: and its count drive the join gate; `site_id` and `orientation` are what the
+#: reports and the orientation cells are keyed on.
+REQUIRED_UNIQUE_SITE_COLUMNS = (
+    "site_id",
+    "chrom",
+    "representative_pos",
+    "family",
+    "insertion_orientation",
+    "host_name",
+    "host_start0",
+    "host_end0",
+    "host_strand",
+    "host_len",
+    "host_offset_5p_0based",
+    "n_carriers",
+    "samples",
+    "private",
+)
+
+
 def parse_nested_state(value: str) -> str:
     """Return a NESTED state, or raise.
 
@@ -173,13 +199,38 @@ def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]
     yields one bogus token per multi-carrier site, which silently reduces the join
     to private sites only -- a failure that looks like a plausible result rather
     than an error, and the reason the separator is a named constant here.
+
+    A file missing any of `REQUIRED_UNIQUE_SITE_COLUMNS` raises `SchemaError`
+    instead of loading. This is not defensive parsing. Two different tables in
+    this workspace are both called `unique_sites.csv` and they do not carry the
+    same columns: the multi-sample site table has `same_family_host_name` and no
+    host interval at all, while the per-call cohort table has `host_start0`. Read
+    the wrong one and every row fails the geometry gate, so the loader returned
+    0 sites from 4,998 rows and both analyses went on to report an empty cohort
+    as if it were a null result. A changed column set is a new input, and the
+    caller has to be told.
+
+    Rows are still dropped individually for scope and geometry, and counted in
+    the returned report; an all-rows-dropped table is not an error here, because
+    a table of hostless sites legitimately has empty geometry for every row. It
+    is the *analysis scripts* that refuse an empty cohort, not the loader.
     """
     samples_separator = "|"
     rows: list[dict[str, Any]] = []
     dropped_contig = 0
     dropped_unusable = 0
     with Path(path).open(newline="") as fh:
-        for raw in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        header = list(reader.fieldnames or [])
+        missing = [
+            column for column in REQUIRED_UNIQUE_SITE_COLUMNS if column not in header
+        ]
+        if missing:
+            raise SchemaError(
+                f"{path} is not a nested-Alu unique-sites table: it is missing "
+                f"column(s) {missing}. Columns found: {header}."
+            )
+        for raw in reader:
             chrom = (raw.get("chrom") or "").strip()
             if not in_scope_contig(chrom):
                 dropped_contig += 1
@@ -216,13 +267,14 @@ def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]
                     == "True",
                 }
             )
-    return rows, {
+    report = {
         "rows_read": len(rows) + dropped_contig + dropped_unusable,
         "rows_in_scope": len(rows),
         "dropped_out_of_scope_contig": dropped_contig,
         "dropped_missing_geometry": dropped_unusable,
         "samples_field_separator": samples_separator,
     }
+    return rows, report
 
 
 def read_callset(path: Path) -> dict[str, list[dict[str, Any]]]:
@@ -332,13 +384,33 @@ def verify_join(sites: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Check the join against dedup's own carrier counts.
 
     This is a gate, not a diagnostic. If the number of recovered calls disagrees
-    with `n_carriers`, or a recovered call contradicts the dedup table on
-    nesting state or orientation, the per-call detail is not safe to use and the
-    analysis must stop rather than proceed on a partial join.
+    with `n_carriers`, or a recovered call is not the call the site describes --
+    wrong family or wrong orientation -- the per-call detail is not safe to use
+    and the analysis must stop rather than proceed on a partial join.
+
+    What is deliberately NOT part of the gate is whether the source call's raw
+    `NESTED` field agrees with the site's nesting state. Those two answer
+    different questions and are computed by different rules:
+
+      - `dedup_samples.py` derives nesting from RepeatMasker by assigning a
+        same-family host and comparing the insertion's strand to the host's,
+        yielding the four-state sense/antisense/unknown classification.
+      - The per-sample VCFs carry a binary legacy `NESTED=nested|unnested` label
+        written by an earlier exporter under its own host-selection rule.
+
+    On this cohort every call at a site the producer calls `nested_antisense`
+    carries the legacy `unnested` label, so gating on that field makes the gate
+    fire on 100% of antisense sites and refuses to run any analysis at all. That
+    is a disagreement between two definitions, not a broken join, and treating it
+    as fatal would report a definitional difference as a data defect. It is
+    counted and surfaced instead, in
+    `calls_where_source_nesting_label_differs_from_site`, so the divergence stays
+    visible rather than being silently dropped.
     """
     carrier_mismatch: list[str] = []
     orientation_mismatch: list[str] = []
-    not_nested: list[str] = []
+    family_mismatch: list[str] = []
+    nesting_label_differs: list[str] = []
     resolved = 0
     total_calls = 0
     for site in sites:
@@ -350,8 +422,12 @@ def verify_join(sites: Sequence[dict[str, Any]]) -> dict[str, Any]:
         for call in site["calls"]:
             if call["orientation"] != site["orientation"]:
                 orientation_mismatch.append(f"{site['site_id']}:{call['sample']}")
-            if not call["nested_state"].startswith("nested"):
-                not_nested.append(f"{site['site_id']}:{call['sample']}")
+            if (call["family"] or "").strip().upper() != (site["family"] or "").strip().upper():
+                family_mismatch.append(f"{site['site_id']}:{call['sample']}")
+            # Diagnostic only -- see the docstring. Compared as nested-vs-not,
+            # never folded into either orientation class.
+            if call["nested_state"].startswith("nested") is False:
+                nesting_label_differs.append(f"{site['site_id']}:{call['sample']}")
     return {
         "sites_total": len(sites),
         "sites_with_at_least_one_joined_call": resolved,
@@ -360,14 +436,22 @@ def verify_join(sites: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "calls_declared_by_dedup": sum(int(s["n_carriers"]) for s in sites),
         "sites_where_carrier_count_disagrees": len(carrier_mismatch),
         "calls_where_orientation_disagrees": len(orientation_mismatch),
-        "calls_not_labelled_nested": len(not_nested),
+        "calls_where_family_disagrees": len(family_mismatch),
+        "calls_where_source_nesting_label_differs_from_site": len(nesting_label_differs),
+        "source_nesting_label_note": (
+            "diagnostic only, not part of the verdict: the legacy binary NESTED "
+            "field and the producer's strand-derived four-state nesting are "
+            "computed under different host-selection rules and disagree on "
+            "antisense sites by construction"
+        ),
         "verdict": (
             "join_consistent_with_dedup_output"
-            if not carrier_mismatch and not orientation_mismatch and not not_nested
+            if not carrier_mismatch and not orientation_mismatch and not family_mismatch
             else "join_disagrees_with_dedup_output"
         ),
         "examples_carrier_mismatch": carrier_mismatch[:5],
         "examples_orientation_mismatch": orientation_mismatch[:5],
+        "examples_family_mismatch": family_mismatch[:5],
     }
 
 
@@ -424,8 +508,17 @@ def read_rmsk_intervals(
     `wanted` maps contig -> list of (host_start0, host_end0, host_name). The
     result is the subset of annotations needed to measure how much of a host
     interval is covered by repeats *other than the host element itself*.
+
+    Both the contig and the interval are filtered here, which is what the name
+    and this docstring promise. Filtering on contig alone retained every
+    annotation on all 23 in-scope contigs -- hundreds of thousands of rows held
+    in memory to answer a question about a few hundred host intervals.
     """
     keep: dict[str, list[tuple[int, int, str]]] = collections.defaultdict(list)
+    spans_by_contig = {
+        contig: [(int(start), int(end)) for start, end, _name in spans]
+        for contig, spans in wanted.items()
+    }
     opener = gzip.open if str(rmsk_path).endswith(".gz") else open
     with opener(rmsk_path, "rt", errors="replace") as fh:  # type: ignore[operator]
         for line in fh:
@@ -433,9 +526,15 @@ def read_rmsk_intervals(
             if len(fields) < 11:
                 continue
             contig = fields[5]
-            if contig not in wanted:
+            spans = spans_by_contig.get(contig)
+            if not spans:
                 continue
-            keep[contig].append((int(fields[6]), int(fields[7]), fields[9]))
+            a_start = int(fields[6])
+            a_end = int(fields[7])
+            # Half-open overlap, matching how host intervals are stored.
+            if not any(a_start < w_end and a_end > w_start for w_start, w_end in spans):
+                continue
+            keep[contig].append((a_start, a_end, fields[9]))
     return dict(keep)
 
 
@@ -449,18 +548,34 @@ def residual_mask_fraction(
     annotation -- matched by an interval agreeing to within 5 bp at both ends --
     is excluded, and what remains measures whether any *neighbouring* repeat
     intrudes on the host interior.
+
+    Coverage is the *union* of the remaining intervals, not the widest single
+    one. A host flanked by two repeats that each cover 40% of it is 80% masked,
+    not 40%; taking the maximum understated every host with more than one
+    intruding annotation and made the diagnostic read cleaner than the genome
+    actually is.
     """
     start, end, _ = host
     span = end - start
     if span <= 0:
         return 1.0
-    worst = 0
+    spans: list[tuple[int, int]] = []
     for a_start, a_end, _name in annotations:
         if a_end <= start or a_start >= end:
             continue
         if abs(a_start - start) <= 5 and abs(a_end - end) <= 5:
             continue
-        overlap = min(a_end, end) - max(a_start, start)
-        if overlap > worst:
-            worst = overlap
-    return worst / span
+        spans.append((max(a_start, start), min(a_end, end)))
+    if not spans:
+        return 0.0
+    spans.sort()
+    covered = 0
+    cur_start, cur_end = spans[0]
+    for lo, hi in spans[1:]:
+        if lo > cur_end:
+            covered += cur_end - cur_start
+            cur_start, cur_end = lo, hi
+        else:
+            cur_end = max(cur_end, hi)
+    covered += cur_end - cur_start
+    return min(covered, span) / span

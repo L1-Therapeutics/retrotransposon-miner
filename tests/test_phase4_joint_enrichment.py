@@ -92,11 +92,66 @@ def test_a_bin_overlapping_a_short_host_is_clipped_not_pseudocounted():
 
 
 def test_a_fully_covered_host_gives_unity_opportunity():
-    assert je.opportunity_fraction(host_len=300, bin_lo=120, bin_hi=140) == pytest.approx(20 / 300)
+    # Offsets 120..140 inclusive is 21 of the host's 300, not 20: the bin edges
+    # are inclusive because that is how `simulate` tests its drawn offsets.
+    assert je.opportunity_fraction(host_len=300, bin_lo=120, bin_hi=140) == pytest.approx(21 / 300)
 
 
 def test_a_bin_beyond_the_host_end_is_excluded_not_counted_as_a_hit():
-    assert je.opportunity_fraction(host_len=50, bin_lo=0, bin_hi=10) == pytest.approx(0.2)
+    # Offsets 0..10 inclusive is 11 of the host's 50.
+    assert je.opportunity_fraction(host_len=50, bin_lo=0, bin_hi=10) == pytest.approx(11 / 50)
+
+
+def test_opportunity_fraction_counts_the_same_offsets_the_null_draws():
+    """The closed form must agree with the simulation's own bin test.
+
+    `simulate` draws an integer offset uniformly on [0, host_len) and counts it
+    when `bin_lo <= offset <= bin_hi`. This brute-forces exactly that and
+    compares. The two disagreeing by one offset per host is a bug that shifts
+    every analytic expectation downward while leaving the headline
+    simulation-driven p-value untouched, so it is easy to miss and is pinned
+    here instead.
+    """
+    for bin_lo, bin_hi in ((120, 140), (280, 300), (0, 10)):
+        for host_len in range(1, 400):
+            brute = sum(
+                1 for offset in range(host_len) if bin_lo <= offset <= bin_hi
+            ) / host_len
+            assert je.opportunity_fraction(
+                host_len=host_len, bin_lo=bin_lo, bin_hi=bin_hi
+            ) == pytest.approx(brute), (bin_lo, bin_hi, host_len)
+
+
+def test_the_simulated_null_mean_converges_to_the_analytic_expectation():
+    """End-to-end version of the same identity, through `simulate` itself.
+
+    The simulation redraws each event's offset uniformly within its host, so its
+    mean must approach the closed form. A persistent gap means the two routes to
+    the same expectation disagree, which is the failure the joint report would
+    have surfaced only as a confusing `expectation_agreement` number.
+    """
+    cell = je.CELLS[0]
+    hosts = [
+        {
+            "host_len": host_len,
+            "events": [
+                (j * 7, "+" if j % 2 == 0 else "-", {}) for j in range(n_events)
+            ],
+            "sites": [],
+        }
+        for host_len in (160, 200, 260, 300, 360)
+        for n_events in (1, 2, 3)
+    ]
+    eligible = [
+        h
+        for h in hosts
+        if je.opportunity_fraction(h["host_len"], cell.bin_lo, cell.bin_hi) > 0
+    ]
+    analytic = je.analytic_expectation(eligible, cell)
+    null = je.simulate(eligible, cell, 200_000, np.random.default_rng(20261001))
+    # Generous, because the statistic is a count; the old off-by-one sat at
+    # ~5% and this still catches it while surviving Monte Carlo noise.
+    assert null.mean() == pytest.approx(analytic, rel=0.02)
 
 
 # --------------------------------------------------------------------------
@@ -228,7 +283,8 @@ def test_the_effect_size_is_observed_over_expected():
     observed = sum(je.observed_statistic(h, cell) for h in hosts)
     expected = je.analytic_expectation(hosts, cell)
     assert observed == 4
-    assert observed / expected == pytest.approx(4 / (4 * 20 / 300))
+    # 21/300, not 20/300: offsets 120..140 are 21 of the host's 300 positions.
+    assert observed / expected == pytest.approx(4 / (4 * 21 / 300))
 
 
 def test_the_bootstrap_brackets_the_point_estimate():
@@ -382,6 +438,37 @@ def test_main_runs_end_to_end_on_a_synthetic_cohort(tmp_path):
     assert len(report["cells"]) == 4
     assert (out / "joint_enrichment.md").exists()
     assert (out / "joint_cells.csv").exists()
+
+
+def test_main_refuses_an_empty_cohort_rather_than_reporting_a_null(tmp_path):
+    """Every site out of scope must stop the run, not become "no effect".
+
+    The cells are computed from `sites` unconditionally, so an empty cohort
+    produces a well-formed report full of zeros -- which reads as a decisive
+    negative. The loader cannot refuse this case (an all-hostless table is
+    legitimate), so the analysis does.
+    """
+    us, callset = _fixture(tmp_path)
+    rows = list(csv.DictReader(us.open(newline="")))
+    for row in rows:
+        row["chrom"] = "chrY"  # out of scope; every row now fails the contig gate
+    with us.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as excinfo:
+        je.main([
+            "--unique-sites", str(us),
+            "--callset-dir", str(callset),
+            "--rmsk", str(tmp_path / "absent.rmsk.gz"),
+            "--outdir", str(out),
+            "--replicates", "10", "--bootstrap", "5",
+        ])
+    assert "no usable sites" in str(excinfo.value)
+    assert not (out / "joint_enrichment.json").exists()
+    assert not (out / "joint_cells.csv").exists()
 
 
 def test_the_join_is_gated_before_any_cell_is_computed(tmp_path):

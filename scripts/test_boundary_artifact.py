@@ -42,7 +42,6 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-import numpy as np
 
 REPO_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(REPO_SRC) not in sys.path:
@@ -388,7 +387,7 @@ def peak_stability(perturbations: dict[str, Any], events: Sequence[dict[str, Any
         observed_swing = hi - lo
         # The largest displacement any single perturbation can force.
         max_shift = max(
-            abs(l) for l, _ in BOUNDARY_PERTURBATIONS.values()
+            abs(shift) for shift, _ in BOUNDARY_PERTURBATIONS.values()
         )
         mechanical = mechanical_shift_expectation(events, region, max_shift)
         # Allow the mechanical displacement plus a modest genuine wobble.

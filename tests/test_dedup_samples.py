@@ -95,6 +95,31 @@ def test_within_sample_duplicate_records_collapse_but_remain_provenanced():
     assert sum(member.source_count for member in sites[0].members) == 3
 
 
+def test_repeated_dedup_passes_do_not_compound_provenance_totals():
+    """`run` dedups the same Call objects once per window, so the within-sample
+    collapse must not write its totals back onto the caller's objects.
+
+    Regression: the in-place version re-summed its own inflated predecessor, so a
+    three-record site reported 3 -> 4 -> 5 source records and grew its id list
+    "a|b|c" -> "a|b|b|c" -> "a|b|b|b|c".
+    """
+    host = m.Host("chr1", 100, 500, "+", "AluY", "ALU")
+    a, b = call("HG03086", 200, host=host), call("HG03086", 205, host=host)
+    c = call("HG01474", 203, host=host)
+    a.source_ids, b.source_ids, c.source_ids = ["a"], ["b"], ["c"]
+    calls = [a, b, c]
+    for window in (m.PRIMARY_WINDOW, *m.SWEEP_WINDOWS):
+        sites, _ = m.unique_sites(calls, window)
+        if window != m.PRIMARY_WINDOW:
+            continue
+        assert sum(member.source_count for member in sites[0].members) == 3
+        ids = [i for member in sites[0].members for i in member.source_ids]
+        assert sorted(ids) == ["a", "b", "c"]
+    # the caller's own records are left exactly as parsed
+    assert [x.source_count for x in calls] == [1, 1, 1]
+    assert [x.source_ids for x in calls] == [["a"], ["b"], ["c"]]
+
+
 def test_matching_and_profile_never_read_gene_fields_or_genotypes():
     host = m.Host("chr1", 100, 400, "+", "AluY", "ALU")
     a, b = call("HG03086", 200, host=host), call("HG01474", 205, host=host)
@@ -146,3 +171,117 @@ def test_fast_fasta_reader_handles_wrapped_sequence():
     # .fai tuple: sequence length, first-base byte offset, bases/line, bytes/line.
     got = m.fasta_sequence_chunk(io.BytesIO(raw), (12, 0, 6, 7), 4, 10)
     assert got == b"ACGTAC"
+
+
+def _load_common():
+    spec = importlib.util.spec_from_file_location(
+        "nested_multi_sample_common", SCRIPT.parent / "nested_multi_sample_common.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_dedup_table_is_loadable_by_the_phase4_consumers(tmp_path):
+    """Producer and consumer must agree on the columns, not just on the filename.
+
+    Both scripts write and read `nested_analysis/results_multi_sample/unique_sites.csv`.
+    This one wrote host geometry only under `same_family_host_*` names, while the
+    Phase 4 loader requires `host_name`/`host_start0`/`host_end0`/`host_len`, so
+    `joint_enrichment.py` and `recurrence_test.py` both died with a SchemaError
+    on the real file while every unit test here still passed. Nothing exercised
+    the seam between the two modules, which is exactly why it went unnoticed.
+
+    The contract is asserted directly: every column the loader requires must be
+    present in a table this script produces.
+    """
+    common = _load_common()
+    host = m.Host("chr1", 900, 1200, "+", "AluY", "ALU")
+    sites = m.anchored_groups(
+        [call("HG03086", 1000, host=host), call("HG01474", 1005, host=host)],
+        10,
+        allow_same_sample=False,
+    )
+    frame = m.build_sites_table(sites, 10)
+    missing = [
+        column
+        for column in common.REQUIRED_UNIQUE_SITE_COLUMNS
+        if column not in frame.columns
+    ]
+    assert missing == [], f"dedup output is missing loader-required columns: {missing}"
+
+    # And it must survive the real loader, not just a column-presence check.
+    out = tmp_path / "unique_sites.csv"
+    frame.to_csv(out, index=False)
+    rows, report = common.load_unique_sites(out)
+    assert report["rows_in_scope"] == 1
+    assert rows[0]["host_name"] == "AluY"
+    assert rows[0]["host_start0"] == 900
+    assert rows[0]["host_end0"] == 1200
+    assert rows[0]["host_len"] == 300
+    # Carriers are emitted in the fixed SAMPLES order, not alphabetical order.
+    assert rows[0]["carriers"] == ["HG03086", "HG01474"]
+
+
+def test_the_host_geometry_columns_agree_with_the_same_family_columns(tmp_path):
+    """The two spellings must describe the same host, not drift apart."""
+    host = m.Host("chr1", 900, 1200, "-", "AluY", "ALU")
+    sites = m.anchored_groups([call("HG03086", 1000, host=host)], 10,
+                              allow_same_sample=True)
+    row = m.site_row(sites[0], "US00001", 10)
+    assert row["host_name"] == row["same_family_host_name"] == "AluY"
+    assert row["host_strand"] == row["same_family_host_strand"] == "-"
+    assert row["host_len"] == row["same_family_host_length"] == 300
+    assert row["host_end0"] - row["host_start0"] == row["host_len"]
+
+
+def test_a_hostless_site_keeps_empty_geometry_rather_than_a_fake_zero():
+    """Unnested calls have no host; zero would look like a real 0 bp element."""
+    sites = m.anchored_groups([call("HG03086", 1000, host=None)], 10,
+                              allow_same_sample=True)
+    row = m.site_row(sites[0], "US00001", 10)
+    assert row["host_name"] == "" and row["host_len"] == ""
+    assert row["host_start0"] == "" and row["host_end0"] == ""
+    assert row["host_strand"] == "" and row["host_offset_5p_0based"] == ""
+    # `same_family_host_length` stayed blank before this fix too; a 0 would be
+    # indistinguishable from a real zero-length element to any downstream reader.
+
+
+def test_the_misleading_any_mei_host_column_is_not_emitted():
+    """`any_MEI_host_id_for_matching` is gone and must not come back.
+
+    The name promises a host drawn from any MEI family, but the frozen matching
+    key in `matching_audit.md` is the *same-family* host, so the column could
+    only ever hold a byte-for-byte duplicate of `same_family_host_id`. It had no
+    consumer and the authoritative producer never emitted it. Populating it from
+    the all-family sweep would have named the wrong host -- the longest element
+    of any family, which for an Alu inside an L1 is the L1 -- so the column is
+    removed rather than filled.
+    """
+    host = m.Host("chr1", 900, 1200, "+", "AluY", "ALU")
+    sites = m.anchored_groups([call("HG03086", 1000, host=host)], 10,
+                              allow_same_sample=True)
+    row = m.site_row(sites[0], "US00001", 10)
+    assert "any_MEI_host_id_for_matching" not in row
+
+
+def test_the_emitted_schema_has_no_field_whose_name_contradicts_its_value():
+    """Both host vocabularies stay; only the false name is gone.
+
+    The `same_family_host_*` spelling is what the matching audit reads and the
+    plain `host_*` spelling is what `nested_multi_sample_common.load_unique_sites`
+    requires. Both describe the same host, and the test above this one already
+    pins that they agree. What must not survive is a third spelling claiming a
+    different host.
+    """
+    host = m.Host("chr1", 900, 1200, "+", "AluY", "ALU")
+    sites = m.anchored_groups([call("HG03086", 1000, host=host)], 10,
+                              allow_same_sample=True)
+    row = m.site_row(sites[0], "US00001", 10)
+    for column in ("host_name", "host_start0", "host_end0", "host_strand",
+                   "host_len", "same_family_host_id", "same_family_host_name",
+                   "same_family_host_strand", "same_family_host_length"):
+        assert column in row
+    assert not [c for c in row if c.startswith("any_")]

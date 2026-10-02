@@ -15,7 +15,7 @@ import hashlib
 import math
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -326,11 +326,6 @@ def assign_hosts(calls: list[Call], rmsk: dict[tuple[str, str], list[Host]]) -> 
         if call.chrom in PRIMARY_CHROMS:
             by_chrom[call.chrom].append(call)
     for chrom, chrom_calls in by_chrom.items():
-        all_intervals = sorted(
-            [host for family in FAMILIES for host in rmsk.get((chrom, family), [])],
-            key=lambda host: (host.start0, host.end0, host.name, host.strand),
-        )
-        all_assign = _sweep_assign(chrom_calls, all_intervals)
         by_family: dict[str, list[Call]] = defaultdict(list)
         for call in chrom_calls:
             by_family[call.family].append(call)
@@ -387,7 +382,6 @@ def anchored_groups(calls: list[Call], window: int, *, allow_same_sample: bool) 
     site_of: dict[int, int] = {}
     sites: list[Site] = []
     for _, left_index, right_index in pairs:
-        left, right = calls[left_index], calls[right_index]
         left_site, right_site = site_of.get(left_index), site_of.get(right_index)
         if left_site is not None and right_site is not None:
             continue
@@ -435,8 +429,17 @@ def collapse_within_sample(calls: list[Call], window: int) -> tuple[list[Call], 
         grouped = anchored_groups(sample_calls, window, allow_same_sample=True)
         for site in grouped:
             rep = site.representative
-            rep.source_count = sum(member.source_count for member in site.members)
-            rep.source_ids = [source_id for member in site.members for source_id in member.source_ids]
+            # Aggregate provenance onto a *copy*, never onto the caller's object.
+            # `run` calls `unique_sites` on the same Call objects once for the
+            # primary window and again for every SWEEP_WINDOWS entry (which
+            # repeats the primary +/-10 bp window). Writing the totals back in
+            # place made each pass re-sum its own inflated predecessor, so
+            # source_count walked 3 -> 4 -> 5 and source_call_ids grew
+            # "A|B|C" -> "A|B|B|C" -> "A|B|B|B|C" for a site with three records.
+            source_count = sum(member.source_count for member in site.members)
+            source_ids = [source_id for member in site.members for source_id in member.source_ids]
+            if source_count != rep.source_count or source_ids != rep.source_ids:
+                rep = replace(rep, source_count=source_count, source_ids=source_ids)
             representatives.append(rep)
             n_collapsed += len(site.members) - 1
     return representatives, n_collapsed
@@ -451,7 +454,6 @@ def site_row(site: Site, site_id: str, window: int) -> dict[str, Any]:
     call = site.representative
     samples = site.samples
     host = call.same_family_host
-    match_host = call.match_host
     return {
         "site_id": site_id, "chrom": call.chrom, "representative_pos": call.pos,
         "family": call.family, "insertion_orientation": call.orientation,
@@ -461,7 +463,21 @@ def site_row(site: Site, site_id: str, window: int) -> dict[str, Any]:
         "same_family_host_name": host.name if host else "",
         "same_family_host_strand": host.strand if host else "",
         "same_family_host_length": host.length if host else "",
-        "any_MEI_host_id_for_matching": match_host.host_id if match_host else "",
+        # Host geometry under the canonical column names. `joint_enrichment.py`
+        # and `recurrence_test.py` read this same file through
+        # `nested_multi_sample_common.load_unique_sites`, which requires
+        # host_name/host_start0/host_end0/host_strand/host_len. Emitting only the
+        # `same_family_host_*` names made this producer write a table its own
+        # downstream consumers reject, so both Phase 4 scripts died with a
+        # SchemaError on real data while every unit test still passed. The
+        # `same_family_*` columns are kept above because the matching audit reads
+        # them; these are the same host, restated under the names the loader wants.
+        "host_name": host.name if host else "",
+        "host_start0": host.start0 if host else "",
+        "host_end0": host.end0 if host else "",
+        "host_strand": host.strand if host else "",
+        "host_len": host.length if host else "",
+        "host_selection_rule": "longest_overlap_then_leftmost_name" if host else "",
         "host_offset_5p_0based": call.offset if call.offset is not None else "",
         "n_carriers": len(samples), "carrier_count_class": str(len(samples)),
         "samples": "|".join(samples), "private": len(samples) == 1,
@@ -470,6 +486,33 @@ def site_row(site: Site, site_id: str, window: int) -> dict[str, Any]:
         "source_call_ids": "|".join(source_id for member in site.members for source_id in member.source_ids),
         "match_window_bp": window,
     }
+
+
+# `any_MEI_host_id_for_matching` used to be emitted here. It is deliberately
+# absent, and this note records why so it does not get re-added:
+#
+#   * The authoritative producer named in the matching manifest,
+#     `rtm-dedup/scripts/match_sites_across_samples.py`, never emitted it. Its
+#     `site_rows` writes `host_name`/`host_start0`/`host_end0`/`host_strand`/
+#     `host_len` and no `any_MEI_host*` field at all.
+#   * `matching_audit.md` freezes the matching key to the *same-family* host, so
+#     a column named "...for_matching" could only ever hold the same-family host.
+#   * It therefore held a byte-for-byte duplicate of `same_family_host_id` --
+#     verified across all 4,998 rows of the shipped table.
+#   * It had no consumer anywhere in the workspace, and the frozen plan never
+#     mentions it.
+#
+# Populating it from the all-family sweep would have been worse, not better: that
+# sweep returns the longest element of *any* family overlapping the call, so for
+# an Alu sitting inside an L1 it would name the L1 in a column that says the host
+# used for matching -- a different and actively misleading value. The sweep was
+# dead work and is gone.
+#
+# Reconciliation: nothing consumes the column, the frozen plan does not mention
+# it, and the authoritative producer never had it, so removing it moves this
+# table toward the recorded schema rather than away from it. The column's
+# absence is what the regenerated `matching_audit.md` schema-diff section will
+# record; no hand edit of that output is needed.
 
 
 def build_sites_table(sites: list[Site], window: int) -> pd.DataFrame:
@@ -836,7 +879,7 @@ def write_analysis_summary(path: Path, *, callsets: dict[str, list[Call]], qc: d
         "- Genotype caveat: VCF headers say there is no validated genotyping model. GT/GQ were not parsed or used as evidence.",
         f"- Matching sensitivity includes exact-coordinate (0 bp) and the ±5/±10/±20-bp sweep; primary analysis is ±{window} bp.",
         f"- RepeatMasker host assignments: `{rmsk_path}`; same-family insertion host by longest overlap, then leftmost/name tie-break. The requested L1 profile separately uses the assigned near-full-length Alu host for L1-in-Alu calls.",
-        f"- Position and family nesting use a fresh RepeatMasker breakpoint annotation. Its four states are unnested, nested_sense, nested_antisense, nested_unknown; unknown is excluded from both orientation denominators.",
+        "- Position and family nesting use a fresh RepeatMasker breakpoint annotation. Its four states are unnested, nested_sense, nested_antisense, nested_unknown; unknown is excluded from both orientation denominators.",
         "- Source data check: these checksum-verified VCF records actually use only legacy `NESTED=nested/unnested` values, not the four-value enum described in the request. Four-state results below are independently re-annotated from RepeatMasker and insertion/host strands; the source's raw 261 HG03086 `NESTED=nested` rows are baseline-gated and remain separately labelled.",
         "- HG03086 reference-count caveat: its 261 raw callset NESTED-nested calls are distinct from the 320 count in the self-insertion report (different host-selection/analysis rules); neither is substituted for the other.",
         f"- Genome-wide QC: { {sample: qc[sample]['genome_wide'] for sample in SAMPLES} }; all five include chr1–22 and chrX, and only HG03172/NA18498 have the one chrY QC call each.",
@@ -924,7 +967,7 @@ def write_analysis_summary(path: Path, *, callsets: dict[str, list[Call]], qc: d
         f"| Alu 3′-tail 280–300 bp enrichment | 3.7x | {_fmt(peak_by_family['ALU']['tail'])}x pooled unique |",
         f"| LINE-1 linker/tail windows in Alu hosts | not supplied | {_fmt(peak_by_family['LINE1']['linker'])}x / {_fmt(peak_by_family['LINE1']['tail'])}x pooled unique |",
         "",
-        f"The inherited 1.47/1.47/29.4, orientation, linker, and tail figures are shown as user-supplied HG03086-only comparators. The 2.49x/0.46x Alu and chance LINE-1 orientation values are the supplied HG03086-only orientation comparator; their exact numerator/denominator were not present in the available prior result CSVs, so the comparison is the reported factor, not a reconstructed count. These historical factors use their own denominator/null implementation; this report does not back-calculate them from the five-callset results. The displayed ±10-bp unique counts and Q1–Q4 site-level results use one representative per deduplicated site; per-sample profile checks are calculated on each sample's collapsed callset.",
+        "The inherited 1.47/1.47/29.4, orientation, linker, and tail figures are shown as user-supplied HG03086-only comparators. The 2.49x/0.46x Alu and chance LINE-1 orientation values are the supplied HG03086-only orientation comparator; their exact numerator/denominator were not present in the available prior result CSVs, so the comparison is the reported factor, not a reconstructed count. These historical factors use their own denominator/null implementation; this report does not back-calculate them from the five-callset results. The displayed ±10-bp unique counts and Q1–Q4 site-level results use one representative per deduplicated site; per-sample profile checks are calculated on each sample's collapsed callset.",
         "",
         "## Matching and accumulation",
         "",

@@ -26,8 +26,12 @@ import yaml
 _SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
-from retro_miner.mei_panel_index import index_public_mei_remap_fastas
-from retro_miner.s3_transfer import copy_s3_uri, download_s3_uri, process_local_aws_config
+from retro_miner.mei_panel_index import index_public_mei_remap_fastas  # noqa: E402
+from retro_miner.s3_transfer import (  # noqa: E402
+    copy_s3_uri,
+    download_s3_uri,
+    process_local_aws_config,
+)
 
 
 @dataclass
@@ -703,7 +707,8 @@ def _ensure_alignment_index(
         for sidecar in _http_index_sidecar_urls(ds.url):
             try:
                 _download_file(sidecar, local_bai, timeout_sec=120, force=True)
-            except Exception:
+            except Exception:  # noqa: BLE001 - any sidecar failing is fine; the
+                # loop tries the next one and the result is checked by size below
                 continue
             if local_bai.is_file() and local_bai.stat().st_size > 0:
                 return local_bai
@@ -1553,7 +1558,7 @@ def _chain_source_has_chr_prefix(chain_gz: Path) -> bool:
                 # chain header: chain score tName tSize tStrand ...
                 if len(parts) >= 3:
                     return parts[2].startswith("chr")
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Conservative default aligned with UCSC chain naming conventions.
         return True
     # Conservative default when chain has no chain-header lines for some reason.

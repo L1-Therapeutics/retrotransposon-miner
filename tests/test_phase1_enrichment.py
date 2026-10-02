@@ -59,6 +59,88 @@ def test_expected_uniform_clips_window_to_element():
 
 
 # --------------------------------------------------------------------------
+# One definition of "window opportunity", shared by every null
+# --------------------------------------------------------------------------
+
+
+def test_window_opportunity_counts_the_window_inside_the_element():
+    # Window [128, 139) is 11 wide and the element is 300 long: 11 positions.
+    assert m.window_opportunity(offset=0, span=300, lo=128, hi=139) == 11
+
+
+def test_window_opportunity_clips_to_the_element():
+    # Element is 20 long, window 100 wide: the whole element, and no more.
+    assert m.window_opportunity(offset=0, span=20, lo=0, hi=100) == 20
+    # Element ends before the window starts: nothing at all.
+    assert m.window_opportunity(offset=0, span=5, lo=128, hi=139) == 0
+
+
+def test_window_opportunity_is_offset_by_the_call():
+    # `offset` shifts the window relative to the element. An event 134 bases in
+    # leaves only the first 5 of the window's 11 positions inside [0, span).
+    assert m.window_opportunity(offset=134, span=300, lo=128, hi=139) == 5
+    # Past the window entirely: the element has no positions left in it.
+    assert m.window_opportunity(offset=200, span=300, lo=128, hi=139) == 0
+
+
+def test_a_degenerate_window_or_element_gives_no_opportunity():
+    assert m.window_opportunity(offset=0, span=300, lo=139, hi=139) == 0
+    assert m.window_opportunity(offset=0, span=0, lo=0, hi=10) == 0
+
+
+def test_a_weighted_null_at_unit_weights_is_exactly_the_uniform_null():
+    """This is the invariant that pins Null B and Null C to Null A.
+
+    They are Null A under a different weight, nothing else. Null B stopped being
+    that when it dropped the clip, and published an expectation 2x Null A's
+    while the median host mappable fraction was 1.0 -- a gap with nothing to do
+    with mappability, reported as if it were the track's doing.
+    """
+    offsets = [0, 30, 128, 140, 290]
+    spans = [300, 300, 150, 150, 12]
+    for lo, hi in ((128, 139), (0, 11), (133, 134)):
+        assert m.expected_weighted(
+            [1.0] * len(offsets), offsets, spans, lo, hi
+        ) == pytest.approx(m.expected_uniform(offsets, spans, lo, hi))
+
+
+def test_a_weighted_null_cannot_exceed_one_expected_event_per_event():
+    """The clip is what makes this true, and Null B's old formula broke it.
+
+    Null B computed `(hi - lo) * f / span`, so a 100-wide window over a 20-long
+    element contributed 5 expected events from one call.
+    """
+    offsets = [0] * 10
+    spans = [20] * 10
+    weighted = m.expected_weighted([1.0] * 10, offsets, spans, 0, 100)
+    assert weighted == pytest.approx(10.0)
+    # The unclipped formula this replaces, for the record.
+    unclipped = sum((100 - 0) * 1.0 / 20 for _ in range(10))
+    assert unclipped == pytest.approx(50.0)
+
+
+def test_a_weighted_null_scales_linearly_in_the_weight():
+    offsets, spans = [0, 50], [300, 300]
+    unit = m.expected_weighted([1.0, 1.0], offsets, spans, 128, 139)
+    half = m.expected_weighted([0.5, 0.5], offsets, spans, 128, 139)
+    assert half == pytest.approx(unit * 0.5)
+
+
+def test_expected_uniform_agrees_with_the_shared_helper_element_by_element():
+    """The refactor that introduced `window_opportunity` must not have moved A."""
+    offsets = [0, 7, 50, 128, 133, 139, 145, 290]
+    spans = [300, 300, 12, 150, 150, 20, 20, 300]
+    for lo, hi in ((128, 139), (0, 100), (133, 134), (10, 11)):
+        assert m.expected_uniform(offsets, spans, lo, hi) == pytest.approx(
+            sum(
+                m.window_opportunity(o, s, lo, hi) / s
+                for o, s in zip(offsets, spans)
+                if s > 0
+            )
+        )
+
+
+# --------------------------------------------------------------------------
 # Coordinate frame: the bug this module exists to prevent
 # --------------------------------------------------------------------------
 

@@ -79,7 +79,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -156,14 +156,24 @@ def opportunity_fraction(host_len: int, bin_lo: int, bin_hi: int) -> float:
     structural zero the pre-registration says to exclude rather than
     pseudocount. The bin is measured in host-relative offset space and the host
     spans offsets [0, host_len).
+
+    Both bin edges are INCLUSIVE, because that is how the null draws and tests
+    offsets in `simulate`. So a host of 300 bp against the [120, 140] bin has
+    21 qualifying offsets -- 120 through 140 -- and the fraction is 21/300, not
+    20/300. Clamping the upper edge to `host_len` and then taking `hi - lo`
+    treats the bin edge as exclusive, which understates every host longer than
+    `bin_hi` by one offset and puts the closed form below the simulated mean.
+    `test_opportunity_fraction_counts_the_same_offsets_the_null_draws` pins the
+    two together.
     """
     if host_len <= bin_lo:
         return 0.0
     lo = max(0, bin_lo)
-    hi = min(host_len, bin_hi)
-    if hi <= lo:
+    # Largest offset that both the bin and the host actually contain.
+    hi = min(host_len - 1, bin_hi)
+    if hi < lo:
         return 0.0
-    return (hi - lo) / host_len
+    return (hi - lo + 1) / host_len
 
 
 # --------------------------------------------------------------------------
@@ -260,10 +270,13 @@ def simulate(
     labels are additionally permuted *within* each host, preserving that host's
     orientation totals, via a per-host random ordering of the event indices.
 
-    Hosts with no opportunity in the bin need no special case: their redrawn
-    offsets are drawn from an interval entirely below the bin, so they can never
-    land in it. The structural-zero exclusion is therefore enforced by the
-    arithmetic itself, and is separately counted for reporting.
+    Hosts whose length leaves no opportunity in the bin need no special case:
+    every offset they can draw lies below `bin_lo`, so they can never land in
+    it. The structural-zero exclusion is therefore enforced by the arithmetic
+    itself, and is separately counted for reporting. Note that this holds only
+    for hosts shorter than the bin's lower edge -- a host *longer* than the bin
+    does have offsets that land in it, which is correct and is why
+    `opportunity_fraction` decides eligibility rather than host length alone.
     """
     lengths = np.array([h["host_len"] for h in hosts], dtype=np.int64)
     counts = np.array([len(h["events"]) for h in hosts], dtype=np.int64)
@@ -635,7 +648,7 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
         "effect size; no multiplied figure is reported anywhere in this document."
     )
     lines.append(
-        f"3. **Secondary cells, Holm-adjusted within the Alu family:** "
+        "3. **Secondary cells, Holm-adjusted within the Alu family:** "
         + "; ".join(
             f"{c['cell_id']} p={_fmt(c.get('holm_adjusted_p'), '.4g')}"
             for c in report["cells"][1:]
@@ -680,7 +693,7 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
     for cell in report["cells"]:
         unstable = cell.get("effect_size_unstable_near_zero_expected")
         effect_text = (
-            f"unstable*" if unstable
+            "unstable*" if unstable
             else f"{_fmt(cell['effect_size_observed_over_expected'], '.2f')}x"
         )
         lines.append(
@@ -759,6 +772,17 @@ def main(argv: list[str] | None = None) -> int:
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     sites, load_report = common.load_unique_sites(args.unique_sites)
+    # An empty cohort is a broken input, not a null result. Both this script and
+    # `recurrence_test.py` would otherwise go on to compute a null over nothing
+    # and report it as "no effect". The loader stays permissive because an
+    # all-hostless table is a legitimate thing to hand it.
+    if not sites:
+        raise SystemExit(
+            f"{args.unique_sites} yielded no usable sites: "
+            f"{json.dumps(load_report)}. Refusing to report an empty cohort as a "
+            f"null result."
+        )
+
     print(f"unique sites in scope: {len(sites)}", flush=True)
     samples = sorted({s for site in sites for s in site["carriers"]})
     callsets = common.load_callsets(args.callset_dir, samples)

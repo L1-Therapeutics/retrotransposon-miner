@@ -247,6 +247,84 @@ def test_typed_fields_are_converted(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# schema drift is an error, not an empty cohort
+# --------------------------------------------------------------------------
+
+
+def test_a_table_missing_the_host_columns_is_rejected(tmp_path):
+    """The wrong `unique_sites.csv` must not load.
+
+    Two tables in this workspace share the filename. The multi-sample site table
+    has `same_family_host_name` and no host interval at all. Fed to this loader
+    it used to fail the geometry gate on every row, so the loader returned 0
+    sites from 4,998 rows and both Phase 4 analyses carried on to report an
+    empty cohort as a null result. The header below is that file's real header.
+    """
+    path = tmp_path / "us.csv"
+    other_header = [
+        "site_id", "chrom", "representative_pos", "family",
+        "insertion_orientation", "same_family_nested_state", "raw_NESTED_value",
+        "same_family_host_id", "same_family_host_name", "same_family_host_strand",
+        "same_family_host_length", "any_MEI_host_id_for_matching",
+        "host_offset_5p_0based", "n_carriers", "carrier_count_class", "samples",
+        "private", "private_to_sample", "source_record_count", "source_call_ids",
+        "match_window_bp",
+    ]
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=other_header)
+        writer.writeheader()
+        writer.writerow({name: "x" for name in other_header})
+
+    with pytest.raises(common.SchemaError) as excinfo:
+        common.load_unique_sites(path)
+    message = str(excinfo.value)
+    for column in ("host_name", "host_start0", "host_end0", "host_len"):
+        assert column in message
+
+
+def test_a_file_where_every_row_fails_the_gate_loads_empty_without_raising(tmp_path):
+    """The loader stays permissive; the analysis scripts are what refuse.
+
+    A table of hostless sites legitimately has empty geometry on every row, so
+    "all rows dropped" is not by itself an error at parse time. The empty-cohort
+    guard lives in `joint_enrichment.py` and `recurrence_test.py`, which is
+    where "no effect" would actually be printed.
+    """
+    path = tmp_path / "us.csv"
+    _write_unique_sites(
+        path,
+        [_site_row(site_id="a", chrom="chrY"), _site_row(site_id="b", chrom="chrY")],
+    )
+    rows, report = common.load_unique_sites(path)
+    assert rows == []
+    assert report["rows_read"] == 2
+    assert report["dropped_out_of_scope_contig"] == 2
+
+
+def test_a_header_only_file_is_empty_rather_than_an_error(tmp_path):
+    """No rows at all is a legitimately empty input; all rows failing is not."""
+    path = tmp_path / "us.csv"
+    _write_unique_sites(path, [])
+    rows, report = common.load_unique_sites(path)
+    assert rows == []
+    assert report["rows_read"] == 0
+
+
+def test_every_required_column_is_one_the_loader_actually_reads():
+    """Keep the guard list honest about the loader's own fields.
+
+    The constant is what decides whether a schema change is caught, so a required
+    column the fixture header lacks -- or a load-bearing column dropped from the
+    list -- would reintroduce the silent failure the guard exists to prevent.
+    """
+    required = set(common.REQUIRED_UNIQUE_SITE_COLUMNS)
+    assert required <= set(UNIQUE_SITES_HEADER)
+    for column in ("chrom", "representative_pos", "host_len",
+                   "host_offset_5p_0based", "n_carriers", "samples"):
+        assert column in required
+
+
+# --------------------------------------------------------------------------
 # the join
 # --------------------------------------------------------------------------
 
@@ -339,7 +417,14 @@ def test_an_orientation_disagreement_fails_the_gate(tmp_path):
     assert common.verify_join([attached])["verdict"] == "join_disagrees_with_dedup_output"
 
 
-def test_a_call_not_labelled_nested_fails_the_gate(tmp_path):
+def test_a_call_not_labelled_nested_is_reported_but_is_not_a_join_failure(tmp_path):
+    """The legacy `NESTED` field is a different definition from site nesting.
+
+    Gating on it fires on every antisense site on this cohort -- 100% of them
+    carry the legacy `unnested` label while the producer, using the host-strand
+    rule, calls them `nested_antisense`. That is a definitional difference, not
+    a broken join, so it is counted and surfaced rather than made fatal.
+    """
     site = _site_row(representative_pos="1000", n_carriers="1", samples="S1")
     call = _call(1000)
     call["nested_state"] = "unnested"
@@ -347,7 +432,27 @@ def test_a_call_not_labelled_nested_fails_the_gate(tmp_path):
         [typed(site)], {"S1": {"chr1": [call]}}
     )[0]
     report = common.verify_join([attached])
-    assert report["calls_not_labelled_nested"] == 1
+    assert report["calls_where_source_nesting_label_differs_from_site"] == 1
+    assert report["verdict"] == "join_consistent_with_dedup_output"
+
+
+def test_a_call_of_the_wrong_family_fails_the_gate(tmp_path):
+    """Joining a LINE-1 call onto an Alu site is a broken join, not a label difference.
+
+    The family check is the one that actually proves the right record was
+    recovered. `family` is carried on both sides, so this is checkable, and the
+    `+/-10 bp` window is wide enough that neighbouring-family calls at the same
+    locus are common enough to be worth pinning.
+    """
+    site = _site_row(representative_pos="1000", n_carriers="1", samples="S1",
+                     family="ALU")
+    call = _call(1000)
+    call["family"] = "LINE1"
+    attached = common.attach_call_details(
+        [typed(site)], {"S1": {"chr1": [call]}}
+    )[0]
+    report = common.verify_join([attached])
+    assert report["calls_where_family_disagrees"] == 1
     assert report["verdict"] == "join_disagrees_with_dedup_output"
 
 
@@ -401,3 +506,108 @@ def test_annotations_outside_the_host_do_not_count():
 
 def test_a_degenerate_host_is_fully_masked():
     assert common.residual_mask_fraction((100, 100, "x"), []) == 1.0
+
+
+def test_coverage_is_the_union_not_the_widest_single_annotation():
+    """Two neighbours each covering 40% leave 20% of the host, not 60%.
+
+    Taking the maximum overlap instead of the union reported a host with several
+    intruding repeats as less masked than it is, which flattered the mappability
+    diagnostic in exactly the direction that would have been preferred.
+    """
+    annotations = [
+        (900, 1200, "AluSx1"),
+        (900, 1020, "AluY"),
+        (1080, 1200, "AluZ"),
+    ]
+    # 900-1020 and 1080-1200 is 240 of the host's 300.
+    assert common.residual_mask_fraction((900, 1200, "AluSx1"), annotations) == pytest.approx(
+        240 / 300
+    )
+
+
+def test_overlapping_neighbours_are_not_double_counted():
+    annotations = [
+        (900, 1200, "AluSx1"),
+        (950, 1100, "AluY"),
+        (1000, 1150, "AluZ"),
+    ]
+    # Union of 950-1100 and 1000-1150 is 950-1150, i.e. 200 of 300.
+    assert common.residual_mask_fraction((900, 1200, "AluSx1"), annotations) == pytest.approx(
+        200 / 300
+    )
+
+
+def test_annotations_are_clipped_to_the_host_before_merging():
+    """An annotation hanging off the host contributes only its overlap."""
+    annotations = [
+        (900, 1200, "AluSx1"),
+        (1150, 1400, "AluY"),  # only 1150-1200 lies inside the host
+    ]
+    assert common.residual_mask_fraction((900, 1200, "AluSx1"), annotations) == pytest.approx(
+        50 / 300
+    )
+
+
+# --------------------------------------------------------------------------
+# the RepeatMasker stream
+# --------------------------------------------------------------------------
+
+
+def _rmsk_line(contig: str, start: int, end: int, name: str = "AluSx") -> str:
+    return "\t".join(
+        [
+            "17",  # sw ID
+            str(start),  # alignment start
+            str(end - start),  # alignment size, deliberately unused
+            "40",  # score
+            "ALU",  # strand
+            contig,
+            str(start),  # 0-based start
+            str(end),  # 0-based end
+            "(0)",  # per-rep
+            name,
+            "(97)",  # class code
+        ]
+    )
+
+
+def test_the_rmsk_stream_drops_annotations_away_from_every_wanted_host(tmp_path):
+    """The contig filter alone kept the whole genome's annotations in memory.
+
+    `read_rmsk_intervals` is documented to keep only intervals overlapping a
+    wanted host. It used to filter on contig only, so the caller received every
+    annotation on all 23 in-scope contigs and had to re-filter per host.
+    """
+    path = tmp_path / "rmsk.txt"
+    path.write_text(
+        "\n".join(
+            [
+                _rmsk_line("chr1", 1000, 1100, "AluSx"),  # wanted
+                _rmsk_line("chr1", 5000, 5100, "AluY"),  # same contig, elsewhere
+                _rmsk_line("chr1", 20000, 20100, "AluZ"),  # same contig, elsewhere
+                _rmsk_line("chr2", 1000, 1100, "AluS"),  # other contig, same coords
+            ]
+        )
+        + "\n"
+    )
+    wanted = {"chr1": [(1000, 1200, "AluSx")]}
+    keep = common.read_rmsk_intervals(path, wanted)
+    assert keep["chr1"] == [(1000, 1100, "AluSx")]
+    assert "chr2" not in keep
+
+
+def test_the_rmsk_stream_keeps_a_host_touching_a_wanted_host_edge(tmp_path):
+    """Half-open overlap: an annotation abutting the host start does not count."""
+    path = tmp_path / "rmsk.txt"
+    path.write_text(
+        "\n".join(
+            [
+                _rmsk_line("chr1", 800, 1000, "A"),  # ends exactly at host start
+                _rmsk_line("chr1", 1000, 1100, "B"),  # starts exactly at host start
+            ]
+        )
+        + "\n"
+    )
+    keep = common.read_rmsk_intervals(path, {"chr1": [(1000, 1200, "H")]})
+    assert keep["chr1"] == [(1000, 1100, "B")]

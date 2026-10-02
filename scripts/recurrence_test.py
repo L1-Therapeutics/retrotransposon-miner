@@ -784,6 +784,15 @@ def main(argv: list[str] | None = None) -> int:
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     sites, load_report = common.load_unique_sites(args.unique_sites)
+    # An empty cohort is a broken input, not a null result. See the same guard in
+    # `joint_enrichment.py`; the loader stays permissive because an all-hostless
+    # table is legitimate, but neither script may compute a null over nothing.
+    if not sites:
+        raise SystemExit(
+            f"{args.unique_sites} yielded no usable sites: "
+            f"{json.dumps(load_report)}. Refusing to report an empty cohort as a "
+            f"null result."
+        )
     samples = sorted({s for site in sites for s in site["carriers"]})
     callsets = common.load_callsets(args.callset_dir, samples)
     sites = common.attach_call_details(sites, callsets)
@@ -894,7 +903,7 @@ def main(argv: list[str] | None = None) -> int:
             f"difference <= {TSD_LENGTH_TOLERANCE_BP} bp",
             "candidate independent recurrence requires same host copy and "
             "position, plus a subfamily, TSD-length or TSD-core discordance",
-            f"a call reporting no TSD makes the pair unevaluable, never IBD and "
+            "a call reporting no TSD makes the pair unevaluable, never IBD and "
             "never discordant; unevaluable pairs are counted separately",
             f"TSD cores shorter than {TSD_CORE_MIN_BP} bp after stripping the "
             "shared terminal homopolymer are unevaluable rather than concordant, "
