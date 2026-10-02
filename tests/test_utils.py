@@ -5,7 +5,50 @@ import gzip
 
 import pytest
 
-from retro_miner._utils import _iter_fasta_records, _open_textmaybe_gz, safe_locus_id
+from retro_miner._utils import _iter_fasta_records, _open_textmaybe_gz, _safe_int, safe_locus_id
+
+
+class TestSafeInt:
+    """_safe_int is the untrusted-value boundary for record/table fields.
+
+    It must return the default for every input it documents as unsupported
+    rather than raising, because callers feed it raw DataFrame row values.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            "",
+            "   ",
+            "abc",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            object(),
+            [1, 2],
+        ],
+    )
+    def test_unsupported_inputs_return_default(self, value):
+        assert _safe_int(value) == 0
+        assert _safe_int(value, 7) == 7
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(7, 7), ("12", 12), (3.9, 3), ("12.7", 12), (-3.9, -3), ("  12  ", 12), (True, 1), (False, 0)],
+    )
+    def test_supported_inputs_convert(self, value, expected):
+        assert _safe_int(value) == expected
+
+    def test_float_column_values_do_not_raise(self):
+        # a numeric DataFrame column yields float (and NaN for a missing cell);
+        # the previous implementation raised NameError on any float
+        assert _safe_int(4.0) == 4
+        assert _safe_int(float("nan"), -1) == -1
+
+    def test_huge_int_is_returned_exactly(self):
+        # int(float(...)) would raise OverflowError here
+        assert _safe_int(10**400) == 10**400
 
 
 class TestSafeLocusId:

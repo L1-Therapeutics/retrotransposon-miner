@@ -16,7 +16,7 @@ import click
 import pandas as pd
 import pysam
 
-from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
+from ._utils import _iter_fasta_records, _safe_int, safe_locus_id as _safe_locus_id
 from .bam_io import open_alignment
 
 _MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
@@ -28,11 +28,9 @@ _MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
 _ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
 
 
-def _safe_int(value: object, default: int = 0) -> int:
-    """Safely convert a value to int, returning default on failure."""
-    if isinstance(value, (str, int, float)):
-        return int(float(value))
-    return default
+# `_safe_int` is shared from _utils: a second, divergent local copy used to live
+# here and still raised ValueError on non-numeric strings and OverflowError on
+# inf, which this module feeds it from parsed assembly records.
 
 
 def _window_locus_id_from_row(row: pd.Series) -> str:

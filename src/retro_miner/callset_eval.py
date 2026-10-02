@@ -719,9 +719,6 @@ def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
     except (TypeError, ValueError, OverflowError):
-        # OverflowError: int(float("inf")) and float(10**400) both raise it,
-        # and it is neither TypeError nor ValueError, so it must be caught here
-        # or an "inf"/"1e400" cell crashes the caller.
         return default
 
 

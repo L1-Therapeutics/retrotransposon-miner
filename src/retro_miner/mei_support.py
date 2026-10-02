@@ -22,7 +22,7 @@ import pysam
 from Bio.Align import PairwiseAligner
 from intervaltree import IntervalTree
 
-from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
+from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats, _safe_int
 
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
@@ -150,13 +150,13 @@ def _load_fragment_to_full_map(path: Path | None) -> dict[str, FragmentToFullMap
         try:
             entry = FragmentToFullMap(
                 fragment_name=frag,
-                fragment_length=int(float(getattr(rec, "fragment_length", 0) or 0)),
+                fragment_length=_safe_int(getattr(rec, "fragment_length", 0)),
                 full_name=full,
-                full_length=int(float(getattr(rec, "full_length", 0) or 0)),
-                fragment_aln_start=int(float(getattr(rec, "fragment_aln_start", 0) or 0)),
-                fragment_aln_end=int(float(getattr(rec, "fragment_aln_end", 0) or 0)),
-                full_aln_start=int(float(getattr(rec, "full_aln_start", 0) or 0)),
-                full_aln_end=int(float(getattr(rec, "full_aln_end", 0) or 0)),
+                full_length=_safe_int(getattr(rec, "full_length", 0)),
+                fragment_aln_start=_safe_int(getattr(rec, "fragment_aln_start", 0)),
+                fragment_aln_end=_safe_int(getattr(rec, "fragment_aln_end", 0)),
+                full_aln_start=_safe_int(getattr(rec, "full_aln_start", 0)),
+                full_aln_end=_safe_int(getattr(rec, "full_aln_end", 0)),
                 strand=str(getattr(rec, "strand", "+") or "+"),
                 family=str(getattr(rec, "family", "") or ""),
             )
@@ -651,7 +651,7 @@ def _parse_vote_map(text: object) -> dict[str, int]:
         label, weight_s = part.rsplit(":", 1)
         label = label.strip()
         try:
-            weight = int(float(weight_s))
+            weight = _safe_int(weight_s)
         except (TypeError, ValueError):
             continue
         if label and weight > 0:
@@ -7984,33 +7984,23 @@ def _infer_disease_insertion_metrics(
         min_side_support: int = 2,
         min_total_support: int = 6,
     ) -> tuple[int, int, int, str]:
-        def _to_int_safe(value: object, default: int = 0) -> int:
-            try:
-                if value is None or (isinstance(value, float) and pd.isna(value)):
-                    return default
-                if isinstance(value, (str, int, float)):
-                    return int(float(value))
-                return default
-            except (TypeError, ValueError):
-                return default
-
-        if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
+        if _safe_int(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
             return (
-                _to_int_safe(row.get("tsd_left_breakpoint", 0), 0),
-                _to_int_safe(row.get("tsd_right_breakpoint", 0), 0),
-                _to_int_safe(row.get("tsd_len_estimate", 0), 0),
+                _safe_int(row.get("tsd_left_breakpoint", 0), 0),
+                _safe_int(row.get("tsd_right_breakpoint", 0), 0),
+                _safe_int(row.get("tsd_len_estimate", 0), 0),
                 str(row.get("tsd_evidence_source", "") or ""),
             )
 
         any_mei_signal = max(
-            _to_int_safe(row.get("disease_mei_supported_reads", 0), 0),
-            _to_int_safe(row.get("control_mei_supported_reads", 0), 0),
-            _to_int_safe(row.get("disease_discordant_mei_supported_reads", 0), 0),
-            _to_int_safe(row.get("control_discordant_mei_supported_reads", 0), 0),
-            _to_int_safe(row.get("disease_split_mei_supported_reads", 0), 0),
-            _to_int_safe(row.get("control_split_mei_supported_reads", 0), 0),
-            _to_int_safe(row.get("disease_full_mei_supported_reads", 0), 0),
-            _to_int_safe(row.get("control_full_mei_supported_reads", 0), 0),
+            _safe_int(row.get("disease_mei_supported_reads", 0), 0),
+            _safe_int(row.get("control_mei_supported_reads", 0), 0),
+            _safe_int(row.get("disease_discordant_mei_supported_reads", 0), 0),
+            _safe_int(row.get("control_discordant_mei_supported_reads", 0), 0),
+            _safe_int(row.get("disease_split_mei_supported_reads", 0), 0),
+            _safe_int(row.get("control_split_mei_supported_reads", 0), 0),
+            _safe_int(row.get("disease_full_mei_supported_reads", 0), 0),
+            _safe_int(row.get("control_full_mei_supported_reads", 0), 0),
         )
         if any_mei_signal < 1:
             return (0, 0, 0, "")
@@ -8018,10 +8008,10 @@ def _infer_disease_insertion_metrics(
         candidates: list[tuple[int, int, int, int, int, int, str]] = []
         for sample in ("disease", "control"):
             sample_pri = 0 if sample == "disease" else 1
-            l_mode = _to_int_safe(row.get(f"{sample}_L_split_breakpoint_mode", 0), 0)
-            r_mode = _to_int_safe(row.get(f"{sample}_R_split_breakpoint_mode", 0), 0)
-            l_support = _to_int_safe(row.get(f"{sample}_L_split_breakpoint_support", 0), 0)
-            r_support = _to_int_safe(row.get(f"{sample}_R_split_breakpoint_support", 0), 0)
+            l_mode = _safe_int(row.get(f"{sample}_L_split_breakpoint_mode", 0), 0)
+            r_mode = _safe_int(row.get(f"{sample}_R_split_breakpoint_mode", 0), 0)
+            l_support = _safe_int(row.get(f"{sample}_L_split_breakpoint_support", 0), 0)
+            r_support = _safe_int(row.get(f"{sample}_R_split_breakpoint_support", 0), 0)
             if l_mode <= 0 or r_mode <= 0:
                 continue
             if l_support < int(min_side_support) or r_support < int(min_side_support):
@@ -8034,8 +8024,8 @@ def _infer_disease_insertion_metrics(
             tsd_len = int(r_mode - l_mode + 1)
             if tsd_len < int(min_len) or tsd_len > int(max_len):
                 continue
-            l_poly_support = _to_int_safe(row.get(f"{sample}_L_poly_breakpoint_support", 0), 0)
-            r_poly_support = _to_int_safe(row.get(f"{sample}_R_poly_breakpoint_support", 0), 0)
+            l_poly_support = _safe_int(row.get(f"{sample}_L_poly_breakpoint_support", 0), 0)
+            r_poly_support = _safe_int(row.get(f"{sample}_R_poly_breakpoint_support", 0), 0)
             poly_support = int(l_poly_support + r_poly_support)
             candidates.append(
                 (
@@ -8089,40 +8079,30 @@ def _infer_disease_insertion_metrics(
         min_len: int = 4,
         max_len: int = 40,
     ) -> tuple[int, int, int, str]:
-        def _to_int_safe(value: object, default: int = 0) -> int:
-            try:
-                if value is None or (isinstance(value, float) and pd.isna(value)):
-                    return default
-                if isinstance(value, (str, int, float)):
-                    return int(float(value))
-                return default
-            except (TypeError, ValueError):
-                return default
-
-        if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
+        if _safe_int(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
             return (
-                _to_int_safe(row.get("tsd_left_breakpoint", 0), 0),
-                _to_int_safe(row.get("tsd_right_breakpoint", 0), 0),
-                _to_int_safe(row.get("tsd_len_estimate", 0), 0),
+                _safe_int(row.get("tsd_left_breakpoint", 0), 0),
+                _safe_int(row.get("tsd_right_breakpoint", 0), 0),
+                _safe_int(row.get("tsd_len_estimate", 0), 0),
                 str(row.get("tsd_evidence_source", "") or ""),
             )
 
         candidates: list[tuple[int, int, int, int, int, int, str]] = []
         for sample in ("disease", "control"):
             sample_pri = 0 if sample == "disease" else 1
-            l_bp = _to_int_safe(row.get(f"{sample}_L_mei_breakpoint_mode", 0), 0)
-            r_bp = _to_int_safe(row.get(f"{sample}_R_mei_breakpoint_mode", 0), 0)
-            l_support = _to_int_safe(row.get(f"{sample}_L_mei_supported_reads", 0), 0)
-            r_support = _to_int_safe(row.get(f"{sample}_R_mei_supported_reads", 0), 0)
-            l_poly_bp = _to_int_safe(row.get(f"{sample}_L_poly_breakpoint_mode", 0), 0)
-            r_poly_bp = _to_int_safe(row.get(f"{sample}_R_poly_breakpoint_mode", 0), 0)
-            l_poly_support = _to_int_safe(row.get(f"{sample}_L_poly_breakpoint_support", 0), 0)
-            r_poly_support = _to_int_safe(row.get(f"{sample}_R_poly_breakpoint_support", 0), 0)
-            l_poly = _to_int_safe(row.get(f"{sample}_L_poly_at_reads", 0), 0)
-            r_poly = _to_int_safe(row.get(f"{sample}_R_poly_at_reads", 0), 0)
-            split_poly = _to_int_safe(row.get(f"split_{sample}_poly_tail_rescued_unique_reads", 0), 0)
-            disc_poly = _to_int_safe(row.get(f"discordant_{sample}_poly_tail_rescued_unique_reads", 0), 0)
-            poly_run = _to_int_safe(row.get(f"{sample}_poly_at_max_run", 0), 0)
+            l_bp = _safe_int(row.get(f"{sample}_L_mei_breakpoint_mode", 0), 0)
+            r_bp = _safe_int(row.get(f"{sample}_R_mei_breakpoint_mode", 0), 0)
+            l_support = _safe_int(row.get(f"{sample}_L_mei_supported_reads", 0), 0)
+            r_support = _safe_int(row.get(f"{sample}_R_mei_supported_reads", 0), 0)
+            l_poly_bp = _safe_int(row.get(f"{sample}_L_poly_breakpoint_mode", 0), 0)
+            r_poly_bp = _safe_int(row.get(f"{sample}_R_poly_breakpoint_mode", 0), 0)
+            l_poly_support = _safe_int(row.get(f"{sample}_L_poly_breakpoint_support", 0), 0)
+            r_poly_support = _safe_int(row.get(f"{sample}_R_poly_breakpoint_support", 0), 0)
+            l_poly = _safe_int(row.get(f"{sample}_L_poly_at_reads", 0), 0)
+            r_poly = _safe_int(row.get(f"{sample}_R_poly_at_reads", 0), 0)
+            split_poly = _safe_int(row.get(f"split_{sample}_poly_tail_rescued_unique_reads", 0), 0)
+            disc_poly = _safe_int(row.get(f"discordant_{sample}_poly_tail_rescued_unique_reads", 0), 0)
+            poly_run = _safe_int(row.get(f"{sample}_poly_at_max_run", 0), 0)
             any_poly = max(l_poly, r_poly, split_poly, disc_poly, 1 if poly_run >= 8 else 0)
             if any_poly < 1:
                 continue
@@ -8542,21 +8522,11 @@ def _infer_disease_insertion_metrics(
             *,
             min_len: int = 4,
         ) -> tuple[int, int, int, str]:
-            def _to_int_safe(value: object, default: int = 0) -> int:
-                try:
-                    if value is None or (isinstance(value, float) and pd.isna(value)):
-                        return default
-                    if isinstance(value, (str, int, float)):
-                        return int(float(value))
-                    return default
-                except (TypeError, ValueError):
-                    return default
-
-            if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
+            if _safe_int(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
                 return (
-                    _to_int_safe(row.get("tsd_left_breakpoint", 0), 0),
-                    _to_int_safe(row.get("tsd_right_breakpoint", 0), 0),
-                    _to_int_safe(row.get("tsd_len_estimate", 0), 0),
+                    _safe_int(row.get("tsd_left_breakpoint", 0), 0),
+                    _safe_int(row.get("tsd_right_breakpoint", 0), 0),
+                    _safe_int(row.get("tsd_len_estimate", 0), 0),
                     str(row.get("tsd_evidence_source", "") or ""),
                 )
 

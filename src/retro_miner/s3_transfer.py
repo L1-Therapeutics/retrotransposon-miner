@@ -37,10 +37,10 @@ def split_s3_uri(uri: str) -> tuple[str, str]:
 
 def s3_max_concurrency(raw: str | None = None) -> int:
     text = raw if raw is not None else os.environ.get("RTM_S3_MAX_CONCURRENCY", "")
-    if text is None or not str(text).strip():
+    if not text.strip():
         return DEFAULT_S3_MAX_CONCURRENCY
     try:
-        value = int(str(text).strip())
+        value = int(text.strip())
     except ValueError as exc:
         raise ValueError(f"RTM_S3_MAX_CONCURRENCY must be a positive integer, got {text!r}") from exc
     if value < 1:

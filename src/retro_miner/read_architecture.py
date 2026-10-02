@@ -21,6 +21,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ._utils import _safe_int
+
 import click
 import matplotlib
 
@@ -56,7 +58,7 @@ def _pair_int(pair: dict[str, object], key: str, default: int = 0) -> int:
     """Safely read an int field from a pair dict."""
     val = pair.get(key, default)
     if isinstance(val, (str, int, float)):
-        return int(float(val))
+        return _safe_int(val)
     return default
 
 # Slim columns pulled from candidate_loci.mei.tsv when gold_review lacks them.
@@ -262,7 +264,7 @@ def _row_int(row: pd.Series, col: str, default: int = 0) -> int:
     if pd.isna(val):
         return default
     try:
-        return int(float(val))
+        return _safe_int(val)
     except (TypeError, ValueError):
         return default
 
@@ -371,8 +373,8 @@ def _mate_polya_width_bp(row: pd.Series) -> int:
         if start_col not in row.index or end_col not in row.index:
             continue
         try:
-            start = int(float(row.get(start_col) or 0))
-            end = int(float(row.get(end_col) or 0))
+            start = _safe_int(row.get(start_col))
+            end = _safe_int(row.get(end_col))
         except (TypeError, ValueError):
             continue
         if start > 0 and end >= start:
@@ -387,7 +389,7 @@ def _mate_polya_width_bp(row: pd.Series) -> int:
     ).strip().lower() in {"polya_rescue", "poly_tail_rescue"}
     if is_rescue and "mate_seq_len" in row.index:
         try:
-            n = int(float(row.get("mate_seq_len") or 0))
+            n = _safe_int(row.get("mate_seq_len") or 0)
         except (TypeError, ValueError):
             n = 0
         if n >= 12:
@@ -777,7 +779,7 @@ def _layout_from_row(
     )
     gold_poly = 0
     try:
-        gold_poly = int(float(row.get("consensus_poly_at_min_bp", 0) or 0))
+        gold_poly = _safe_int(row.get("consensus_poly_at_min_bp", 0))
     except (TypeError, ValueError):
         gold_poly = 0
     polya_zone_bp = _max_polya_zone_bp(detail, consensus_poly_at_min_bp=gold_poly)
@@ -1121,7 +1123,7 @@ def _polya_tail_width_from_rec(rec, *, default: int = 0) -> int:
         if w >= 12:
             return int(w)
         try:
-            pw = int(float(getattr(rec, "polya_width", 0) or 0))
+            pw = _safe_int(getattr(rec, "polya_width", 0))
         except (TypeError, ValueError):
             pw = 0
         if pw >= 12:
@@ -1152,13 +1154,13 @@ def _dpe_has_anchor_polya_clip(rec) -> bool:
     if bool(getattr(rec, "poly_tail_anchor_rescued", False)):
         return True
     try:
-        run = int(float(getattr(rec, "anchor_poly_at_run", 0) or 0))
+        run = _safe_int(getattr(rec, "anchor_poly_at_run", 0))
     except (TypeError, ValueError):
         run = 0
     if run >= 8:
         return True
     try:
-        soft = int(float(getattr(rec, "soft_clip_len", 0) or 0))
+        soft = _safe_int(getattr(rec, "soft_clip_len", 0))
     except (TypeError, ValueError):
         soft = 0
     base = str(getattr(rec, "anchor_poly_base", "") or "").upper()
@@ -1168,11 +1170,11 @@ def _dpe_has_anchor_polya_clip(rec) -> bool:
 def _dpe_anchor_polya_width(rec, layout: LocusLayout) -> int:
     """Width of the orange polyA overhang drawn from the flank junction into the polyA zone."""
     try:
-        soft = int(float(getattr(rec, "soft_clip_len", 0) or 0))
+        soft = _safe_int(getattr(rec, "soft_clip_len", 0))
     except (TypeError, ValueError):
         soft = 0
     try:
-        run = int(float(getattr(rec, "anchor_poly_at_run", 0) or 0))
+        run = _safe_int(getattr(rec, "anchor_poly_at_run", 0))
     except (TypeError, ValueError):
         run = 0
     width = max(soft, run, 0)
@@ -1290,7 +1292,7 @@ def _clip_len_from_rec(rec) -> int:
         val = getattr(rec, col, None)
         if val is not None and not (isinstance(val, float) and pd.isna(val)):
             try:
-                n = int(float(val))
+                n = _safe_int(val)
             except (TypeError, ValueError):
                 n = 0
             if n > 0:
@@ -2047,7 +2049,7 @@ def _pair_segments(
         side_order = 0 if p["side"] == "L" else 1
         type_order = 0 if p.get("evidence_type") == "SR" else 1
         anchor_val = p.get("anchor_pos", 0)
-        anchor_order = int(float(anchor_val)) if isinstance(anchor_val, (str, int, float)) else 0
+        anchor_order = _safe_int(anchor_val) if isinstance(anchor_val, (str, int, float)) else 0
         read_name = str(p.get("read_name", ""))
         return (side_order, type_order, anchor_order, read_name)
 

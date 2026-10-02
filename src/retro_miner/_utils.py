@@ -6,6 +6,7 @@ by any module in the package without risk of circular imports.
 from __future__ import annotations
 
 import gzip
+import math
 import re
 import warnings
 from pathlib import Path
@@ -20,6 +21,30 @@ def safe_locus_id(chrom: str, start: int, end: int) -> str:
     """
     chrom_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chrom))
     return f"{chrom_safe}_{int(start)}_{int(end)}"
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    """Safely convert *value* to int, returning *default* on failure.
+
+    - int values are returned directly (no float round-trip, so huge ints
+      like ``10**400`` are preserved exactly).
+    - float values are converted if finite, otherwise *default*.
+    - strings are stripped and parsed via ``float()`` first.
+    - everything else returns *default*.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return default if not math.isfinite(value) else int(value)
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return default
+        return default if not math.isfinite(number) else int(number)
+    return default
 
 
 def _open_textmaybe_gz(path: Path) -> IO[str]:
