@@ -344,7 +344,9 @@ def _assign_rows_to_loci(df: pd.DataFrame, loci: pd.DataFrame) -> pd.DataFrame:
     for row in loci.itertuples(index=False):
         chrom = str(row.chrom)
         tree = trees.setdefault(chrom, IntervalTree())
-        tree.addi(int(row.window_start), int(row.window_end) + 1, (int(row.window_start), int(row.window_end)))
+        window_start = int(row.window_start)
+        window_end = int(row.window_end)
+        tree.addi(window_start, window_end + 1, (window_start, window_end))
 
     assigned_rows: list[dict[str, object]] = []
     for row in df.itertuples(index=False):
@@ -591,8 +593,8 @@ def _write_candidate_windows_bed(loci: pd.DataFrame, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8") as handle:
         for row in loci.itertuples(index=False):
             # BED uses 0-based start, half-open end.
-            start0 = int(row.window_start) - 1
-            end0 = int(row.window_end)
+            start0 = row.window_start - 1
+            end0 = row.window_end
             handle.write(f"{row.chrom}\t{start0}\t{end0}\t{row.row_id}\n")
 
 
@@ -678,8 +680,8 @@ def _annotate_junk_flags(
         mate_bed = tmp / "candidate_mate_positions.bed"
         with mate_bed.open("w", encoding="utf-8") as handle:
             for row in mate_with_id.itertuples(index=False):
-                start0 = int(row.mate_pos) - 1
-                end0 = int(row.mate_pos)
+                start0 = row.mate_pos - 1
+                end0 = row.mate_pos
                 handle.write(f"{row.mate_chrom}\t{start0}\t{end0}\t{row.row_id}\n")
 
         if segdup_bed is not None and segdup_bed.exists():

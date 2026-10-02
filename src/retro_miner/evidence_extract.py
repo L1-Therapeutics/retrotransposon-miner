@@ -4,7 +4,7 @@ import os
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import click
 import numpy as np
@@ -105,7 +105,7 @@ def _parse_region_to_bounds(region: str) -> tuple[str, int | None, int | None]:
     return (chrom, start0, end0)
 
 
-def _iter_reads_for_regions(bam: pysam.AlignmentFile, regions: list[str]):
+def _iter_reads_for_regions(bam: pysam.AlignmentFile, regions: list[str]) -> Iterator[pysam.AlignedSegment]:
     """Yield reads from a BAM over a list of samtools-style region strings.
 
     Region strings are parsed to integer (contig, start0, end0) bounds **once**
@@ -474,7 +474,13 @@ def extract_discordant_evidence(
 
             chrom = bam.get_reference_name(read.reference_id)
             soft_clip_side, soft_clip_len, soft_clip_pos, soft_clip_seq = _longest_soft_clip_from_read(read)
-            if fetch_mate_seq and mate_bam is not None:
+            mate_seq = ""
+            mate_ref_start = 0
+            mate_ref_end = 0
+            mate_soft_clip_side = ""
+            mate_soft_clip_len = 0
+            mate_soft_clip_seq = ""
+            if fetch_mate_seq and mate_bam is not None and read.query_name is not None:
                 (
                     mate_seq,
                     mate_ref_start,
@@ -493,13 +499,6 @@ def extract_discordant_evidence(
                     mate_seq_fetched_rows += 1
                 elif "interchrom" in reasons:
                     mate_seq_missing_interchrom_rows += 1
-            else:
-                mate_seq = ""
-                mate_ref_start = 0
-                mate_ref_end = 0
-                mate_soft_clip_side = ""
-                mate_soft_clip_len = 0
-                mate_soft_clip_seq = ""
             rows.append(
                 {
                     "sample": sample_name,
