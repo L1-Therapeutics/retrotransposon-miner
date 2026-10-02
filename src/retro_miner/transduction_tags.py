@@ -438,7 +438,7 @@ def build_transduction_groups(
         else:
             srcs.add(node[4:])
     out: list[TransductionGroup] = []
-    for i, (root, (calls, srcs)) in enumerate(sorted(groups.items()), start=1):
+    for i, (_root, (calls, srcs)) in enumerate(sorted(groups.items()), start=1):
         out.append(
             TransductionGroup(
                 group_id=f"TG{i:04d}",

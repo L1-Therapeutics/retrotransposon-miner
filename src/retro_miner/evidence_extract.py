@@ -738,12 +738,7 @@ def _split_rows_from_read(
         else:
             pos_1based = int(read.reference_end) if read.reference_end is not None else 0
         query_seq = read.query_sequence or ""
-        clip_seq = ""
-        if query_seq:
-            if clip_side == "L":
-                clip_seq = query_seq[:clip_len]
-            else:
-                clip_seq = query_seq[-clip_len:]
+        clip_seq = _soft_clip_query_seq(query_seq, clip_side, clip_len)
         span_len, poly_frac, poly_base, _poly_region = _longest_poly_at_span(
             clip_seq, min_frac=0.90, min_len=8
         )

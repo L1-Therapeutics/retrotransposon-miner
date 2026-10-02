@@ -356,10 +356,10 @@ _IGV_BATCH_FORBIDDEN: frozenset[str] = frozenset("\n\r\t")
 
 
 def _validate_igv_chrom(chrom: str) -> None:
-    """Raise ValueError if *chrom* contains characters that would corrupt an IGV batch command.
+    r"""Raise ValueError if *chrom* contains characters that would corrupt an IGV batch command.
 
     Newlines, carriage returns, and tabs are forbidden because a ``goto`` line such as
-    ``goto chr22\\nBAD:100-200`` would be split into two separate batch commands, causing
+    ``goto chr22\nBAD:100-200`` would be split into two separate batch commands, causing
     IGV to receive an unintended command and to navigate to the wrong locus.
     """
     for ch in _IGV_BATCH_FORBIDDEN:

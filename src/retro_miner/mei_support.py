@@ -8864,7 +8864,10 @@ def _infer_disease_insertion_metrics(
 
 def _apply_assembly_refinement_overrides(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
-    s = lambda col, default: _df_col_series(out, col, default)
+
+    def s(col: str, default: object) -> pd.Series:
+        return _df_col_series(out, col, default)
+
     asm_source = s("asm_breakpoint_source", "").fillna("").astype(str)
     asm_has_mei = asm_source.isin(["disease", "control"])
 
@@ -9375,7 +9378,10 @@ def _broaden_poly_at_fields(candidates: pd.DataFrame) -> pd.DataFrame:
 
 def _add_consolidated_event_fields(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
-    s = lambda col, default: _df_col_series(out, col, default)
+
+    def s(col: str, default: object) -> pd.Series:
+        return _df_col_series(out, col, default)
+
     for prefix in ("disease", "control"):
         out[f"{prefix}_left_supported_reads"] = (
             s(f"{prefix}_L_mei_supported_reads", 0).fillna(0).astype(int)
@@ -9761,7 +9767,9 @@ def _match_l1_endonuclease_motif(
 
 def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out = _ensure_candidate_schema_defaults(candidates)
-    s = lambda col, default: _df_col_series(out, col, default)
+
+    def s(col: str, default: object) -> pd.Series:
+        return _df_col_series(out, col, default)
 
     for col in [
         "disease_L_mei_family",
@@ -11103,7 +11111,10 @@ def _annotate_bam_depth_for_consistent_loci(
 ) -> pd.DataFrame:
     stage_start = time.monotonic()
     out = candidates.copy()
-    s = lambda col, default: _df_col_series(out, col, default)
+
+    def s(col: str, default: object) -> pd.Series:
+        return _df_col_series(out, col, default)
+
     out["depth_filter_family_consistent"] = False
     out["depth_filter_two_sided_consistent"] = False
     out["depth_filter_pass"] = False
@@ -11443,7 +11454,9 @@ def _normal_ci_bounds_from_soft_counts(
 
 def _add_heuristic_assembly_like_vaf_fields(candidates: pd.DataFrame) -> pd.DataFrame:
     out = candidates.copy()
-    s = lambda col, default: _df_col_series(out, col, default)
+
+    def s(col: str, default: object) -> pd.Series:
+        return _df_col_series(out, col, default)
 
     sr_t = s("disease_split_mei_supported_reads", 0).fillna(0).astype(float)
     sr_n = s("control_split_mei_supported_reads", 0).fillna(0).astype(float)
@@ -11514,7 +11527,10 @@ def _add_heuristic_assembly_like_vaf_fields(candidates: pd.DataFrame) -> pd.Data
 
 def _assign_bronze_silver_stages(candidates: pd.DataFrame) -> pd.DataFrame:
     out = _ensure_candidate_schema_defaults(candidates)
-    s = lambda col, default: _df_col_series(out, col, default)
+
+    def s(col: str, default: object) -> pd.Series:
+        return _df_col_series(out, col, default)
+
     out["bronze_stage_pass"] = True
 
     junk_clean = s("junk_flag_count", 999).fillna(999).astype(int) == 0
@@ -14007,12 +14023,7 @@ def _annotate_g1k_mei_overlap(
                 hit_id = f"{b_cols[0]}:{b_cols[1]}-{b_cols[2]}"
             ins_type_s = b_cols[4] if len(b_cols) >= 5 else ""
             subfamily_s = b_cols[5] if len(b_cols) >= 6 else ""
-            ins_len_i = -1
-            if len(b_cols) >= 7:
-                try:
-                    ins_len_i = int(float(b_cols[6]))
-                except ValueError:
-                    ins_len_i = -1
+            ins_len_i = _safe_int(b_cols[6], -1)
             tsd_s = b_cols[7] if len(b_cols) >= 8 else ""
             region_s = b_cols[8] if len(b_cols) >= 9 else ""
             try:
@@ -14184,26 +14195,14 @@ def _annotate_lr_mei_overlap(
             polya_len = -1
             not_canonical = False
             if len(b_cols) >= 7:
-                try:
-                    ins_len = int(float(b_cols[6]))
-                except ValueError:
-                    ins_len = -1
+                ins_len = _safe_int(b_cols[6], -1)
             if len(b_cols) >= 8:
-                try:
-                    tsd_len = int(float(b_cols[7]))
-                except ValueError:
-                    tsd_len = -1
+                tsd_len = _safe_int(b_cols[7], -1)
             if len(b_cols) >= 9:
-                try:
-                    polya_len = int(float(b_cols[8]))
-                except ValueError:
-                    polya_len = -1
+                polya_len = _safe_int(b_cols[8], -1)
             conformation = b_cols[9] if len(b_cols) >= 10 else ""
             if len(b_cols) >= 11:
-                try:
-                    not_canonical = int(float(b_cols[10])) > 0
-                except ValueError:
-                    not_canonical = False
+                not_canonical = _safe_int(b_cols[10], 0) > 0
             try:
                 a_start0 = int(parts[1])
                 a_end0 = int(parts[2])
@@ -14475,10 +14474,10 @@ def _choose_event_orientation(row: pd.Series) -> str:
 
 
 def _bed_field(value: object, *, default: str = ".") -> str:
-    """Format one BED column for bedtools.
+    r"""Format one BED column for bedtools.
 
-    bedtools type-checking rejects trailing empty fields (``...\\t\\n``). Missing
-    optional values must be the BED placeholder ``.``, and embedded tabs/newlines
+    bedtools type-checking rejects trailing empty fields (``...\t\n``). Missing
+    optional values must be the BED placeholder `.`, and embedded tabs/newlines
     must never appear inside a field.
     """
     if value is None:
@@ -14606,7 +14605,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
         with cand_bed.open("w", encoding="utf-8") as hout:
             for i, row in enumerate(out.itertuples(index=False)):
                 as_row = pd.Series(row._asdict())
-                chrom = str(getattr(row, "chrom"))
+                chrom = str(row.chrom)
                 pos_1based = int(getattr(row, "insertion_breakpoint_pos", 0) or 0)
                 if pos_1based <= 0:
                     pos_1based = int(
@@ -15404,7 +15403,7 @@ def annotate_candidate_loci_with_mei(
     )
     for full_prefix in ("disease_full", "control_full"):
         full_metrics = candidate.apply(
-            lambda r: _sample_insertion_span_and_orientation(r, full_prefix),
+            lambda r, _fp=full_prefix: _sample_insertion_span_and_orientation(r, _fp),
             axis=1,
             result_type="expand",
         )
