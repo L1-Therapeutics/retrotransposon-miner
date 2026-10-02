@@ -185,6 +185,9 @@ def gc_frames(engine, fasta, lengths, gaps, coverage, targets):
 def family_enrichment(engine, sites, lengths, coverage, bundles, gaps, excluded, reps, tier):
     result = []
     cov_index = {'legacy': 0, 'primary': 1, 'tier2': 2}[tier]
+    uniform_by_chrom = {chrom: sum(b-a for a,b in coverage[chrom, 'ALU'][cov_index]) /
+                        (lengths[chrom] if tier == 'legacy' else lengths[chrom]-sum(b-a for a,b in gaps[chrom]))
+                        for chrom in engine.PRIMARY_CHROMS}
     for j, family in enumerate(FAMILIES):
         # Tier2 is a new eligible-host universe: remove observations assigned to
         # excluded hosts as well as removing those hosts from opportunity.
@@ -192,9 +195,7 @@ def family_enrichment(engine, sites, lengths, coverage, bundles, gaps, excluded,
                (tier != 'tier2' or not s.representative.same_family_host or s.representative.same_family_host.key not in excluded)]
         obs = sum(s.representative.same_family_host is not None for s in sub)
         if family == 'ALU':
-            probabilities = np.asarray([sum(b-a for a, b in coverage[s.representative.chrom, family][cov_index]) /
-                (lengths[s.representative.chrom] if tier == 'legacy' else
-                 lengths[s.representative.chrom]-sum(b-a for a, b in gaps[s.representative.chrom])) for s in sub])
+            probabilities = np.asarray([uniform_by_chrom[s.representative.chrom] for s in sub])
         else:
             probabilities = engine.gc_probabilities(sub, family, bundles[tier], np.random.default_rng(SEED+j))
         expected = float(probabilities.sum())
@@ -293,7 +294,7 @@ def layer_counts(sites):
 
 
 def cohort_analysis(engine, samples, callsets, lengths, coverage, bundles, gaps, excluded, alu_opps,
-                    l1_opps, projections, hosts, reps, masks=None):
+                    l1_opps, projections, hosts, reps, masks=None, other_opps=None):
     calls = [c for s in samples for c in callsets[s]]
     sites, collapsed = dedup(engine, calls)
     private = [s for s in sites if len(s.samples) == 1]
@@ -311,8 +312,7 @@ def cohort_analysis(engine, samples, callsets, lengths, coverage, bundles, gaps,
         for family in ('ALU', 'SVA'):
             eligible = [c for c in reps_calls if c.family == family and c.same_family_host is not None
                         and c.offset is not None and c.same_family_host.strand in {'+', '-'}]
-            reference_hosts = [h for (chrom, f), hs in hosts.items() if f == family for h in hs]
-            bases = opportunity.bin_opportunity(reference_hosts, gaps, np.linspace(0, 1, 11), relative=True)
+            bases = other_opps[family]
             profiles.extend(profile_table([c.offset/c.same_family_host.length for c in eligible], np.linspace(0, 1, 11),
                                           bases, reps, label, family, 'same_family_relative_all'))
         for method in ('consensus_primary', 'consensus_tier2', 'consensus_short_read', 'relative_all', 'near_full_relative'):
@@ -584,11 +584,14 @@ def run(args):
         masked_hosts[name] = nmask
     l1_opps['relative_all'] = (np.linspace(0,1,11),opportunity.bin_opportunity(l1hosts,gaps,np.linspace(0,1,11),relative=True))
     l1_opps['near_full_relative'] = (np.linspace(0,1,11),opportunity.bin_opportunity([h for h in l1hosts if 5500<=h.length<=7000],gaps,np.linspace(0,1,11),relative=True))
+    other_opps = {family: opportunity.bin_opportunity([h for (chrom,f),hs in hosts.items() if f==family for h in hs],
+                  gaps,np.linspace(0,1,11),relative=True) for family in ('ALU','SVA')}
     print('Aligning L1 event hosts', flush=True)
     projections, projection_rows = l1_event_projection(engine, all_calls, args.fasta, seqs, metadata)
     print('Analyzing original five and ten with identical code', flush=True)
-    five = cohort_analysis(engine,ORIGINAL,calls,lengths,cov,bundles,gaps,excluded,alu_opps,l1_opps,projections,hosts,args.replicates,masks)
-    ten = cohort_analysis(engine,SAMPLES,calls,lengths,cov,bundles,gaps,excluded,alu_opps,l1_opps,projections,hosts,args.replicates,masks)
+    five = cohort_analysis(engine,ORIGINAL,calls,lengths,cov,bundles,gaps,excluded,alu_opps,l1_opps,projections,hosts,args.replicates,masks,other_opps)
+    ten = cohort_analysis(engine,SAMPLES,calls,lengths,cov,bundles,gaps,excluded,alu_opps,l1_opps,projections,hosts,args.replicates,masks,other_opps)
+    print('Five/ten analysis completed; checking registered matching counts', flush=True)
     # Registered count gates are matching checks, not expectations of the new null.
     if (five['headline']['union'],five['headline']['private'],five['headline']['shared'],five['headline']['nested_L1']) != (4998,3051,1947,231):
         raise engine.InputGateError(f'five-genome matching reproduction failed: {five["headline"]}')
