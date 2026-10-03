@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pysam
 
-from ._utils import _longest_poly_at_span, _poly_at_stats
+from ._utils import _longest_poly_at_span, _poly_at_stats, read_tsv
 from .bam_io import open_alignment
 
 
@@ -89,7 +89,7 @@ def clone_sample_evidence_tables(outdir: Path, *, src_sample: str, dst_sample: s
             dst = outdir / f"{prefix}.{dst_sample}{suffix}"
             if not src.exists():
                 continue
-            df = pd.read_parquet(src) if suffix == ".parquet" else pd.read_csv(src, sep="\t")
+            df = pd.read_parquet(src) if suffix == ".parquet" else read_tsv(src)
             if "sample" in df.columns:
                 df = df.copy()
                 df["sample"] = dst_sample

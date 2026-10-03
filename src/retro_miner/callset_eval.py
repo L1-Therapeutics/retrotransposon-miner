@@ -259,9 +259,9 @@ def rtm_family(row: dict[str, Any]) -> str:
 
 
 def load_rtm_calls(path: Path, chrom: str | None = None) -> tuple[list[Variant], list[dict[str, Any]]]:
-    import pandas as pd
+    from ._utils import read_tsv
 
-    df = pd.read_csv(path, sep="\t", low_memory=False)
+    df = read_tsv(path)
     want = normalize_chrom(chrom) if chrom else ""
     rows: list[dict[str, Any]] = []
     variants: list[Variant] = []

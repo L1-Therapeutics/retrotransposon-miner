@@ -496,6 +496,28 @@ def _rmsk_with_only_the_hosts(tmp_path: Path) -> Path:
     return path
 
 
+def _rmsk_with_an_intruder(tmp_path: Path) -> Path:
+    """Hosts, plus one LINE1 sitting inside the first host's interior.
+
+    Excluding each host's own annotation leaves this intruder's residual mask,
+    which is what moves the diagnostic onto its other verdict.
+    """
+    path = tmp_path / "fixture_intruder.rmsk.gz"
+    lines = []
+    for i in range(4):
+        start = 1_000_000 + i * 10_000
+        lines.append(
+            f"1\t{start}\t{start + 300}\t300\t.\tchr1\t{start}\t{start + 300}\t"
+            f"+\tAluSx\tAluSx#SINE/Alu\t(0)\t(0)"
+        )
+    lines.append(
+        "1\t40\t140\t100\t.\tchr1\t1000050\t1000150\t+\tL1PA2\tL1PA2#LINE/L1\t(0)\t(0)"
+    )
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return path
+
+
 def _case_opportunity_diagnostic(tmp_path: Path) -> GateCase:
     """Three branches, all from the real reader: unavailable, identical, differs.
 
@@ -568,10 +590,10 @@ VERDICT_INDEPENDENT = {
     ),
 }
 
-#: Gates whose verdict and explanation live in different functions, so the scan
-#: cannot pair them and the sweep covers them by hand instead.
+#: Gates the scan finds but cannot certify, with the reason. Anything here is a
+#: standing claim that has to be re-checked when that function changes, which is
+#: strictly better than the gate being absent.
 SCAN_BLIND = {
-    "gate_3b_genotype_channel": "explanation added after the dict literal",
     "main": "assembles the whole report, so the scan pairs keys from unrelated dicts",
 }
 
@@ -586,6 +608,35 @@ ANALYSED_SCRIPTS = (
 )
 
 EXPLANATION_KEYS = {"note", "consequence", "reason", "caveat"}
+
+
+def _keys_emitted_by(fn: ast.FunctionDef) -> set[str]:
+    """Every string key a function puts into a dict it returns.
+
+    Two ways, because refactoring moves keys between them. `gate_3b_genotype_channel`
+    and `gate_3d_cross_method_floor` originally returned a dict literal holding
+    `verdict` and `consequence` together; when their explanations became
+    conditional they were built as a dict and then completed with
+    `three_b["consequence"] = ...`, so a literal-only scan stopped seeing the
+    pair and the gate silently dropped out of the completeness check. Scanning
+    subscript assignments as well is what keeps a refactor from quietly
+    unregistering a gate.
+    """
+    keys: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    keys.add(key.value)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Subscript)
+        ):
+            index = node.targets[0].slice
+            if isinstance(index, ast.Constant) and isinstance(index.value, str):
+                keys.add(index.value)
+    return keys
 
 
 def _discovered_gates() -> set[str]:
@@ -604,15 +655,34 @@ def _discovered_gates() -> set[str]:
         for node in tree.body:
             if not isinstance(node, ast.FunctionDef):
                 continue
-            keys: set[str] = set()
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Dict):
-                    for key in inner.keys:
-                        if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                            keys.add(key.value)
+            keys = _keys_emitted_by(node)
             if "verdict" in keys and keys & EXPLANATION_KEYS:
                 found.add(node.name)
     return found
+
+
+def test_the_scan_finds_a_gate_whose_explanation_is_assigned_after_the_dict():
+    """The scanner must not be narrower than the refactors it has to survive.
+
+    `gate_3b_genotype_channel` builds its dict and then sets
+    `three_b["consequence"]` on it, because the explanation became conditional
+    and stopped being a literal. A scan that only read dict literals found the
+    gate while both keys sat together and stopped finding it the moment they did
+    not -- so the one gate whose completeness was most recently in question would
+    have been the one quietly dropped. This pins the capability, so narrowing the
+    scanner again fails here rather than silently unregistering a gate.
+    """
+    discovered = _discovered_gates()
+    assert "gate_3b_genotype_channel" in discovered, (
+        "the completeness scan can no longer see a gate that assigns its "
+        "explanation by subscript; a refactor has narrowed the scanner"
+    )
+    source = (SCRIPTS / "score_genotype_concordance.py").read_text()
+    assert 'three_b["consequence"]' in source, (
+        "gate_3b no longer assigns its consequence by subscript, so this test "
+        "is pinning a pattern that no longer exists and should be replaced with "
+        "whatever the gate does now"
+    )
 
 
 def test_every_gate_carrying_a_verdict_is_accounted_for():
