@@ -524,6 +524,63 @@ def genotype_is_nonref(gt: str) -> bool:
     return any(a not in ("0",) for a in alleles)
 
 
+def genotype_axis_band_counts(table: collections.Counter) -> dict[str, int]:
+    """Matched calls per allele-count band, from the stratification counter."""
+    counts = {"AC_gt_2": 0, "AC_le_2": 0, "AC_unknown": 0}
+    for (_lr, _nr, band), n in table.items():
+        if band in counts:
+            counts[band] += n
+    return counts
+
+
+def genotype_axis_verdict(
+    sample: str,
+    n_samples: int,
+    in_pool: bool,
+    bands: dict[str, int],
+) -> tuple[str, str, str]:
+    """(verdict, phase3_tier, rationale) for the genotype-axis independence gate.
+
+    Membership fixes the verdict, but it does not fix the *tier*: the restricted
+    tier membership permits is "sites with AC > 2", and that tier is only worth
+    offering if the stratification actually put calls in it. Emitting
+    `restricted_concordance_only` unconditionally promised Phase 3 a usable tier
+    even when every matched site sat at AC <= 2 and the tier was empty. The
+    populated case keeps the original wording so a published report is unaffected.
+    """
+    if not in_pool:
+        return (
+            "independent",
+            "top",
+            f"{sample} is not among the {n_samples} pooled samples, so its "
+            "genotype is an outside observation of the discovery cohort.",
+        )
+    usable = bands.get("AC_gt_2", 0)
+    if usable == 0:
+        return (
+            "not_independent",
+            "no_usable_tier",
+            f"{sample} IS one of the {n_samples} pooled samples, so the genotype "
+            "axis is internal to the discovery cohort. Membership restricts Phase 3 "
+            "to sites with AC > 2, but the stratification found "
+            f"{usable} matched calls in that band "
+            f"({bands.get('AC_le_2', 0)} at AC <= 2, "
+            f"{bands.get('AC_unknown', 0)} with AC unresolvable), so there is no "
+            "tier for Phase 3 to restrict to and the genotype axis is unavailable "
+            "rather than merely restricted.",
+        )
+    return (
+        "not_independent",
+        "restricted_concordance_only",
+        f"{sample} IS one of the {n_samples} pooled samples, so the genotype "
+        "axis is internal to the discovery cohort. For any site this cohort could "
+        "have discovered because the sample carries it, genotype is circular "
+        "rather than corroborating. Phase 3 may only use sites whose AC shows "
+        "other carriers (AC > 2), which is a restricted tier and never licenses a "
+        "detection-accuracy claim.",
+    )
+
+
 def assess_genotype_axis_independence(
     geno_bcf: Path,
     site_bcf: Path,
@@ -597,24 +654,9 @@ def assess_genotype_axis_independence(
         table[(long_read_derived, nonref, band)] += 1
 
     # A verdict is written, not inferred downstream.
-    if not in_pool:
-        verdict = "independent"
-        rationale = (
-            f"{sample} is not among the {len(samples)} pooled samples, so its "
-            "genotype is an outside observation of the discovery cohort."
-        )
-        tier = "top"
-    else:
-        verdict = "not_independent"
-        rationale = (
-            f"{sample} IS one of the {len(samples)} pooled samples, so the "
-            "genotype axis is internal to the discovery cohort. For any site "
-            "this cohort could have discovered because the sample carries it, "
-            "genotype is circular rather than corroborating. Phase 3 may only "
-            "use sites whose AC shows other carriers (AC > 2), which is a "
-            "restricted tier and never licenses a detection-accuracy claim."
-        )
-        tier = "restricted_concordance_only"
+    verdict, tier, rationale = genotype_axis_verdict(
+        sample, len(samples), in_pool, genotype_axis_band_counts(table)
+    )
 
     return {
         "sample": sample,
@@ -624,6 +666,7 @@ def assess_genotype_axis_independence(
         "n_calls_without_matched_pooled_site": unmatched,
         "match_shift_bp": HG03086_POS_SHIFT,
         "match_tolerance_bp": HG03086_MATCH_TOL,
+        "allele_count_band_counts": genotype_axis_band_counts(table),
         "stratified_counts": {
             f"long_read_derived={lr}|nonref={nr}|{band}": n
             for (lr, nr, band), n in sorted(table.items(), key=str)
@@ -716,6 +759,8 @@ def detect_tsd_sentinels(
             "sentinels_detected_tsd_length_not_continuous"
             if sentinels
             else "no_sentinels_detected"
+            if total
+            else "tsd_length_absent_no_verdict_available"
         ),
         "consequence": (
             "Phase 2b must exclude these values and may not treat TSD length as "
@@ -723,6 +768,15 @@ def detect_tsd_sentinels(
             "valid on the non-sentinel subset."
             if sentinels
             else "TSD length may be treated as continuous."
+            if total
+            # Absence of sentinels is a finding about the calls that exist. With
+            # no TSD-bearing calls there is nothing to have found a sentinel in,
+            # so saying the length is continuous asserts a property of an
+            # unexamined distribution -- this gate has no verdict to give.
+            else "No call in this family carries a TSD length, so there is no "
+            "distribution to test for sentinels and no verdict about whether TSD "
+            "length is continuous. Phase 2b has no TSD arm to exclude anything "
+            "from."
         ),
     }
 

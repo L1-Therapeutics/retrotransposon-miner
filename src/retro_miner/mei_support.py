@@ -34,7 +34,7 @@ import pysam
 from Bio.Align import PairwiseAligner
 from intervaltree import IntervalTree
 
-from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
+from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats, read_tsv
 
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import (
@@ -149,7 +149,7 @@ def _load_fragment_to_full_map(path: Path | None) -> dict[str, FragmentToFullMap
     if path is None or not path.exists():
         return {}
     try:
-        df = pd.read_csv(path, sep="\t")
+        df = read_tsv(path)
     except (OSError, pd.errors.ParserError, ValueError):
         return {}
     required = {
@@ -420,7 +420,7 @@ def _load_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
     if parquet_path.exists():
         return pd.read_parquet(parquet_path)
     if tsv_path.exists():
-        return pd.read_csv(tsv_path, sep="\t")
+        return read_tsv(tsv_path)
     raise FileNotFoundError(f"Missing {stem} for sample={sample}")
 
 
@@ -2059,7 +2059,7 @@ def _load_supporting_reads_detail_table(path: Path) -> pd.DataFrame:
     path = Path(path)
     if path.suffix == ".parquet":
         return pd.read_parquet(path)
-    return pd.read_csv(path, sep="\t", low_memory=False)
+    return read_tsv(path)
 
 
 def _hydrate_sample_mei_hits_from_detail(
@@ -16109,7 +16109,7 @@ def annotate_candidate_loci_with_mei(
     reuse_dir = Path(reuse_mei_annotate_dir) if reuse_mei_annotate_dir is not None else None
     bwa_threads = max(1, int(bwa_threads))
     load_t0 = time.monotonic()
-    candidate = pd.read_csv(candidate_loci_path, sep="\t")
+    candidate = read_tsv(candidate_loci_path)
     split_disease_raw = _load_table(evidence_dir, "split_evidence", "disease")
     split_control_raw = _load_table(evidence_dir, "split_evidence", "control")
     discordant_disease_raw = _load_table(evidence_dir, "discordant_evidence", "disease")

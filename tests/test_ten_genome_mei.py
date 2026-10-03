@@ -1,6 +1,5 @@
 """Synthetic gates for the provenance-locked ten-genome extension."""
 import gzip
-import subprocess
 import sys
 from pathlib import Path
 
@@ -8,40 +7,21 @@ import numpy as np
 import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1]/'scripts'
-SNAPSHOT = Path('/tmp/rtm_head_10g')
 sys.path.insert(0,str(SCRIPTS))
 import analyze_ten_genome_mei as m  # noqa: E402
 import mei_reference_opportunity as o  # noqa: E402
 
 
 def engine():
-    # Unit-test grouping using the committed snapshot, never the concurrent
-    # dirty dedup. In a detached production checkout this falls back to itself.
-    # `test_snapshot_is_not_behind_head` guards this preference: a snapshot that
-    # drifts from HEAD keeps these tests green against code the repository no
-    # longer holds, which is a silent false pass rather than a failure.
-    return m.load_engine(SNAPSHOT/'scripts' if SNAPSHOT.is_dir() else SCRIPTS)
-
-
-def test_snapshot_provides_the_code_head_has():
-    """`engine()` loads the snapshot, so the snapshot must hold what HEAD holds.
-
-    Compared by content, not by commit SHA. A commit that touches no tested
-    module leaves the snapshot parked on an older SHA while still supplying
-    exactly the code HEAD has, and failing on that would be noise rather than
-    signal. What must never pass is a snapshot whose *code* has diverged, since
-    these tests would then keep exercising superseded rules and report green.
-    """
-    if not SNAPSHOT.is_dir():
-        pytest.skip('no detached snapshot on this host; using the live tree')
-    for name in ('dedup_samples.py','analyze_ten_genome_mei.py','mei_reference_opportunity.py'):
-        committed = subprocess.check_output(['git','show',f'HEAD:scripts/{name}'],
-                                            cwd=SCRIPTS.parent)
-        on_disk = (SNAPSHOT/'scripts'/name).read_bytes()
-        assert committed == on_disk, (
-            f'{SNAPSHOT}/scripts/{name} differs from HEAD; engine() loads the '
-            f'snapshot, so these tests would exercise superseded code. Refresh it '
-            f'with: git -C {SNAPSHOT} checkout --detach $(git rev-parse HEAD)')
+    # Grouping runs against this repository's own scripts, so an uncommitted
+    # edit is exercised immediately. These tests used to prefer a detached
+    # production checkout at /tmp/rtm_head_10g, with a guard asserting that
+    # checkout still held what HEAD held. That worktree has since been removed
+    # and its purpose is finished -- the run it existed for is recorded in
+    # analysis_metrics.json -- so the guard could only ever skip, and a test
+    # that can never fail is worse than no test at all. The preference is gone
+    # rather than left in place pretending to protect something.
+    return m.load_engine(SCRIPTS)
 
 
 def call(e, sample, pos, host=None, orient='+'):

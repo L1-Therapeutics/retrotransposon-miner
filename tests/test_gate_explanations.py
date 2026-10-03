@@ -54,6 +54,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import analyze_ten_genome_mei as ten  # noqa: E402
+import build_longread_nested_cohort as cohort  # noqa: E402
 import joint_enrichment as je  # noqa: E402
 import recurrence_test as rt  # noqa: E402
 import score_genotype_concordance as p3  # noqa: E402
@@ -98,6 +99,110 @@ class GateCase:
 _SITE_LENGTHS = {"chr1": 248956422, "chr2": 243199373}
 _GENOTYPE_LENGTHS = {"chr1": 248387328, "chr2": 243199373}
 _3A_SITES = [("chr1", 100), ("chr2", 200)]
+
+
+def _case_genotype_axis_independence() -> GateCase:
+    """Membership fixes the verdict; it does not fix whether the tier exists.
+
+    This gate emits `phase3_tier` next to a rationale telling Phase 3 what to do
+    with that tier. Membership alone decided both, so the "AC > 2" tier was
+    advertised even when the stratification had put no calls in it -- a gate
+    offering a restricted tier that does not exist is a promise, not a caveat.
+    """
+    populated = cohort.genotype_axis_verdict(
+        "HG03086", 908, True, {"AC_gt_2": 1158, "AC_le_2": 17, "AC_unknown": 0}
+    )
+    empty = cohort.genotype_axis_verdict(
+        "HG03086", 908, True, {"AC_gt_2": 0, "AC_le_2": 17, "AC_unknown": 0}
+    )
+    assert populated[0] == empty[0] == "not_independent", "membership is unchanged"
+    assert populated[1] != empty[1], (
+        f"an empty AC>2 tier must not be offered to Phase 3 as {populated[1]!r}"
+    )
+    return GateCase(
+        "genotype_axis_independence",
+        Branch(
+            empty[0],
+            f"tier={empty[1]}",
+            empty[2],
+            "no tier for Phase 3 to restrict to",
+            "rationale",
+        ),
+        Branch(
+            populated[0],
+            f"tier={populated[1]}",
+            populated[2],
+            "Phase 3 may only use sites whose AC shows",
+            "rationale",
+        ),
+    )
+
+
+def _bcf_lines_for_tsd_lengths(lengths: list[int]) -> list[str]:
+    """`bcftools view -H` lines carrying a family and a TSD_LEN per record."""
+    out = []
+    for i, length in enumerate(lengths):
+        info = f"FAM_N=ALU;TSD_LEN={length};STRAND=+"
+        out.append("\t".join(["chr1", str(1000 + i), ".", "N", "<INS>", "60", ".", info]))
+    return out
+
+
+def _detect_tsd_sentinels(monkeypatch, lengths: list[int]):
+    monkeypatch.setattr(
+        cohort, "bcftools_lines", lambda cmd: _bcf_lines_for_tsd_lengths(lengths)
+    )
+    return cohort.detect_tsd_sentinels(Path("sites.bcf"))
+
+
+def _case_detect_tsd_sentinels(monkeypatch) -> GateCase:
+    """Gate 0d had two branches and needed a third.
+
+    "No sentinels detected" licensed treating TSD length as continuous. But a
+    family with no TSD-bearing calls also detects no sentinels, and in that case
+    the gate had examined no distribution at all while reporting a property of
+    it. The empty-callset branch is asserted here rather than carried in
+    `GateCase`, which holds two.
+    """
+    # One call per element, so the spike is a repeated *length*: 40 calls at 20
+    # against a local background of 1, the signature the gate looks for.
+    spike = [20] * 40 + [21, 22, 23, 24, 25, 26, 27]
+    detected = _detect_tsd_sentinels(monkeypatch, spike)
+    flat = [20] * 4 + [21, 22, 23, 24, 25, 26, 27]
+    clean = _detect_tsd_sentinels(monkeypatch, flat)
+    empty = _detect_tsd_sentinels(monkeypatch, [])
+
+    assert detected["sentinel_values"].get("20", {}).get("count") == 40
+
+    assert detected["sentinel_values"], "the spike must be detected as a sentinel"
+    assert detected["verdict"] == "sentinels_detected_tsd_length_not_continuous"
+    assert clean["verdict"] == "no_sentinels_detected"
+    assert clean["n_calls_with_tsd"] == 11
+
+    # The third branch: no calls at all is not a clean bill of health.
+    assert empty["n_calls_with_tsd"] == 0
+    assert empty["sentinel_share_of_calls"] is None
+    assert empty["verdict"] == "tsd_length_absent_no_verdict_available", empty["verdict"]
+    assert "may be treated as continuous" not in empty["consequence"], empty[
+        "consequence"
+    ]
+
+    return GateCase(
+        "tsd_sentinel_detected",
+        Branch(
+            detected["verdict"],
+            detected["verdict"],
+            detected["consequence"],
+            "Phase 2b must exclude these values",
+            "consequence",
+        ),
+        Branch(
+            clean["verdict"],
+            clean["verdict"],
+            clean["consequence"],
+            "may be treated as continuous",
+            "consequence",
+        ),
+    )
 
 
 def _gate_3a(monkeypatch, present):
@@ -273,6 +378,8 @@ def _all_cases(monkeypatch, tmp_path: Path) -> list[GateCase]:
         _case_dependent_gate(),
         _case_classify_pair(),
         _case_opportunity_diagnostic(tmp_path),
+        _case_genotype_axis_independence(),
+        _case_detect_tsd_sentinels(monkeypatch),
     ]
 
 
@@ -309,6 +416,8 @@ def test_the_registry_covers_every_gate_that_carries_an_explanation(cases):
         "ten_genome_dependent_gate",
         "recurrence_classify_pair",
         "joint_opportunity_diagnostic",
+        "genotype_axis_independence",
+        "tsd_sentinel_detected",
     }
     for case in cases:
         assert case.blocked.selector != case.open.selector, (
@@ -580,6 +689,8 @@ REGISTRY_FUNCTION = {
     "ten_genome_dependent_gate": "dependent_gate",
     "recurrence_classify_pair": "classify_pair",
     "joint_opportunity_diagnostic": "opportunity_diagnostic",
+    "genotype_axis_independence": "genotype_axis_verdict",
+    "tsd_sentinel_detected": "detect_tsd_sentinels",
 }
 
 VERDICT_INDEPENDENT = {
@@ -605,6 +716,7 @@ ANALYSED_SCRIPTS = (
     "nested_multi_sample_common.py",
     "score_tprt_hallmarks.py",
     "test_position_enrichment.py",
+    "build_longread_nested_cohort.py",
 )
 
 EXPLANATION_KEYS = {"note", "consequence", "reason", "caveat"}
