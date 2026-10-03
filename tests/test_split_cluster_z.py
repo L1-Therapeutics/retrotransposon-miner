@@ -46,16 +46,24 @@ def _load_call(catalog_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 def test_rank19_split_reads_do_not_cluster() -> None:
     gold, splits = _load_call("rank019_chr18_57632912")
     scored = annotate_split_cluster_binomial_z(gold, splits)
-    assert int(scored[WINDOW_READS_COL].iloc[0]) == 43
-    assert int(scored[CLUSTERED_READS_COL].iloc[0]) == 0
+    assert int(scored[WINDOW_READS_COL].iloc[0]) == 43, (
+        f"rank019: expected 43 window reads, got {scored[WINDOW_READS_COL].iloc[0]}"
+    )
+    assert int(scored[CLUSTERED_READS_COL].iloc[0]) == 0, (
+        f"rank019: expected 0 clustered reads, got {scored[CLUSTERED_READS_COL].iloc[0]}"
+    )
     assert binomial_z(0, 43, CHR18_SILVER_RATE) < -3.0
 
 
 def test_rank1_split_reads_cluster() -> None:
     gold, splits = _load_call("rank001_chr18_30220890")
     scored = annotate_split_cluster_binomial_z(gold, splits)
-    assert int(scored[WINDOW_READS_COL].iloc[0]) == 41
-    assert int(scored[CLUSTERED_READS_COL].iloc[0]) == 40
+    assert int(scored[WINDOW_READS_COL].iloc[0]) == 41, (
+        f"rank001: expected 41 window reads, got {scored[WINDOW_READS_COL].iloc[0]}"
+    )
+    assert int(scored[CLUSTERED_READS_COL].iloc[0]) == 40, (
+        f"rank001: expected 40 clustered reads, got {scored[CLUSTERED_READS_COL].iloc[0]}"
+    )
     assert binomial_z(40, 41, CHR18_SILVER_RATE) > 0.0
 
 
@@ -64,9 +72,11 @@ def test_rank109_is_below_minus_2_at_chr18_silver_rate() -> None:
     scored = annotate_split_cluster_binomial_z(gold, splits)
     n = int(scored[WINDOW_READS_COL].iloc[0])
     k = int(scored[CLUSTERED_READS_COL].iloc[0])
-    assert n == 38
-    assert k == 3
-    assert binomial_z(k, n, CHR18_SILVER_RATE) < _SPLIT_CLUSTER_Z_CUTOFF
+    assert n == 38, f"rank109: expected 38 window reads, got {n}"
+    assert k == 3, f"rank109: expected 3 clustered reads, got {k}"
+    assert binomial_z(k, n, CHR18_SILVER_RATE) < _SPLIT_CLUSTER_Z_CUTOFF, (
+        f"rank109: z={binomial_z(k, n, CHR18_SILVER_RATE)} >= cutoff {_SPLIT_CLUSTER_Z_CUTOFF}"
+    )
 
 
 def test_binomial_z_depends_on_split_count() -> None:
@@ -93,12 +103,24 @@ def test_z_below_minus_2_drops_gold_and_keeps_rank1() -> None:
     rank1 = by_window[30220369]
     rank19 = by_window[57632449]
     rank109 = by_window[31960184]
-    assert bool(rank1.gold_stage_pass)
-    assert float(rank1.split_cluster_binomial_z) > _SPLIT_CLUSTER_Z_CUTOFF
-    assert not bool(rank19.gold_stage_pass)
-    assert "split_cluster_low_z" in str(rank19.gold_stage_fail_reason)
-    assert not bool(rank109.gold_stage_pass)
-    assert "split_cluster_low_z" in str(rank109.gold_stage_fail_reason)
+    assert bool(rank1.gold_stage_pass), (
+        f"rank1 expected gold_stage_pass=True, got fail_reason={rank1.gold_stage_fail_reason}"
+    )
+    assert float(rank1.split_cluster_binomial_z) > _SPLIT_CLUSTER_Z_CUTOFF, (
+        f"rank1 z={rank1.split_cluster_binomial_z} <= cutoff {_SPLIT_CLUSTER_Z_CUTOFF}"
+    )
+    assert not bool(rank19.gold_stage_pass), (
+        f"rank19 expected gold_stage_pass=False, got fail_reason={rank19.gold_stage_fail_reason}"
+    )
+    assert "split_cluster_low_z" in str(rank19.gold_stage_fail_reason), (
+        f"rank19 expected split_cluster_low_z, got: {rank19.gold_stage_fail_reason}"
+    )
+    assert not bool(rank109.gold_stage_pass), (
+        f"rank109 expected gold_stage_pass=False, got fail_reason={rank109.gold_stage_fail_reason}"
+    )
+    assert "split_cluster_low_z" in str(rank109.gold_stage_fail_reason), (
+        f"rank109 expected split_cluster_low_z, got: {rank109.gold_stage_fail_reason}"
+    )
     review = _build_gold_review_table(out, empirical_stage=False)
     assert BINOMIAL_Z_COL in review.columns
     review_gold = {
@@ -124,4 +146,4 @@ def test_fixture_bam_contains_named_detail_read(catalog_id: str) -> None:
         bam_names = {read.query_name for read in bam.fetch()}
     finally:
         bam.close()
-    assert read_name in bam_names
+    assert read_name in bam_names, f"read {read_name} not found in BAM {bam_path}"

@@ -278,7 +278,9 @@ def _default_head_size(uri: str) -> int | None:
             return int((proc.stdout or "").strip())
         except ValueError:
             return None
-        request = urllib.request.Request(
+    if not uri.startswith("http://") and not uri.startswith("https://"):
+        return None
+    request = urllib.request.Request(
         uri,
         method="HEAD",
         headers={"User-Agent": "retrotransposon-miner/bam-stage"},

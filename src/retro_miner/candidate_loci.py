@@ -596,22 +596,7 @@ def _write_candidate_windows_bed(loci: pd.DataFrame, output_path: Path) -> None:
             handle.write(f"{row.chrom}\t{start0}\t{end0}\t{row.row_id}\n")
 
 
-def _get_overlapping_row_ids(a_bed: Path, b_bed: Path) -> set[int]:
-    cmd = ["bedtools", "intersect", "-a", str(a_bed), "-b", str(b_bed), "-wa", "-u"]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    row_ids: set[int] = set()
-    for line in proc.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        try:
-            row_ids.add(int(parts[3]))
-        except ValueError:
-            continue
-    return row_ids
-
-
-def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fraction: float) -> set[int]:
+def _get_overlapping_row_ids(a_bed: Path, b_bed: Path, min_fraction: float | None = None) -> set[int]:
     cmd = [
         "bedtools",
         "intersect",
@@ -621,9 +606,9 @@ def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fractio
         str(b_bed),
         "-wa",
         "-u",
-        "-f",
-        str(min_fraction),
     ]
+    if min_fraction is not None:
+        cmd.extend(["-f", str(min_fraction)])
     proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
     row_ids: set[int] = set()
     for line in proc.stdout.splitlines():
@@ -635,6 +620,11 @@ def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fractio
         except ValueError:
             continue
     return row_ids
+
+
+# Backwards-compatible alias kept for callers that pass the fraction explicitly.
+def _get_overlapping_row_ids_with_fraction(a_bed: Path, b_bed: Path, min_fraction: float) -> set[int]:
+    return _get_overlapping_row_ids(a_bed, b_bed, min_fraction=min_fraction)
 
 
 def _annotate_junk_flags(
@@ -943,15 +933,15 @@ def build_candidate_loci(
         merged = merged.fillna(0)
 
         int_cols = [
-        c
-        for c in merged.columns
-        if c.endswith("_rows")
-        or c.endswith("_unique_reads")
-        or c.endswith("_mapq_min")
-        or c.endswith("_clip_len_max")
-        or c.endswith("_run_max")
-        or c.endswith("_nm_max")
-    ]
+            c
+            for c in merged.columns
+            if c.endswith("_rows")
+            or c.endswith("_unique_reads")
+            or c.endswith("_mapq_min")
+            or c.endswith("_clip_len_max")
+            or c.endswith("_run_max")
+            or c.endswith("_nm_max")
+        ]
         for col in int_cols:
             merged[col] = merged[col].astype(int)
 
