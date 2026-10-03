@@ -22,10 +22,27 @@ sample name, within the frozen +/-10 bp rule.
 
 The join is verified rather than assumed. `verify_join` checks that the number
 of calls recovered per site equals `n_carriers` from the dedup table, that every
-recovered call agrees with the dedup table on nesting state and orientation, and
-that it reports the count of sites it could not resolve. On the shipped data all
-763 sites resolve, all 1,284 recovered calls match `sum(n_carriers)`, and every
-call agrees on orientation; a mismatch is an error, not a warning.
+recovered call agrees with the dedup table on family and orientation, and that it
+reports the count of sites it could not resolve. On the shipped 10-genome table
+all 1,516 cohort sites resolve, all 3,265 recovered calls match
+`sum(n_carriers)`, and every call agrees on family and orientation; a mismatch is
+an error, not a warning.
+
+The cohort
+----------
+Cohort membership is settled here and nowhere else -- see `COHORT_RULE` and
+`is_nested_site`. It is the producer's strand-derived
+`same_family_nested_state` beginning with `nested`, so both orientation classes
+are in scope. This is not a preference. `nested_antisense` sites are real nested
+insertions -- the producer found a same-family host on the opposite strand --
+and dropping them on a criterion that matches no cell of the design biases the
+`n_sense_in_bin - n_antisense_in_bin` contrast the interaction cells report,
+because the two nesting strata carry different orientation mixes. An A/B on
+identical input moved the primary interaction cell from +5 to +8 and the
+same-host IBD count from 25 to 0. `load_unique_sites` applies the rule, counts
+what it excluded and why, and records the rule text in its report;
+`joint_enrichment.py` and `recurrence_test.py` consume that one cohort rather
+than each re-deriving it.
 
 Scope and prohibitions
 ----------------------
@@ -81,6 +98,39 @@ SENSE = "+"
 ANTISENSE = "-"
 ORIENTATION_VALUES = (SENSE, ANTISENSE)
 
+#: The Phase 4 cohort, settled once here so no script re-derives it.
+#:
+#: The estimand is insertions *nested inside another copy of the same family*,
+#: in either orientation class. "Nested" decides cohort membership and
+#: `insertion_orientation` is an independent axis; neither substitutes for the
+#: other, and in this data they are close to uncorrelated (of the 1,197
+#: `nested_sense` sites only 558 are `+`). Restricting the cohort to
+#: `nested_sense` would therefore not isolate "the sense arm" -- it would drop
+#: a whole stratum of real nested insertions on a criterion that corresponds to
+#: no cell of the pre-registered design. Worse, because the two strata carry
+#: different orientation mixes, dropping `nested_antisense` shifts the
+#: sense:antisense balance that the interaction cells `S2_interaction_120_140`
+#: and `S3_interaction_280_300` measure (`n_sense_in_bin - n_antisense_in_bin`).
+#: In the primary 120-140 bin it removes 14 sense-oriented and 17
+#: antisense-oriented sites, moving the contrast from +5 to +8 while the cohort
+#: shrinks by a fifth. That interaction was an artifact of the filter, not a
+#: property of the genome, and the sense-only rule also reported 0 same-host IBD
+#: pairs where the full cohort finds 25.
+#:
+#: A published Phase 4 run used 763 sites, which is the `nested_sense` count of
+#: the 5-genome table. That was this mistake rather than a defensible
+#: narrowing, and it also had two scripts disagreeing with each other about the
+#: cohort size on the same input. `nested_unknown` is nested but belongs to
+#: neither orientation class, so it is in the cohort and contributes to neither
+#: orientation cell.
+COHORT_NESTED_PREFIX = "nested"
+COHORT_RULE = (
+    "cohort membership is the producer's strand-derived "
+    "same_family_nested_state starting with 'nested' (nested_sense, "
+    "nested_antisense or nested_unknown); insertion_orientation is a separate "
+    "axis and is not used to decide membership"
+)
+
 
 class NestedEnumError(ValueError):
     """A NESTED value outside the known enum. Never coerced, never defaulted."""
@@ -93,13 +143,18 @@ class SchemaError(ValueError):
 #: Every column `load_unique_sites` reads, and why each one is load-bearing.
 #: The host interval drives the geometry gate and `host_key`; the carrier list
 #: and its count drive the join gate; `site_id` and `orientation` are what the
-#: reports and the orientation cells are keyed on.
+#: reports and the orientation cells are keyed on; `same_family_nested_state`
+#: decides cohort membership and is load-bearing for that reason -- if the
+#: cohort predicate runs against a column the file may not carry, it fails open
+#: and quietly returns an unnested cohort, which is the same failure mode as
+#: the missing-host-geometry bug documented on `load_unique_sites`.
 REQUIRED_UNIQUE_SITE_COLUMNS = (
     "site_id",
     "chrom",
     "representative_pos",
     "family",
     "insertion_orientation",
+    "same_family_nested_state",
     "host_name",
     "host_start0",
     "host_end0",
@@ -162,6 +217,23 @@ def in_scope_contig(chrom: str) -> bool:
     return chrom in ALLOWED_CONTIGS
 
 
+def is_nested_site(state: str | None) -> bool:
+    """Cohort membership. See `COHORT_RULE` for why this is not `nested_sense`.
+
+    Takes the producer's `same_family_nested_state` value. An empty or missing
+    value is *not* nested: a site the producer could not place is not evidence of
+    nesting, and admitting it would let the cohort grow every time the producer
+    degrades.
+
+    Deliberately a prefix test against the producer's own vocabulary rather
+    than a membership test against `NESTED_ENUM`. Those are different fields
+    computed under different host-selection rules -- `NESTED_ENUM` describes the
+    per-call legacy VCF label, which is why `verify_join` treats disagreement
+    between the two as a non-gating diagnostic.
+    """
+    return (state or "").strip().startswith(COHORT_NESTED_PREFIX)
+
+
 def to_int(value: str | None) -> int | None:
     if value is None:
         return None
@@ -192,7 +264,7 @@ def canonical_subfamily(value: str | None) -> str | None:
 # --------------------------------------------------------------------------
 
 
-def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Read the dedup output, typed, with the out-of-scope rows dropped.
 
     The `samples` field is pipe-separated. Splitting it on a comma or a semicolon
@@ -210,15 +282,29 @@ def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]
     as if it were a null result. A changed column set is a new input, and the
     caller has to be told.
 
-    Rows are still dropped individually for scope and geometry, and counted in
-    the returned report; an all-rows-dropped table is not an error here, because
-    a table of hostless sites legitimately has empty geometry for every row. It
-    is the *analysis scripts* that refuse an empty cohort, not the loader.
+    Rows are still dropped individually for nesting, scope and geometry, and
+    counted in the returned report; an all-rows-dropped table is not an error
+    here, because a table of hostless or wholly unnested sites is a legitimate
+    thing to hand it. It is the *analysis scripts* that refuse an empty cohort,
+    not the loader.
+
+    Cohort membership is applied here, explicitly, before scope and before
+    geometry. It used to be implicit: the producer leaves host geometry blank on
+    unnested rows, so the geometry gate happened to drop them, and the cohort was
+    "whatever has a host interval" -- a definition nobody wrote down and nobody
+    reviewed. That is how two scripts ended up disagreeing about the cohort size
+    on one input (1516 vs 1197), and how the 763-site sense-only run happened.
+    The rule now lives in `COHORT_RULE`/`is_nested_site`, is asserted against a
+    required column, and is written into the returned report so every artifact
+    states the cohort it was computed on.
     """
     samples_separator = "|"
     rows: list[dict[str, Any]] = []
     dropped_contig = 0
     dropped_unusable = 0
+    dropped_not_nested = 0
+    excluded_states: collections.Counter[str] = collections.Counter()
+    cohort_states: collections.Counter[str] = collections.Counter()
     with Path(path).open(newline="") as fh:
         reader = csv.DictReader(fh)
         header = list(reader.fieldnames or [])
@@ -231,6 +317,14 @@ def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]
                 f"column(s) {missing}. Columns found: {header}."
             )
         for raw in reader:
+            # Cohort first, explicitly. See the docstring: this used to be an
+            # accident of the geometry gate rather than a stated rule.
+            site_nested_state = (raw.get("same_family_nested_state") or "").strip()
+            if not is_nested_site(site_nested_state):
+                dropped_not_nested += 1
+                excluded_states[site_nested_state or "(empty)"] += 1
+                continue
+            cohort_states[site_nested_state] += 1
             chrom = (raw.get("chrom") or "").strip()
             if not in_scope_contig(chrom):
                 dropped_contig += 1
@@ -252,6 +346,7 @@ def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]
                     "pos": pos,
                     "family": (raw.get("family") or "").strip(),
                     "orientation": (raw.get("insertion_orientation") or "").strip(),
+                    "site_nested_state": site_nested_state,
                     "host_name": (raw.get("host_name") or "").strip(),
                     "host_start0": to_int(raw.get("host_start0")),
                     "host_end0": to_int(raw.get("host_end0")),
@@ -268,8 +363,15 @@ def load_unique_sites(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]
                 }
             )
     report = {
-        "rows_read": len(rows) + dropped_contig + dropped_unusable,
+        "rows_read": len(rows)
+        + dropped_contig
+        + dropped_unusable
+        + dropped_not_nested,
         "rows_in_scope": len(rows),
+        "cohort_rule": COHORT_RULE,
+        "cohort_nesting_states": dict(sorted(cohort_states.items())),
+        "excluded_nesting_states": dict(sorted(excluded_states.items())),
+        "dropped_not_nested": dropped_not_nested,
         "dropped_out_of_scope_contig": dropped_contig,
         "dropped_missing_geometry": dropped_unusable,
         "samples_field_separator": samples_separator,

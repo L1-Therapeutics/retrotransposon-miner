@@ -41,30 +41,37 @@ class _SampleExtractResult:
     total_elapsed_s: float
 
 
+@dataclass(frozen=True)
+class _ExtractionConfig:
+    """Encapsulates all extraction parameters for a single sample run."""
+
+    bam: Path
+    mate_bam: Path | None
+    outdir: Path
+    region_list: list[str]
+    min_mapq: int = 20
+    min_mapq_discordant: int = 0
+    min_clip_len: int = 20
+    poly_tail_rescue_min_clip_len: int = 8
+    poly_tail_rescue_min_run: int = 8
+    poly_tail_rescue_min_frac: float = 0.8
+    short_mei_rescue_min_clip_len: int = 12
+    with_discordant: bool = True
+    discordant_quantile: float = 0.995
+    discordant_min_abs_tlen: int = 1000
+    discordant_poly_tail_rescue_window_bases: int = 25
+    discordant_poly_tail_rescue_min_run: int = 10
+    discordant_poly_tail_rescue_min_frac: float = 0.8
+    discordant_poly_tail_rescue_min_abs_tlen: int = 500
+    discordant_mate_fetch_window_bp: int = 500
+    fetch_mate_seq: bool = True
+    require_strong_discordant_reason: bool = True
+
+
 def _extract_one_sample(
     *,
     sample: str,
-    bam: Path,
-    mate_bam: Path | None,
-    outdir: Path,
-    region_list: list[str],
-    min_mapq: int,
-    min_mapq_discordant: int,
-    min_clip_len: int,
-    poly_tail_rescue_min_clip_len: int,
-    poly_tail_rescue_min_run: int,
-    poly_tail_rescue_min_frac: float,
-    short_mei_rescue_min_clip_len: int,
-    with_discordant: bool,
-    discordant_quantile: float,
-    discordant_min_abs_tlen: int,
-    discordant_poly_tail_rescue_window_bases: int,
-    discordant_poly_tail_rescue_min_run: int,
-    discordant_poly_tail_rescue_min_frac: float,
-    discordant_poly_tail_rescue_min_abs_tlen: int,
-    discordant_mate_fetch_window_bp: int,
-    fetch_mate_seq: bool,
-    require_strong_discordant_reason: bool,
+    config: _ExtractionConfig,
 ) -> _SampleExtractResult:
     """Extract split (+ optional discordant) evidence for one sample.
 
@@ -72,31 +79,31 @@ def _extract_one_sample(
     only its own sample-named output files under ``outdir``.
     """
     sample_t0 = time.monotonic()
-    click.echo(f"[extract] sample={sample} bam={bam} regions={','.join(region_list)}")
-    if with_discordant:
+    click.echo(f"[extract] sample={sample} bam={config.bam} regions={','.join(config.region_list)}")
+    if config.with_discordant:
         click.echo(f"[extract] sample={sample} one-pass split+discordant")
         split_summary, discordant_summary = extract_split_and_discordant_evidence(
-            bam_path=bam,
+            bam_path=config.bam,
             sample_name=sample,
-            outdir=outdir,
-            regions=region_list,
-            min_mapq=min_mapq,
-            min_mapq_discordant=min_mapq_discordant,
-            min_clip_len=min_clip_len,
-            poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
-            poly_tail_rescue_min_run=poly_tail_rescue_min_run,
-            poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
-            short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
-            insert_quantile=discordant_quantile,
-            min_abs_tlen=discordant_min_abs_tlen,
-            poly_tail_rescue_window_bases=discordant_poly_tail_rescue_window_bases,
-            discordant_poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
-            discordant_poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
-            poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
-            require_strong_discordant_reason=require_strong_discordant_reason,
-            mate_bam_path=mate_bam,
-            mate_fetch_window_bp=discordant_mate_fetch_window_bp,
-            fetch_mate_seq=fetch_mate_seq,
+            outdir=config.outdir,
+            regions=config.region_list,
+            min_mapq=config.min_mapq,
+            min_mapq_discordant=config.min_mapq_discordant,
+            min_clip_len=config.min_clip_len,
+            poly_tail_rescue_min_clip_len=config.poly_tail_rescue_min_clip_len,
+            poly_tail_rescue_min_run=config.poly_tail_rescue_min_run,
+            poly_tail_rescue_min_frac=config.poly_tail_rescue_min_frac,
+            short_mei_rescue_min_clip_len=config.short_mei_rescue_min_clip_len,
+            insert_quantile=config.discordant_quantile,
+            min_abs_tlen=config.discordant_min_abs_tlen,
+            poly_tail_rescue_window_bases=config.discordant_poly_tail_rescue_window_bases,
+            discordant_poly_tail_rescue_min_run=config.discordant_poly_tail_rescue_min_run,
+            discordant_poly_tail_rescue_min_frac=config.discordant_poly_tail_rescue_min_frac,
+            poly_tail_rescue_min_abs_tlen=config.discordant_poly_tail_rescue_min_abs_tlen,
+            require_strong_discordant_reason=config.require_strong_discordant_reason,
+            mate_bam_path=config.mate_bam,
+            mate_fetch_window_bp=config.discordant_mate_fetch_window_bp,
+            fetch_mate_seq=config.fetch_mate_seq,
         )
         one_pass_elapsed = time.monotonic() - sample_t0
         click.echo(
@@ -124,16 +131,16 @@ def _extract_one_sample(
 
     split_t0 = time.monotonic()
     split_summary = extract_split_evidence(
-        bam_path=bam,
+        bam_path=config.bam,
         sample_name=sample,
-        outdir=outdir,
-        regions=region_list,
-        min_mapq=min_mapq,
-        min_clip_len=min_clip_len,
-        poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
-        poly_tail_rescue_min_run=poly_tail_rescue_min_run,
-        poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
-        short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
+        outdir=config.outdir,
+        regions=config.region_list,
+        min_mapq=config.min_mapq,
+        min_clip_len=config.min_clip_len,
+        poly_tail_rescue_min_clip_len=config.poly_tail_rescue_min_clip_len,
+        poly_tail_rescue_min_run=config.poly_tail_rescue_min_run,
+        poly_tail_rescue_min_frac=config.poly_tail_rescue_min_frac,
+        short_mei_rescue_min_clip_len=config.short_mei_rescue_min_clip_len,
     )
     split_elapsed = time.monotonic() - split_t0
     click.echo(
@@ -369,50 +376,49 @@ def extract_split_evidence_cmd(
     results_by_sample: dict[str, _SampleExtractResult] = {}
     errors: list[str] = []
 
-    def _submit_kwargs(job: dict) -> dict:
-        return {
-            "sample": str(job["sample"]),
-            "bam": Path(job["bam"]),
-            "mate_bam": Path(job["mate_bam"]) if job["mate_bam"] is not None else None,
-            "outdir": outdir,
-            "region_list": region_list,
-            "min_mapq": min_mapq,
-            "min_mapq_discordant": min_mapq_discordant,
-            "min_clip_len": min_clip_len,
-            "poly_tail_rescue_min_clip_len": poly_tail_rescue_min_clip_len,
-            "poly_tail_rescue_min_run": poly_tail_rescue_min_run,
-            "poly_tail_rescue_min_frac": poly_tail_rescue_min_frac,
-            "short_mei_rescue_min_clip_len": short_mei_rescue_min_clip_len,
-            "with_discordant": with_discordant,
-            "discordant_quantile": discordant_quantile,
-            "discordant_min_abs_tlen": discordant_min_abs_tlen,
-            "discordant_poly_tail_rescue_window_bases": discordant_poly_tail_rescue_window_bases,
-            "discordant_poly_tail_rescue_min_run": discordant_poly_tail_rescue_min_run,
-            "discordant_poly_tail_rescue_min_frac": discordant_poly_tail_rescue_min_frac,
-            "discordant_poly_tail_rescue_min_abs_tlen": discordant_poly_tail_rescue_min_abs_tlen,
-            "discordant_mate_fetch_window_bp": discordant_mate_fetch_window_bp,
-            "fetch_mate_seq": fetch_mate_seq,
-            "require_strong_discordant_reason": require_strong_discordant_reason,
-        }
+    def _make_config(job: dict) -> _ExtractionConfig:
+        return _ExtractionConfig(
+            bam=Path(job["bam"]),
+            mate_bam=Path(job["mate_bam"]) if job["mate_bam"] is not None else None,
+            outdir=outdir,
+            region_list=region_list,
+            min_mapq=min_mapq,
+            min_mapq_discordant=min_mapq_discordant,
+            min_clip_len=min_clip_len,
+            poly_tail_rescue_min_clip_len=poly_tail_rescue_min_clip_len,
+            poly_tail_rescue_min_run=poly_tail_rescue_min_run,
+            poly_tail_rescue_min_frac=poly_tail_rescue_min_frac,
+            short_mei_rescue_min_clip_len=short_mei_rescue_min_clip_len,
+            with_discordant=with_discordant,
+            discordant_quantile=discordant_quantile,
+            discordant_min_abs_tlen=discordant_min_abs_tlen,
+            discordant_poly_tail_rescue_window_bases=discordant_poly_tail_rescue_window_bases,
+            discordant_poly_tail_rescue_min_run=discordant_poly_tail_rescue_min_run,
+            discordant_poly_tail_rescue_min_frac=discordant_poly_tail_rescue_min_frac,
+            discordant_poly_tail_rescue_min_abs_tlen=discordant_poly_tail_rescue_min_abs_tlen,
+            discordant_mate_fetch_window_bp=discordant_mate_fetch_window_bp,
+            fetch_mate_seq=fetch_mate_seq,
+            require_strong_discordant_reason=require_strong_discordant_reason,
+        )
 
     if workers <= 1:
         for job in sample_jobs:
             sample = str(job["sample"])
             try:
-                results_by_sample[sample] = _extract_one_sample(**_submit_kwargs(job))
-            except Exception as exc:  # noqa: BLE001
+                results_by_sample[sample] = _extract_one_sample(sample=sample, config=_make_config(job))
+            except (OSError, RuntimeError, ValueError) as exc:
                 errors.append(f"{sample}: {exc}")
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(_extract_one_sample, **_submit_kwargs(job)): str(job["sample"])
+                pool.submit(_extract_one_sample, sample=str(job["sample"]), config=_make_config(job)): str(job["sample"])
                 for job in sample_jobs
             }
             for fut in as_completed(futures):
                 sample = futures[fut]
                 try:
                     results_by_sample[sample] = fut.result()
-                except Exception as exc:  # noqa: BLE001 - surface worker failures to CLI
+                except (OSError, RuntimeError, ValueError) as exc:
                     errors.append(f"{sample}: {exc}")
 
     if errors:

@@ -17,7 +17,9 @@ Two tiers:
 * Tier 0 (default) -- seconds. Re-derives the input-derived counts in every
   published JSON: the loader's row report, the per-call join counts, and the
   cohort's analysis-set size. This is the tier that would have caught the
-  incident.
+  incident. It also checks that no two directories carry divergent copies of
+  the same Phase 4 report, which is how the canonical copy went stale without
+  any single path ever disappearing.
 * Tier 1 (`slow`) -- minutes. Re-executes the analyses that are self-contained
   enough to re-run and compares the headline numbers exactly.
 
@@ -151,6 +153,119 @@ def test_every_published_report_records_its_inputs():
         assert _recorded_inputs(json.loads(path.read_text())), (
             f"{path.name} records no absolute-path inputs"
         )
+
+
+def _phase4_copies(name: str) -> list[Path]:
+    """Every published copy of one Phase 4 report, wherever it was written.
+
+    The glob is deliberately `*<name>` under every `results*` directory rather
+    than the exact filename: the stale/correct pair this exists to catch were
+    named differently (`joint_enrichment.json` in the plan's directory,
+    `phase4_joint_enrichment.json` next to the dedup output), so matching the
+    canonical name alone would find only one of them and see no conflict.
+    """
+    if not ANALYSIS.is_dir():
+        return []
+    return sorted(
+        path
+        for results in sorted(ANALYSIS.glob("results*"))
+        if results.is_dir()
+        for path in results.glob(f"*{name}")
+        if path.is_file()
+    )
+
+
+def _report_fingerprint(doc: dict) -> dict:
+    """The subset that decides whether two copies are the same result.
+
+    Only cohort-derived quantities, so a cosmetic or provenance-only difference
+    between two copies is not reported as a conflict.
+    """
+    fingerprint: dict = {"load_report": doc.get("load_report")}
+    split = doc.get("cohort_split")
+    if isinstance(split, dict):
+        fingerprint["shared_sites"] = split.get("shared_sites")
+        fingerprint["private_sites"] = split.get("private_sites")
+    cells = doc.get("cells")
+    if isinstance(cells, list):
+        fingerprint["observed_by_cell"] = {
+            str(cell.get("cell_id")): cell.get("observed")
+            for cell in cells
+            if isinstance(cell, dict)
+        }
+    return fingerprint
+
+
+@pytest.mark.parametrize("name", PHASE4_JSONS)
+def test_phase4_published_copies_agree(name):
+    """Two copies of one report that disagree are a trap, not redundancy.
+
+    Re-running Phase 4 into a new outdirectory leaves the previous copy in
+    place, at a path that still exists, still parses, and still answers to the
+    plan's filename. Nothing in this suite looked outside `results_phase4/`, so
+    the superseded copy kept reading as current while the directory the plan
+    names went stale. A second copy is fine while it is identical; it is the
+    disagreement that makes the published number unknowable, because a reader
+    cannot tell which path is the result.
+    """
+    _require_published()
+    copies = _phase4_copies(name)
+    if len(copies) < 2:
+        return
+    prints = [(p, _report_fingerprint(json.loads(p.read_text()))) for p in copies]
+    canonical_path, canonical = prints[0]
+    conflicts: list[str] = []
+    for path, fingerprint in prints[1:]:
+        drift = [
+            f"{key}: {canonical.get(key)!r} != {fingerprint.get(key)!r}"
+            for key in sorted(fingerprint)
+            if canonical.get(key) != fingerprint.get(key)
+        ]
+        if drift:
+            conflicts.append(
+                f"{path}\n    vs {canonical_path}\n    "
+                + "\n    ".join(drift)
+            )
+    assert not conflicts, (
+        f"{name} is published in {len(copies)} places and they are not the same "
+        f"result. One of them no longer describes the substrate it records. The "
+        f"plan names `results_phase4/`; keep the copy that reproduces and remove "
+        f"or re-point the other:\n  " + "\n  ".join(conflicts)
+    )
+
+
+@pytest.mark.parametrize("name", PHASE4_JSONS)
+def test_every_phase4_copy_reproduces_from_its_recorded_input(name):
+    """Apply the tier-0 reproduction check to every copy, not just the first.
+
+    A second copy is only safe if it also re-derives. If one copy of a report
+    still describes the substrate it was computed from and another does not,
+    the numbers are ambiguous no matter which path a reader opens.
+    """
+    copies = _phase4_copies(name)
+    if not copies:
+        pytest.skip(f"no published copy of {name} present on this host")
+    stale: list[str] = []
+    for path in copies:
+        doc = json.loads(path.read_text())
+        recorded = doc.get("load_report")
+        if not recorded:
+            stale.append(f"{path}: records no load_report")
+            continue
+        try:
+            _sites, derived = common.load_unique_sites(
+                Path(_recorded_inputs(doc)["unique_sites"])
+            )
+        except (common.SchemaError, KeyError) as exc:
+            stale.append(f"{path}: loader rejects its own recorded input: {exc}")
+            continue
+        drift = _drift(recorded, derived, LOAD_REPORT_KEYS)
+        if drift:
+            stale.append(f"{path}:\n    " + "\n    ".join(drift))
+    assert not stale, (
+        f"published {name} no longer reproduces from the input it records:\n  "
+        + "\n  ".join(stale)
+    )
 
 
 def test_every_recorded_input_still_exists():

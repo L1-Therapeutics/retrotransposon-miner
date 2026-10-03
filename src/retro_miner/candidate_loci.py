@@ -1,3 +1,9 @@
+"""Build disease-vs-control candidate loci from split/discordant evidence tables.
+
+Clusters breakpoint evidence into genomic windows, computes enrichment
+ratios, and annotates with segdup/mappability/gap/blacklist flags.
+"""
+
 from __future__ import annotations
 
 import time
@@ -13,7 +19,44 @@ from intervaltree import IntervalTree
 from ._utils import _open_textmaybe_gz
 
 
+__all__ = [
+    "build_candidate_loci",
+    "_RUN_T0",
+    "_progress",
+    "_load_evidence_table",
+    "_validate_evidence_columns",
+    "_windowize",
+    "_cluster_sorted_positions",
+    "_split_cluster_positions",
+    "_distance_to_closed_interval",
+    "_build_loci_from_evidence",
+    "_annotate_segdup_on_breakpoint_windows",
+    "_annotate_low_mappability_on_windows",
+    "_annotate_giab_highconf_on_windows",
+    "_annotate_gap_on_windows",
+    "_annotate_encode_blacklist_on_windows",
+    "_aggregate_split_metrics",
+    "_aggregate_discordant_metrics",
+    "_compute_enrichment",
+    "_annotate_candidate_loci",
+    "_write_candidate_loci_table",
+    "annotate_segdup_on_breakpoint_windows",
+]
+
+
 _RUN_T0: float | None = None
+
+# Named constants for magic numbers
+_DEFAULT_WINDOW_SIZE = 200
+_DEFAULT_SPLIT_CLUSTER_BP = 100
+_DEFAULT_DISCORDANT_CLUSTER_BP = 400
+_DEFAULT_MAX_LOCUS_SPAN_BP = 2000
+_DEFAULT_PSEUDOCOUNT = 1.0
+_DEFAULT_SEGDUP_MIN_FRACTION = 0.1
+_DEFAULT_MAPPABILITY_LOW_THRESHOLD = 0.5
+_DEFAULT_MAPPABILITY_MIN_FRACTION = 0.5
+_DEFAULT_GAP_MIN_FRACTION = 0.1
+_DEFAULT_ENCODE_BLACKLIST_MIN_FRACTION = 0.1
 
 
 def _progress(msg: str) -> None:

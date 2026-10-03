@@ -157,10 +157,10 @@ def test_the_read_callset_signature_only_pulls_the_columns_it_needs():
 
 UNIQUE_SITES_HEADER = [
     "site_id", "chrom", "representative_pos", "representative_sample", "family",
-    "insertion_orientation", "host_name", "host_start0", "host_end0", "host_strand",
-    "host_len", "host_offset_5p_0based", "host_selection_rule", "n_carriers",
-    "samples", "private", "private_to_sample", "window_bp",
-    "tsd_overlap_within_site", "site_allele_count", "site_allele_freq",
+    "insertion_orientation", "same_family_nested_state", "host_name", "host_start0",
+    "host_end0", "host_strand", "host_len", "host_offset_5p_0based",
+    "host_selection_rule", "n_carriers", "samples", "private", "private_to_sample",
+    "window_bp", "tsd_overlap_within_site", "site_allele_count", "site_allele_freq",
     "pooled_site_matched",
 ]
 
@@ -177,6 +177,9 @@ def _site_row(**overrides) -> dict:
     base = {
         "site_id": "US00001", "chrom": "chr1", "representative_pos": "1000",
         "representative_sample": "S1", "family": "ALU", "insertion_orientation": "+",
+        # Every fixture site is in the nested cohort by default; the tests that
+        # care about the unnested arm override this explicitly.
+        "same_family_nested_state": "nested_sense",
         "host_name": "AluSx1", "host_start0": "900", "host_end0": "1200",
         "host_strand": "+", "host_len": "300", "host_offset_5p_0based": "100",
         "host_selection_rule": "longest_span", "n_carriers": "1", "samples": "S1",
@@ -611,3 +614,141 @@ def test_the_rmsk_stream_keeps_a_host_touching_a_wanted_host_edge(tmp_path):
     )
     keep = common.read_rmsk_intervals(path, {"chr1": [(1000, 1200, "H")]})
     assert keep["chr1"] == [(1000, 1100, "B")]
+
+
+# --------------------------------------------------------------------------
+# the cohort: settled, explicit, and stated in the load report
+# --------------------------------------------------------------------------
+
+
+def test_the_cohort_is_every_nested_site_not_only_the_sense_ones(tmp_path):
+    """The single question this module now answers, pinned.
+
+    A published Phase 4 run used 763 sites -- the `nested_sense` count of the
+    5-genome table -- and dropped every antisense-nested site. Those are real
+    nested insertions, excluded on a criterion that matches no cell of the
+    pre-registered design. Because the two nesting strata carry different
+    orientation mixes, dropping them also biases the `n_sense - n_antisense`
+    contrast the interaction cells report: an A/B on identical input moved the
+    primary interaction cell from +5 to +8, and the same-host IBD count from 25
+    to 0. The cells are not made vacuous by the filter -- they are made wrong.
+    """
+    path = tmp_path / "us.csv"
+    _write_unique_sites(
+        path,
+        [
+            _site_row(site_id="sense", same_family_nested_state="nested_sense"),
+            _site_row(site_id="anti", same_family_nested_state="nested_antisense"),
+            _site_row(site_id="unknown", same_family_nested_state="nested_unknown"),
+            _site_row(site_id="flat", same_family_nested_state="unnested"),
+        ],
+    )
+    rows, report = common.load_unique_sites(path)
+    assert [s["site_id"] for s in rows] == ["sense", "anti", "unknown"]
+    assert report["dropped_not_nested"] == 1
+    assert report["excluded_nesting_states"] == {"unnested": 1}
+    assert report["cohort_nesting_states"] == {
+        "nested_antisense": 1,
+        "nested_sense": 1,
+        "nested_unknown": 1,
+    }
+
+
+def test_cohort_membership_is_not_the_orientation_field(tmp_path):
+    """Orientation and nesting are independent axes; neither implies the other.
+
+    In the shipped data only 558 of 1,197 `nested_sense` sites are `+`, so
+    "restrict to sense" and "restrict to nested_sense" select different,
+    arbitrary halves. A cohort filter keyed on `insertion_orientation` would
+    silently answer a different question than the one pre-registered.
+    """
+    path = tmp_path / "us.csv"
+    _write_unique_sites(
+        path,
+        [
+            _site_row(site_id="a", same_family_nested_state="nested_sense",
+                      insertion_orientation="-"),
+            _site_row(site_id="b", same_family_nested_state="nested_antisense",
+                      insertion_orientation="+"),
+        ],
+    )
+    rows, _ = common.load_unique_sites(path)
+    assert len(rows) == 2
+
+
+def test_an_unplaced_site_is_not_treated_as_nested():
+    """A missing state is not evidence of nesting.
+
+    Admitting empty states would let the cohort grow every time the producer
+    degrades, which is the opposite of a gate.
+    """
+    for value in ("", "   ", None, "NESTED", "unknown", "Nested"):
+        assert common.is_nested_site(value) is False
+    for value in ("nested", "nested_sense", "nested_antisense", "nested_unknown"):
+        assert common.is_nested_site(value) is True
+
+
+def test_the_load_report_states_the_cohort_rule_it_applied(tmp_path):
+    """Every artifact has to say which cohort produced it.
+
+    Two scripts disagreed about the cohort size on one input for a long time
+    because neither wrote the rule down. The rule text is now part of the load
+    report, so it travels into both Phase 4 JSONs.
+    """
+    path = tmp_path / "us.csv"
+    _write_unique_sites(path, [_site_row()])
+    _rows, report = common.load_unique_sites(path)
+    assert report["cohort_rule"] == common.COHORT_RULE
+    assert "same_family_nested_state" in report["cohort_rule"]
+    assert "nested_sense" in report["cohort_rule"]
+    assert "nested_antisense" in report["cohort_rule"]
+
+
+def test_the_cohort_column_is_required_rather_than_defaulted(tmp_path):
+    """The cohort predicate must not be able to fail open.
+
+    `same_family_nested_state` is what decides membership. If the file may omit
+    it and the predicate reads a missing value as "not nested", a table with the
+    wrong columns returns an empty cohort that looks like a null result -- the
+    same failure mode as the missing-host-geometry bug on this loader.
+    """
+    path = tmp_path / "us.csv"
+    header = [c for c in UNIQUE_SITES_HEADER if c != "same_family_nested_state"]
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        writer.writerow({name: "x" for name in header})
+    with pytest.raises(common.SchemaError) as excinfo:
+        common.load_unique_sites(path)
+    assert "same_family_nested_state" in str(excinfo.value)
+
+
+def test_rows_are_counted_in_exactly_one_drop_bucket(tmp_path):
+    """The breakdown has to reconcile, or `rows_read` stops being auditable."""
+    path = tmp_path / "us.csv"
+    _write_unique_sites(
+        path,
+        [
+            _site_row(site_id="kept"),
+            _site_row(site_id="unnested", same_family_nested_state="unnested"),
+            _site_row(site_id="chrY", chrom="chrY"),
+            _site_row(site_id="y_and_unnested", chrom="chrY",
+                      same_family_nested_state="unnested"),
+            _site_row(site_id="no_geometry", host_len=""),
+        ],
+    )
+    rows, report = common.load_unique_sites(path)
+    assert report["rows_read"] == 5
+    assert (
+        report["rows_in_scope"]
+        + report["dropped_not_nested"]
+        + report["dropped_out_of_scope_contig"]
+        + report["dropped_missing_geometry"]
+        == report["rows_read"]
+    )
+    assert report["rows_in_scope"] == len(rows) == 1
+    # Nesting is decided before scope, so a chrY unnested row is counted as
+    # unnested rather than double-counted under both buckets.
+    assert report["dropped_not_nested"] == 2
+    assert report["dropped_out_of_scope_contig"] == 1
+    assert report["dropped_missing_geometry"] == 1

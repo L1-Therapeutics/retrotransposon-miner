@@ -2955,7 +2955,7 @@ def generate_gold_read_architecture_plots(
             )
             status = "ok"
             err = ""
-        except Exception as exc:  # noqa: BLE001 - keep batch going
+        except (RuntimeError, ValueError, OSError) as exc:  # noqa: BLE001 - keep batch going
             status = "error"
             err = str(exc)
             click.echo(f"[read-arch] failed {chrom}:{ws}-{we}: {exc}")

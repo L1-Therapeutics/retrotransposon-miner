@@ -623,6 +623,26 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
         "orientation table is not scanned."
     )
     lines.append("")
+    cohort = report["cohort_definition"]
+    states = ", ".join(
+        f"{state} {count:,}"
+        for state, count in sorted(cohort["nesting_states_in_cohort"].items())
+    )
+    lines.append(
+        f"**Cohort: {cohort['sites_in_cohort']:,} nested insertion sites** ({states}), "
+        f"shared with `scripts/recurrence_test.py`. Membership is the producer's "
+        "strand-derived `same_family_nested_state` beginning with `nested`, so both "
+        "orientation classes are in scope and `insertion_orientation` remains an "
+        "independent axis. An earlier version of this analysis used a "
+        "`nested_sense`-only cohort and has been withdrawn: it dropped 319 real "
+        "nested insertions on a criterion matching no cell of the design, and "
+        "because the two nesting strata carry different orientation mixes it "
+        "shifted the `n_sense - n_antisense` contrast the interaction cells "
+        "report. On identical input it moved this cohort's primary interaction "
+        "cell from +5 to +8 and the same-host IBD count from 25 to 0. The full "
+        "rule is recorded in `load_report.cohort_rule`."
+    )
+    lines.append("")
 
     lines.append("## Headline")
     lines.append("")
@@ -887,6 +907,21 @@ def main(argv: list[str] | None = None) -> int:
             "seed": args.seed,
         },
         "load_report": load_report,
+        "cohort_definition": {
+            "rule": common.COHORT_RULE,
+            "sites_in_cohort": len(sites),
+            "nesting_states_in_cohort": dict(
+                sorted(
+                    collections.Counter(
+                        s["site_nested_state"] for s in sites
+                    ).items()
+                )
+            ),
+            "same_cohort_as_recurrence_test": (
+                "both scripts take the cohort from nested_multi_sample_common."
+                "load_unique_sites; neither re-derives it"
+            ),
+        },
         "join_verification": join,
         "nested_enum_census": census,
         "nested_enum_note": (

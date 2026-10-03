@@ -343,7 +343,8 @@ def test_only_the_requested_host_family_enters_the_table():
 
 HEADER = [
     "site_id", "chrom", "representative_pos", "representative_sample", "family",
-    "insertion_orientation", "host_name", "host_start0", "host_end0", "host_strand",
+    "insertion_orientation", "same_family_nested_state", "host_name", "host_start0",
+    "host_end0", "host_strand",
     "host_len", "host_offset_5p_0based", "host_selection_rule", "n_carriers",
     "samples", "private", "private_to_sample", "window_bp", "tsd_overlap_within_site",
     "site_allele_count", "site_allele_freq", "pooled_site_matched",
@@ -376,7 +377,12 @@ def _fixture(tmp_path: Path, n_hosts: int = 30):
                 {
                     "site_id": site_id, "chrom": "chr1", "representative_pos": str(pos),
                     "representative_sample": "S1", "family": "ALU",
-                    "insertion_orientation": orient, "host_name": "AluSx1",
+                    "insertion_orientation": orient,
+                    # Constant, so `orientation` is the only varying axis: the
+                    # two are independent fields in the real data and a fixture
+                    # that tied them together would hide a cohort bug.
+                    "same_family_nested_state": "nested_sense",
+                    "host_name": "AluSx1",
                     "host_start0": str(start), "host_end0": str(start + 300),
                     "host_strand": "+", "host_len": "300",
                     "host_offset_5p_0based": str(offset),

@@ -1,3 +1,9 @@
+"""Extract split-read and discordant paired-end MEI evidence from BAMs.
+
+Parses alignment CIGARs to identify soft-clip breakpoints, polyA/T tails,
+and discordant pairs indicative of retrotransposon insertions.
+"""
+
 from __future__ import annotations
 
 import os
@@ -13,6 +19,42 @@ import pysam
 
 from ._utils import _longest_poly_at_span, _poly_at_stats
 from .bam_io import open_alignment
+
+
+__all__ = [
+    "ExtractionSummary",
+    "same_alignment_path",
+    "clone_sample_evidence_tables",
+    "clone_extraction_summary",
+    "extract_split_evidence",
+    "extract_discordant_evidence",
+    "extract_split_and_discordant_evidence",
+    "_normalize_regions",
+    "_parse_region_to_bounds",
+    "_iter_reads_for_regions",
+    "_collect_soft_clips",
+    "_soft_clip_query_seq",
+    "_longest_soft_clip_from_read",
+    "_clip_to_poly_at_region",
+    "_poly_at_breakpoint_proximal_stats",
+]
+
+
+# Named constants for magic numbers
+_DEFAULT_MIN_MAPQ = 20
+_DEFAULT_MIN_CLIP_LEN = 20
+_DEFAULT_POLY_TAIL_RESCUE_MIN_CLIP_LEN = 8
+_DEFAULT_POLY_TAIL_RESCUE_MIN_RUN = 8
+_DEFAULT_POLY_TAIL_RESCUE_MIN_FRAC = 0.8
+_DEFAULT_SHORT_MEI_RESCUE_MIN_CLIP_LEN = 12
+_DEFAULT_DISCORDANT_QUANTILE = 0.995
+_DEFAULT_DISCORDANT_MIN_ABS_TLEN = 1000
+_DEFAULT_DISCORDANT_POLY_TAIL_RESCUE_WINDOW_BASES = 25
+_DEFAULT_DISCORDANT_POLY_TAIL_RESCUE_MIN_RUN = 10
+_DEFAULT_DISCORDANT_POLY_TAIL_RESCUE_MIN_FRAC = 0.8
+_DEFAULT_DISCORDANT_POLY_TAIL_RESCUE_MIN_ABS_TLEN = 500
+_DEFAULT_DISCORDANT_MATE_FETCH_WINDOW_BP = 500
+_FULL_READ_POLY_AT_MIN_LEN = 140
 
 
 @dataclass

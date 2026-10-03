@@ -1,3 +1,9 @@
+"""Per-locus local assembly (SPAdes) for silver-tier MEI candidates.
+
+Extracts reads from disease/control BAM stacks, runs SPAdes, aligns contigs
+back to the MEI panel with minimap2, and annotates assembly-derived features.
+"""
+
 from __future__ import annotations
 
 import gzip
@@ -19,13 +25,17 @@ import pysam
 from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
 from .bam_io import open_alignment
 
-_MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
-_MINIMAP2_INDEX_LOCK = threading.Lock()
-_MEI_FASTA_LENGTH_CACHE: dict[str, dict[str, int]] = {}
-_MEI_FASTA_LENGTH_CACHE_LOCK = threading.Lock()
-_MIN_SIDE_ANCHOR_ALN_LEN = 30
-_MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
-_ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
+
+__all__ = [
+    "annotate_silver_with_local_assembly",
+    "_MINIMAP2_INDEX_CACHE",
+    "_MINIMAP2_INDEX_LOCK",
+    "_MEI_FASTA_LENGTH_CACHE",
+    "_MEI_FASTA_LENGTH_CACHE_LOCK",
+    "_MIN_SIDE_ANCHOR_ALN_LEN",
+    "_MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE",
+    "_ASSEMBLY_FEATURE_SCHEMA_VERSION",
+]
 
 
 def _window_locus_id_from_row(row: pd.Series) -> str:

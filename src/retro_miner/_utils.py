@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import IO
 
 
+# Named constants for magic numbers
+_FULL_READ_POLY_AT_MIN_LEN = 140
+_POLY_AT_MIN_LEN_DEFAULT = 25
+_POLY_AT_MIN_FRAC_DEFAULT = 0.90
+_SAFE_LOCUS_CHAR_REPLACEMENT = "_"
+
+
 def safe_locus_id(chrom: str, start: int, end: int) -> str:
     """Return a filesystem-safe locus identifier string.
 

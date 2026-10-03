@@ -287,7 +287,7 @@ def _default_head_size(uri: str) -> int | None:
         with urllib.request.urlopen(request, timeout=60) as resp:
             cl = resp.headers.get("Content-Length")
             return int(cl) if cl else None
-    except Exception:  # noqa: BLE001
+    except (OSError, ValueError):  # noqa: BLE001
         return None
 
 
@@ -371,7 +371,7 @@ def apply_bam_stage(
                 copy_fn(idx_uri, idx_dest)
                 if idx_dest.is_file() and idx_dest.stat().st_size > 0:
                     return
-            except Exception as exc:  # noqa: BLE001
+            except (OSError, RuntimeError) as exc:
                 last_err = str(exc)
                 continue
         raise RuntimeError(

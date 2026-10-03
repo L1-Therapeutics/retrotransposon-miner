@@ -1,3 +1,9 @@
+"""Generate IGV snapshot PNGs for gold-review MEI loci.
+
+Manages a headless IGV batch session and captures locus-specific screenshots
+for manual review.
+"""
+
 from __future__ import annotations
 
 import atexit
@@ -19,7 +25,17 @@ import pandas as pd
 from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
 from .bam_io import alignment_path_is_cram, open_alignment, resolve_alignment_reference
 
-_XVFB_PROC: subprocess.Popen[bytes] | None = None
+
+__all__ = [
+    "generate_gold_review_igv_plots",
+    "_pid_is_alive",
+    "_find_igv_launcher",
+    "_make_igv_batch_session",
+    "_igv_snapshot_for_locus",
+    "_IGV_LAUNCHER_ENV_VAR",
+    "_XVFB_PROC",
+    "_XVFB_LOCK",
+]
 
 
 def _pid_is_alive(pid: int) -> bool:

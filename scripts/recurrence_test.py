@@ -554,6 +554,27 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
         "review."
     )
     lines.append("")
+    cohort = report["cohort_definition"]
+    states = ", ".join(
+        f"{state} {count:,}"
+        for state, count in sorted(cohort["nesting_states_in_cohort"].items())
+    )
+    lines.append(
+        f"**Cohort: {cohort['sites_in_cohort']:,} nested insertion sites** ({states}), "
+        "the same cohort `scripts/joint_enrichment.py` uses -- both take it from "
+        "`nested_multi_sample_common.load_unique_sites`. An earlier version of this "
+        "analysis re-derived \"nested\" from the per-call legacy `NESTED` field, "
+        "which is computed under a different host-selection rule and labels every "
+        "antisense-nested site `unnested`; that filter deleted 319 sites and put "
+        "the two scripts on different cohorts from one input file. It also "
+        "suppressed the result: on identical input the `nested_sense`-only cohort "
+        "reported 0 IBD same-host pairs against 9 candidate, both below its own "
+        "chance expectation, where this cohort finds 25 IBD. "
+        f"{cohort['sites_whose_any_call_carries_legacy_nested_label']:,} of "
+        f"{cohort['sites_in_cohort']:,} sites carry the legacy `nested` label on at "
+        "least one call. That count is reported, not obeyed."
+    )
+    lines.append("")
 
     lines.append("## Headline")
     lines.append("")
@@ -802,8 +823,39 @@ def main(argv: list[str] | None = None) -> int:
             "per-call join disagrees with the dedup output; refusing to continue: "
             f"{json.dumps(join)}"
         )
-    nested = [s for s in sites if any(c["nested_state"].startswith("nested") for c in s["calls"])]
-    print(f"nested unique sites: {len(nested)} across {len(samples)} genomes", flush=True)
+    # The cohort is the loader's, per `common.COHORT_RULE`. This script used to
+    # re-derive "nested" from the per-call legacy VCF label, which is a
+    # different field computed under a different host-selection rule. On the
+    # shipped table that put this script on 1,197 sites while
+    # `joint_enrichment.py` reported 1,516 for the same input -- two published
+    # cohorts from one file. It is now a recorded diagnostic instead of a
+    # selection, so the divergence stays visible without steering the analysis.
+    nested = sites
+    legacy_labelled = [
+        s
+        for s in sites
+        if any(c["nested_state"].startswith("nested") for c in s["calls"])
+    ]
+    cohort_definition = {
+        "rule": common.COHORT_RULE,
+        "sites_in_cohort": len(nested),
+        "nesting_states_in_cohort": dict(
+            sorted(collections.Counter(s["site_nested_state"] for s in nested).items())
+        ),
+        "sites_whose_any_call_carries_legacy_nested_label": len(legacy_labelled),
+        "legacy_label_note": (
+            "diagnostic only. The legacy binary per-call NESTED field and the "
+            "producer's strand-derived four-state nesting disagree on antisense "
+            "sites by construction (see verify_join). It is reported so the size "
+            "of that disagreement is on the record; it does not select the "
+            "cohort, because doing so silently deleted every antisense site."
+        ),
+    }
+    print(
+        f"nested unique sites: {len(nested)} across {len(samples)} genomes "
+        f"(legacy label would have selected {len(legacy_labelled)})",
+        flush=True,
+    )
 
     census = common.nested_census_for_sites(sites)
 
@@ -878,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
         "n_genomes": len(samples),
         "genomes": samples,
         "nested_unique_sites": len(nested),
+        "cohort_definition": cohort_definition,
         "load_report": load_report,
         "join_verification": join,
         "nested_enum_census": census,

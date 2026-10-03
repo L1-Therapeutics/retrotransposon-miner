@@ -1631,7 +1631,7 @@ def _hydrate_discordant_mate_cache(
         return out, 0
     try:
         cache = pd.read_parquet(cache_path)
-    except Exception as exc:  # noqa: BLE001 - stale cache must not block annotation
+    except (OSError, pd.errors.ParserError, ValueError) as exc:  # noqa: BLE001 - stale cache must not block annotation
         click.echo(f"[mei-annotate] ignoring unreadable mate cache {cache_path}: {exc}")
         return out, 0
     required = _MATE_CACHE_KEYS + _MATE_CACHE_FIELDS
@@ -12084,7 +12084,7 @@ def _sample_random_windows(
         )
         if not sampled.empty:
             return sampled
-    except Exception:  # noqa: BLE001 - bedtools shuffle may raise anything; fall back to Python sampler
+    except (RuntimeError, OSError, ValueError):  # noqa: BLE001 - bedtools shuffle may raise anything; fall back to Python sampler
         click.echo("[mei-annotate] empirical stage: bedtools sampling unavailable; using python fallback")
 
     allowed_intervals = _load_bed_intervals(highconf_bed) if highconf_bed is not None else {}
@@ -16996,7 +16996,7 @@ def annotate_candidate_loci_with_mei(
                     gold_only=True,
                     top_n=read_architecture_top_n,
                 )
-            except Exception as exc:  # noqa: BLE001 - do not fail annotate on plot errors
+            except (RuntimeError, ValueError, OSError) as exc:  # noqa: BLE001 - do not fail annotate on plot errors
                 click.echo(f"[mei-annotate] read-architecture plot generation failed: {exc}")
     click.echo(f"[mei-annotate] wrote {len(candidate)} rows to {out_path}")
     click.echo(f"[mei-annotate] total annotate walltime={time.monotonic() - total_t0:.1f}s")

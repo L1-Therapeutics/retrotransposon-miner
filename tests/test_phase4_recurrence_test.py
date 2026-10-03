@@ -298,7 +298,8 @@ def test_the_ibd_affirmation_rate_is_measured_not_assumed():
 
 HEADER = [
     "site_id", "chrom", "representative_pos", "representative_sample", "family",
-    "insertion_orientation", "host_name", "host_start0", "host_end0", "host_strand",
+    "insertion_orientation", "same_family_nested_state", "host_name", "host_start0",
+    "host_end0", "host_strand",
     "host_len", "host_offset_5p_0based", "host_selection_rule", "n_carriers",
     "samples", "private", "private_to_sample", "window_bp", "tsd_overlap_within_site",
     "site_allele_count", "site_allele_freq", "pooled_site_matched",
@@ -330,7 +331,8 @@ def _fixture(tmp_path: Path):
             {
                 "site_id": site_id, "chrom": "chr1", "representative_pos": str(pos),
                 "representative_sample": "S1", "family": "ALU",
-                "insertion_orientation": "+", "host_name": "AluSx1",
+                "insertion_orientation": "+",
+                "same_family_nested_state": "nested_sense", "host_name": "AluSx1",
                 "host_start0": str(start), "host_end0": str(start + 300),
                 "host_strand": "+", "host_len": "300",
                 "host_offset_5p_0based": str(pos - start),
@@ -449,3 +451,156 @@ def test_the_denominator_caveat_rejects_comparison_to_pooled_svAN(tmp_path):
     for block in report["per_family"].values():
         assert "hosts_total" in block
         assert "carrier_observations" in block
+
+
+# --------------------------------------------------------------------------
+# the cohort is the loader's, and the legacy label does not select it
+# --------------------------------------------------------------------------
+
+
+def _mixed_orientation_fixture(tmp_path: Path):
+    """One sense site, one antisense site; their calls disagree about nesting.
+
+    The antisense site's call carries the legacy `NESTED=unnested` label, which
+    is what this cohort's exporter actually emits for every antisense insertion.
+    """
+    us = tmp_path / "unique_sites.csv"
+    callset = tmp_path / "callsets"
+    callset.mkdir()
+    rows = [
+        {
+            "site_id": "US0001", "chrom": "chr1", "representative_pos": "1000",
+            "representative_sample": "S1", "family": "ALU",
+            "insertion_orientation": "+", "same_family_nested_state": "nested_sense",
+            "host_name": "AluSx1", "host_start0": "900", "host_end0": "1200",
+            "host_strand": "+", "host_len": "300", "host_offset_5p_0based": "100",
+            "host_selection_rule": "longest_span", "n_carriers": "1", "samples": "S1",
+            "private": "True", "private_to_sample": "S1", "window_bp": "10",
+            "tsd_overlap_within_site": "0", "site_allele_count": "1",
+            "site_allele_freq": "0.2", "pooled_site_matched": "False",
+        },
+        {
+            "site_id": "US0002", "chrom": "chr1", "representative_pos": "5000",
+            "representative_sample": "S1", "family": "ALU",
+            "insertion_orientation": "-",
+            "same_family_nested_state": "nested_antisense",
+            "host_name": "AluSx1", "host_start0": "4900", "host_end0": "5200",
+            "host_strand": "+", "host_len": "300", "host_offset_5p_0based": "100",
+            "host_selection_rule": "longest_span", "n_carriers": "1", "samples": "S1",
+            "private": "True", "private_to_sample": "S1", "window_bp": "10",
+            "tsd_overlap_within_site": "0", "site_allele_count": "1",
+            "site_allele_freq": "0.2", "pooled_site_matched": "False",
+        },
+    ]
+    with us.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=HEADER)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    vcf = [
+        VCF_HEADER,
+        "chr1\t1000\tUS0001\tN\t<INS>\t.\t.\tNESTED=nested;ORIENT=+;"
+        "MEIFAMILY=ALU;MEISUBFAMILY=AluYb9#SINE/Alu;TSD=ACGTACGTACGT\tGT\t0/1",
+        # Same producer state, opposite legacy label. This is the disagreement
+        # the old filter resolved by deleting the site.
+        "chr1\t5000\tUS0002\tN\t<INS>\t.\t.\tNESTED=unnested;ORIENT=-;"
+        "MEIFAMILY=ALU;MEISUBFAMILY=AluYb9#SINE/Alu;TSD=ACGTACGTACGT\tGT\t0/1",
+    ]
+    (callset / "S1.vcf").write_text("\n".join(vcf) + "\n")
+    return us, callset
+
+
+def test_an_antisense_site_stays_in_the_cohort_when_its_call_says_unnested(tmp_path):
+    """Regression for the 763-site run.
+
+    This script used to re-derive "nested" from the per-call legacy `NESTED`
+    field, which is computed under a different host-selection rule and reports
+    `unnested` for every antisense site. The filter therefore deleted the whole
+    antisense arm and put this script on a different cohort than
+    `joint_enrichment.py` for one and the same input file. The cohort is the
+    loader's now, and the legacy label is recorded rather than obeyed.
+    """
+    us, callset = _mixed_orientation_fixture(tmp_path)
+    out = tmp_path / "out"
+    rc = rt.main(
+        [
+            "--unique-sites", str(us),
+            "--callset-dir", str(callset),
+            "--outdir", str(out),
+            "--chance-draws", "50",
+        ]
+    )
+    assert rc == 0
+    report = json.loads((out / "recurrence.json").read_text())
+    cohort = report["cohort_definition"]
+    assert cohort["sites_in_cohort"] == 2
+    assert cohort["nesting_states_in_cohort"] == {
+        "nested_antisense": 1,
+        "nested_sense": 1,
+    }
+    # The legacy label is still reported, and it still disagrees -- that is the
+    # point of recording it rather than deleting on it.
+    assert cohort["sites_whose_any_call_carries_legacy_nested_label"] == 1
+    assert report["nested_unique_sites"] == 2
+    assert report["load_report"]["dropped_not_nested"] == 0
+
+
+def test_both_phase4_scripts_report_the_same_cohort_on_one_input(tmp_path):
+    """One file, one cohort, two scripts.
+
+    This is the invariant that was broken: `joint_enrichment.py` took whatever
+    the loader returned while `recurrence_test.py` re-derived "nested" from the
+    per-call legacy label, so the two published different cohorts from one input
+    (1,516 against 1,197). Asserted behaviourally on a fixture that contains
+    the exact disagreement -- an antisense site whose call is labelled
+    `unnested` -- so a reintroduction fails here rather than in a report.
+    """
+    import joint_enrichment as je
+
+    us, callset = _mixed_orientation_fixture(tmp_path)
+    jout = tmp_path / "joint"
+    assert je.main(
+        [
+            "--unique-sites", str(us),
+            "--callset-dir", str(callset),
+            "--outdir", str(jout),
+            "--replicates", "50",
+            "--bootstrap", "50",
+        ]
+    ) == 0
+    rout = tmp_path / "rec"
+    assert rt.main(
+        [
+            "--unique-sites", str(us),
+            "--callset-dir", str(callset),
+            "--outdir", str(rout),
+            "--chance-draws", "50",
+        ]
+    ) == 0
+
+    joint = json.loads((jout / "joint_enrichment.json").read_text())
+    recurrence = json.loads((rout / "recurrence.json").read_text())
+    assert (
+        joint["cohort_definition"]["sites_in_cohort"]
+        == recurrence["cohort_definition"]["sites_in_cohort"]
+        == 2
+    )
+    assert (
+        joint["load_report"]["cohort_nesting_states"]
+        == recurrence["load_report"]["cohort_nesting_states"]
+    )
+
+
+def test_neither_phase4_script_re_derives_the_cohort():
+    """The cohort rule has exactly one home.
+
+    A cheap source-level guard next to the behavioural one above: it fails the
+    moment someone reintroduces a local cohort filter, which is the specific
+    edit that caused the drift.
+    """
+    for name in ("joint_enrichment.py", "recurrence_test.py"):
+        source = (SCRIPTS / name).read_text()
+        assert "common.COHORT_RULE" in source, f"{name} does not cite the cohort rule"
+        assert "nested = [s for s in sites" not in source, (
+            f"{name} filters the cohort itself; it must use the loader's"
+        )
