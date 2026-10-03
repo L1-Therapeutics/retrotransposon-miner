@@ -2204,7 +2204,7 @@ def _hydrate_sample_mei_hits_from_detail(
                     m[c] = strand.where(strand.isin(["+", "-"]), "")
             for c in ("mei_hit", "mate_mei_hit", "vntr_rescue", "polya_rescue"):
                 if c in m.columns:
-                    m[c] = m[c].fillna(False).infer_objects(copy=False).astype(bool)
+                    m[c] = m[c].fillna(False).infer_objects().astype(bool)
             if "mei_hit_source" in m.columns:
                 m["mei_hit_source"] = m["mei_hit_source"].fillna("").astype(str)
             m["mei_score"] = (
@@ -2217,7 +2217,7 @@ def _hydrate_sample_mei_hits_from_detail(
             )
             for c in ("mei_hit", "mate_mei_hit", "vntr_rescue", "polya_rescue"):
                 if c in disc_hits.columns:
-                    disc_hits[c] = disc_hits[c].fillna(False).infer_objects(copy=False).astype(bool)
+                    disc_hits[c] = disc_hits[c].fillna(False).infer_objects().astype(bool)
             disc_hits["target"] = disc_hits["target"].fillna("").astype(str)
             disc_hits["mate_mei_target"] = disc_hits.get(
                 "mate_mei_target", pd.Series("", index=disc_hits.index)
@@ -4546,7 +4546,7 @@ def _split_polya_member_mask(split_df: pd.DataFrame) -> pd.Series:
         return pd.Series(dtype=bool)
     mask = pd.Series(False, index=split_df.index)
     if "poly_tail_rescued" in split_df.columns:
-        mask = mask | split_df["poly_tail_rescued"].fillna(False).infer_objects(copy=False).astype(bool)
+        mask = mask | split_df["poly_tail_rescued"].fillna(False).infer_objects().astype(bool)
     if "clip_poly_at_run" in split_df.columns:
         mask = mask | (
             pd.to_numeric(split_df["clip_poly_at_run"], errors="coerce").fillna(0).astype(int) >= 8
@@ -4805,9 +4805,9 @@ def _build_supporting_reads_detail_table(
             out[col] = default
     out["mei_strand"] = out["mei_strand"].fillna("").astype(str)
     out["mate_mei_strand"] = out["mate_mei_strand"].fillna("").astype(str)
-    out["short_mei_seed_rescued"] = out["short_mei_seed_rescued"].fillna(False).infer_objects(copy=False).astype(bool)
+    out["short_mei_seed_rescued"] = out["short_mei_seed_rescued"].fillna(False).infer_objects().astype(bool)
     out["polya_rescue"] = out["polya_rescue"].fillna(False).astype(bool)
-    out["poly_tail_rescued"] = out["poly_tail_rescued"].fillna(False).infer_objects(copy=False).astype(bool)
+    out["poly_tail_rescued"] = out["poly_tail_rescued"].fillna(False).infer_objects().astype(bool)
     return out
 
 
@@ -5526,8 +5526,8 @@ def _poly_at_artifact_tsd_mask(tsd_seq: pd.Series) -> pd.Series:
     """True for sequences that are polyA/polyT tails, not real TSDs."""
     tsd_seq_s = tsd_seq.fillna("").astype(str).str.upper()
     tsd_len_s = tsd_seq_s.str.len().astype(int)
-    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects(copy=False).astype(float)
-    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects(copy=False).astype(float)
+    a_fraction = (tsd_seq_s.str.count("A") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects().astype(float)
+    t_fraction = (tsd_seq_s.str.count("T") / tsd_len_s.replace(0, pd.NA)).fillna(0.0).infer_objects().astype(float)
     dominant_poly_fraction = pd.concat([a_fraction, t_fraction], axis=1).max(axis=1)
     longest_at_run = tsd_seq_s.str.findall(r"[AT]+").map(
         lambda parts: max((len(p) for p in parts), default=0)
@@ -6494,7 +6494,7 @@ def _add_candidate_support_info_fields(
         else pd.Series(False, index=locus_gate.index)
     )
     control_gate_series = (
-        locus_gate["control_has_mei_support"].fillna(False).infer_objects(copy=False).astype(bool)
+        locus_gate["control_has_mei_support"].fillna(False).infer_objects().astype(bool)
         if "control_has_mei_support" in locus_gate.columns
         else pd.Series(False, index=locus_gate.index)
     )
@@ -6623,12 +6623,12 @@ def _add_candidate_support_info_fields(
         other_has_mei_col = f"{other_prefix}_has_mei_support"
         status_tbl = locus_gate.loc[:, key_cols].copy()
         status_tbl["sample_has_mei_support"] = (
-            locus_gate[sample_has_mei_col].fillna(False).infer_objects(copy=False).astype(bool)
+            locus_gate[sample_has_mei_col].fillna(False).infer_objects().astype(bool)
             if sample_has_mei_col in locus_gate.columns
             else pd.Series(False, index=locus_gate.index)
         )
         status_tbl["other_has_mei_support"] = (
-            locus_gate[other_has_mei_col].fillna(False).infer_objects(copy=False).astype(bool)
+            locus_gate[other_has_mei_col].fillna(False).infer_objects().astype(bool)
             if other_has_mei_col in locus_gate.columns
             else pd.Series(False, index=locus_gate.index)
         )
@@ -10491,8 +10491,12 @@ def _series_flag(df: pd.DataFrame, *names: str) -> pd.Series:
 
 def _row_is_polya_evidence(df: pd.DataFrame) -> pd.Series:
     out = _series_flag(df, "polya_rescue", "poly_tail_rescued", "poly_tail_anchor_rescued")
-    if "clip_poly_at_run" in df.columns:
-        out = out | (pd.to_numeric(df["clip_poly_at_run"], errors="coerce").fillna(0).astype(int) >= 8)
+    # Split evidence carries clip_poly_at_run, discordant evidence carries
+    # anchor_poly_at_run for the same concept. Checking only the first would
+    # silently skip the run-length rule for every discordant row.
+    for run_col in ("clip_poly_at_run", "anchor_poly_at_run"):
+        if run_col in df.columns:
+            out = out | (pd.to_numeric(df[run_col], errors="coerce").fillna(0).astype(int) >= 8)
     return out
 
 
@@ -10697,6 +10701,13 @@ def _genomic_flank_evidence_table(
 
 
 def _event_orientation_series(df: pd.DataFrame) -> pd.Series:
+    """Return the insertion orientation for each locus.
+
+    Preference order: ``consensus_insertion_orientation``,
+    ``insertion_orientation``, ``disease_insertion_orientation``,
+    ``control_insertion_orientation``. Values are normalized to ``"+"``,
+    ``"-"``, or ``""`` when unknown.
+    """
     ori = pd.Series("", index=df.index, dtype="object")
     for col in (
         "consensus_insertion_orientation",
@@ -10711,6 +10722,16 @@ def _event_orientation_series(df: pd.DataFrame) -> pd.Series:
     return ori.where(ori.isin(["+", "-"]), "")
 
 
+def _flank_count(df: pd.DataFrame, prefix: str, col: str) -> pd.Series:
+    """Return a flank-count column as a clean integer Series.
+
+    Missing columns are treated as 0. Non-numeric values are coerced
+    to NaN then filled with 0.
+    """
+    raw = _df_col_series(df, f"{prefix}_{col}", 0)
+    return pd.to_numeric(raw, errors="coerce").fillna(0).astype(int)
+
+
 def _sample_orientation_consistent_sidepair(df: pd.DataFrame, prefix: str) -> pd.Series:
     """Two-sided genomic-flank support with orientation-consistent MEI.
 
@@ -10723,10 +10744,10 @@ def _sample_orientation_consistent_sidepair(df: pd.DataFrame, prefix: str) -> pd
       side (+ → right-flank polyA; − → left-flank polyA).
     """
     min_mei = int(_GOLD_MIN_FLANK_MEI_READS)
-    l_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_mei_reads", 0), errors="coerce").fillna(0)
-    r_mei_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_mei_reads", 0), errors="coerce").fillna(0)
-    l_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_left_flank_polya_reads", 0), errors="coerce").fillna(0)
-    r_poly_n = pd.to_numeric(_df_col_series(df, f"{prefix}_right_flank_polya_reads", 0), errors="coerce").fillna(0)
+    l_mei_n = _flank_count(df, prefix, "left_flank_mei_reads")
+    r_mei_n = _flank_count(df, prefix, "right_flank_mei_reads")
+    l_poly_n = _flank_count(df, prefix, "left_flank_polya_reads")
+    r_poly_n = _flank_count(df, prefix, "right_flank_polya_reads")
     l_mei = l_mei_n >= min_mei
     r_mei = r_mei_n >= min_mei
     l_poly = l_poly_n >= 1
@@ -15725,6 +15746,11 @@ def _choose_event_family_and_subfamily(row: pd.Series) -> tuple[str, str]:
         "known_mei_polymorphism_family",
         "g1k_melt_id",
         "lr_svan_id",
+        # Consensus columns come last: they are less specific than the
+        # per-side disease/control winners above, but they are the only family
+        # label populated on rows that carry no discordant vote maps.
+        "consensus_mei_family",
+        "mei_family",
     ):
         fam = _normalize_mei_family_token(str(row.get(col, "") or ""))
         if fam:
@@ -15759,6 +15785,20 @@ def _choose_event_orientation(row: pd.Series) -> str:
         if cc in {"+", "-"}:
             return cc
     return ""
+
+
+def _to_int_or(value: object, default: int = 0) -> int:
+    """Coerce to int, treating NaN/None/unparseable as ``default``.
+
+    ``value or default`` is not sufficient: NaN is truthy, so a null
+    ``insertion_breakpoint_pos`` reaches ``int()`` and raises.
+    """
+    try:
+        if value is None or pd.isna(value):
+            return int(default)
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _bed_field(value: object, *, default: str = ".") -> str:
@@ -15846,6 +15886,14 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
 
     Uses ``bedtools intersect`` against an MEI-filtered rmsk BED (chrom-restricted
     to the candidate set). Requires ``bedtools`` on PATH.
+
+    ``nested_same_class_orientation`` is four-valued: ``unnested`` when no
+    same-family element overlaps the breakpoint, ``nested_sense`` when the
+    insertion orientation matches the element's strand, ``nested_antisense``
+    when it differs, and ``nested_unknown`` when the call is nested but
+    orientation could not be resolved on either side. Sense and antisense
+    insertions can be counted and compared against each other; ``nested_unknown``
+    belongs to neither and should be excluded from both counts.
     """
     out = candidates.copy().reset_index(drop=True)
     out["nested_repeat_overlap"] = False
@@ -15863,6 +15911,16 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
 
     chroms = set(out["chrom"].fillna("").astype(str))
     chroms.discard("")
+
+    if not chroms:
+        # Nothing to intersect against. Do not fall through: an empty chrom set
+        # makes the rmsk BED empty too, which would surface as the
+        # "rmsk table lacks repName/repClass" error below and point at the
+        # wrong input.
+        click.echo(
+            "[mei-annotate] nested-rmsk skipped: no candidate carries a usable chrom"
+        )
+        return out
 
     bedtools_bin = shutil.which("bedtools")
     if bedtools_bin is None:
@@ -15894,11 +15952,12 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             for i, row in enumerate(out.itertuples(index=False)):
                 as_row = pd.Series(row._asdict())
                 chrom = str(getattr(row, "chrom"))
-                pos_1based = int(getattr(row, "insertion_breakpoint_pos", 0) or 0)
+                pos_1based = _to_int_or(getattr(row, "insertion_breakpoint_pos", 0), 0)
                 if pos_1based <= 0:
-                    pos_1based = int(
-                        (int(getattr(row, "window_start", 1)) + int(getattr(row, "window_end", 1))) // 2
-                    )
+                    pos_1based = (
+                        _to_int_or(getattr(row, "window_start", 1), 1)
+                        + _to_int_or(getattr(row, "window_end", 1), 1)
+                    ) // 2
                 pos0 = max(0, pos_1based - 1)
                 event_family = _choose_event_family(as_row)
                 event_orientation = _choose_event_orientation(as_row)
@@ -15924,7 +15983,10 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             f"elapsed={time.monotonic() - inter_t0:.1f}s"
         )
 
-        # a(8) + b(9): pick best same-family hit (prefer same-orient, then longer).
+        # a(8) + b(9): pick the longest same-family hit, tie-broken on genomic start.
+        # Selection must not consider orientation: choosing by it would bias any
+        # downstream measure of opposite-orientation nesting toward same-orientation
+        # elements. Orientation is reported after the winner is chosen.
         post_t0 = time.monotonic()
         best: dict[int, tuple[tuple[int, int], dict[str, object]]] = {}
         for line in proc.stdout.splitlines():
@@ -15945,6 +16007,10 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
                 length = int(parts[12])
             except ValueError:
                 length = max(0, int(parts[10]) - int(parts[9]))
+            try:
+                rep_start = int(parts[9])
+            except ValueError:
+                rep_start = 0
             rep_name, strand = parts[11], parts[13]
             rep_class, rep_family, norm_fam = parts[14], parts[15], parts[16]
             if not event_fam or norm_fam != event_fam:
@@ -15952,7 +16018,15 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
             same_orient = int(
                 event_orient in {"+", "-"} and strand in {"+", "-"} and strand == event_orient
             )
-            score = (same_orient, length)
+            if event_orient in {"+", "-"} and strand in {"+", "-"}:
+                label = "nested_sense" if same_orient else "nested_antisense"
+            else:
+                # Orientation undetermined on either side: the call is nested,
+                # but sense vs antisense is not knowable. Reporting it as
+                # antisense would inflate the antisense count, so it gets its
+                # own value and callers can exclude it from either side.
+                label = "nested_unknown"
+            score = (length, -rep_start)
             rec: dict[str, object] = {
                 "nested_repeat_overlap": True,
                 "nested_repeat_name": rep_name,
@@ -15963,7 +16037,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
                 "nested_insertion_orientation": event_orient,
                 "nested_same_class": True,
                 "nested_same_orientation": bool(same_orient),
-                "nested_same_class_orientation": "nested" if same_orient else "unnested",
+                "nested_same_class_orientation": label,
             }
             prev = best.get(idx)
             if prev is None or score > prev[0]:

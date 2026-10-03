@@ -123,6 +123,124 @@ def test_nested_rmsk_bedtools_flags_same_family_hits(tmp_path: Path):
     assert out.loc[2, "nested_same_class_orientation"] == "unnested"
 
 
+# ------------------------------------------------------- three-valued nesting vocabulary
+# "unnested" means no same-family element overlaps the breakpoint. An insertion
+# inside a same-family element in the opposite orientation is still nested, so it
+# gets its own value rather than borrowing "unnested" from the no-overlap case.
+
+
+def _candidate(chrom: str, pos: int, subfamily: str, orientation: str) -> dict:
+    return {
+        "chrom": chrom,
+        "window_start": pos - 60,
+        "window_end": pos + 60,
+        "insertion_breakpoint_pos": pos,
+        "consensus_insertion_orientation": orientation,
+        "disease_L_mei_subfamily": subfamily,
+        "disease_L_mei_supported_reads": 5,
+    }
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_opposite_orientation_nesting_is_labelled_nested_antisense(tmp_path: Path):
+    """An antisense call is nested in the element it overlaps."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "-")])  # insertion - inside a + AluY
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert bool(out.loc[0, "nested_same_class"]) is True
+    assert bool(out.loc[0, "nested_same_orientation"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_antisense"
+    assert out.loc[0, "nested_same_class_orientation"] in {"nested_sense", "nested_antisense"}
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_same_orientation_nesting_is_labelled_nested_sense(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "+")])  # insertion + inside a + AluY
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert bool(out.loc[0, "nested_same_orientation"]) is True
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_sense"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_no_overlapping_element_stays_unnested(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 9000, "AluY", "-")])  # far from the element
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is False
+    assert bool(out.loc[0, "nested_same_class"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "unnested"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_opposite_and_same_orientation_nesting_are_distinguished(tmp_path: Path):
+    """The two overlapping cases must not collapse onto the same value."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n"
+        "chr22\t1000\t1500\t.\t0\t-\tAluYb\tSINE\tAlu\n",
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame(
+        [
+            _candidate("chr22", 150, "AluY", "-"),    # opposite to the + element
+            _candidate("chr22", 1200, "AluYb", "-"),  # same as the - element
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_antisense"
+    assert out.loc[1, "nested_same_class_orientation"] == "nested_sense"
+    assert out.loc[0, "nested_same_class_orientation"] != out.loc[1, "nested_same_class_orientation"]
+
+
+# ------------------------------------------------------------------ orientation-blind selection
+# The winning element must be chosen on length alone. Ranking by orientation first
+# would make any downstream count of opposite-orientation nesting partly a measure
+# of the tie-break rather than of the biology.
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_overlapping_hit_is_selected_by_length_not_orientation(tmp_path: Path):
+    """A longer opposite-orientation element must beat a shorter same-orientation one."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t100\t800\t.\t0\t-\tAluLong\tSINE\tAlu\n"   # 700 bp, opposite to a + insertion
+        "chr22\t120\t250\t.\t0\t+\tAluShort\tSINE\tAlu\n", # 130 bp, same as a + insertion
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "+")])  # inside both elements
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_repeat_name"] == "AluLong"      # longest wins
+    assert out.loc[0, "nested_repeat_strand"] == "-"
+    assert bool(out.loc[0, "nested_same_orientation"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_antisense"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_equal_length_overlapping_hits_tie_break_on_genomic_start(tmp_path: Path):
+    """Same length must still resolve deterministically, to the leftmost element."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t200\t400\t.\t0\t+\tAluRight\tSINE\tAlu\n"  # 200 bp, starts later
+        "chr22\t100\t300\t.\t0\t-\tAluLeft\tSINE\tAlu\n",   # 200 bp, starts earlier
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame([_candidate("chr22", 250, "AluY", "+")])  # inside both elements
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_repeat_name"] == "AluLeft"
+
+
 def test_nested_rmsk_requires_bedtools(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("retro_miner.mei_support.shutil.which", lambda _name: None)
     rmsk = tmp_path / "rmsk.txt"
@@ -141,3 +259,151 @@ def test_nested_rmsk_requires_bedtools(monkeypatch, tmp_path: Path):
     )
     with pytest.raises(RuntimeError, match="requires bedtools"):
         _annotate_nested_retrotransposon(cand, rmsk)
+
+
+# ------------------------------------------------- null-tolerant coordinate handling
+# NaN is truthy, so `value or 0` does not catch it and int(nan) raises.
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_null_breakpoint_falls_back_to_window_midpoint(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": 90,
+                "window_end": 210,  # midpoint 150 sits inside the element
+                "insertion_breakpoint_pos": float("nan"),
+                "consensus_insertion_orientation": "+",
+                "disease_L_mei_subfamily": "AluY",
+                "disease_L_mei_supported_reads": 5,
+            }
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_sense"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_null_window_bounds_do_not_raise(tmp_path: Path):
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame(
+        [
+            {
+                "chrom": "chr22",
+                "window_start": float("nan"),
+                "window_end": float("nan"),
+                "insertion_breakpoint_pos": 0,
+                "consensus_insertion_orientation": "+",
+                "disease_L_mei_subfamily": "AluY",
+                "disease_L_mei_supported_reads": 5,
+            }
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    # No usable coordinate, so nothing can be shown to overlap.
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is False
+    assert out.loc[0, "nested_same_class_orientation"] == "unnested"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_null_chrom_does_not_report_an_rmsk_format_error(tmp_path: Path):
+    """A null chrom must not be blamed on the rmsk table's field layout."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame(
+        [
+            {
+                "chrom": float("nan"),
+                "window_start": 90,
+                "window_end": 210,
+                "insertion_breakpoint_pos": 150,
+                "consensus_insertion_orientation": "+",
+                "disease_L_mei_subfamily": "AluY",
+                "disease_L_mei_supported_reads": 5,
+            }
+        ]
+    )
+
+    # Previously raised ValueError telling the user to supply a full rmsk table.
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert out.loc[0, "nested_same_class_orientation"] == "unnested"
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_unresolvable_orientation_is_nested_unknown_not_antisense(tmp_path: Path):
+    """An undetermined orientation must not be counted as antisense."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text("chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n", encoding="utf-8")
+    cand = pd.DataFrame([_candidate("chr22", 150, "AluY", "")])  # no resolvable orientation
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    assert bool(out.loc[0, "nested_repeat_overlap"]) is True
+    assert out.loc[0, "nested_insertion_orientation"] == ""
+    assert out.loc[0, "nested_same_class_orientation"] == "nested_unknown"
+    assert out.loc[0, "nested_same_class_orientation"] not in {"nested_sense", "nested_antisense"}
+
+
+@pytest.mark.skipif(shutil.which("bedtools") is None, reason="bedtools not on PATH")
+def test_sense_and_antisense_exclude_unknown_from_both_counts(tmp_path: Path):
+    """nested_unknown belongs to neither class, so the two counts stay clean."""
+    rmsk = tmp_path / "rmsk.txt"
+    rmsk.write_text(
+        "chr22\t100\t400\t.\t0\t+\tAluY\tSINE\tAlu\n"
+        "chr22\t1000\t1500\t.\t0\t-\tAluYb\tSINE\tAlu\n",
+        encoding="utf-8",
+    )
+    cand = pd.DataFrame(
+        [
+            _candidate("chr22", 150, "AluY", "+"),    # sense
+            _candidate("chr22", 1200, "AluYb", "-"),  # sense
+            _candidate("chr22", 1250, "AluYb", ""),   # orientation undetermined
+        ]
+    )
+
+    out = _annotate_nested_retrotransposon(cand, rmsk)
+    labels = list(out["nested_same_class_orientation"])
+    assert labels == ["nested_sense", "nested_sense", "nested_unknown"]
+    assert sum(1 for v in labels if v == "nested_sense") == 2
+    assert sum(1 for v in labels if v == "nested_antisense") == 0
+    # The unknown case is nested, but it is in neither bucket.
+    assert sum(1 for v in labels if v in {"nested_sense", "nested_antisense"}) == 2
+    assert int(out["nested_repeat_overlap"].sum()) == 3
+
+
+def test_choose_event_family_falls_back_to_consensus_column():
+    """consensus_mei_family is the only family label on most candidates.
+
+    Rows without discordant vote maps previously resolved to an empty family,
+    which made the nested annotator silently skip them.
+    """
+    from retro_miner.mei_support import _choose_event_family
+
+    assert _choose_event_family(pd.Series({"consensus_mei_family": "ALU"})) == "ALU"
+    assert _choose_event_family(pd.Series({"consensus_mei_family": "L1"})) == "LINE1"
+    assert _choose_event_family(pd.Series({"mei_family": "SVA"})) == "SVA"
+    # Subfamily labels still normalise.
+    assert _choose_event_family(pd.Series({"consensus_mei_family": "AluYb8"})) == "ALU"
+    # Absent / empty / unknown tokens stay unresolved.
+    assert _choose_event_family(pd.Series({"consensus_mei_family": ""})) == ""
+    assert _choose_event_family(pd.Series({"consensus_mei_family": float("nan")})) == ""
+    assert _choose_event_family(pd.Series({})) == ""
+
+
+def test_choose_event_family_prefers_specific_columns_over_consensus():
+    """Per-side winners must outrank the consensus column."""
+    from retro_miner.mei_support import _choose_event_family
+
+    row = pd.Series(
+        {
+            "known_mei_polymorphism_family": "SVA",
+            "consensus_mei_family": "ALU",
+        }
+    )
+    assert _choose_event_family(row) == "SVA"
