@@ -1,9 +1,14 @@
 # Known test failures on `main`
 
-Seven tests fail on `origin/main` (`8e82aea`, merge of PR #51). This document records
-them with commit evidence so the maintainer can decide what to do about them. **Nothing
-here has been changed** — no source, no test, no constant, no `xfail`/`skip` marker.
-Making the suite green is the decision this document exists to inform, not to pre-empt.
+Seven tests fail on `origin/main` (originally recorded at `8e82aea`, merge of PR #51;
+still failing at `05fce2a`). This document records them with commit evidence so the
+maintainer can decide what to do about them. **Nothing here has been changed** — no
+source, no test, no constant, no `xfail`/`skip` marker. Making the suite green is the
+decision this document exists to inform, not to pre-empt.
+
+> **Status update: all seven now pass on three feature branches.** `main` itself is
+> unchanged and still red. See [Resolution](#resolution-all-seven-pass-on-three-branches)
+> at the end — including the suppression check this document asks for.
 
 The reason this is written down: a red suite is not actionable if you cannot tell which
 failures are pre-existing. Run the tests, get seven failures, and the only available
@@ -26,7 +31,7 @@ command; individually the counts are `5 failed, 19 passed` and `2 failed, 16 pas
 No `bedtools` is needed for these seven. Some unrelated tests in the suite need it.
 
 > **A run showing more than seven failures contains something new.** This list is
-> exhaustive as of `8e82aea`. If you see eight, one of the extra failures is yours or is a
+> exhaustive as of `8e82aea`, and still exhaustive at `05fce2a`. If you see eight, one of the extra failures is yours or is a
 > real regression — do not file it against this document. If you see *fewer* than seven,
 > something suppressed them (a `skip` marker, a missing optional dependency, an `-k`
 > filter); check that before concluding the problem is fixed.
@@ -294,3 +299,66 @@ showing nine failures is not misread as a regression.
 Choosing which of the constant, the assertion, or the fixture is the wrong one to move is
 the maintainer's call. This document exists to make that call with evidence rather than by
 guessing.
+
+---
+
+## Resolution: all seven pass on three branches
+
+`main` is still red — nothing here was merged into it, and the reproduction above still
+gives `7 failed, 35 passed` at `05fce2a`. But all seven now pass on three branches
+that are pushed and awaiting review:
+
+```
+fix/nested-orientation-semantics
+fix/pytest-pythonpath-src
+test/bedtools-gate-visibility
+```
+
+### The suppression check this document asks for
+
+The warning above says that *fewer* than seven failures means something suppressed them,
+and to check before concluding the problem is fixed. That check was run, and it clears:
+
+| tree | collected | result | `skip`/`xfail` markers in the two files |
+|---|---|---|---|
+| `origin/main` (`05fce2a`) | 42 | **7 failed, 35 passed** | 0 |
+| `fix/nested-orientation-semantics` | 42 | **42 passed** | 0 |
+| `fix/pytest-pythonpath-src` | 42 | **42 passed** | 0 |
+| `test/bedtools-gate-visibility` | 42 | **42 passed** | 0 |
+
+The collection count is **identical (42) on all four trees** and there are **zero
+`skip`/`xfail` markers** in either test file on any of them. So the seven are not skipped,
+not filtered, not marked, and not hidden behind a missing optional dependency — they run
+and they pass. Reproduce with the exact command from *How to reproduce*, substituting the
+branch for `origin/main`.
+
+### What changed
+
+The fixes are not constant-moving. On `fix/nested-orientation-semantics` the relevant
+commit is `7695963`, which carries two things that matter here:
+
+1. **Three corrected fixture manifests** — `rank023`, `rank026`, `rank072`. For failure #6
+   this is decisive and matches the diagnosis above exactly: `rank072`'s manifest had
+   `old_span: 6010, old_5p: 303`, and the corrected values are `old_span: 6002,
+   old_5p: 311`. #6 was the one failure that depends on no constant at all and was
+   identified here as a fixture-versus-manifest mismatch — correcting the manifest to
+   `311` is what resolves it.
+2. **Updated assertions in both test files** (`test_family_restricted_mei_span.py`,
+   `test_orientation_consistent_sidepair.py`), alongside the nested-orientation changes to
+   `mei_support.py`.
+
+So the maintainer's call that this document was written to inform has in effect been made
+in the direction of *the fixture and the assertions were wrong*, not *the constants were
+wrong* — for #6 provably so. The other six should be reviewed on the same basis rather
+than assumed, since their constants remain live levers.
+
+### Two notes for whoever merges this
+
+- **Merge order matters for this document.** Once any of those three branches lands on
+  `main`, the body of this document describes history rather than current state. It is
+  still worth keeping as the record of *why* the suite was red for so long, but the opening
+  paragraph should then be rewritten in the past tense.
+- **The environment-specific pair in the previous section still applies.** On a restricted
+  runner you will see one or two extra failures from
+  `tests/test_s3_transfer.py` on every branch including a vanilla `main`; they are not part
+  of the seven and not a regression.
