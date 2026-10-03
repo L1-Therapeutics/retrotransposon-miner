@@ -465,3 +465,57 @@ def test_stratify_reports_unresolved_orientation_separately():
     assert res["unresolved_orientation"]["n_sites"] == 1
     assert res["sense"]["n_sites"] == 0
     assert res["antisense"]["n_sites"] == 0
+
+
+def test_an_empty_strand_is_unresolved_not_antisense():
+    """`strand in "+-"` is True for the empty string; that guard was a no-op.
+
+    `"" in "+-"` evaluates True in Python, so an insert strand written as `""`
+    passed the "is this a real strand" guard and, being unequal to the host
+    strand, landed in *antisense* -- inflating the very contrast the guard
+    exists to keep clean, while `unresolved_orientation` excluded it.
+
+    The cohort table already writes unresolved strands both ways: `insert_strand`
+    uses "." here, but `host_strand` is empty in 22,877 rows of the per-call
+    table. The analysis-set gates happen to exclude those today, so no published
+    number moves; the guard was correct only by luck.
+    """
+    events = [
+        {"insert_strand": "", "host_strand": "+", "consensus_match_name": "AluY", "offset": 133},
+        {"insert_strand": "-", "host_strand": "", "consensus_match_name": "AluY", "offset": 133},
+    ]
+    res = m.stratify(events, 128, 139)
+    assert res["antisense"]["n_sites"] == 0
+    assert res["sense"]["n_sites"] == 0
+    # The insert-unresolved stratum still reports the first one.
+    assert res["unresolved_orientation"]["n_sites"] == 1
+
+
+def test_the_three_orientation_strata_partition_the_cohort():
+    """Every event lands in exactly one of sense / antisense / unresolved.
+
+    With a resolved host strand, bare equality would put a "." insert strand
+    into neither sense nor antisense while a "" one fell into antisense. Stating
+    the partition is what makes a miscounted stratum visible.
+    """
+    events = [
+        {"insert_strand": i, "host_strand": h, "consensus_match_name": "AluY", "offset": 133}
+        for i, h in (("+", "+"), ("-", "-"), ("-", "+"), ("+", "-"), (".", "+"), ("", "+"))
+    ]
+    res = m.stratify(events, 128, 139)
+    total = (
+        res["sense"]["n_sites"]
+        + res["antisense"]["n_sites"]
+        + res["unresolved_orientation"]["n_sites"]
+    )
+    assert total == len(events)
+    assert (res["sense"]["n_sites"], res["antisense"]["n_sites"]) == (2, 2)
+    assert res["unresolved_orientation"]["n_sites"] == 2
+
+
+def test_resolved_strands_is_a_set_not_the_string_plus_minus():
+    """Pin the constant so the substring trap cannot be reintroduced."""
+    assert m.RESOLVED_STRANDS == frozenset({"+", "-"})
+    # The exact behaviour being guarded against.
+    assert ("" in "+-") is True
+    assert ("" in m.RESOLVED_STRANDS) is False

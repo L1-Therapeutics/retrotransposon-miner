@@ -71,6 +71,19 @@ SLOP_SERIES = (0, 2, 5, 10)
 NEAR_FULL_MIN = 280
 NEAR_FULL_MAX = 320
 
+#: The only two strand values a *resolved* element carries.
+#:
+#: Membership must be tested against this frozenset, never against the string
+#: "+-". `"" in "+-"` is True in Python -- the empty string is a substring of
+#: everything -- so a strand guard written as `strand in "+-"` silently admits
+#: unresolved elements and files them as *antisense*, which is the precise bias
+#: the guard exists to prevent. This is not hypothetical here: `host_strand` is
+#: empty in 22,877 rows of the per-call cohort table. None of them reach the
+#: Phase 1 analysis set today (the gates upstream exclude them), so no published
+#: number changes; but the guard was load-bearing only by luck, and the cohort
+#: table already demonstrates that an unresolved strand is written as "".
+RESOLVED_STRANDS = frozenset({"+", "-"})
+
 #: Exploratory scan resolution across the host.
 SCAN_BIN_BP = 20
 SCAN_BINS = tuple(range(0, 320, SCAN_BIN_BP))
@@ -88,7 +101,10 @@ def _to_int(value: str) -> int | None:
         return None
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not a ValueError subclass: int(float("inf")) raises
+        # it. A non-finite cohort cell must read as unevaluable, not abort the
+        # run.
         return None
 
 
@@ -609,17 +625,28 @@ def stratify(
 
     out: dict[str, Any] = {}
     for label, pred in (
-        ("sense", lambda e: e["insert_strand"] == e["host_strand"]),
+        # Both arms require *both* strands resolved. "Sense" as bare equality
+        # happens to reject an unresolved host strand already, but stating it
+        # makes the three strata an explicit partition: resolved-same,
+        # resolved-opposite, insert-unresolved.
+        (
+            "sense",
+            lambda e: e["insert_strand"] in RESOLVED_STRANDS
+            and e["host_strand"] in RESOLVED_STRANDS
+            and e["insert_strand"] == e["host_strand"],
+        ),
         # Antisense must be an explicit *opposite* strand, not merely unequal.
         # Using `!=` would sweep an unresolvable insert strand into antisense
         # and bias exactly the contrast being reported.
         (
             "antisense",
-            lambda e: e["insert_strand"] in "+-" and e["insert_strand"] != e["host_strand"],
+            lambda e: e["insert_strand"] in RESOLVED_STRANDS
+            and e["host_strand"] in RESOLVED_STRANDS
+            and e["insert_strand"] != e["host_strand"],
         ),
         ("host_plus_strand", lambda e: e["host_strand"] == "+"),
         ("host_minus_strand", lambda e: e["host_strand"] == "-"),
-        ("unresolved_orientation", lambda e: e["insert_strand"] not in "+-"),
+        ("unresolved_orientation", lambda e: e["insert_strand"] not in RESOLVED_STRANDS),
     ):
         sub = subset(pred)
         out[label] = {

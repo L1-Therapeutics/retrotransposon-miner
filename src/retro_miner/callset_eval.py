@@ -239,7 +239,7 @@ def rtm_breakpoint(row: dict[str, Any]) -> int:
         raw = row.get(col)
         try:
             pos = int(float(raw))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if pos > 0:
             return pos
@@ -780,7 +780,10 @@ def _tier_keeps(tier: str, rule: str) -> bool:
 def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not a ValueError subclass: int(float("inf")) raises
+        # it, so without this a single non-finite cell in a cohort column
+        # aborts the run instead of falling back to `default`.
         return default
 
 

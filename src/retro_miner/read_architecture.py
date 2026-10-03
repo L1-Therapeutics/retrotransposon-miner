@@ -250,7 +250,10 @@ def _row_int(row: pd.Series, col: str, default: int = 0) -> int:
         return default
     try:
         return int(float(val))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not a subclass of ValueError, and int(float("inf"))
+        # raises it. A non-finite cell ("inf", "1e400") would otherwise abort
+        # the whole annotation run instead of falling back to the default.
         return default
 
 

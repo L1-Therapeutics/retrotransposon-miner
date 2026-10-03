@@ -139,6 +139,15 @@ DE_NOVO_TSD_RANGE = (5, 27)
 POLYA_MIN_LEN = 8
 #: Mismatch budget for calling a reported TSD corroborated by the reference.
 TSD_MAX_MISMATCH = 2
+#: Mismatch offsets are counted exactly up to this distance from the 3' end of
+#: the reported TSD; everything deeper shares one bucket. The bucket is labelled
+#: by what it is rather than by its lower bound, because the distribution's job
+#: is to separate "mismatches bunched at the terminal bases" from "mismatches
+#: scattered along the sequence", and a bucket silently named for its first
+#: member hides exactly that: on the shipped cohort 80% of offsets fell in the
+#: 6-or-deeper bucket, so labelling it `6` claimed the TSD was readable six
+#: bases past the point it was.
+TSD_OFFSET_DETAIL_MAX = 5
 #: Secondary poly(A) threshold: the primary one is satisfied by nearly every
 #: call, so it cannot separate anything and a second cut is reported too.
 POLYA_SECONDARY_MIN_LEN = 20
@@ -179,7 +188,10 @@ def _to_int(value: str | None) -> int | None:
         return None
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not a ValueError subclass: int(float("inf")) raises
+        # it. A non-finite cohort cell must read as unevaluable, not abort the
+        # run -- the same contract the empty-string and "." cases above take.
         return None
 
 
@@ -372,7 +384,29 @@ def polya_state(row: dict[str, str]) -> dict[str, Any]:
         return {"state": "unevaluable", "reason": "no_caller_polya_field", "polya_len": None}
     if declared is None:
         return {"state": "unevaluable", "reason": "polya_len_missing", "polya_len": None}
-    body = seq[:declared] if 0 < declared <= len(seq) else seq
+    if declared > len(seq):
+        # The caller declares more poly-A than it supplied, so neither the
+        # length nor the composition is supported by the evidence. This used to
+        # fall back to the truncated sequence while still reporting `declared`,
+        # which let one row score poly-A *absent* on the sequence and *>= 20 bp*
+        # on the declared length at the same time. A length that disagrees with
+        # its sequence is unevaluable, not absent.
+        return {
+            "state": "unevaluable",
+            "reason": "polya_len_exceeds_polya_seq",
+            "polya_len": None,
+            "polya_declared_len": declared,
+            "polya_seq_len": len(seq),
+        }
+    if declared <= 0:
+        return {
+            "state": "unevaluable",
+            "reason": "polya_len_not_positive",
+            "polya_len": None,
+            "polya_declared_len": declared,
+            "polya_seq_len": len(seq),
+        }
+    body = seq[:declared]
     return {
         "state": "present" if len(body) >= POLYA_MIN_LEN else "absent",
         "reason": None,
@@ -995,6 +1029,7 @@ def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
     n_all_terminal = 0
     mm_hist: collections.Counter = collections.Counter()
     offset_hist: collections.Counter = collections.Counter()
+    all_offsets: list[int] = []
     for s in scored:
         tsd = s["components"]["tsd"]
         if tsd["state"] not in ("reference_verifiable", "reference_inconsistent"):
@@ -1004,13 +1039,23 @@ def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
             n_exact += 1
         mm_hist[tsd["n_mismatches"]] += 1
         offsets = tsd["mismatch_offsets_from_3prime_end"] or []
+        all_offsets.extend(offsets)
         for off in offsets:
-            offset_hist[min(off, 6)] += 1
+            offset_hist[min(off, TSD_OFFSET_DETAIL_MAX + 1)] += 1
         if offsets and all(off <= 2 for off in offsets):
             n_all_terminal += 1
-    total_offsets = sum(offset_hist.values()) or 1
+    total_offsets = len(all_offsets)
     terminal = sum(v for k, v in offset_hist.items() if k <= 2)
+    deep = offset_hist[TSD_OFFSET_DETAIL_MAX + 1]
     near_allowance = sum(v for k, v in mm_hist.items() if k == TSD_MAX_MISMATCH)
+    # Report the shallow buckets by their exact offset and the tail under a
+    # label that states it is a tail, so the JSON cannot be read as saying the
+    # offsets stop six bases from the 3' end.
+    offset_report: dict[Any, int] = {
+        k: v for k, v in sorted(offset_hist.items()) if k <= TSD_OFFSET_DETAIL_MAX
+    }
+    if deep:
+        offset_report[f"{TSD_OFFSET_DETAIL_MAX + 1}_or_more_bases_from_3prime_end"] = deep
     return {
         "n_evaluable": n_eval,
         "n_exact_match": n_exact,
@@ -1019,13 +1064,22 @@ def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "share_at_mismatch_allowance": near_allowance / n_eval if n_eval else None,
         "n_more_than_allowance": sum(v for k, v in mm_hist.items() if k > TSD_MAX_MISMATCH),
         "mismatch_count_histogram": dict(sorted(mm_hist.items())),
-        "mismatch_offset_from_3prime_end_histogram": dict(sorted(offset_hist.items())),
-        "share_of_mismatches_in_last_3_bases": terminal / total_offsets,
+        "mismatch_offset_from_3prime_end_histogram": offset_report,
+        "deepest_mismatch_offset_from_3prime_end": max(all_offsets) if all_offsets else None,
+        # A share of 0 here would read as "none of the mismatches are terminal",
+        # which is not what zero mismatches means. The siblings above already
+        # return None rather than invent a number, and so does this one.
+        "share_of_mismatches_in_last_3_bases": (
+            terminal / total_offsets if total_offsets else None
+        ),
         "n_calls_with_all_mismatches_in_last_3_bases": n_all_terminal,
         "share_of_calls_whose_mismatches_are_all_terminal": (
             n_all_terminal / n_eval if n_eval else None
         ),
         "max_mismatch_allowed": TSD_MAX_MISMATCH,
+        "mismatch_offsets_counted_exactly_through_bases_from_3prime_end": (
+            TSD_OFFSET_DETAIL_MAX
+        ),
         "finding": (
             "A true two-junction TSD reconstruction is impossible from these inputs: "
             "the reference lacks the duplicated copy and no sample reads are available. "
@@ -1170,8 +1224,18 @@ def event_polya_present(row: dict[str, str]) -> bool | None:
 
 
 def event_polya_long(row: dict[str, str]) -> bool | None:
+    """Poly-A of at least `POLYA_SECONDARY_MIN_LEN`, or None when unevaluable.
+
+    An `absent` row has no long poly-A by definition, so it answers False rather
+    than being scored on whatever length the caller declared. The two poly-A
+    events must never disagree about one row: `polya_present` False with
+    `polya_len_ge_20` True would put the same call on both sides of a contrast.
+    """
+    state = row.get("_polya_state")
+    if state == "unevaluable" or state == "absent":
+        return None if state == "unevaluable" else False
     n = _to_int(row.get("polya_len"))
-    if row.get("_polya_state") == "unevaluable" or n is None:
+    if n is None:
         return None
     return n >= POLYA_SECONDARY_MIN_LEN
 
@@ -1380,7 +1444,11 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
         f"{tv['n_calls_with_all_mismatches_in_last_3_bases']} calls "
         f"({_pct(tv['share_of_calls_whose_mismatches_are_all_terminal'])}); across all "
         f"individual mismatches the share in the last 3 bases is "
-        f"{_pct(tv['share_of_mismatches_in_last_3_bases'])}.",
+        f"{_pct(tv['share_of_mismatches_in_last_3_bases'])}. Offsets are counted "
+        f"exactly through {tv['mismatch_offsets_counted_exactly_through_bases_from_3prime_end']} "
+        f"bases from the 3' end and share one labelled bucket beyond that; the "
+        f"deepest mismatch sits "
+        f"{tv['deepest_mismatch_offset_from_3prime_end']} bases in.",
         f"- {tv['finding']}",
         "",
         "Read those numbers before drawing a conclusion from them. The spike at exactly",

@@ -768,3 +768,202 @@ def test_shipped_cohort_columns_are_all_present():
         "perc_resolved", "alignment_identity",
     }
     assert required <= set(rows[0])
+
+
+# ---------------------------------------------------------------------------
+# Poly-A: a declared length the sequence cannot support is unevaluable
+# ---------------------------------------------------------------------------
+
+
+def test_a_declared_polya_length_longer_than_the_sequence_is_unevaluable():
+    """The caller declaring more poly-A than it supplied supports neither number.
+
+    This used to fall back to the truncated sequence while still reporting the
+    declared length, so one row could score poly-A *absent* on the sequence and
+    *>= 20 bp* on the declared length simultaneously. A length that disagrees
+    with its sequence is unevaluable, which is what the neighbouring missing-length
+    case already did.
+    """
+    out = tprt.polya_state(make_row(polya_seq="AAAA", polya_len="40"))
+
+    assert out["state"] == "unevaluable"
+    assert out["reason"] == "polya_len_exceeds_polya_seq"
+    assert out["polya_len"] is None
+    assert out["polya_declared_len"] == 40
+    assert out["polya_seq_len"] == 4
+
+
+def test_a_non_positive_polya_length_is_unevaluable_not_absent():
+    out = tprt.polya_state(make_row(polya_seq="A" * 20, polya_len="0"))
+    assert out["state"] == "unevaluable"
+    assert out["reason"] == "polya_len_not_positive"
+
+
+def test_the_two_polya_events_can_never_disagree_about_one_row():
+    """`polya_present` and `polya_len_ge_20` share a row, so they must agree.
+
+    A call that is a non-carrier for one poly-A contrast and an exposed case for
+    the other would corrupt whichever comparison used it.
+    """
+    cases = [
+        ({"polya_seq": "", "polya_len": ""}),
+        ({"polya_seq": "AAAA", "polya_len": ""}),
+        ({"polya_seq": "AAAA", "polya_len": "4"}),
+        ({"polya_seq": "AAAA", "polya_len": "40"}),
+        ({"polya_seq": "A" * 20, "polya_len": "20"}),
+        ({"polya_seq": "A" * 20, "polya_len": "0"}),
+        ({"polya_seq": "A" * 30, "polya_len": "10"}),
+    ]
+    for overrides in cases:
+        state = tprt.polya_state(make_row(**overrides))
+        row = {"_polya_state": state["state"], "polya_len": state["polya_len"]}
+        present = tprt.event_polya_present(row)
+        long_enough = tprt.event_polya_long(row)
+        assert not (present is False and long_enough is True), (
+            f"row {overrides}: poly-A reported absent but >= "
+            f"{tprt.POLYA_SECONDARY_MIN_LEN} bp ({state})"
+        )
+
+
+def test_an_absent_polya_is_not_also_a_long_polya():
+    row = {"_polya_state": "absent", "polya_len": "40"}
+    assert tprt.event_polya_present(row) is False
+    assert tprt.event_polya_long(row) is False
+
+
+def test_a_present_short_polya_is_present_but_not_long():
+    state = tprt.polya_state(make_row(polya_seq="A" * 10, polya_len="10"))
+    row = {"_polya_state": state["state"], "polya_len": state["polya_len"]}
+    assert state["state"] == "present"
+    assert tprt.event_polya_present(row) is True
+    assert tprt.event_polya_long(row) is False
+
+
+def test_a_present_long_polya_is_present_and_long():
+    state = tprt.polya_state(make_row(polya_seq="A" * 25, polya_len="25"))
+    row = {"_polya_state": state["state"], "polya_len": state["polya_len"]}
+    assert tprt.event_polya_present(row) is True
+    assert tprt.event_polya_long(row) is True
+
+
+def test_a_present_poly_a_still_uses_only_the_declared_prefix():
+    """`polya_a_fraction` must describe the declared window, not the whole field."""
+    state = tprt.polya_state(make_row(polya_seq="A" * 10 + "C" * 10, polya_len="10"))
+    assert state["state"] == "present"
+    assert state["polya_a_fraction"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# TSD mismatch offsets: a bucket must not be named after its first member
+# ---------------------------------------------------------------------------
+
+
+def scored_with_offsets(offsets_per_call, state="reference_inconsistent"):
+    """Build the `scored` shape `tsd_verification` reads: only `components.tsd`."""
+    out = []
+    for offsets in offsets_per_call:
+        offsets = list(offsets)
+        out.append(
+            {
+                "components": {
+                    "tsd": {
+                        "state": state,
+                        "exact": not offsets,
+                        "n_mismatches": len(offsets),
+                        "mismatch_offsets_from_3prime_end": offsets or None,
+                    }
+                }
+            }
+        )
+    return out
+
+
+def histogram_bounds(label):
+    """The set of offsets a histogram label claims to hold, as read off the key.
+
+    A reader only ever sees the key. If the key says `6`, the count beside it is
+    read as "6". Anything that is not an exact offset must therefore name its
+    own lower bound, and this is what that naming is worth.
+    """
+    if isinstance(label, int):
+        return {label}
+    prefix, _, rest = str(label).partition("_or_more")
+    return set(range(int(prefix), 10_000)) if rest else {int(label)}
+
+
+def test_the_deep_offset_bucket_is_not_named_after_its_first_member():
+    """80% of the shipped cohort's offsets sit in the bucket clamped at 6.
+
+    Labelling that bucket `6` tells a reader the mismatches stop six bases from
+    the 3' end, which is false: the deepest one on the shipped cohort is 61.
+    """
+    scored = scored_with_offsets([range(0, 20)])
+    hist = tprt.tsd_verification(scored)["mismatch_offset_from_3prime_end_histogram"]
+
+    assert 6 not in hist, "`6` was the label for offsets 6..19 and had to go"
+    assert [k for k in hist if isinstance(k, int)] == [0, 1, 2, 3, 4, 5], (
+        "offsets the reader can place exactly keep exact labels"
+    )
+    tail = [k for k in hist if not isinstance(k, int)]
+    assert len(tail) == 1 and tail[0].startswith("6_or_more"), (
+        f"the tail needs a label that admits it is a tail, got {sorted(map(str, hist))}"
+    )
+    assert hist[tail[0]] == 14, "offsets 6..19 all land in that one bucket"
+
+
+def test_every_histogram_count_can_be_reproduced_from_its_own_label():
+    """The label has to mean what it says, or the histogram is a rumour.
+
+    This is the check the clamp defeated: summing the buckets a reader believes
+    the key describes must return the true number of mismatches, and no bucket
+    may claim an exact offset it does not hold.
+    """
+    truth = [0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 40, 61]
+    scored = scored_with_offsets([truth, [0, 61], []])
+    hist = tprt.tsd_verification(scored)["mismatch_offset_from_3prime_end_histogram"]
+
+    for label, count in hist.items():
+        claimed = histogram_bounds(label)
+        actual = sum(1 for o in truth + [0, 61] if o in claimed)
+        assert count == actual, (
+            f"bucket {label!r} holds {count} offsets but its label describes "
+            f"{actual} of {truth + [0, 61]}"
+        )
+    assert sum(hist.values()) == len(truth) + 2, "no offset lost or double counted"
+
+
+def test_the_deepest_mismatch_offset_is_reported_rather_than_clamped_away():
+    scored = scored_with_offsets([[3, 47]])
+    tv = tprt.tsd_verification(scored)
+    assert tv["deepest_mismatch_offset_from_3prime_end"] == 47
+    assert tv["mismatch_offsets_counted_exactly_through_bases_from_3prime_end"] == 5
+
+
+def test_no_mismatches_at_all_is_not_a_share_of_zero():
+    """Zero mismatches means the share is undefined, not that none are terminal.
+
+    `exact_match_fraction` and `share_at_mismatch_allowance` already return None
+    rather than invent a number; this ratio was the one that did not, so a cohort
+    where every call matched the reference exactly would have reported that 0% of
+    its mismatches were at the terminal bases.
+    """
+    tv = tprt.tsd_verification(scored_with_offsets([[], [], []]))
+    assert tv["n_evaluable"] == 3
+    assert tv["n_exact_match"] == 3
+    assert tv["mismatch_offset_from_3prime_end_histogram"] == {}
+    assert tv["deepest_mismatch_offset_from_3prime_end"] is None
+    assert tv["share_of_mismatches_in_last_3_bases"] is None
+    # This one is 0.0 and should be: its denominator is the evaluable calls, of
+    # which three exist and none has a terminal-mismatch defect. The ratio
+    # missing a None guard is the mismatch-level one above, whose denominator is
+    # the mismatches, of which there are none.
+    assert tv["share_of_calls_whose_mismatches_are_all_terminal"] == 0.0
+
+
+def test_the_terminal_share_still_agrees_with_the_histogram_it_is_read_from():
+    scored = scored_with_offsets([[0], [1, 2], [2, 2, 3], [9, 9, 9]])
+    tv = tprt.tsd_verification(scored)
+    hist = tv["mismatch_offset_from_3prime_end_histogram"]
+    counted = sum(v for k, v in hist.items() if histogram_bounds(k) <= {0, 1, 2})
+    assert tv["share_of_mismatches_in_last_3_bases"] == counted / 9
+    assert tv["n_calls_with_all_mismatches_in_last_3_bases"] == 2

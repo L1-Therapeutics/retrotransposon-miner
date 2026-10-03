@@ -21,7 +21,6 @@ of scope here and remains unverified.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -254,13 +253,13 @@ def test_poly_a_max_run_is_case_insensitive_and_ignores_other_bases() -> None:
     assert la._poly_at_max_run("ATATA") == 1  # alternation is not a run
 
 
-def test_summarize_contigs_counts_sequences_and_the_longest() -> None:
+def test_summarize_contigs_counts_sequences_and_the_longest(tmp_path) -> None:
     """A FASTA with no trailing newline must still count its last record."""
-    path = Path("/tmp/_la_test_contigs.fa")
+    path = tmp_path / "contigs.fa"
     path.write_text(">c1\nACGT\nACGT\n>c2\nACGTACGTAC\n")
     count, longest = la._summarize_contigs(path)
     assert (count, longest) == (2, 10)
-    assert la._summarize_contigs(Path("/tmp/_la_missing.fa")) == (0, 0)
+    assert la._summarize_contigs(tmp_path / "missing.fa") == (0, 0)
 
 
 def test_microhomology_is_empty_for_a_pure_homopolymer_overlap_unless_allowed() -> None:
@@ -566,17 +565,17 @@ def test_cap_escalation_stays_quiet_when_both_arms_are_convincing() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_a_corrupt_manifest_is_treated_as_absent_rather_than_crashing() -> None:
+def test_a_corrupt_manifest_is_treated_as_absent_rather_than_crashing(tmp_path) -> None:
     """A half-written manifest from a killed run must not abort the batch."""
-    path = Path("/tmp/_la_manifest_bad.json")
+    path = tmp_path / "manifest_bad.json"
     path.write_text("{not json at all")
     assert la._parse_existing_manifest(path) is None
-    assert la._parse_existing_manifest(Path("/tmp/_la_no_such_manifest.json")) is None
+    assert la._parse_existing_manifest(tmp_path / "no_such_manifest.json") is None
 
 
-def test_a_json_array_manifest_is_rejected_because_it_is_not_a_mapping() -> None:
+def test_a_json_array_manifest_is_rejected_because_it_is_not_a_mapping(tmp_path) -> None:
     """`manifest["status"]` on a list would raise, not return a default."""
-    path = Path("/tmp/_la_manifest_list.json")
+    path = tmp_path / "manifest_list.json"
     path.write_text("[1, 2, 3]")
     assert la._parse_existing_manifest(path) is None
 
@@ -607,8 +606,8 @@ def test_a_non_assembled_manifest_is_never_a_cache_hit(tmp_path) -> None:
     assert not la._has_assembled_cache(locus, None, interval_pad_bp=300)
 
 
-def test_a_valid_manifest_round_trips() -> None:
-    path = Path("/tmp/_la_manifest_ok.json")
+def test_a_valid_manifest_round_trips(tmp_path) -> None:
+    path = tmp_path / "manifest_ok.json"
     payload = {"status": "assembled", "interval": {"pad_bp": 150}, "n": 3}
     path.write_text(json.dumps(payload))
     assert la._parse_existing_manifest(path) == payload

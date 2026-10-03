@@ -8852,7 +8852,9 @@ def _infer_disease_insertion_metrics(
                 if pd.isna(value):
                     return int(default)
                 return int(float(value))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # int(float("inf")) raises OverflowError, which is not a
+                # ValueError; without this a non-finite cell aborts the run.
                 return int(default)
 
         if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):
@@ -8955,7 +8957,9 @@ def _infer_disease_insertion_metrics(
                 if pd.isna(value):
                     return int(default)
                 return int(float(value))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # int(float("inf")) raises OverflowError, which is not a
+                # ValueError; without this a non-finite cell aborts the run.
                 return int(default)
 
         if _to_int_safe(row.get("tsd_len_estimate", 0), 0) >= int(min_len):

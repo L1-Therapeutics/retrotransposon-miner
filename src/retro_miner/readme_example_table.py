@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from ._utils import read_tsv
+
 EXAMPLE_SECTION_START = "Gold-tier calls from the SEQC2"
 EXAMPLE_SECTION_END = "\n## Examples\n"
 
@@ -113,7 +115,7 @@ def build_example_table_markdown(
     caption: str | None = None,
 ) -> str:
     """Build the README example table markdown (caption + table)."""
-    gold = pd.read_csv(gold_review, sep="\t", low_memory=False)
+    gold = read_tsv(gold_review)
     g = gold.loc[gold["analysis_stage_tier"].astype(str).str.lower() == "gold"].copy()
     if g.empty:
         raise ValueError(f"no gold rows in {gold_review}")
@@ -124,7 +126,7 @@ def build_example_table_markdown(
     g["chrom"] = g["chrom"].astype(str)
 
     if rank_index is not None and Path(rank_index).exists():
-        idx = pd.read_csv(rank_index, sep="\t")
+        idx = read_tsv(rank_index)
         idx["chrom"] = idx["chrom"].astype(str)
         for c in ("window_start", "window_end"):
             idx[c] = pd.to_numeric(idx[c], errors="coerce").fillna(0).astype(int)
@@ -133,7 +135,7 @@ def build_example_table_markdown(
         selected = g.head(int(top_n)).copy()
 
     if fill_gold_review is not None and Path(fill_gold_review).exists():
-        fill = pd.read_csv(fill_gold_review, sep="\t", low_memory=False)
+        fill = read_tsv(fill_gold_review)
         fill["chrom"] = fill["chrom"].astype(str)
         for c in ("window_start", "window_end"):
             fill[c] = pd.to_numeric(fill[c], errors="coerce").fillna(0).astype(int)

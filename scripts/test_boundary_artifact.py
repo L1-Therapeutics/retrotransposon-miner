@@ -94,7 +94,10 @@ def _to_int(value: str) -> int | None:
         return None
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not a ValueError subclass: int(float("inf")) raises
+        # it. A non-finite cohort cell must read as unevaluable, not abort the
+        # run.
         return None
 
 
