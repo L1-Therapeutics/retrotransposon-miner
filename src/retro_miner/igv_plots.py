@@ -26,15 +26,52 @@ from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
 from .bam_io import alignment_path_is_cram, open_alignment, resolve_alignment_reference
 
 
+#: The Xvfb process started by `_start_xvfb`, or None when no virtual display is
+#: running. `_start_xvfb` does `global _XVFB_PROC` and assigns it, so the name
+#: only ever came into existence as a side effect of a successful start. That
+#: left `_stop_xvfb`'s `if _XVFB_PROC is not None` guard unreachable in the
+#: only case it exists for -- reading the handle before any display was started
+#: -- where it raised `NameError` instead of returning quietly -- and made the
+#: `_XVFB_PROC` entry in `__all__` unresolvable, so `import *` failed.
+_XVFB_PROC: "subprocess.Popen[bytes] | None" = None
+
+
 __all__ = [
     "generate_gold_review_igv_plots",
     "_pid_is_alive",
-    "_find_igv_launcher",
-    "_make_igv_batch_session",
-    "_igv_snapshot_for_locus",
-    "_IGV_LAUNCHER_ENV_VAR",
+    "_igv_singleton_lock",
+    "_headless_display_help",
+    "_find_xvfb_binary",
+    "_needs_virtual_display",
+    "_start_xvfb",
+    "_headless_display_env",
+    "_resolve_bam_index",
+    "_snapshot_png_looks_empty",
+    "_igv_chroms_from_variants",
+    "_run_samtools",
+    "_materialize_alignment_for_igv",
+    "resolve_igv_launcher",
+    "_count_reads_in_window",
+    "_estimate_panel_height",
+    "_safe_snapshot_stem",
+    "_validate_igv_chrom",
+    "_quote_igv_path",
+    "_window_locus_id",
+    "_row_discovery_window",
+    "_read_json_dict",
+    "_build_assembly_contig_track",
+    "_select_variants_for_plots",
+    "_write_contig_annotation_bed",
+    "_row_inferred_breakpoint_pos",
+    "_write_inferred_breakpoint_bed",
+    "build_igv_batch_script",
+    "_wrap_headless_command",
+    "_local_genome_from_batch",
+    "_igv_pref_roots",
+    "_pin_igv_default_genome",
+    "_verify_snapshot_pngs",
+    "run_igv_batch",
     "_XVFB_PROC",
-    "_XVFB_LOCK",
 ]
 
 
@@ -66,7 +103,7 @@ def _igv_singleton_lock(
     while owner_fd is None:
         try:
             owner_fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(owner_fd, f"{os.getpid()}\t{int(time.time())}\n".encode("utf-8"))
+            os.write(owner_fd, f"{os.getpid()}\t{int(time.time())}\n".encode())
             break
         except FileExistsError:
             stale = False

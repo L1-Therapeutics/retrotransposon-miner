@@ -180,7 +180,13 @@ def _extract_one_sample(
     default=None,
     help="Optional comma-separated region/chromosome list (overrides --region), e.g. chr15,chr16,chr17.",
 )
-@click.option("--min-mapq", default=20, show_default=True, type=click.IntRange(min=0, max=255), help="Minimum split-read anchor mapping quality.")
+@click.option(
+    "--min-mapq",
+    default=20,
+    show_default=True,
+    type=click.IntRange(min=0, max=255),
+    help="Minimum split-read anchor mapping quality.",
+)
 @click.option(
     "--min-mapq-discordant",
     default=0,
@@ -188,7 +194,13 @@ def _extract_one_sample(
     type=click.IntRange(min=0, max=255),
     help="Minimum discordant-read anchor mapping quality.",
 )
-@click.option("--min-clip-len", default=20, show_default=True, type=click.IntRange(min=1), help="Minimum soft-clip length for primary SR clips.")
+@click.option(
+    "--min-clip-len",
+    default=20,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Minimum soft-clip length for primary SR clips.",
+)
 @click.option(
     "--poly-tail-rescue-min-clip-len",
     default=8,
@@ -201,7 +213,10 @@ def _extract_one_sample(
     default=12,
     show_default=True,
     type=int,
-    help="Minimum soft-clip length kept as short-MEI rescue candidates (counted only if consistent with ≥min-clip-len MEI SR).",
+    help=(
+        "Minimum soft-clip length kept as short-MEI rescue candidates "
+        "(counted only if consistent with ≥min-clip-len MEI SR)."
+    ),
 )
 @click.option(
     "--poly-tail-rescue-min-run",
@@ -411,7 +426,11 @@ def extract_split_evidence_cmd(
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(_extract_one_sample, sample=str(job["sample"]), config=_make_config(job)): str(job["sample"])
+                pool.submit(
+                    _extract_one_sample,
+                    sample=str(job["sample"]),
+                    config=_make_config(job),
+                ): str(job["sample"])
                 for job in sample_jobs
             }
             for fut in as_completed(futures):
@@ -508,7 +527,13 @@ def extract_split_evidence_cmd(
     default=None,
     help="Output directory for candidate loci table (defaults to evidence-dir).",
 )
-@click.option("--window-size", type=click.IntRange(min=1), default=200, show_default=True, help="Window size in bp for locus binning.")
+@click.option(
+    "--window-size",
+    type=click.IntRange(min=1),
+    default=200,
+    show_default=True,
+    help="Window size in bp for locus binning.",
+)
 @click.option(
     "--split-cluster-bp",
     type=int,
@@ -854,7 +879,10 @@ def build_candidate_loci_cmd(
     "--empirical-cache-dir",
     type=click.Path(file_okay=False, path_type=Path),
     default=None,
-    help="Optional cache directory for empirical random-window metrics (defaults to out-tsv directory/empirical_cache).",
+    help=(
+        "Optional cache directory for empirical random-window metrics "
+        "(defaults to out-tsv directory/empirical_cache)."
+    ),
 )
 @click.option(
     "--igv-plots/--no-igv-plots",
@@ -1243,10 +1271,21 @@ def export_vcf_cmd(
               help="Output VCF with GENE/GENEID/GENE_STRAND/CSQ/CSQ_TERMS/CSQ_NTX added to INFO.")
 @click.option("--tsv", "tsv_path", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Optional flat TSV (one row per record) alongside the VCF.")
-@click.option("--gene-gtf", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Override the bundled Ensembl GRCh38.115 gene-strand table (GTF gene features or gene_id/strand TSV).")
-@click.option("--snpeff-genome", default="GRCh38.99", show_default=True,
-              help="Database name as listed by `snpEff databases` (e.g. GRCh38.99, GRCh38.115, GRCh38.mane.1.2.ensembl).")
+@click.option(
+    "--gene-gtf",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        "Override the bundled Ensembl GRCh38.115 gene-strand table "
+        "(GTF gene features or gene_id/strand TSV)."
+    ),
+)
+@click.option(
+    "--snpeff-genome",
+    default="GRCh38.99",
+    show_default=True,
+    help="Database name as listed by `snpEff databases` (e.g. GRCh38.99, GRCh38.115, GRCh38.mane.1.2.ensembl).",
+)
 @click.option("--snpeff-bin", default="snpEff", show_default=True, help="snpEff launcher on PATH or full path.")
 @click.option("--snpeff-config", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="snpEff.config path (conda installs: <env>/share/snpeff-<ver>/snpEff.config).")
@@ -1268,7 +1307,11 @@ def annotate_genes_cmd(
         f"seconds={stats.seconds:.1f} elapsed={time.monotonic() - t0:.1f}s -> {out_path}"
     )
     if stats.n_unmatched:
-        click.echo(f"[annotate-genes] WARNING: {stats.n_unmatched} record(s) not returned by snpEff; left unannotated.", err=True)
+        click.echo(
+            f"[annotate-genes] WARNING: {stats.n_unmatched} record(s) "
+            "not returned by snpEff; left unannotated.",
+            err=True,
+        )
 
 
 if __name__ == "__main__":

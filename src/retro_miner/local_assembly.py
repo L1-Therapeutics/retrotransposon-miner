@@ -38,6 +38,61 @@ __all__ = [
 ]
 
 
+# --------------------------------------------------------------------------
+# Module-level state and thresholds
+#
+# These seven names were referenced from function bodies at sixteen sites and
+# exported in `__all__`, but were never defined anywhere in the module. The
+# module imported cleanly -- the references are inside function bodies, so the
+# failure only appears on first call -- and nothing raised, because no test
+# exercised any of the paths. Every one of `_run_minimap2_paf`,
+# `_load_fasta_lengths`, `_choose_consensus_features` and
+# `_extract_sample_assembly_features` raised `NameError` on entry. The giveaway
+# was `threading` sitting in the imports, unused, because the two locks it exists
+# to build were missing.
+# --------------------------------------------------------------------------
+
+#: Process-wide minimap2 index cache: resolved reference FASTA path -> `.mmi`
+#: path. Indexing a reference is the expensive part of the per-locus alignment,
+#: and the panel FASTA does not change within a run, so it is built once.
+_MINIMAP2_INDEX_CACHE: dict[str, Path] = {}
+
+#: Guards `_MINIMAP2_INDEX_CACHE`. Loci are processed concurrently by
+#: `ThreadPoolExecutor`, so without this two threads can build the same index at
+#: once and race on the partially written `.mmi`.
+_MINIMAP2_INDEX_LOCK = threading.Lock()
+
+#: Resolved FASTA path -> {contig name: length}. The MEI panel reference is
+#: re-read once per locus without this.
+_MEI_FASTA_LENGTH_CACHE: dict[str, dict[str, int]] = {}
+
+#: Guards `_MEI_FASTA_LENGTH_CACHE`; same concurrency rationale as above.
+_MEI_FASTA_LENGTH_CACHE_LOCK = threading.Lock()
+
+#: Minimum assembly-contig-to-MEI alignment length for a hit to count as a
+#: breakpoint *side anchor*. Shorter hits cannot localise a junction, so they
+#: are excluded from the left/right candidate pools and do not contribute to the
+#: `side_anchors` score used to pick between disease and control features.
+#: Matches the package's own MEI-alignment floor,
+#: `mei_support._MEI_ALIGN_MIN_ALN_BP_LONG`, rather than introducing a second
+#: convention for the same quantity.
+_MIN_SIDE_ANCHOR_ALN_LEN = 20
+
+#: Terminal A/T homopolymer run required before the 3' end is imputed out to the
+#: full MEI target length. Deliberately the same gate as
+#: `mei_support._MIN_POLYA_RUN_FOR_END_IMPUTE`; assembly and read evidence must
+#: not disagree about what counts as a polyA tail.
+_MIN_POLYA_RUN_FOR_FULL_3P_IMPUTE = 12
+
+#: Schema version stamped into `coord_logic_version` on every feature record.
+#: `_has_sideaware_feature_schema` accepts a cached record only when its version
+#: is `>=` this, so raising it invalidates old caches and lowering it lets stale
+#: coordinate logic through. Version 1: no assembly feature record has ever been
+#: produced in this workspace, so there is no earlier schema to stay compatible
+#: with.
+_ASSEMBLY_FEATURE_SCHEMA_VERSION = 1
+
+
 def _window_locus_id_from_row(row: pd.Series) -> str:
     chrom = str(row.get("chrom", ""))
     window_start = int(row.get("window_start", 1))

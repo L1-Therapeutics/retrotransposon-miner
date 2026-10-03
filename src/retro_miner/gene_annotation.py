@@ -163,7 +163,7 @@ def _open_text(path: str | Path):
     p = Path(path)
     if p.suffix == ".gz":
         return gzip.open(p, "rt")
-    return open(p, "rt")
+    return open(p)
 
 
 def parse_info(info: str) -> dict[str, str | None]:

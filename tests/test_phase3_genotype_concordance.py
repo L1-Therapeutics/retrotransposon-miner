@@ -881,3 +881,221 @@ def test_the_accumulation_curve_and_the_halves_agree_on_one_sample_order():
     assert curve["genome_order"] == "sorted_sample_name"
     assert curve["n_genomes"] == len(sorted_samples)
     assert curve["final_unique_sites"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Gate 3a: the note and the prose must not assert a conclusion the verdict denies
+# ---------------------------------------------------------------------------
+
+
+SITE_LENGTHS = {"chr1": 248956422, "chr2": 243199373}
+GENO_LENGTHS = {"chr1": 248387328, "chr2": 243199373}
+
+
+def _gate_3a(monkeypatch, present):
+    """Run the real gate over canned headers and a canned set of present sites."""
+    monkeypatch.setattr(
+        p3, "header_contig_lengths", lambda path: dict(SITE_LENGTHS)
+    )
+    monkeypatch.setattr(p3, "site_coordinates", lambda path: set(present))
+    return p3.gate_3a_coordinate_frame(
+        Path("site.bcf"), Path("geno.bcf"), [("chr1", 100), ("chr2", 200)]
+    )
+
+
+def test_gate_3a_note_claims_coordinate_agreement_only_when_nothing_is_missing(
+    monkeypatch,
+):
+    gate = _gate_3a(monkeypatch, [("chr1", 100), ("chr2", 200)])
+    assert gate["verdict"] == "frame_agreement_demonstrated_by_exact_coordinates"
+    assert gate["analysis_sites_absent_from_genotype_bcf"] == 0
+    assert "every analysis coordinate is present" in gate["note"]
+
+
+def test_gate_3a_note_must_not_claim_presence_when_the_gate_blocks(monkeypatch):
+    """The note used to be a fixed string asserting full coordinate presence.
+
+    It was emitted whatever the verdict, so a blocked gate carried a note saying
+    every coordinate was present verbatim -- a positive claim about the data,
+    contradicting the count in the same dict and the verdict beside it.
+    """
+    gate = _gate_3a(monkeypatch, [("chr1", 100)])  # chr2:200 is absent
+
+    assert gate["verdict"] == "frame_disagreement_blocks_join"
+    assert gate["analysis_sites_absent_from_genotype_bcf"] == 1
+    assert "every analysis coordinate is present" not in gate["note"]
+    assert "absent from the genotype callset" in gate["note"]
+    assert "blocked" in gate["note"]
+
+
+def test_gate_3a_note_and_verdict_never_contradict_each_other(monkeypatch):
+    for present in ([("chr1", 100), ("chr2", 200)], [("chr1", 100)], []):
+        gate = _gate_3a(monkeypatch, present)
+        absent = gate["analysis_sites_absent_from_genotype_bcf"]
+        blocked = gate["verdict"] == "frame_disagreement_blocks_join"
+        assert blocked == (absent > 0)
+        assert ("every analysis coordinate is present" in gate["note"]) is not blocked
+
+
+def test_the_gate_3a_prose_never_says_the_join_was_verified_when_blocked(monkeypatch):
+    """The published prose asserted the join was verified, unconditionally.
+
+    It stated the conclusion first and quoted the absent-site count as a
+    parenthetic, so a blocked gate rendered as "N sites are absent, and the data
+    overrules the headers anyway". This is the copy a reader takes away.
+    """
+    three_a = _gate_3a(monkeypatch, [("chr1", 100)])  # chr2:200 is absent
+    prose = p3.gate_3a_prose(three_a)
+
+    assert three_a["verdict"] == "frame_disagreement_blocks_join"
+    assert "The join was verified on exact" not in prose
+    assert "so the data overrules" not in prose
+    assert prose.startswith("Gate 3a blocked the join")
+    assert "1 of 2 analysis coordinates are absent" in prose
+    assert "Nothing downstream of this gate should be read as a result" in prose
+
+
+def test_the_gate_3a_prose_keeps_the_verified_wording_when_nothing_is_missing(
+    monkeypatch,
+):
+    three_a = _gate_3a(monkeypatch, [("chr1", 100), ("chr2", 200)])
+    prose = p3.gate_3a_prose(three_a)
+
+    assert "The join was verified on exact" in prose
+    assert "none of the 2 analysis sites is absent" in prose
+    assert "Gate 3a blocked the join" not in prose
+
+
+def test_the_gate_3a_prose_branch_agrees_with_the_gate_verdict(monkeypatch):
+    """The two branches must be exhaustive and never both readable as true."""
+    for present in ([("chr1", 100), ("chr2", 200)], [("chr1", 100)], []):
+        three_a = _gate_3a(monkeypatch, present)
+        prose = p3.gate_3a_prose(three_a)
+        blocked = three_a["verdict"] == "frame_disagreement_blocks_join"
+        assert prose.startswith("Gate 3a blocked") is blocked
+        assert ("so the data overrules" in prose) is not blocked
+
+
+# ---------------------------------------------------------------------------
+# Gates 3b and 3d: consequences and headline claims must track their verdicts
+# ---------------------------------------------------------------------------
+
+
+def _three_b(n_missing):
+    return p3.gate_3b_genotype_channel({"n_missing_genotypes": n_missing}, 10, 5)
+
+
+def _three_d(nested_covered, nested_total, control_covered, control_total):
+    return p3.gate_3d_cross_method_floor(
+        [("chr1", 100)] * nested_total,
+        [("chr1", 100)] * control_total,
+        Path("cross.bcf"),
+        0,
+        records=[],
+    )
+
+
+def test_gate_3b_consequence_says_not_executable_only_when_no_channel():
+    """The consequence was one fixed string declaring the design unrunnable.
+
+    Gate 3b passes whenever any genotype is missing or partial, so on such a
+    callset the gate passed while its consequence still said NOT EXECUTABLE and
+    claimed Phase 3 had fallen back to the recurrence axis.
+    """
+    blocked = _three_b(0)
+    assert blocked["verdict"] == "no_missingness_channel_zero_zero_uninterpretable"
+    assert "NOT EXECUTABLE" in p3.gate_3b_consequence(blocked)
+
+    open_gate = _three_b(3)
+    assert open_gate["verdict"] == "missingness_channel_present"
+    consequence = p3.gate_3b_consequence(open_gate)
+    assert "NOT EXECUTABLE" not in consequence
+    assert "proceeds on the recurrence axis" not in consequence
+    assert "not blocked by this gate" in consequence
+
+
+def test_gate_3b_consequence_does_not_claim_the_design_was_executed():
+    """The gate passing is a precondition cleared, not an analysis produced.
+
+    Nothing in this script branches on the 3b verdict, so a passing gate cannot
+    honestly be reported as the design having run.
+    """
+    consequence = p3.gate_3b_consequence(_three_b(7))
+    assert "not run by this script" in consequence
+    assert "not a result produced" in consequence
+
+
+def test_gate_3b_consequence_agrees_with_the_gate_it_describes():
+    for n_missing in (0, 1, 99):
+        gate = _three_b(n_missing)
+        blocked = gate["verdict"] == "no_missingness_channel_zero_zero_uninterpretable"
+        assert ("NOT EXECUTABLE" in gate["consequence"]) is blocked
+        assert gate["consequence"] == p3.gate_3b_consequence(gate)
+
+
+def test_the_headline_design_claim_matches_the_missing_genotype_count():
+    """The fixed line rendered "found no missingness channel: 0 missing"."""
+    blocked = p3.headline_design_executability(_three_b(0))
+    assert "not executable on this data" in blocked
+    assert "Gate 3b found no missingness channel: 0 missing" in blocked
+
+    open_gate = p3.headline_design_executability(_three_b(4))
+    assert "not executable on this data" not in open_gate
+    assert "found no missingness channel" not in open_gate
+    assert "4 missing or partial genotypes" in open_gate
+    assert "not a design being executed" in open_gate
+
+
+def _three_d_verdict(nested_rate, control_rate):
+    """A Gate 3d result for the given coverage rates, via the real gate."""
+    return {
+        "verdict": (
+            "cross_method_comparator_structurally_blind_to_nested_alu"
+            if nested_rate is not None
+            and control_rate is not None
+            and nested_rate < control_rate / 2
+            else "cross_method_comparator_covers_nested_alu"
+        ),
+        "nested_arm": {"fraction_covered": nested_rate},
+        "control_arm_non_nested_alu": {"fraction_covered": control_rate},
+        "fisher_exact_two_sided_p": 0.5,
+    }
+
+
+def test_gate_3d_consequence_says_blind_only_when_the_verdict_says_blind():
+    """The fixed consequence said the comparator "cannot score these sites".
+
+    That text is rendered into the published gate table, so a gate reporting
+    `covers_nested_alu` sat next to a consequence declaring agreement
+    unavailable.
+    """
+    blind = _three_d_verdict(0.05, 0.90)
+    assert "cannot score these sites" in p3.gate_3d_consequence(blind)
+    assert "unavailable" in p3.gate_3d_consequence(blind)
+
+    covers = _three_d_verdict(0.80, 0.90)
+    consequence = p3.gate_3d_consequence(covers)
+    assert "cannot score these sites" not in consequence
+    assert "cross-method agreement is unavailable" not in consequence
+    assert "available to be measured" in consequence
+
+
+def test_gate_3d_consequence_never_claims_agreement_was_established():
+    """Coverage is not concordance, whichever way the gate falls."""
+    # The arm that reaches the sites is the one at risk of implying agreement,
+    # so that is the branch that must carry the disclaimer.
+    consequence = p3.gate_3d_consequence(_three_d_verdict(0.80, 0.90))
+    assert "not established by their presence" in consequence
+    assert "validation" not in consequence.lower() or "established" not in consequence
+
+
+def test_the_cross_method_headline_agrees_with_the_gate_verdict():
+    blind = p3.headline_cross_method(_three_d_verdict(0.05, 0.90))
+    assert blind.startswith("2. **Cross-method agreement is unavailable")
+    assert "structurally blind" in blind
+
+    covers = p3.headline_cross_method(_three_d_verdict(0.80, 0.90))
+    assert "agreement is unavailable" not in covers
+    assert "reaches the nested-Alu arm" in covers
+    assert "structural-blindness explanation does not apply" in covers
+    assert "not thereby established" in covers

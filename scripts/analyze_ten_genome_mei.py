@@ -12,6 +12,7 @@ import copy
 import csv
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -389,6 +390,42 @@ def md_table(headers, rows):
         '| '+' | '.join(fmt(v).replace('|', ',') for v in row)+' |' for row in rows]
 
 
+def join_failure_reason(join):
+    """Name the check that actually failed, from the counters that fired.
+
+    This replaces a hardcoded explanation of the gate that had gone stale: it
+    claimed the committed consumers require `NESTED=nested` on every recovered
+    call, which was true until `verify_join` demoted that comparison to a
+    reported diagnostic. Hardcoding the cause is the worst way to describe a
+    gate, because the message is only read when the gate fires -- so a reader is
+    handed a confident explanation that may be the wrong one, and is told not to
+    patch the consumers on that basis. Derived from the counters, it cannot
+    disagree with the code that produced them.
+    """
+    fired = [
+        name
+        for name, value in (
+            ("carrier-count disagreement", join.get("sites_where_carrier_count_disagrees")),
+            ("orientation disagreement", join.get("calls_where_orientation_disagrees")),
+            ("family disagreement", join.get("calls_where_family_disagrees")),
+        )
+        if value
+    ]
+    if not fired:
+        return (
+            "the join verdict is not join_consistent_with_dedup_output but no "
+            "mismatch counter fired, so the gate's own rule changed and this "
+            "message is not authoritative"
+        )
+    return (
+        f"the join gate fired on {' and '.join(fired)}; the recovered per-call "
+        f"detail is not safe to use, so Phase 4 was not run. The legacy binary "
+        f"NESTED label is reported separately as a diagnostic "
+        f"({join.get('calls_where_source_nesting_label_differs_from_site')} calls "
+        f"differ) and is not part of this verdict."
+    )
+
+
 def dependent_gate(scripts, outdir, callsets):
     """Probe committed consumers unchanged; never turn an incompatible join into zero events."""
     spec = importlib.util.spec_from_file_location('ten_genome_committed_common', scripts/'nested_multi_sample_common.py')
@@ -402,26 +439,31 @@ def dependent_gate(scripts, outdir, callsets):
               'status': 'incompatible' if join['verdict'] != 'join_consistent_with_dedup_output' else 'ready',
               'opportunity_caveat': CAVEAT}
     if result['status'] == 'incompatible':
-        result['reason'] = ('Committed consumers require every recovered source call to have raw NESTED=nested; '
-                            'the producer independently assigns all same-family RMSK overlaps, including raw unnested antisense calls. '
-                            'This is a nesting-definition/input-contract mismatch, not zero recurrence. Consumers were not patched.')
+        result['reason'] = join_failure_reason(join)
     else:
         # Use existing CLI unmodified, temporary output subdirectory owned here.
+        # The scratch directory is removed on the way in and on the way out: a
+        # run killed between mkdir and the move-out below used to leave it
+        # behind, and `exist_ok=False` then failed every later run with a
+        # FileExistsError naming a temporary directory instead of the cause.
         dest = outdir/'phase4_run'
-        dest.mkdir(exist_ok=False)
-        for script in ('joint_enrichment.py', 'recurrence_test.py'):
-            command = [sys.executable, str(scripts/script), '--unique-sites', str(outdir/'unique_sites.csv'),
-                       '--callset-dir', str(callsets), '--outdir', str(dest)]
-            if script == 'joint_enrichment.py':
-                command += ['--rmsk', str(ROOT/'nested_analysis/data/rmsk.txt.gz')]
-            completed = subprocess.run(command, capture_output=True, text=True)
-            result[script] = {'returncode': completed.returncode, 'stdout': completed.stdout, 'stderr': completed.stderr}
-            if completed.returncode:
-                result['status'] = 'failed'
-                break
-        for path in dest.iterdir():
-            path.rename(outdir/f'phase4_{path.name}')
-        dest.rmdir()
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir()
+        try:
+            for script in ('joint_enrichment.py', 'recurrence_test.py'):
+                command = [sys.executable, str(scripts/script), '--unique-sites', str(outdir/'unique_sites.csv'),
+                           '--callset-dir', str(callsets), '--outdir', str(dest)]
+                if script == 'joint_enrichment.py':
+                    command += ['--rmsk', str(ROOT/'nested_analysis/data/rmsk.txt.gz')]
+                completed = subprocess.run(command, capture_output=True, text=True)
+                result[script] = {'returncode': completed.returncode, 'stdout': completed.stdout, 'stderr': completed.stderr}
+                if completed.returncode:
+                    result['status'] = 'failed'
+                    break
+            for path in dest.iterdir():
+                path.rename(outdir/f'phase4_{path.name}')
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
     (outdir/'phase4_status.json').write_text(json.dumps(result, indent=2)+'\n')
     return result
 

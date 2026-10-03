@@ -18,7 +18,7 @@ import csv
 import json
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
@@ -34,6 +34,11 @@ METRICS = RESULTS / "analysis_metrics.json"
 SITES_CSV = RESULTS / "unique_sites.csv"
 PRIVATE_CSV = RESULTS / "private_sites.csv"
 SUMMARY_MD = RESULTS / "analysis_summary.md"
+ACCUMULATION_CSV = RESULTS / "accumulation_curve.csv"
+PER_SAMPLE_CSV = RESULTS / "per_sample_calls.csv"
+PROFILES_CSV = RESULTS / "position_profiles.csv"
+PROJECTION_CSV = RESULTS / "l1_consensus_projection.csv"
+HOST_EVIDENCE_CSV = RESULTS / "host_parent_evidence.csv"
 
 SLOW = os.environ.get("RTM_REPRODUCE_SLOW") == "1"
 requires_slow = pytest.mark.skipif(
@@ -54,6 +59,10 @@ if str(SCRIPTS) not in sys.path:
 
 import analyze_ten_genome_mei as ten  # noqa: E402
 import mei_reference_opportunity as opportunity  # noqa: E402
+
+
+def _phase4_status_path():
+    return RESULTS / "phase4_status.json"
 
 
 @pytest.fixture(scope="module")
@@ -306,3 +315,151 @@ def test_report_carries_the_opportunity_caveat_on_every_enrichment_claim(publish
                     if line.strip().startswith(f"{number}."))
         if "enrichment" in line or "x versus" in line:
             assert ten.CAVEAT in line, f"answer {number} reports a number unconditioned"
+
+
+# ---------------------------------------------------------------------------
+# the derived artifacts
+#
+# Five further CSVs carry the bulk of the scientific output. Each is checked
+# against the metrics block or against the identity that defines it, so a
+# number cannot quietly stop meaning what its column name says.
+# ---------------------------------------------------------------------------
+def read_csv(path):
+    _require(path)
+    with path.open(encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_accumulation_curve_lands_on_the_published_union_counts(published):
+    """The curve is built by re-running dedup on growing cohort prefixes.
+
+    Its fifth and tenth rows must therefore reproduce the five-genome and
+    ten-genome unions the run gated on, which makes it an independent witness
+    to both.
+    """
+    rows = read_csv(ACCUMULATION_CSV)
+    assert len(rows) == len(ten.SAMPLES)
+    assert [row["sample_added"] for row in rows] == list(ten.SAMPLES)
+    assert [int(row["samples_included"]) for row in rows] == list(range(1, 11))
+
+    counts = [int(row["unique_sites"]) for row in rows]
+    assert counts == sorted(counts), "adding a genome must never remove a site"
+    five = sum(entry["union"] for entry in published["five"]["layers"])
+    ten_union = sum(entry["union"] for entry in published["ten"]["layers"])
+    assert counts[4] == five == 4998
+    assert counts[9] == ten_union == 7132
+    for row in rows:
+        assert int(row["ALU"]) + int(row["LINE1"]) + int(row["SVA"]) == int(row["unique_sites"])
+
+
+def test_per_sample_rows_are_each_private_to_their_own_genome():
+    """A per-genome table collapses within-sample records, so every row is n=1."""
+    rows = read_csv(PER_SAMPLE_CSV)
+    assert rows
+    for row in rows:
+        index = ten.SAMPLES.index(row["sample"])
+        assert row["n_carriers"] == "1"
+        assert row["presence_bitmap"].count("1") == 1
+        assert row["presence_bitmap"][index] == "1"
+        assert row["private_to_sample"] == row["sample"]
+
+
+def test_l1_projection_status_census_matches_the_metrics_block(published):
+    """The CSV and the diagnostics block are written at different points."""
+    rows = read_csv(PROJECTION_CSV)
+    census = Counter(row["status"] for row in rows)
+    assert dict(census) == published["diagnostics"]["opportunity"]["projection_status"]
+    assert census["eligible"] > 0, "no L1 reached the consensus-projected eligible state"
+
+
+def profile_groups():
+    groups = defaultdict(list)
+    for row in read_csv(PROFILES_CSV):
+        groups[(row["cohort_layer"], row["family"], row["method"])].append(row)
+    return groups
+
+
+def test_position_profile_expected_follows_the_opportunity_null():
+    """`expected` is the group's observed count rescaled by that bin's share of
+    reference opportunity -- recomputed here rather than taken on trust."""
+    for key, rows in profile_groups().items():
+        observed_total = sum(float(row["observed"]) for row in rows)
+        opportunity_total = sum(float(row["opportunity_bp"]) for row in rows)
+        for row in rows:
+            share = float(row["opportunity_bp"]) / opportunity_total if opportunity_total else 0.0
+            assert float(row["expected"]) == pytest.approx(
+                observed_total * share, rel=1e-6, abs=1e-6), key
+
+
+def test_position_profile_enrichment_is_observed_over_expected():
+    for row in read_csv(PROFILES_CSV):
+        expected = float(row["expected"])
+        assert float(row["bin_start"]) < float(row["bin_end"])
+        if expected > 0:
+            assert float(row["enrichment"]) == pytest.approx(
+                float(row["observed"]) / expected, rel=1e-6)
+        else:
+            # A zero-opportunity bin is left at zero, never pseudocounted, so
+            # it cannot carry an enrichment.
+            assert float(row["observed"]) == 0
+            assert float(row["enrichment"]) == 0
+
+
+def test_no_profile_bin_reports_events_where_opportunity_is_zero():
+    """Events can only be counted against callable reference."""
+    for row in read_csv(PROFILES_CSV):
+        if float(row["opportunity_bp"]) == 0:
+            assert float(row["observed"]) == 0, row
+            assert row["zero_opportunity_excluded"] in {"True", "False"}
+
+
+def test_host_parent_evidence_carriage_counts_are_self_consistent():
+    rows = read_csv(HOST_EVIDENCE_CSV)
+    assert rows
+    for row in rows:
+        samples = row["samples"].split(",") if row["samples"] else []
+        assert int(row["n_genomes"]) == len(samples)
+        assert len(set(samples)) == len(samples)
+        assert all(sample in ten.SAMPLES for sample in samples)
+        assert samples == [s for s in ten.SAMPLES if s in set(samples)], "not in cohort order"
+        assert row["window"] in {"linker", "tail", "any L1-host position"}
+
+
+def test_every_derived_artifact_carries_the_opportunity_caveat():
+    """Each is quotable on its own, so each must carry the qualification."""
+    for path in (ACCUMULATION_CSV, PER_SAMPLE_CSV, PROFILES_CSV, PROJECTION_CSV,
+                 HOST_EVIDENCE_CSV, SITES_CSV, PRIVATE_CSV):
+        rows = read_csv(path)
+        assert rows, path.name
+        assert {row["opportunity_caveat"] for row in rows} == {ten.CAVEAT}, path.name
+
+
+def test_the_shipped_report_is_exactly_what_the_current_code_renders(tmp_path, published):
+    """Re-render the report from the published artifacts and demand equality.
+
+    Every other check here compares selected fields. This one rebuilds the whole
+    document from the machine-readable record and compares it byte for byte, so
+    no wording, ordering or rounding in the published summary can drift away
+    from the numbers behind it unnoticed.
+
+    `write_report` takes the dependent Phase 4 result as an argument; it is
+    reconstructed from `phase4_status.json`, minus the two bookkeeping blocks
+    that gate records rather than report content.
+    """
+    status = json.loads(_phase4_status_path().read_text())
+    dependent = {k: v for k, v in status.items() if k not in ("provenance", "load")}
+
+    carriage = [
+        {"family": row["family"], "window": row["window"], "host_id": row["host_id"],
+         "samples": row["samples"], "n_genomes": int(row["n_genomes"]),
+         "opportunity_caveat": row["opportunity_caveat"]}
+        for row in read_csv(HOST_EVIDENCE_CSV)
+    ]
+
+    ten.write_report(tmp_path, published["five"], published["ten"], published["qc"],
+                     published["delta"], published["provenance"], published["diagnostics"],
+                     carriage, dependent)
+
+    rendered = (tmp_path / "analysis_summary.md").read_text(encoding="utf-8")
+    shipped = SUMMARY_MD.read_text(encoding="utf-8")
+    assert rendered == shipped, "the shipped report is not what this code renders"

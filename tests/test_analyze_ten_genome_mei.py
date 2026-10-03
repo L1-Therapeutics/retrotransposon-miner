@@ -11,6 +11,7 @@ the rule it defends so a future failure says which guarantee broke.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -636,3 +637,185 @@ def test_delta_reports_a_zero_baseline_as_no_change_not_a_division_error():
             for row in ten.delta_rows(_headline(union=0), _headline(union=10))}
     assert rows["Dedup union"]["percent_change"] is None
     assert rows["Dedup union"]["flag_gt20pct"] is False
+
+
+# ---------------------------------------------------------------------------
+# dependent_gate: the failure message must name the check that actually fired
+# ---------------------------------------------------------------------------
+
+
+def _join(**overrides):
+    """A `verify_join` result, consistent unless a test says otherwise."""
+    result = {
+        "sites_total": 10,
+        "sites_with_at_least_one_joined_call": 10,
+        "sites_with_no_joined_call": 0,
+        "calls_recovered": 20,
+        "calls_declared_by_dedup": 20,
+        "sites_where_carrier_count_disagrees": 0,
+        "calls_where_orientation_disagrees": 0,
+        "calls_where_family_disagrees": 0,
+        "calls_where_source_nesting_label_differs_from_site": 592,
+        "verdict": "join_consistent_with_dedup_output",
+    }
+    result.update(overrides)
+    return result
+
+
+def test_the_failure_reason_names_the_counter_that_fired():
+    """The message used to assert a cause the gate no longer tests.
+
+    It claimed the committed consumers require `NESTED=nested` on every
+    recovered call. `verify_join` no longer gates on that field, so the message
+    would have told a reader to look at the nesting definition and leave the
+    consumers alone while the real cause sat in a different counter.
+    """
+    assert "family disagreement" in ten.join_failure_reason(
+        _join(calls_where_family_disagrees=3)
+    )
+    assert "carrier-count disagreement" in ten.join_failure_reason(
+        _join(sites_where_carrier_count_disagrees=1)
+    )
+    assert "orientation disagreement" in ten.join_failure_reason(
+        _join(calls_where_orientation_disagrees=7)
+    )
+
+
+def test_the_failure_reason_reports_every_counter_that_fired():
+    reason = ten.join_failure_reason(
+        _join(
+            sites_where_carrier_count_disagrees=2,
+            calls_where_family_disagrees=1,
+        )
+    )
+    assert "carrier-count disagreement" in reason
+    assert "family disagreement" in reason
+
+
+def test_the_failure_reason_never_blames_the_nesting_label():
+    """The legacy NESTED comparison is a diagnostic, not a gate.
+
+    592 calls differ on that field on the real cohort and the verdict is still
+    `join_consistent_with_dedup_output`. A message that named the label as the
+    cause would be wrong for every run that actually fails.
+    """
+    reason = ten.join_failure_reason(_join(calls_where_family_disagrees=1))
+    assert "NESTED" in reason  # it is mentioned, to rule it out
+    assert "not part of this verdict" in reason
+    assert "not zero recurrence" not in reason
+
+
+def test_the_failure_reason_refuses_to_guess_when_no_counter_fires():
+    """An unexplained failure must not acquire a confident invented cause."""
+    reason = ten.join_failure_reason(
+        _join(verdict="join_disagrees_with_dedup_output")
+    )
+    assert "not authoritative" in reason
+
+
+def test_the_failure_reason_cannot_claim_the_old_nesting_cause():
+    """Directly pins the regression: the stale text must not come back."""
+    reason = ten.join_failure_reason(_join(calls_where_orientation_disagrees=4))
+    for stale in ("require every recovered source call",
+                  "nesting-definition/input-contract mismatch",
+                  "Consumers were not patched"):
+        assert stale not in reason
+
+
+FAKE_COMMON = '''
+"""Stand-in for `nested_multi_sample_common.py`, written to a real path.
+
+`dependent_gate` loads the committed consumer by file path, so the honest way to
+test it is to give it a real file to load rather than to patch `importlib`.
+"""
+SITES = [{"site_id": "US00001", "carriers": ["HG03086"], "chrom": "chr1",
+          "pos": 100, "n_carriers": 1}]
+
+def load_unique_sites(path):
+    return SITES, {"rows_read": 1}
+
+def load_callsets(callsets, samples):
+    return {}
+
+def attach_call_details(sites, callsets):
+    return sites
+
+def verify_join(sites):
+    return VERDICT
+'''
+
+
+def _write_fake_scripts(tmp_path, verdict):
+    """A `scripts/` directory holding a `nested_multi_sample_common.py` stub."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir(exist_ok=True)
+    (scripts / "nested_multi_sample_common.py").write_text(
+        f"VERDICT = {verdict!r}\n" + FAKE_COMMON
+    )
+    return scripts
+
+
+def test_a_leftover_scratch_directory_does_not_break_a_rerun(tmp_path, monkeypatch):
+    """`mkdir(exist_ok=False)` made the gate single-use after any abnormal exit.
+
+    A kill between creating the scratch directory and moving its contents out
+    left it behind, and every later run then failed with a FileExistsError
+    naming a temporary directory rather than the cause.
+    """
+    scripts = _write_fake_scripts(tmp_path, _join())
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    (outdir / "unique_sites.csv").write_text("site_id\n")
+    stale = outdir / "phase4_run"
+    stale.mkdir()
+    (stale / "half-written.json").write_text("{}")
+
+    monkeypatch.setattr(
+        ten.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    result = ten.dependent_gate(scripts, outdir, tmp_path / "callsets")
+
+    assert result["status"] == "ready"
+    assert not stale.exists(), "the leftover scratch directory was not cleaned up"
+    assert not (outdir / "phase4_run").exists(), "the scratch directory outlived the run"
+
+
+def test_the_scratch_directory_is_removed_even_when_a_consumer_fails(tmp_path, monkeypatch):
+    """A failing consumer must not leave the next run unable to start."""
+    scripts = _write_fake_scripts(tmp_path, _join())
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    (outdir / "unique_sites.csv").write_text("site_id\n")
+
+    monkeypatch.setattr(
+        ten.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+    result = ten.dependent_gate(scripts, outdir, tmp_path / "callsets")
+
+    assert result["status"] == "failed"
+    assert not (outdir / "phase4_run").exists()
+
+
+def test_an_incompatible_join_records_the_fired_counter_and_no_reason_to_blame(
+    tmp_path,
+):
+    """End to end through the real gate, with a real failing verdict."""
+    failing = _join(calls_where_family_disagrees=4,
+                    verdict="join_disagrees_with_dedup_output")
+    scripts = _write_fake_scripts(tmp_path, failing)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    (outdir / "unique_sites.csv").write_text("site_id\n")
+
+    result = ten.dependent_gate(scripts, outdir, tmp_path / "callsets")
+    assert result["status"] == "incompatible"
+    assert "family disagreement" in result["reason"]
+    assert "require every recovered source call" not in result["reason"]
+    assert not (outdir / "phase4_run").exists(), "the consumers must not run"
+    recorded = json.loads((outdir / "phase4_status.json").read_text())
+    assert recorded["status"] == "incompatible"
+    assert recorded["reason"] == result["reason"], (
+        "the provenance artifact must record the same reason the run reported"
+    )

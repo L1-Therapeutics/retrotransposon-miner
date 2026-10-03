@@ -2622,7 +2622,15 @@ def plot_locus_architecture(
                 mei_index=cache._mei_index if cache is not None else None,
             )
         else:
-            assert gold_path is not None
+            if gold_path is None:
+                # An assert here would be stripped under `python -O`, turning a
+                # clear precondition failure into a TypeError from deep inside
+                # `_load_locus_row`. Reachable when a cache carries no `gold_tsv`
+                # and no explicit `gold_tsv` argument was passed either.
+                raise ValueError(
+                    "gold_tsv is required when the cache carries no gold_tsv and "
+                    "no row was supplied"
+                )
             row = _load_locus_row(gold_path, chrom, pos, mei_df=mei_df)
     elif mei_df is not None or (cache is not None and cache._mei_index):
         row = _enrich_row_from_mei(

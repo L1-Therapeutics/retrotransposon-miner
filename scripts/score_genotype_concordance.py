@@ -375,6 +375,21 @@ def gate_3a_coordinate_frame(
     ]
     available = site_coordinates(genotype_bcf)
     missing = [s for s in analysis_sites if s not in available]
+    if missing:
+        note = (
+            "header contig lengths disagree AND "
+            f"{len(missing)} of {len(analysis_sites)} analysis coordinates are "
+            "absent from the genotype callset, so the coordinate frame is not "
+            "resolved and the join is blocked. The headers cannot be used to "
+            "decide this, because they are what disagree."
+        )
+    else:
+        note = (
+            "header contig lengths disagree but every analysis coordinate is "
+            "present verbatim in the genotype callset, so the join is verified "
+            "on the data rather than on the headers; the header disagreement is "
+            "reported because a future join that trusted it would be wrong"
+        )
     return {
         "gate": "3a",
         "site_bcf": str(site_bcf),
@@ -390,13 +405,127 @@ def gate_3a_coordinate_frame(
             if not missing
             else "frame_disagreement_blocks_join"
         ),
-        "note": (
-            "header contig lengths disagree but every analysis coordinate is "
-            "present verbatim in the genotype callset, so the join is verified "
-            "on the data rather than on the headers; the header disagreement is "
-            "reported because a future join that trusted it would be wrong"
-        ),
+        "note": note,
     }
+
+
+def headline_design_executability(three_b: dict[str, Any]) -> str:
+    """Headline item 1, branching on Gate 3b.
+
+    The fixed version opened by declaring the design not executable and then
+    quoted the missing-genotype count, so a callset with a missingness channel
+    rendered "found no missingness channel: 0 missing or partial genotypes" in
+    the report's first numbered claim. Branching keeps the claim and the count
+    telling the same story.
+    """
+    if not three_b["missingness_channel_present"]:
+        return (
+            f"1. **The pre-registered Phase 3 design is not executable on this data.** "
+            f"Gate 3b found no missingness channel: "
+            f"{three_b['missing_or_partial_genotypes']} missing or partial genotypes "
+            f"out of {three_b['genotypes_examined']:,} examined. A `0/0` therefore "
+            "cannot be separated from a genotyping failure inside a hard repeat, so "
+            "the plan's \"concordance at demonstrated-callable loci\" has no "
+            "demonstration available and was not run."
+        )
+    return (
+        f"1. **Gate 3b found a missingness channel, and the pre-registered Phase 3 "
+        f"design is still not run.** "
+        f"{three_b['missing_or_partial_genotypes']} missing or partial genotypes out "
+        f"of {three_b['genotypes_examined']:,} examined means a `0/0` can be "
+        "separated from a genotyping failure, so the gate's precondition is met. No "
+        "concordance-at-demonstrated-callable-loci analysis is implemented in this "
+        "script, so this is an unmet precondition being cleared, not a design being "
+        "executed."
+    )
+
+
+def headline_cross_method(three_d: dict[str, Any]) -> str:
+    """Headline item 2, branching on Gate 3d's verdict.
+
+    The fixed version asserted cross-method agreement was unavailable and that the
+    comparator was structurally blind, regardless of the coverage rates printed in
+    the same sentence.
+    """
+    nested = _fmt_pct(three_d.get('nested_arm', {}).get('fraction_covered'))
+    control = _fmt_pct(
+        three_d.get('control_arm_non_nested_alu', {}).get('fraction_covered')
+    )
+    measured = (
+        f"An independent short-read callset covers {nested} of nested-Alu sites "
+        f"against {control} of non-nested Alu sites from the same cohort "
+        f"(Fisher exact p = {_fmt_p(three_d.get('fisher_exact_two_sided_p'))}). "
+    )
+    if three_d["verdict"] == "cross_method_comparator_structurally_blind_to_nested_alu":
+        return (
+            "2. **Cross-method agreement is unavailable, and that is now a "
+            f"measurement.** {measured}A short read cannot span an Alu inserted "
+            "into an Alu, so the comparator is structurally blind here rather than "
+            "merely noisy."
+        )
+    return (
+        "2. **The short-read comparator reaches the nested-Alu arm on this data.** "
+        f"{measured}The nested arm is not less than half the control arm, so the "
+        "structural-blindness explanation does not apply and cross-method agreement "
+        "is available to be measured. It is not thereby established; the rates above "
+        "are coverage, not concordance."
+    )
+
+
+def gate_3b_consequence(three_b: dict[str, Any]) -> str:
+    """Gate 3b's consequence, branching on whether a missingness channel exists.
+
+    This was one fixed string asserting the design is NOT EXECUTABLE. Gate 3b's
+    verdict is `missingness_channel_present` whenever any genotype is missing or
+    partial, so on such a callset the gate passed while its consequence still
+    declared the pre-registered design unrunnable and said Phase 3 had fallen
+    back to the recurrence axis -- a statement about what the run did, made
+    without reference to the run.
+    """
+    if not three_b["missingness_channel_present"]:
+        return (
+            "a 0/0 is indistinguishable from a genotyping failure inside a hard "
+            "repeat, so non-carriers are not demonstrated negatives and the "
+            "pre-registered 'concordance at demonstrated-callable loci' design is "
+            "NOT EXECUTABLE on this callset; Phase 3 proceeds on the recurrence "
+            "axis across independent halves of the cohort, where carriers are "
+            "positive evidence and no negative is required"
+        )
+    return (
+        f"a missingness channel is present "
+        f"({three_b['missing_or_partial_genotypes']} missing or partial genotypes "
+        f"out of {three_b['genotypes_examined']:,} examined), so a 0/0 can be "
+        "separated from a genotyping failure and the pre-registered design is not "
+        "blocked by this gate. It is still not run by this script: no "
+        "concordance-at-demonstrated-callable-loci analysis is implemented here, so "
+        "the gate passing is a precondition met, not a result produced"
+    )
+
+
+def gate_3d_consequence(three_d: dict[str, Any]) -> str:
+    """Gate 3d's consequence, branching on whether the comparator is blind.
+
+    The fixed version said the short-read callset "cannot score these sites" and
+    that cross-method agreement is "unavailable". The verdict is
+    `cross_method_comparator_covers_nested_alu` whenever the nested arm is not
+    less than half the control arm, so on such data the gate reported agreement
+    available in one field and unavailable in the next. This text is rendered
+    into the published gate table, so the contradiction was on the page.
+    """
+    if three_d["verdict"] == "cross_method_comparator_structurally_blind_to_nested_alu":
+        return (
+            "an independent short-read callset cannot score these sites, so "
+            "cross-method agreement is unavailable for this locus class; the "
+            "evidence for that absence is this measurement, not an assumption, "
+            "and the word 'validated' therefore stays off the table"
+        )
+    return (
+        "the short-read comparator reaches the nested-Alu arm on this data, so "
+        "the structural-blindness explanation does not apply and cross-method "
+        "agreement is available to be measured rather than assumed unavailable; "
+        "the coverage rates above are the measurement, and agreement on them is "
+        "not established by their presence"
+    )
 
 
 def gate_3b_genotype_channel(
@@ -413,7 +542,7 @@ def gate_3b_genotype_channel(
     """
     n_missing = counters.get("n_missing_genotypes", 0)
     n_short = counters.get("n_records_with_unexpected_sample_count", 0)
-    return {
+    three_b = {
         "gate": "3b",
         "genotypes_examined": n_sites * n_samples,
         "missing_or_partial_genotypes": n_missing,
@@ -424,15 +553,9 @@ def gate_3b_genotype_channel(
             if n_missing > 0
             else "no_missingness_channel_zero_zero_uninterpretable"
         ),
-        "consequence": (
-            "a 0/0 is indistinguishable from a genotyping failure inside a hard "
-            "repeat, so non-carriers are not demonstrated negatives and the "
-            "pre-registered 'concordance at demonstrated-callable loci' design is "
-            "NOT EXECUTABLE on this callset; Phase 3 proceeds on the recurrence "
-            "axis across independent halves of the cohort, where carriers are "
-            "positive evidence and no negative is required"
-        ),
     }
+    three_b["consequence"] = gate_3b_consequence(three_b)
+    return three_b
 
 
 def gate_3c_sample_identity(
@@ -607,7 +730,7 @@ def gate_3d_cross_method_floor(
         control_covered,
         n_control - control_covered,
     )
-    return {
+    three_d = {
         "gate": "3d",
         "cross_method_file": str(cross_method_path),
         "cross_method_records_considered": n_records,
@@ -635,13 +758,9 @@ def gate_3d_cross_method_floor(
             and nested_rate < control_rate / 2
             else "cross_method_comparator_covers_nested_alu"
         ),
-        "consequence": (
-            "an independent short-read callset cannot score these sites, so "
-            "cross-method agreement is unavailable for this locus class; the "
-            "evidence for that absence is this measurement, not an assumption, "
-            "and the word 'validated' therefore stays off the table"
-        ),
     }
+    three_d["consequence"] = gate_3d_consequence(three_d)
+    return three_d
 
 
 # --------------------------------------------------------------------------
@@ -1109,6 +1228,40 @@ def _fmt_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{100 * value:.2f}%"
 
 
+def gate_3a_prose(three_a: dict[str, Any]) -> str:
+    """The Gate 3a paragraph, branching on the verdict rather than asserting one.
+
+    This used to be a single fixed paragraph claiming the join "was verified on
+    exact coordinates anyway" and quoting the absent-site count as a parenthetic,
+    so a blocked gate rendered as "N sites are absent, and the data overrules the
+    headers anyway". Unlike the JSON note this text reaches the human-readable
+    report, which is the copy a reader actually takes away, so it must not carry
+    a conclusion its own gate denies.
+    """
+    absent = three_a['analysis_sites_absent_from_genotype_bcf']
+    shared = (
+        f"The site and genotype callsets declare different lengths for "
+        f"{three_a['contig_length_disagreements']} of {three_a['shared_contigs']} "
+        "shared contigs, with the sign of the difference flipping across "
+        "chromosomes"
+    )
+    if absent:
+        return (
+            f"Gate 3a blocked the join. {shared}, and {absent} of "
+            f"{three_a['analysis_sites']} analysis coordinates are absent from the "
+            "genotype callset. The coordinate frame is therefore not resolved, and "
+            "the headers cannot settle it because they are what disagree. Nothing "
+            "downstream of this gate should be read as a result."
+        )
+    return (
+        f"Gate 3a is worth reading closely: {shared}. The join was verified on exact "
+        f"coordinates anyway -- none of the {three_a['analysis_sites']} analysis "
+        "sites is absent from the genotype callset -- so the data overrules the "
+        "headers. The header disagreement is still reported, because a join that "
+        "had trusted it would have been wrong."
+    )
+
+
 def write_report(outdir: Path, report: dict[str, Any]) -> None:
     gates = report["gates"]
     summary = report["recurrence"]
@@ -1128,24 +1281,8 @@ def write_report(outdir: Path, report: dict[str, Any]) -> None:
 
     lines.append("## Headline")
     lines.append("")
-    lines.append(
-        f"1. **The pre-registered Phase 3 design is not executable on this data.** "
-        f"Gate 3b found no missingness channel: {gates['3b']['missing_or_partial_genotypes']} "
-        f"missing or partial genotypes out of {gates['3b']['genotypes_examined']:,} "
-        "examined. A `0/0` therefore cannot be separated from a genotyping failure "
-        "inside a hard repeat, so the plan's \"concordance at demonstrated-callable "
-        "loci\" has no demonstration available and was not run."
-    )
-    lines.append(
-        f"2. **Cross-method agreement is unavailable, and that is now a measurement.** "
-        f"An independent short-read callset covers {_fmt_pct(floor.get('nested_arm', {}).get('fraction_covered'))} "
-        f"of nested-Alu sites against "
-        f"{_fmt_pct(floor.get('control_arm_non_nested_alu', {}).get('fraction_covered'))} "
-        f"of non-nested Alu sites from the same cohort "
-        f"(Fisher exact p = {_fmt_p(floor.get('fisher_exact_two_sided_p'))}). A short "
-        "read cannot span an Alu inserted into an Alu, so the comparator is "
-        "structurally blind here rather than merely noisy."
-    )
+    lines.append(headline_design_executability(gates['3b']))
+    lines.append(headline_cross_method(floor))
     lines.append(
         f"3. **What remains is recurrence, and it is thin.** "
         f"{summary['cross_half_supported']} of {summary['sites_with_genotype_record']} "
@@ -1166,16 +1303,7 @@ def write_report(outdir: Path, report: dict[str, Any]) -> None:
             f"| {key} | `{gate['verdict']}` | {consequence.split('.')[0]}. |"
         )
     lines.append("")
-    lines.append(
-        f"Gate 3a is worth reading closely: the site and genotype callsets declare "
-        f"different lengths for {gates['3a']['contig_length_disagreements']} of "
-        f"{gates['3a']['shared_contigs']} shared contigs, with the sign of the "
-        "difference flipping across chromosomes. The join was verified on exact "
-        f"coordinates anyway -- {gates['3a']['analysis_sites_absent_from_genotype_bcf']} "
-        "analysis sites are absent from the genotype callset -- so the data overrules "
-        "the headers. The header disagreement is still reported, because a join that "
-        "had trusted it would have been wrong."
-    )
+    lines.append(gate_3a_prose(gates['3a']))
     lines.append("")
 
     lines.append("## Genotype concordance across independent halves")

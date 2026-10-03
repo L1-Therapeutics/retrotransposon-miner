@@ -25,22 +25,27 @@ __all__ = [
     "_progress",
     "_load_evidence_table",
     "_validate_evidence_columns",
+    "_read_passing_counts",
     "_windowize",
     "_cluster_sorted_positions",
     "_split_cluster_positions",
     "_distance_to_closed_interval",
     "_build_loci_from_evidence",
-    "_annotate_segdup_on_breakpoint_windows",
-    "_annotate_low_mappability_on_windows",
-    "_annotate_giab_highconf_on_windows",
-    "_annotate_gap_on_windows",
-    "_annotate_encode_blacklist_on_windows",
+    "_merge_overlapping_loci",
+    "_assign_rows_to_loci",
+    "_aggregate_evidence",
     "_aggregate_split_metrics",
     "_aggregate_discordant_metrics",
-    "_compute_enrichment",
-    "_annotate_candidate_loci",
-    "_write_candidate_loci_table",
+    "_safe_cpm",
+    "_parse_interval_parts",
+    "_normalize_track_to_bed",
+    "_write_candidate_windows_bed",
+    "_get_overlapping_row_ids",
+    "_get_overlapping_row_ids_with_fraction",
+    "_annotate_junk_flags",
+    "_breakpoint_query_intervals",
     "annotate_segdup_on_breakpoint_windows",
+    "_recompute_locus_junk_flag_count",
 ]
 
 
@@ -932,9 +937,19 @@ def build_candidate_loci(
         split_control_raw = _load_evidence_table(evidence_dir, "split_evidence", "control")
         _validate_evidence_columns(split_control_raw, "split_evidence", "control", _SPLIT_EVIDENCE_REQUIRED_COLS)
         discordant_disease_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "disease")
-        _validate_evidence_columns(discordant_disease_raw, "discordant_evidence", "disease", _DISCORDANT_EVIDENCE_REQUIRED_COLS)
+        _validate_evidence_columns(
+            discordant_disease_raw,
+            "discordant_evidence",
+            "disease",
+            _DISCORDANT_EVIDENCE_REQUIRED_COLS,
+        )
         discordant_control_raw = _load_evidence_table(evidence_dir, "discordant_evidence", "control")
-        _validate_evidence_columns(discordant_control_raw, "discordant_evidence", "control", _DISCORDANT_EVIDENCE_REQUIRED_COLS)
+        _validate_evidence_columns(
+            discordant_control_raw,
+            "discordant_evidence",
+            "control",
+            _DISCORDANT_EVIDENCE_REQUIRED_COLS,
+        )
         _progress(
             "loaded evidence rows "
             f"split_disease={len(split_disease_raw)}, split_control={len(split_control_raw)}, "
@@ -1019,7 +1034,11 @@ def build_candidate_loci(
     )
 
         _progress("sorting final candidate loci")
-        merged = merged.sort_values(["enrichment_ratio", "disease_total_rows"], ascending=[False, False], kind="mergesort")
+        merged = merged.sort_values(
+            ["enrichment_ratio", "disease_total_rows"],
+            ascending=[False, False],
+            kind="mergesort",
+        )
 
         out_tsv = outdir / "candidate_loci.tsv"
         out_parquet = outdir / "candidate_loci.parquet"

@@ -9144,8 +9144,8 @@ def _infer_disease_insertion_metrics(
                 if not chrom:
                     continue
                 try:
-                    ws = int(getattr(row, "window_start"))
-                    we = int(getattr(row, "window_end"))
+                    ws = int(row.window_start)
+                    we = int(row.window_end)
                 except (TypeError, ValueError):
                     continue
                 side = str(getattr(row, "clip_side", "") or "").strip().upper()
@@ -15935,7 +15935,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
         with cand_bed.open("w", encoding="utf-8") as hout:
             for i, row in enumerate(out.itertuples(index=False)):
                 as_row = pd.Series(row._asdict())
-                chrom = str(getattr(row, "chrom"))
+                chrom = str(row.chrom)
                 pos_1based = int(getattr(row, "insertion_breakpoint_pos", 0) or 0)
                 if pos_1based <= 0:
                     pos_1based = int(
