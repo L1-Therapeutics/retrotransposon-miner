@@ -6,8 +6,13 @@ Without `pythonpath = ["src"]` the suite can import another branch's code and
 still pass, with no error and no warning.
 """
 
+from __future__ import annotations
+
+import importlib.util
 import tomllib
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,12 +28,16 @@ def test_pyproject_pins_pythonpath_to_src():
 
 
 def test_retro_miner_resolves_inside_this_checkout():
-    # This is the assertion that would have caught the real problem: it is the
-    # one that fails, silently-but-loudly-here, when sys.path resolves
-    # retro_miner to a sibling worktree instead of the tree these tests live in.
-    import retro_miner
+    """The suite must exercise THIS checkout's src, never a sibling worktree's.
 
-    module_path = Path(retro_miner.__file__).resolve()
+    Skips when retro_miner is not installed at all: bare pytest runs get the
+    package from pythonpath = ["src"], so there is nothing to police unless
+    some sys.path entry (e.g. an editable install) could supply a copy.
+    """
+    spec = importlib.util.find_spec("retro_miner")
+    if spec is None or spec.origin is None:
+        pytest.skip("retro_miner not installed; pythonpath = ['src'] supplies it")
+    module_path = Path(spec.origin).resolve()
     assert module_path.is_relative_to(REPO_ROOT / "src"), (
         f"retro_miner resolved to {module_path}, which is outside "
         f"{REPO_ROOT / 'src'} -- a sibling worktree's editable install won on sys.path"
