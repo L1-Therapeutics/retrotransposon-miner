@@ -353,3 +353,112 @@ the counts may be read:
 The honest reading: the test was run, candidate pairs exist, and it did not
 resolve the question, because child subfamily and TSD do not discriminate at this
 scale.
+
+## Phase 4 amendment — the cohort is every nested site, not the sense ones
+
+**Also added after the freeze. Nothing above this line is edited by this
+section.** The Phase 4 §"Substrate" figures quoted earlier in this document
+(763 sites, 5 genomes) are **superseded**: the substrate was re-run at 10
+genomes, and the cohort rule that selected it was found to be wrong. Both
+analyses have been regenerated. This section records the correction, the
+evidence for it, and every number that moves.
+
+### What the question actually was
+
+Phase 4 was run on 763 sites. That number is the `nested_sense` count of the
+5-genome table, so the published cohort was the subset of nested insertions
+labelled sense-relative-to-host. The question put to me was whether the right
+cohort was that 763, or the 963 host-bearing sites of the same table. On the
+current substrate the framing has dissolved: host-bearing and nested are the
+**same set** (1,516 of 1,516; all 5,616 unnested rows are hostless), so the
+real question was only ever sense-only versus all-nested.
+
+### The decision
+
+**The cohort is every nested insertion, in either orientation class.** It is
+stated once, in `nested_multi_sample_common.COHORT_RULE` / `is_nested_site()`,
+applied in `load_unique_sites`, recorded in `load_report.cohort_rule`, and
+echoed into both Phase 4 JSONs and both markdown reports.
+
+`same_family_nested_state` beginning with `nested` — `nested_sense`,
+`nested_antisense`, `nested_unknown`. An empty value is **not** nested.
+
+### Why, and one claim I had to withdraw
+
+`nested_antisense` sites are real nested insertions: the producer found a
+same-family host on the opposite strand. Excluding them is not a narrowing, it
+is dropping a stratum of the study's events on a criterion that corresponds to
+no cell of the pre-registered design.
+
+The first justification I wrote for this was that a `nested_sense`-only cohort
+would drive the two interaction cells `S2`/`S3` — whose statistic is
+`n_sense_in_bin − n_antisense_in_bin` — to exactly zero, making the
+pre-registered tests vacuous. **That was wrong, and I checked it rather than
+shipping it.** Orientation is carried by its own `ORIENT` field, independent of
+the nesting label, so a sense-only cohort still contains orientation-antisense
+sites and the interaction cells remain computable. The real effect is worse than
+vacuity: the filter *biases* them.
+
+Because the two nesting strata carry different orientation mixes, deleting
+`nested_antisense` shifts the sense:antisense balance those cells report. In the
+primary 120–140 bin it removes 14 sense-oriented and 17 antisense-oriented
+sites. Measured on identical input, with the substrate held fixed and only the
+predicate varied:
+
+| | `nested_sense` only | all nested |
+|---|---|---|
+| cohort | 1,197 | 1,516 |
+| S2 interaction 120–140, observed | 12 | 8 |
+| S2 p | 0.0135 | 0.0710 |
+| same-host IBD pairs | **0** | **25** |
+| candidate pairs / chance | 9 / 14.16 | 63 / 32.32 |
+
+So the withdrawn cohort did not merely lose sites. It manufactured a nominally
+significant position×orientation interaction that the full cohort does not
+support, and it reported **zero** inherited same-host pairs where the full
+cohort finds 25.
+
+### A second defect this exposed
+
+The two Phase 4 scripts did not share a cohort definition. `recurrence_test.py`
+re-derived "nested" from the per-call legacy `NESTED` field, which is computed
+under a different host-selection rule and labels every antisense-nested site
+`unnested`. On one input file the pair reported **1,516** and **1,197** sites.
+Both now take the cohort from the loader; the legacy label is recorded as a
+non-gating diagnostic (`sites_whose_any_call_carries_legacy_nested_label`,
+1,197 of 1,516) so the disagreement stays visible.
+
+Regenerating also exposed that the recurrence report's headline asserted "chance
+exceeds observed" unconditionally. Once the observed count rose above the
+chance expectation, the sentence kept claiming the opposite of what its own
+numbers said. That comparison is now derived from the data.
+
+### Regenerated results (10 genomes, 1,516 sites, seed 20261001)
+
+Joint enrichment — 10,000 replicates, 2,000 bootstrap:
+
+| cell | observed | expected | p |
+|---|---|---|---|
+| `P1_primary` | 47 | 17.38 | 9.999e-05 |
+| `S1_tail_sense` | 38 | 10.24 | 9.999e-05 |
+| `S2_interaction_120_140` | 8 | −0.87 | 0.0710 |
+| `S3_interaction_280_300` | 2 | −0.23 | 0.3508 |
+
+Position factor 2.41x, orientation factor 0.98x. Shared 647 / private 869. The
+primary and tail-sense enrichment survive the correction and hold at the
+simulation floor. **The primary interaction does not** — on the full cohort it
+is 8 against an expectation of −0.87, p = 0.071, not significant.
+
+Same-host recurrence at ±10 bp: **25 IBD**, **63 candidate**, **54 TSD
+unevaluable**, across 236 host copies carrying more than one nested event;
+chance expectation 32.32, so the candidate count now clears its positional
+chance expectation for the first time. Per family, hosts with >1 event / host
+copies: Alu 192/810, L1 34/318, SVA 6/46, other 4/17. The candidate definition
+remains loose — independent pairs satisfy it at ~0.90–0.95 by family — so this
+is positional clustering, not demonstrated shared ancestry. The IBD arm is what
+speaks to identity by descent, and the chance rate of an independent pair
+satisfying the full IBD definition is ~0.0009 for Alu, so those 25 pairs are
+not what chance would produce.
+
+These denominators are 10 genomes and remain **not** comparable to the pooled
+SVAN 26/2,559 Alu-host figure.

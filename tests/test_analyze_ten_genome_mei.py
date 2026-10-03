@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -490,6 +491,114 @@ def test_unmasked_calls_drops_only_overlapping_breakpoints(engine):
     masks = {"chr1": opportunity.SpanMask([(999, 1001)])}
     assert [c.pos for c in ten.unmasked_calls(calls, masks)] == [2000]
     assert ten.unmasked_calls(calls, None) == calls
+
+
+# ---------------------------------------------------------------------------
+# input/output provenance
+#
+# Two cohorts wrote `unique_sites.csv` at the same path, so the generation-1
+# phase4 reports now name an input that no longer exists and cannot be
+# reconstructed. Recording hashes of the inputs and of what a run overwrites
+# turns that silent hazard into a recorded fact.
+# ---------------------------------------------------------------------------
+def fake_args(tmp_path, *, with_mappability=True):
+    callsets = tmp_path / "callsets"
+    callsets.mkdir()
+    for sample in ten.SAMPLES:
+        (callsets / f"{sample}.vcf").write_text(f"# {sample}\n")
+    rmsk = tmp_path / "rmsk.txt.gz"
+    rmsk.write_bytes(b"rmsk")
+    fasta = tmp_path / "genome.fa"
+    fasta.write_bytes(b">chr1\nACGT")
+    consensus = tmp_path / "consensus.fa"
+    consensus.write_bytes(b">L1HS\nACGT")
+    low = tmp_path / "low.bed"
+    if with_mappability:
+        low.write_text("chr1\t0\t1\n")
+    return SimpleNamespace(callset_dir=callsets, rmsk=rmsk, fasta=fasta,
+                           consensus=consensus,
+                           low_mappability=low if with_mappability else tmp_path / "absent.bed",
+                           outdir=tmp_path / "out", replicates=1000)
+
+
+def test_input_hashes_cover_every_input_the_run_reads(tmp_path, engine):
+    hashes = ten.input_hashes(engine, fake_args(tmp_path))
+    assert set(hashes) == {f"callsets/{s}.vcf" for s in ten.SAMPLES} | {
+        "rmsk.txt.gz", "hg38.fasta", "consensus.fa", "low_mappability.bed"}
+    assert all(len(h) == 64 for h in hashes.values())
+    assert len(set(hashes.values())) == len(hashes)
+
+
+def test_input_hashes_refuse_to_record_a_missing_input(tmp_path, engine):
+    """A silently absent input would be recorded as if it had been used."""
+    args = fake_args(tmp_path)
+    args.fasta = tmp_path / "absent.fa"
+    with pytest.raises(FileNotFoundError, match="hg38.fasta"):
+        ten.input_hashes(engine, args)
+
+
+def test_absent_optional_mask_is_omitted_rather_than_faked(tmp_path, engine):
+    hashes = ten.input_hashes(engine, fake_args(tmp_path, with_mappability=False))
+    assert "low_mappability.bed" not in hashes
+
+
+def test_superseded_table_fingerprints_the_table_about_to_be_overwritten(tmp_path, engine):
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    assert ten.superseded_table(engine, outdir) is None
+
+    table = outdir / "unique_sites.csv"
+    table.write_text("site_id,chrom\nUS00001,chr1\nUS00002,chr1\n")
+    prior = ten.superseded_table(engine, outdir)
+    assert prior["data_rows"] == 2
+    assert prior["sha256"] == engine.sha256(table)
+
+    # After the rewrite the fingerprint must describe the new bytes, not the old.
+    table.write_text("site_id,chrom\nUS00001,chr1\n")
+    assert ten.superseded_table(engine, outdir)["data_rows"] == 1
+    assert ten.superseded_table(engine, outdir)["sha256"] != prior["sha256"]
+
+
+def test_superseded_table_counts_a_header_only_table_as_zero_rows(tmp_path, engine):
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    (outdir / "unique_sites.csv").write_text("site_id,chrom\n")
+    assert ten.superseded_table(engine, outdir)["data_rows"] == 0
+
+
+def test_output_hashes_cover_artifacts_and_never_the_manifest_itself(tmp_path, engine):
+    """A file cannot contain its own hash; including it would be a lie."""
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    (outdir / "unique_sites.csv").write_text("a\n")
+    (outdir / "analysis_summary.md").write_text("b\n")
+    (outdir / "outputs_sha256.json").write_text("{}")
+
+    hashes = ten.output_hashes(engine, outdir)
+    assert set(hashes) == {"unique_sites.csv", "analysis_summary.md"}
+    assert hashes["unique_sites.csv"] == engine.sha256(outdir / "unique_sites.csv")
+
+
+def test_provenance_records_inputs_and_supersession_not_only_scripts(tmp_path, engine):
+    args = fake_args(tmp_path)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    (outdir / "unique_sites.csv").write_text("site_id\nUS00001\n")
+    prior = ten.superseded_table(engine, outdir)
+
+    prov = ten.provenance(Path(SCRIPTS), engine, args, prior)
+    assert prov["inputs_sha256"]["hg38.fasta"] == engine.sha256(args.fasta)
+    assert set(prov["scripts_sha256"]) == {
+        "analyze_ten_genome_mei.py", "mei_reference_opportunity.py", "dedup_samples.py",
+        "nested_multi_sample_common.py", "joint_enrichment.py", "recurrence_test.py"}
+    assert prov["supersedes_unique_sites"]["data_rows"] == 1
+    assert prov["opportunity_caveat"] == ten.CAVEAT
+    assert prov["commit"] and len(prov["commit"]) == 40
+
+
+def test_provenance_records_no_supersession_on_a_first_run(tmp_path, engine):
+    prov = ten.provenance(Path(SCRIPTS), engine, fake_args(tmp_path), None)
+    assert prov["supersedes_unique_sites"] is None
 
 
 DELTA_KEYS = ("enrichment_ALU", "enrichment_LINE1", "enrichment_SVA", "linker", "tail",

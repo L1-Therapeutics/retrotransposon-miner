@@ -187,6 +187,28 @@ VCF_HEADER_LINES = [
 
 VCF_COLUMN_HEADER = "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}"
 
+__all__ = [
+    "VCF_FILEFORMAT",
+    "VCF_HEADER_LINES",
+    "VCF_COLUMN_HEADER",
+    "PIPELINE_PARAMS_NAME",
+    "export_vcf",
+    "export_vcf_from_tsv",
+    "load_tsv_rows",
+    "fill_breakpoint_columns",
+    "filter_min_score",
+    "attach_rank_percentiles",
+    "build_vcf_record",
+    "vcf_header_lines",
+    "lookup_reference_build",
+    "parse_pipeline_params",
+    "resolve_sample_name",
+    "format_sigfigs",
+    "split_known_mei_ids",
+    "locus_id",
+    "breakpoint_pos",
+]
+
 
 def _vcf_safe(value: Any) -> str:
     """Sanitize a value for use inside a single VCF INFO/text field."""

@@ -431,9 +431,22 @@ def test_the_window_sweep_is_reported_in_full(tmp_path):
 
 
 def test_the_headline_states_the_chance_comparison_not_just_a_count(tmp_path):
-    _, out = _run(tmp_path)
+    """It has to state the comparison, and in whichever direction is true.
+
+    This assertion used to name the direction outright ("does not clear..."),
+    which is what let the template keep claiming it after the corrected cohort
+    made the opposite true. The direction is now read off the report.
+    """
+    report, out = _run(tmp_path)
     text = (out / "recurrence.md").read_text()
-    assert "does not clear its own chance expectation" in text
+    clears = (
+        report["any_candidate_recurrent"]
+        > report["positional_chance"]["expected_pairs_under_chance"]
+    )
+    if clears:
+        assert "**does** clear its own chance expectation" in text
+    else:
+        assert "does **not** clear its own chance expectation" in text
     assert "first test of its kind" in text
 
 
@@ -604,3 +617,25 @@ def test_neither_phase4_script_re_derives_the_cohort():
         assert "nested = [s for s in sites" not in source, (
             f"{name} filters the cohort itself; it must use the loader's"
         )
+
+
+def test_the_headline_comparison_matches_the_numbers_it_quotes(tmp_path):
+    """A directional claim in generated prose must be derived, not asserted.
+
+    The headline used to hardcode "chance exceeds the N pairs observed" and to
+    conclude the count did not clear its own expectation. When the cohort was
+    corrected the observed count rose above the chance expectation and the
+    sentence went on asserting the opposite of what the numbers said -- in a
+    report, which is the one place a reader has no way to check.
+    """
+    report, out = _run(tmp_path)
+    text = (out / "recurrence.md").read_text()
+    expected = report["positional_chance"]["expected_pairs_under_chance"]
+    observed = report["any_candidate_recurrent"]
+    assert f"{expected:.2f}" in text
+    if observed > expected:
+        assert "**does** clear its own chance expectation" in text
+        assert "does **not** clear its own chance expectation" not in text
+    else:
+        assert "does **not** clear its own chance expectation" in text
+        assert "**does** clear its own chance expectation" not in text

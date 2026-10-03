@@ -1,5 +1,6 @@
 """Synthetic gates for the provenance-locked ten-genome extension."""
 import gzip
+import subprocess
 import sys
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1]/'scripts'
+SNAPSHOT = Path('/tmp/rtm_head_10g')
 sys.path.insert(0,str(SCRIPTS))
 import analyze_ten_genome_mei as m  # noqa: E402
 import mei_reference_opportunity as o  # noqa: E402
@@ -15,8 +17,28 @@ import mei_reference_opportunity as o  # noqa: E402
 def engine():
     # Unit-test grouping using the committed snapshot, never the concurrent
     # dirty dedup. In a detached production checkout this falls back to itself.
-    snapshot = Path('/tmp/rtm_head_10g/scripts')
-    return m.load_engine(snapshot if snapshot.exists() else SCRIPTS)
+    # `test_snapshot_is_not_behind_head` guards this preference: a snapshot that
+    # drifts from HEAD keeps these tests green against code the repository no
+    # longer holds, which is a silent false pass rather than a failure.
+    return m.load_engine(SNAPSHOT/'scripts' if SNAPSHOT.is_dir() else SCRIPTS)
+
+
+def test_snapshot_is_not_behind_head():
+    """The snapshot must hold exactly what HEAD holds, or it tests stale code."""
+    if not SNAPSHOT.is_dir():
+        pytest.skip('no detached snapshot on this host; using the live tree')
+    head = subprocess.check_output(['git','rev-parse','HEAD'],cwd=SCRIPTS.parent,text=True).strip()
+    pinned = subprocess.check_output(['git','rev-parse','HEAD'],cwd=SNAPSHOT,text=True).strip()
+    assert pinned == head, (
+        f'{SNAPSHOT} is at {pinned[:12]} but HEAD is {head[:12]}; engine() loads the '
+        f'snapshot, so these tests would pass against superseded code')
+    for name in ('dedup_samples.py','analyze_ten_genome_mei.py'):
+        committed = subprocess.check_output(['git','show',f'HEAD:scripts/{name}'],
+                                            cwd=SCRIPTS.parent)
+        on_disk = (SNAPSHOT/'scripts'/name).read_bytes()
+        assert committed == on_disk, (
+            f'{SNAPSHOT}/scripts/{name} differs from HEAD; the snapshot worktree '
+            f'has uncommitted edits')
 
 
 def call(e, sample, pos, host=None, orient='+'):

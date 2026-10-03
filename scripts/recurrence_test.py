@@ -27,11 +27,11 @@ more than 2 bp, or a discordant TSD sequence beyond the shared terminal motif.
 A third category exists because the first two cannot cover every case honestly.
 
 **TSD unevaluable.** Neither call reports a TSD. On this cohort that is the
-common case, not the rare one: 479 of 1,284 nested calls carry no TSD at all.
-A missing TSD is not a TSD of length zero, so such a pair is neither evidence
-for identity by descent nor evidence against it. These pairs are counted and
-reported in their own column and are excluded from both headline numbers. Folding
-them into either would manufacture a result from absent data.
+common case, not the rare one: a large fraction of the recovered calls carry no
+TSD at all. A missing TSD is not a TSD of length zero, so such a pair is neither
+evidence for identity by descent nor evidence against it. These pairs are counted
+and reported in their own column and are excluded from both headline numbers.
+Folding them into either would manufacture a result from absent data.
 
 **Pre-declared TSD-sequence rule.** To call the TSD sequence *discordant*, both
 sequences are first stripped of their longest shared terminal A/T homopolymer run
@@ -456,7 +456,7 @@ def ibd_affirmation_chance(
 
     This is the specificity of the identity-by-descent call, and it is the number
     that decides whether the candidate count means anything. The child-subfamily
-    alphabet is large (89 distinct values on this cohort), so two independent
+    alphabet is large, so two independent
     insertions rarely share one; a definition requiring a shared subfamily may
     therefore be unable to affirm identity by descent even when it holds. That
     possibility has to be measured, because an empty IBD column is ambiguous
@@ -590,18 +590,47 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
         "independent ones."
     )
     lines.append("")
-    lines.append(
-        f"**The candidate count does not clear its own chance expectation, and "
-        f"should not be read as evidence of independent recurrence.** The chance "
-        f"number of same-host pairs within +/-{chance['window_bp']} bp is "
-        f"{_fmt(chance['expected_pairs_under_chance'], '.2f')}, which exceeds the "
-        f"{primary['pairs_within_window']} pairs actually observed. The "
-        "pre-specified definition is also loose: two genuinely independent "
-        "insertions drawn from this cohort already satisfy the candidate criterion "
-        "at the rates in section (c). The honest reading is that the test was run "
-        "and did not resolve the question, because the available evidence -- child "
-        "subfamily and TSD -- does not discriminate at this scale."
+    # The comparison below is derived, not asserted. An earlier version of this
+    # template hardcoded "chance exceeds observed" and concluded the count did
+    # not clear its expectation; when the cohort was corrected and the observed
+    # count rose above the chance expectation, that sentence kept asserting the
+    # opposite of what the numbers said.
+    expected = float(chance["expected_pairs_under_chance"])
+    observed = int(report["any_candidate_recurrent"])
+    clears = observed > expected
+    comparison = (
+        f"against {observed} observed, so the count **does** clear its own chance "
+        "expectation"
+        if clears
+        else f"against {observed} observed, so the count does **not** clear its "
+        "own chance expectation"
     )
+    if clears:
+        lines.append(
+            f"**The candidate count clears its own chance expectation.** The chance "
+            f"number of same-host pairs within +/-{chance['window_bp']} bp is "
+            f"{_fmt(expected, '.2f')} {comparison}. Two independent readings have to "
+            "be held apart here. Positionally, the events cluster more tightly "
+            "within host copies than random placement predicts. That is *not* by "
+            "itself evidence of shared ancestry, because the pre-specified "
+            "definition is loose: two genuinely independent insertions drawn from "
+            "this cohort already satisfy the candidate criterion at the rates in "
+            "section (c). The arm that speaks to identity by descent is the IBD "
+            "count in section (b), which requires breakpoints, child subfamily and "
+            "TSD to agree."
+        )
+    else:
+        lines.append(
+            f"**The candidate count does not clear its own chance expectation, and "
+            f"should not be read as evidence of independent recurrence.** The chance "
+            f"number of same-host pairs within +/-{chance['window_bp']} bp is "
+            f"{_fmt(expected, '.2f')} {comparison}. The pre-specified definition is "
+            "also loose: two genuinely independent insertions drawn from this "
+            "cohort already satisfy the candidate criterion at the rates in section "
+            "(c). The honest reading is that the test was run and did not resolve the "
+            "question, because the available evidence -- child subfamily and TSD -- "
+            "does not discriminate at this scale."
+        )
     lines.append("")
 
     lines.append("## (a) Hosts with more than one nested event, per family")
@@ -978,8 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
             "child subfamily are recovered by joining the dedup output back to the "
             "callsets by sample name within the frozen +/-10 bp rule, and the join "
             "is gated on reproducing dedup's own carrier counts",
-            "denominators here are 5 genomes and are not comparable to published "
-            "pooled-SVAN host counts; they are labelled rather than aligned",
+            f"denominators here are {len(samples)} genomes and are not comparable to "
+            "published pooled-SVAN host counts; they are labelled rather than aligned",
         ],
     }
     (args.outdir / "recurrence.json").write_text(

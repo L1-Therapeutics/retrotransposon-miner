@@ -1,3 +1,16 @@
+"""Annotate MEI candidate loci with family/subfamily support, insertion spans, and quality metrics.
+
+This module is the main annotation pipeline for retrotransposon-miner.
+It handles:
+- MEI consensus remapping (bwa mem)
+- PolyA/T tail detection and rescue
+- Split-read cluster scoring
+- Discordant mate sequence resolution
+- Local assembly (SPAdes) integration
+- Empirical outlier scoring
+- Gold/silver/bronze tier assignment
+"""
+
 from __future__ import annotations
 
 import gzip
@@ -43,6 +56,19 @@ from retro_miner.mei_panel_index import (
     ensure_mei_remap_bwa_index,
     ensure_polya_trimmed_mei_fasta,
 )
+
+
+__all__ = [
+    "ClipAlignmentSummary",
+    "FragmentToFullMap",
+    "annotate_candidate_loci_with_mei",
+    "_MIN_MEI_ANCHOR_BP",
+    "_MIN_POLYA_RUN_FOR_END_IMPUTE",
+    "_MIN_MEI_ANCHOR_BP_RELAXED",
+    "_PEAK_DEPTH_Z_CUTOFF",
+    "_SPLIT_CLUSTER_Z_CUTOFF",
+    "_MIN_REPORTABLE_MEI_SPAN_BP",
+]
 
 
 @dataclass

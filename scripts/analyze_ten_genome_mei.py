@@ -426,11 +426,53 @@ def dependent_gate(scripts, outdir, callsets):
     return result
 
 
-def provenance(scripts, engine, args):
+def input_hashes(engine, args):
+    """SHA-256 of every input the run reads, not only of the scripts it runs.
+
+    `scripts_sha256` records which code produced a table; it cannot record which
+    inputs did. Without input hashes a later cohort that overwrites a published
+    table in place is undetectable, which is how the generation-1 phase4 reports
+    in `results_phase4/` came to name an input that no longer exists.
+    """
+    paths = {f'callsets/{sample}.vcf': args.callset_dir/f'{sample}.vcf' for sample in SAMPLES}
+    paths['rmsk.txt.gz'] = args.rmsk
+    paths['hg38.fasta'] = args.fasta
+    paths['consensus.fa'] = args.consensus
+    if args.low_mappability and Path(args.low_mappability).is_file():
+        paths['low_mappability.bed'] = Path(args.low_mappability)
+    missing = sorted(name for name, path in paths.items() if not path.is_file())
+    if missing:
+        raise FileNotFoundError(f'cannot hash absent input(s): {missing}')
+    return {name: engine.sha256(path) for name, path in sorted(paths.items())}
+
+
+def superseded_table(engine, outdir):
+    """Fingerprint the table this run is about to overwrite, if one is there.
+
+    Must be called before `unique_sites.csv` is written; afterwards it would
+    only ever describe this run's own output.
+    """
+    path = outdir/'unique_sites.csv'
+    if not path.is_file():
+        return None
+    with path.open(encoding='utf-8', errors='replace') as handle:
+        rows = max(sum(1 for _ in handle) - 1, 0)
+    return {'file': 'unique_sites.csv', 'sha256': engine.sha256(path), 'data_rows': rows}
+
+
+def output_hashes(engine, outdir, name='outputs_sha256.json'):
+    """Hash every artifact this run left behind, so a rerun can be compared."""
+    return {p.name: engine.sha256(p) for p in sorted(outdir.iterdir())
+            if p.is_file() and p.name != name}
+
+
+def provenance(scripts, engine, args, supersedes=None):
     sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=scripts.parent, text=True).strip()
     hashes = {p.name: engine.sha256(p) for p in [scripts/'analyze_ten_genome_mei.py', scripts/'mei_reference_opportunity.py',
                 scripts/'dedup_samples.py', scripts/'nested_multi_sample_common.py', scripts/'joint_enrichment.py', scripts/'recurrence_test.py']}
-    return {'commit': sha, 'scripts_sha256': hashes, 'python': sys.version, 'python_executable': sys.executable,
+    return {'commit': sha, 'scripts_sha256': hashes, 'inputs_sha256': input_hashes(engine, args),
+            'supersedes_unique_sites': supersedes,
+            'python': sys.version, 'python_executable': sys.executable,
             'replicates': args.replicates, 'seed': SEED, 'gap_source': str(args.fasta)+' (exact N/n runs)',
             'opportunity_caveat': CAVEAT}
 
@@ -553,6 +595,12 @@ def write_report(outdir, five, ten, qc, deltas, provenance_data, diagnostics, ca
 def run(args):
     scripts = Path(__file__).resolve().parent
     engine = load_engine(scripts)
+    # Fingerprint the table before it is replaced, so an in-place overwrite of a
+    # published artifact leaves a trace in the new run's own provenance block.
+    prior = superseded_table(engine, args.outdir)
+    if prior:
+        print(f'note: this run will overwrite a published unique_sites.csv '
+              f'({prior["data_rows"]} rows, sha256 {prior["sha256"][:12]})', flush=True)
     calls, qc = read_calls(engine, args.callset_dir)
     all_calls = [c for s in SAMPLES for c in calls[s]]
     print('Reading reference hosts', flush=True)
@@ -657,7 +705,7 @@ def run(args):
                  'consensus_masked_host_annotations':masked_hosts,'projection_status':dict(Counter(r['status'] for r in projection_rows))},
                  'mappability_path':str(args.low_mappability) if masks is not None else 'not available',
                  'child_contexts':ctx,'l1_in_alu':sum(c.alu_host is not None for c in lc)}
-    prov=provenance(scripts,engine,args)
+    prov=provenance(scripts,engine,args,prior)
     deltas=delta_rows(five,ten)
     # Persist full five rerun numeric substrate in the task-owned audit JSON.
     audit={'provenance':prov,'qc':qc,'sweep':sweep,'five':{k:v for k,v in five.items() if k!='sites'},
@@ -674,6 +722,11 @@ def run(args):
     (args.outdir/'matching_audit.md').write_text('\n'.join(lines)+'\n')
     dependent=dependent_gate(scripts,args.outdir,args.callset_dir)
     write_report(args.outdir,five,ten,qc,deltas,prov,diagnostics,carriage,dependent)
+    # Written last, and never listing itself: a file cannot contain its own hash.
+    (args.outdir/'outputs_sha256.json').write_text(json.dumps(
+        {'commit':prov['commit'],'inputs_sha256':prov['inputs_sha256'],
+         'scripts_sha256':prov['scripts_sha256'],'supersedes_unique_sites':prior,
+         'outputs_sha256':output_hashes(engine,args.outdir)},indent=2)+'\n')
     print(json.dumps({'five':five['headline'],'ten':ten['headline'],'layers':ten['layers'],'dependent':dependent},indent=2),flush=True)
 
 

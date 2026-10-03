@@ -32,6 +32,16 @@ _BOOL_COLUMNS = (
     "two_sided_support",
 )
 
+__all__ = [
+    "merge_gold_review_tables",
+    "GOLD_REVIEW_NAME",
+    "GOLD_REVIEW_VCF_NAME",
+    "annotation_done_marker",
+    "incomplete_chromosomes",
+    "write_merged_gold_review",
+    "main",
+]
+
 
 def _parse_bool(series: pd.Series) -> pd.Series:
     if series.dtype == bool:

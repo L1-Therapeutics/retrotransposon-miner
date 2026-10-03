@@ -96,6 +96,28 @@ CONSUMER_REQUIRED_COLUMNS = {
     "family",
 }
 
+#: The four clauses of the analysis-set gate. These are the columns whose
+#: absence empties the cohort, which is the failure that reads as a clean null.
+#: The rest of `CONSUMER_REQUIRED_COLUMNS` are read with `.get()` and degrade
+#: rather than empty, and are covered separately.
+GATE_COLUMNS = (
+    "nested_in_alu_host",
+    "host_len",
+    "consensus_mapping",
+    "consensus_offset",
+)
+
+#: `load_nested_rows` reaches these with `row[...]`, not `row.get(...)`, so
+#: dropping one raises KeyError instead of failing the gate. A third access
+#: discipline in the same function, and worth pinning separately: the set of
+#: columns that must exist is the union of all three, not any one of them.
+HARD_INDEXED_COLUMNS = ("chrom", "pos", "host_start0", "host_end0")
+
+assert set(GATE_COLUMNS) <= CONSUMER_REQUIRED_COLUMNS
+SOFT_COLUMNS = sorted(
+    CONSUMER_REQUIRED_COLUMNS - set(GATE_COLUMNS) - set(HARD_INDEXED_COLUMNS)
+)
+
 HOST_LEN = 300  # inside NEAR_FULL_HOST / NEAR_FULL_MIN..MAX
 N_HOSTS = 8
 
@@ -108,7 +130,7 @@ def _row(
     host_len: int = HOST_LEN,
     host_strand: str = "+",
     insert_strand: str = "+",
-    consensus_offset,
+    consensus_offset=130,
     nested: str = "1",
     consensus_mapping: str = "unambiguous",
     tsd_len: str = "16",
@@ -301,27 +323,54 @@ def test_both_consumers_admit_the_same_rows_to_their_analysis_set(cohort):
     assert len(phase1) == N_HOSTS * 6
 
 
-def test_every_gate_rejects_at_least_one_fixture_row(cohort):
+def test_every_gate_clause_has_a_row_it_alone_rejects(cohort):
     """Each clause of the four-part gate must have something to reject.
 
     Without this, inverting any clause leaves the counts above unchanged and the
-    gate is untested rather than correct.
+    gate is untested rather than correct. The test is per-row rather than
+    per-file: it looks for rows that satisfy every clause *except* one, so a
+    clause cannot look exercised merely because some other clause happened to
+    drop the same row.
     """
     rows = _read_back(cohort)
-    in_scope = tprt.nested_analysis_set(rows)
-    assert in_scope, "no rows survived, so nothing below is a real exclusion"
 
-    def survivors(**overrides) -> int:
-        patched = [{**row, **overrides} for row in rows]
-        return len(tprt.nested_analysis_set(patched))
+    def fails(row, clause: str) -> bool:
+        """Whether this row fails one clause of the gate."""
+        if clause == "nested_in_alu_host":
+            return row.get("nested_in_alu_host") != "1"
+        if clause == "host_len":
+            try:
+                host_len = int(row["host_len"])
+            except (KeyError, TypeError, ValueError):
+                return True
+            return not (tpe.NEAR_FULL_MIN <= host_len <= tpe.NEAR_FULL_MAX)
+        if clause == "consensus_mapping":
+            return row.get("consensus_mapping") != "unambiguous"
+        if clause == "consensus_offset":
+            try:
+                int(row.get("consensus_offset", ""))
+            except (TypeError, ValueError):
+                return True
+            return False
+        raise AssertionError(f"unhandled gate clause {clause!r}")
 
-    baseline = len(in_scope)
-    # Every clause removed individually must admit strictly more rows, which
-    # proves each clause is doing work.
-    assert survivors(nested_in_alu_host="0") > baseline
-    assert survivors(host_len="200") > baseline
-    assert survivors(consensus_mapping="ambiguous") > baseline
-    assert survivors(consensus_offset="") > baseline
+    # The fixture rows must match this reader exactly, or the exclusion counts
+    # below describe the reader rather than the real gate.
+    assert len([r for r in rows if not any(fails(r, c) for c in GATE_COLUMNS)]) == (
+        N_HOSTS * 6
+    )
+
+    for clause in GATE_COLUMNS:
+        rejected_only_by = [
+            row
+            for row in rows
+            if fails(row, clause)
+            and not any(fails(row, other) for other in GATE_COLUMNS if other != clause)
+        ]
+        assert rejected_only_by, (
+            f"no fixture row is rejected by the {clause!r} clause alone, so that "
+            "clause is not exercised by this fixture"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -368,11 +417,14 @@ def test_phase2b_tprt_hallmarks_runs_on_a_producer_shaped_table(cohort, tmp_path
     assert rc == 0
     report = json.loads((out / "tprt_hallmarks.json").read_text())
     assert report["phase"] == "2b"
+    assert report["set_sizes"]["analysis_set"] == N_HOSTS * 6
+    assert report["set_sizes"]["peak"] > 0
+    assert report["set_sizes"]["mid_host_control"] > 0
+    assert report["set_sizes"]["unnested"] > 0, "the unnested comparison arm is empty"
     assert set(report["comparisons"]) == {"peak_vs_rest_of_host", "nested_vs_unnested"}
     for name, comparison in report["comparisons"].items():
-        assert comparison["n_peak"] > 0 or comparison["n_comparison"] > 0, (
-            f"comparison {name} compared two empty arms"
-        )
+        assert comparison["exposed_input"] > 0, f"{name} exposed arm is empty"
+        assert comparison["reference_input"] > 0, f"{name} reference arm is empty"
     assert (out / "tprt_hallmarks.md").exists()
 
 
@@ -398,7 +450,7 @@ def test_both_phases_report_the_same_site_count(cohort, tmp_path):
     )
     phase1 = json.loads((phase1_out / "position_enrichment.json").read_text())
     phase2b = json.loads((phase2b_out / "tprt_hallmarks.json").read_text())
-    assert phase1["primary_test"]["n_sites"] == phase2b["n_analysis_set"], (
+    assert phase1["primary_test"]["n_sites"] == phase2b["set_sizes"]["analysis_set"], (
         "Phase 1 and Phase 2b disagree on the analysis-set size for the same "
         "input file, so their headline numbers are not comparable"
     )
@@ -424,14 +476,14 @@ def _drop_column(source: Path, target: Path, column: str) -> None:
     )
 
 
-@pytest.mark.parametrize("column", sorted(CONSUMER_REQUIRED_COLUMNS))
-def test_removing_any_gate_or_analysis_column_is_not_a_clean_null(cohort, tmp_path, column):
-    """Drop any column the consumers read and the run must stop, not score zero.
+@pytest.mark.parametrize("column", GATE_COLUMNS)
+def test_removing_a_gate_column_is_refused_by_both_consumers(cohort, tmp_path, column):
+    """Drop a gate column and the run must stop, not score zero.
 
-    A dropped column makes `.get()` return `None`, which fails the gate silently
-    and empties the analysis set. Downstream that is indistinguishable from "we
-    looked and there is no enrichment here" -- the failure mode the Phase 4
-    scripts were hardened against and which is still open here.
+    A dropped column makes `.get()` return `None`, which fails the gate
+    silently and empties the analysis set. Downstream that is indistinguishable
+    from "we looked and there is no enrichment here" -- the failure mode the
+    Phase 4 scripts were hardened against and which was still open in Phase 2b.
     """
     broken = tmp_path / f"drop_{column}.csv"
     _drop_column(cohort["cohort_csv"], broken, column)
@@ -440,12 +492,53 @@ def test_removing_any_gate_or_analysis_column_is_not_a_clean_null(cohort, tmp_pa
         f"dropping {column} should empty the analysis set; if it does not, the "
         "gate no longer reads this column and this test proves nothing"
     )
-    with pytest.raises(SystemExit):
-        tpe.main(
-            [
-                "--cohort", str(broken),
-                "--outdir", str(tmp_path / "phase1"),
-                "--mapability-bed", str(cohort["root"] / "absent.bed"),
-                "--replicates", "10",
-            ]
+    for name, main, extra in (
+        (
+            "phase1",
+            tpe.main,
+            ["--mapability-bed", str(cohort["root"] / "absent.bed"), "--replicates", "10"],
+        ),
+        ("phase2b", tprt.main, ["--permutations", "10", "--no-reference"]),
+    ):
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "--cohort", str(broken),
+                    "--outdir", str(tmp_path / name),
+                    *extra,
+                ]
+            )
+
+
+@pytest.mark.parametrize("column", HARD_INDEXED_COLUMNS)
+def test_dropping_a_hard_indexed_column_is_a_crash_not_a_cohort(cohort, tmp_path, column):
+    """`load_nested_rows` reaches these with `row[...]`, so absence raises.
+
+    Worth pinning because it is the loud half of the contract: `chrom`, `pos`,
+    `host_start0` and `host_end0` break the run, while the four gate columns
+    break it quietly by emptying the cohort. Three access disciplines in one
+    function, and only the loud one was previously apparent.
+    """
+    broken = tmp_path / f"drop_{column}.csv"
+    _drop_column(cohort["cohort_csv"], broken, column)
+    rows = _read_back({"cohort_csv": broken})
+    with pytest.raises(KeyError):
+        tpe.load_nested_rows(rows)
+
+
+def test_dropping_a_soft_column_degrades_rather_than_empties(cohort, tmp_path):
+    """The columns read with `.get()` must not be load-bearing for the cohort.
+
+    `tsd_seq` and friends are evidence, not membership. If removing one emptied
+    the analysis set it would be a gate column by accident, and the four-clause
+    gate would be a lie.
+    """
+    for column in SOFT_COLUMNS:
+        broken = tmp_path / f"drop_{column}.csv"
+        _drop_column(cohort["cohort_csv"], broken, column)
+        rows = _read_back({"cohort_csv": broken})
+        assert tprt.nested_analysis_set(rows), (
+            f"dropping {column} emptied the analysis set, so it is a gate "
+            "column and belongs in GATE_COLUMNS"
         )
+        assert tpe.load_nested_rows(rows), f"dropping {column} emptied Phase 1"

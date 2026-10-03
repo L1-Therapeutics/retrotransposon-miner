@@ -1524,6 +1524,22 @@ def main(argv: list[str] | None = None) -> int:
     rows = read_cohort(args.cohort)
     analysis = nested_analysis_set(rows)
     peak_rows, mid_rows = split_by_offset(analysis)
+    # An empty analysis set is a broken input, not a null result. Scoring an
+    # empty list and running both comparisons over empty arms produces a
+    # well-formed report full of zeros and "no difference detected", which reads
+    # as a decisive negative. The usual cause is a schema break: a gate column
+    # missing from the cohort table makes `.get()` return None, every row fails
+    # the gate, and the cohort empties silently. `test_position_enrichment.py`
+    # and both Phase 4 scripts already refuse this case; this was the one
+    # consumer that did not.
+    if not analysis:
+        raise SystemExit(
+            f"{args.cohort} yielded an empty analysis set "
+            f"({len(rows)} rows read; gate is nested_in_alu_host == 1, "
+            f"{NEAR_FULL_HOST[0]}-{NEAR_FULL_HOST[1]} bp host, unambiguous "
+            f"consensus mapping, numeric consensus_offset). Refusing to report "
+            f"an empty cohort as a null result."
+        )
     unnested_rows = [r for r in rows if r.get("nested_in_alu_host") != "1"]
     print(
         f"analysis set {len(analysis)} | peak {len(peak_rows)} | mid-host control "

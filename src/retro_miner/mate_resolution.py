@@ -24,6 +24,15 @@ _SLICE_BASENAME_TO_FULL: dict[str, tuple[str, str]] = {
 # Fail annotate when this many off-chrom discordants still lack mate_seq.
 MIN_EMPTY_INTERCHROM_MATES_TO_FAIL = 10
 
+__all__ = [
+    "InterchromMateSeqStats",
+    "infer_full_genome_mate_bam",
+    "interchrom_mate_seq_stats",
+    "missing_interchrom_mates_message",
+    "require_interchrom_mate_sequences",
+    "MIN_EMPTY_INTERCHROM_MATES_TO_FAIL",
+]
+
 
 @dataclass(frozen=True)
 class InterchromMateSeqStats:

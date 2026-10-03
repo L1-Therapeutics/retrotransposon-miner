@@ -31,6 +31,41 @@ _TIER_RANK = {
     "none": 0,
 }
 
+# Named constants for magic numbers
+_DEFAULT_PAD_BP = 200
+_MIN_KMER_LEN = 8
+_MIN_POSITIVE_POS = 0
+
+__all__ = [
+    "MEI_FAMILIES",
+    "_LINE1_TOKEN",
+    "_SCORE_COLUMNS",
+    "_TIER_RANK",
+    "Variant",
+    "normalize_chrom",
+    "normalize_mei_family",
+    "is_insertion_svtype",
+    "is_melt_mei_insertion",
+    "normalize_strand",
+    "strand_from_meinfo",
+    "is_mei_like_text",
+    "is_carrier_alleles",
+    "is_carrier_gt_string",
+    "padded_interval",
+    "intervals_overlap",
+    "match_variants",
+    "overlap_metrics",
+    "rtm_breakpoint",
+    "rtm_end",
+    "rtm_family",
+    "load_rtm_calls",
+    "load_melt_calls",
+    "load_mei_calls",
+    "per_sample_carriers",
+    "recall_sweep",
+    "novel_calls",
+]
+
 
 @dataclass(frozen=True)
 class Variant:
