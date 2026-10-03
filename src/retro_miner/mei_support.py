@@ -1044,6 +1044,17 @@ def _mei_score_from_metrics(*, pid: float, qcov: float, mapq: int) -> float:
     return float(max(0.0, min(1.0, raw_score)))
 
 
+def panel_divergence_from_nm(nm: int, aln_len: int) -> float | None:
+    """Compute NM-derived divergence fraction for a panel alignment.
+
+    Returns ``nm / aln_len`` when ``aln_len > 0`` and ``nm >= 0``; ``None``
+    otherwise.  Pure and trivially testable.
+    """
+    if aln_len <= 0 or nm < 0:
+        return None
+    return nm / aln_len
+
+
 def _pick_best_mei_hits(rows: list[dict]) -> pd.DataFrame:
     if not rows:
         return _empty_mei_hits()
@@ -15793,7 +15804,7 @@ def _write_rmsk_mei_bed(
 ) -> int:
     """Write MEI-normalizable rmsk intervals as BED for bedtools intersect.
 
-    Columns: chrom start0 end0 repName length strand repClass repFamily normFamily
+    Columns: chrom start0 end0 repName length strand repClass repFamily normFamily milliDiv
     """
     n = 0
     opener = gzip.open if str(rmsk_table_path).endswith(".gz") else open
@@ -15812,6 +15823,12 @@ def _write_rmsk_mei_bed(
                     rep_name = parts[10]
                     rep_class = parts[11]
                     rep_family = parts[12]
+                    raw_milli_div = parts[2] if len(parts) > 2 else ""
+                    milli_div = (
+                        int(raw_milli_div)
+                        if raw_milli_div.lstrip("-").isdigit()
+                        else -1
+                    )
                 # BED-like fallback: chrom start end ... strand repName repClass repFamily
                 elif len(parts) >= 8 and parts[0].startswith("chr"):
                     chrom = parts[0]
@@ -15821,6 +15838,7 @@ def _write_rmsk_mei_bed(
                     rep_name = parts[6]
                     rep_class = parts[7]
                     rep_family = parts[8] if len(parts) > 8 else ""
+                    milli_div = -1
                 else:
                     continue
             except (ValueError, IndexError):
@@ -15835,7 +15853,7 @@ def _write_rmsk_mei_bed(
             length = int(end0) - int(start0)
             _write_bed_row(
                 hout,
-                [chrom, start0, end0, rep_name, length, strand, rep_class, rep_family, fam],
+                [chrom, start0, end0, rep_name, length, strand, rep_class, rep_family, fam, milli_div],
             )
             n += 1
     return n
