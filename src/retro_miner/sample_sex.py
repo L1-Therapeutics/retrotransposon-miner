@@ -13,6 +13,14 @@ from pathlib import Path
 # Halfway between the male cluster near 0.5 and the female cluster near 1.
 MALE_X_TO_AUTOSOME_MAX = 0.75
 
+__all__ = [
+    "MALE_X_TO_AUTOSOME_MAX",
+    "mapped_per_base",
+    "x_to_autosome_ratio",
+    "classify_sex",
+    "main",
+]
+
 
 def _canonical_chrom(name: str) -> str:
     if name == "*":

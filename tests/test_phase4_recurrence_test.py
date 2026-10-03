@@ -579,6 +579,10 @@ def test_both_phase4_scripts_report_the_same_cohort_on_one_input(tmp_path):
             "--outdir", str(jout),
             "--replicates", "50",
             "--bootstrap", "50",
+            # This test is about cohort agreement, not the residual-mask
+            # opportunity diagnostic. Omitting --rmsk streams the whole
+            # RepeatMasker file and turns a 2-second test into a 74-second one.
+            "--rmsk", str(tmp_path / "absent.rmsk.gz"),
         ]
     ) == 0
     rout = tmp_path / "rec"

@@ -23,22 +23,25 @@ def engine():
     return m.load_engine(SNAPSHOT/'scripts' if SNAPSHOT.is_dir() else SCRIPTS)
 
 
-def test_snapshot_is_not_behind_head():
-    """The snapshot must hold exactly what HEAD holds, or it tests stale code."""
+def test_snapshot_provides_the_code_head_has():
+    """`engine()` loads the snapshot, so the snapshot must hold what HEAD holds.
+
+    Compared by content, not by commit SHA. A commit that touches no tested
+    module leaves the snapshot parked on an older SHA while still supplying
+    exactly the code HEAD has, and failing on that would be noise rather than
+    signal. What must never pass is a snapshot whose *code* has diverged, since
+    these tests would then keep exercising superseded rules and report green.
+    """
     if not SNAPSHOT.is_dir():
         pytest.skip('no detached snapshot on this host; using the live tree')
-    head = subprocess.check_output(['git','rev-parse','HEAD'],cwd=SCRIPTS.parent,text=True).strip()
-    pinned = subprocess.check_output(['git','rev-parse','HEAD'],cwd=SNAPSHOT,text=True).strip()
-    assert pinned == head, (
-        f'{SNAPSHOT} is at {pinned[:12]} but HEAD is {head[:12]}; engine() loads the '
-        f'snapshot, so these tests would pass against superseded code')
-    for name in ('dedup_samples.py','analyze_ten_genome_mei.py'):
+    for name in ('dedup_samples.py','analyze_ten_genome_mei.py','mei_reference_opportunity.py'):
         committed = subprocess.check_output(['git','show',f'HEAD:scripts/{name}'],
                                             cwd=SCRIPTS.parent)
         on_disk = (SNAPSHOT/'scripts'/name).read_bytes()
         assert committed == on_disk, (
-            f'{SNAPSHOT}/scripts/{name} differs from HEAD; the snapshot worktree '
-            f'has uncommitted edits')
+            f'{SNAPSHOT}/scripts/{name} differs from HEAD; engine() loads the '
+            f'snapshot, so these tests would exercise superseded code. Refresh it '
+            f'with: git -C {SNAPSHOT} checkout --detach $(git rev-parse HEAD)')
 
 
 def call(e, sample, pos, host=None, orient='+'):

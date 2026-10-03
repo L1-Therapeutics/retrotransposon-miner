@@ -34,6 +34,21 @@ CLUSTERED_READS_COL = "split_cluster_reads"
 BINOMIAL_P_COL = "split_cluster_binomial_p"
 BINOMIAL_Z_COL = "split_cluster_binomial_z"
 
+__all__ = [
+    "POS_BP",
+    "KMER",
+    "MAX_MISMATCH",
+    "MIN_CLUSTER",
+    "MIN_BACKGROUND_SPLITS",
+    "WINDOW_READS_COL",
+    "CLUSTERED_READS_COL",
+    "BINOMIAL_P_COL",
+    "BINOMIAL_Z_COL",
+    "binomial_z",
+    "cluster_assigned_reads",
+    "annotate_split_cluster_binomial_z",
+]
+
 
 def binomial_z(clustered: int, n_reads: int, rate: float) -> float:
     """Binomial z of ``clustered`` successes in ``n_reads`` at ``rate``."""

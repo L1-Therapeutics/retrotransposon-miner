@@ -32,6 +32,25 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
+__all__ = [
+    "VcfRecord",
+    "GeneAnnotation",
+    "AnnotationStats",
+    "CONSEQUENCE_SEVERITY",
+    "parse_info",
+    "read_vcf",
+    "write_vcf",
+    "add_info_headers",
+    "most_severe_term",
+    "load_gene_strands",
+    "bundled_gene_strands",
+    "parse_snpeff_ann",
+    "snpeff_command",
+    "annotate_records",
+    "annotate_vcf",
+    "write_annotation_tsv",
+]
+
 # Ensembl "Calculated variant consequences" table, most severe first.
 CONSEQUENCE_SEVERITY: tuple[str, ...] = (
     "transcript_ablation",

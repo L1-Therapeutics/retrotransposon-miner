@@ -92,6 +92,88 @@ def _to_int(value: str) -> int | None:
         return None
 
 
+class CohortSchemaError(ValueError):
+    """The cohort table is missing a column this analysis decides membership on.
+
+    Distinct from an empty analysis set, which is a data outcome worth reporting.
+    This is a table that cannot be read as the table it claims to be, and it must
+    never be allowed to present as "we looked and found nothing".
+    """
+
+
+#: Columns the cohort table must carry. Absence is a `CohortSchemaError`, checked
+#: against the header once before any row is examined.
+#:
+#: These are the columns that decide *membership*: the four identity fields that
+#: every downstream cell is keyed on, plus the four clauses of the analysis-set
+#: gate. The gate clauses used to be read with `row.get(...)`, so a column that
+#: went missing -- renamed on the producer's side, or dropped from
+#: `build_longread_nested_cohort.OUTPUT_COLUMNS` -- made every row fail the gate,
+#: emptied the cohort, and produced a well-formed report of zeros that reads as a
+#: decisive negative. That is the same failure mode Phase 4 was hardened against,
+#: and it was still open here.
+REQUIRED_COHORT_COLUMNS = (
+    "chrom",
+    "pos",
+    "host_start0",
+    "host_end0",
+    "nested_in_alu_host",
+    "host_len",
+    "consensus_mapping",
+)
+
+#: Evidence columns, not membership. Absence degrades to an empty value rather
+#: than raising or excluding the row: dropping `tsd`-like evidence changes what a
+#: row can be scored on, not whether it is in the study. Keeping this list
+#: explicit is the point -- it is the set that would turn into gate columns by
+#: accident if it were not written down.
+OPTIONAL_COHORT_COLUMNS = (
+    "host_strand",
+    "host_name",
+    "consensus_match_name",
+    "consensus_span_bp",
+    "site_allele_count",
+    "insert_strand",
+    "offset_drift_bp",
+    "perc_resolved",
+    "not_canonical",
+)
+
+
+def _cell(row: dict[str, str], name: str) -> str:
+    """The one accessor. Every column read inside the loop goes through here.
+
+    Returns "" for an absent column. That is safe *only* because the required
+    columns are validated against the header before the loop runs; if a required
+    column were read this way without that check, its absence would silently
+    exclude rows instead of raising.
+    """
+    value = row.get(name)
+    return "" if value is None else value
+
+
+def _require_cohort_columns(rows: Sequence[dict[str, str]], coordinate: str) -> None:
+    """Validate the header before any row decides membership.
+
+    The header is taken from the first row's keys, which for a `csv.DictReader`
+    is exactly the file's header: every record is materialised with all header
+    columns present, so a column cannot be absent from a later row and present
+    in an earlier one when the input came from one table.
+    """
+    if not rows:
+        return
+    needed = (*REQUIRED_COHORT_COLUMNS, coordinate)
+    header = set(rows[0])
+    missing = sorted(name for name in needed if name not in header)
+    if missing:
+        raise CohortSchemaError(
+            f"cohort table is missing required column(s) {missing}. These decide "
+            f"which rows enter the analysis set, so reading them as absent would "
+            f"empty the cohort and report it as a null result. Columns present: "
+            f"{sorted(header)}."
+        )
+
+
 def load_nested_rows(
     rows: Iterable[dict[str, str]],
     coordinate: str = "consensus_offset",
@@ -103,39 +185,53 @@ def load_nested_rows(
     the projected consensus offset because that is the frame the pre-registered
     133 window is defined in; "host_offset_5p_0based" is available because the
     projection is not exact for every host.
+
+    One access discipline: the required columns in `REQUIRED_COHORT_COLUMNS`
+    (plus the requested coordinate) are validated against the header up front,
+    and every read inside the loop goes through `_cell`. The four identity fields
+    are parsed with `int()` rather than `_to_int` on purpose -- a present but
+    unparseable identity is a loud `ValueError`, not a row that quietly
+    disappears from the denominator.
+
+    A *present but empty* required value still excludes its row, which is a data
+    outcome rather than a schema break. If that empties the cohort entirely the
+    caller is expected to refuse rather than report a null; see `main`.
     """
+    rows = list(rows)
+    _require_cohort_columns(rows, coordinate)
     out: list[dict[str, Any]] = []
     for row in rows:
-        if row.get("nested_in_alu_host") != "1":
+        if _cell(row, "nested_in_alu_host") != "1":
             continue
-        host_len = _to_int(row.get("host_len", ""))
+        host_len = _to_int(_cell(row, "host_len"))
         if host_len is None or not (NEAR_FULL_MIN <= host_len <= NEAR_FULL_MAX):
             continue
-        if require_unambiguous and row.get("consensus_mapping") != "unambiguous":
+        if require_unambiguous and _cell(row, "consensus_mapping") != "unambiguous":
             continue
-        offset = _to_int(row.get(coordinate, ""))
+        offset = _to_int(_cell(row, coordinate))
         if offset is None:
             continue
-        ac = _to_int(row.get("site_allele_count", "")) or 0
-        span = _to_int(row.get("consensus_span_bp", ""))
+        chrom = _cell(row, "chrom")
+        host_start0 = int(_cell(row, "host_start0"))
+        host_end0 = int(_cell(row, "host_end0"))
         out.append(
             {
-                "chrom": row["chrom"],
-                "pos": int(row["pos"]),
-                "host_start0": int(row["host_start0"]),
-                "host_end0": int(row["host_end0"]),
-                "host_strand": row.get("host_strand", ""),
-                "host_name": row.get("host_name", ""),
+                "chrom": chrom,
+                "pos": int(_cell(row, "pos")),
+                "host_start0": host_start0,
+                "host_end0": host_end0,
+                "host_strand": _cell(row, "host_strand"),
+                "host_name": _cell(row, "host_name"),
                 "host_len": host_len,
-                "consensus_span_bp": span,
+                "consensus_span_bp": _to_int(_cell(row, "consensus_span_bp")),
                 "offset": offset,
-                "allele_count": ac,
-                "insert_strand": row.get("insert_strand", ""),
-                "consensus_match_name": row.get("consensus_match_name", ""),
-                "offset_drift_bp": _to_int(row.get("offset_drift_bp", "")),
-                "perc_resolved": row.get("perc_resolved", ""),
-                "not_canonical": row.get("not_canonical", ""),
-                "host_key": (row["chrom"], int(row["host_start0"]), int(row["host_end0"])),
+                "allele_count": _to_int(_cell(row, "site_allele_count")) or 0,
+                "insert_strand": _cell(row, "insert_strand"),
+                "consensus_match_name": _cell(row, "consensus_match_name"),
+                "offset_drift_bp": _to_int(_cell(row, "offset_drift_bp")),
+                "perc_resolved": _cell(row, "perc_resolved"),
+                "not_canonical": _cell(row, "not_canonical"),
+                "host_key": (chrom, host_start0, host_end0),
             }
         )
     return out

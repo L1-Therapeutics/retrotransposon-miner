@@ -322,6 +322,91 @@ def test_load_nested_rows_drops_unusable_coordinates():
 
 
 # --------------------------------------------------------------------------
+# Column access: one discipline, so a missing column can never empty the cohort
+# --------------------------------------------------------------------------
+
+
+def test_the_required_and_optional_column_sets_are_disjoint():
+    """A column cannot be load-bearing for membership and merely informative."""
+    assert not set(m.REQUIRED_COHORT_COLUMNS) & set(m.OPTIONAL_COHORT_COLUMNS)
+
+
+def test_the_declared_column_sets_cover_everything_load_nested_rows_reads():
+    """The declarations are the contract, so nothing may be read outside them.
+
+    A column read by `_cell` but absent from all three categories would be
+    neither validated nor documented, and the partition would be a fiction. The
+    third category is the coordinate columns, which are required only when the
+    caller selects that frame -- `load_nested_rows` validates whichever one was
+    asked for, so they belong to no fixed list.
+    """
+    declared = (
+        set(m.REQUIRED_COHORT_COLUMNS)
+        | set(m.OPTIONAL_COHORT_COLUMNS)
+        | {"consensus_offset", "host_offset_5p_0based"}
+    )
+    assert {"chrom", "pos", "host_start0", "host_end0"} <= declared
+    assert set(_row()) - declared == set(), (
+        f"the fixture carries column(s) {sorted(set(_row()) - declared)} that "
+        "`load_nested_rows` neither declares nor reads"
+    )
+
+
+@pytest.mark.parametrize("column", m.REQUIRED_COHORT_COLUMNS)
+def test_a_missing_required_column_is_a_schema_error(column):
+    """The gate columns used to fail open here, and that was the defect.
+
+    `nested_in_alu_host` and the other three clauses were read with
+    `row.get(...)`, so a column that went missing made every row fail the gate,
+    emptied the cohort, and produced a report of zeros reading as "no enrichment
+    here". The identity columns raised `KeyError` instead -- three behaviours in
+    one function. All of them now raise `CohortSchemaError`.
+    """
+    row = {k: v for k, v in _row().items() if k != column}
+    with pytest.raises(m.CohortSchemaError) as excinfo:
+        m.load_nested_rows([row])
+    message = str(excinfo.value)
+    assert column in message
+    assert "chrom" in message  # the header is reported, so the fix is obvious
+
+
+def test_the_schema_error_is_distinguishable_from_an_empty_cohort():
+    """An empty analysis set is a data outcome; a missing column is not.
+
+    Collapsing the two is what let a schema break present as a clean null, so the
+    distinction has to survive into the exception type.
+    """
+    assert m.load_nested_rows([_row(nested_in_alu_host="0")]) == []
+    assert m.load_nested_rows([]) == []
+
+
+@pytest.mark.parametrize("column", m.OPTIONAL_COHORT_COLUMNS)
+def test_a_missing_optional_column_degrades_and_keeps_the_row(column):
+    """Evidence columns are not membership, so absence must not exclude a row."""
+    row = {k: v for k, v in _row().items() if k != column}
+    out = m.load_nested_rows([row])
+    assert len(out) == 1, f"dropping {column} changed the analysis-set size"
+
+
+def test_a_degraded_optional_column_reads_as_empty_not_as_its_old_value():
+    out = m.load_nested_rows([{k: v for k, v in _row().items() if k != "host_strand"}])
+    assert out[0]["host_strand"] == ""
+
+
+@pytest.mark.parametrize("column", ("pos", "host_start0", "host_end0"))
+def test_a_present_but_unparseable_identity_is_loud(column):
+    """Present-but-garbage must not quietly leave the denominator.
+
+    These three are parsed with `int()` rather than `_to_int`, so an unusable
+    value raises instead of excluding the row. A row that vanishes from the
+    denominator for a reason nobody reported is the failure this whole change is
+    about.
+    """
+    with pytest.raises(ValueError):
+        m.load_nested_rows([_row(**{column: "not-a-number"})])
+
+
+# --------------------------------------------------------------------------
 # Estimand: sites and carriers are never merged
 # --------------------------------------------------------------------------
 

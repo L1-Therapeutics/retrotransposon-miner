@@ -6,8 +6,9 @@ real callsets into the numbers that were actually published. A rule can be
 pinned and still be applied wrongly, and `analysis_metrics.json` recorded hashes
 of the code but never of the inputs, so nothing would have caught that.
 
-Cheap checks (published CSVs and the metrics block) run by default. The checks
-that must parse the 156 MB `rmsk.txt.gz` take about five minutes and are opt-in:
+Cheap checks (published CSVs, the metrics block, and the rendered report) run by
+default. The checks that must parse the 156 MB `rmsk.txt.gz` take about five
+minutes and are opt-in:
 
     RTM_REPRODUCE_SLOW=1 pytest tests/test_published_ten_genome_reproduction.py
 """
@@ -32,6 +33,7 @@ MANIFEST = CALLSETS / "manifest.sha256"
 METRICS = RESULTS / "analysis_metrics.json"
 SITES_CSV = RESULTS / "unique_sites.csv"
 PRIVATE_CSV = RESULTS / "private_sites.csv"
+SUMMARY_MD = RESULTS / "analysis_summary.md"
 
 SLOW = os.environ.get("RTM_REPRODUCE_SLOW") == "1"
 requires_slow = pytest.mark.skipif(
@@ -51,6 +53,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import analyze_ten_genome_mei as ten  # noqa: E402
+import mei_reference_opportunity as opportunity  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -216,3 +219,90 @@ def test_five_genome_registered_counts_reproduce(engine, ingestion, published):
             sum(len(s.samples) == 1 for s in sites),
             sum(len(s.samples) >= 2 for s in sites),
             nested_l1) == (4998, 3051, 1947, 231)
+
+
+# ---------------------------------------------------------------------------
+# the written report against the machine-readable record
+#
+# `analysis_summary.md` is the artifact a person actually reads, and it is
+# rendered separately from `analysis_metrics.json`. A number that drifts between
+# them would be invisible to every other check here, so each row is rebuilt from
+# the metrics through the same formatter the writer uses and required to appear
+# verbatim.
+# ---------------------------------------------------------------------------
+def report_text():
+    _require(SUMMARY_MD)
+    return SUMMARY_MD.read_text(encoding="utf-8")
+
+
+def row(cells):
+    return "| " + " | ".join(cells) + " |"
+
+
+def test_qc_table_is_rendered_from_the_published_qc_block(published):
+    text = report_text()
+    for entry in published["qc"]:
+        assert row([entry["sample"], ten.fmt(entry["calls"]), ten.fmt(entry["ALU"]),
+                    ten.fmt(entry["LINE1"]), ten.fmt(entry["SVA"]), ten.fmt(entry["chrY"]),
+                    "PASS", entry["schema"], entry["note"]]) in text
+
+
+def test_delta_table_is_rendered_from_the_published_delta(published):
+    text = report_text()
+    for entry in published["delta"]:
+        assert row([entry["headline"], ten.fmt(entry["five"]), ten.fmt(entry["ten"]),
+                    ten.fmt(entry["percent_change"]), entry["reason"]]) in text
+
+
+def test_enrichment_table_is_rendered_from_the_published_enrichment(published):
+    text = report_text()
+    primary = published["ten"]["enrichment"]["private"]["primary"]
+    tier2 = published["ten"]["enrichment"]["private"]["tier2"]
+    for observed, sensitivity in zip(primary, tier2):
+        assert observed["family"] == sensitivity["family"]
+        assert row([observed["family"], ten.fmt(observed["nested"]), ten.fmt(observed["expected"]),
+                    ten.fmt(observed["enrichment"]), ten.fmt(observed["p"]),
+                    ten.fmt(sensitivity["enrichment"])]) in text
+
+
+def test_embedded_provenance_block_is_the_published_provenance(published):
+    """The report quotes its own provenance; it must not drift from the record."""
+    text = report_text()
+    blocks = text.split("```json")
+    assert len(blocks) > 1, "report carries no provenance block"
+    quoted = json.loads(blocks[-1].split("```")[0])
+    assert quoted == published["provenance"]
+
+
+def test_report_states_every_standing_caveat(published):
+    """A caveat dropped from the prose is the one most likely to be missed.
+
+    The report is generated from the same data, so a rule can be enforced in the
+    pipeline and still go unmentioned in the text a reader relies on.
+    """
+    text = report_text()
+    required = [
+        "GT/GQ are never parsed",
+        "Gene/snpEff fields are not analysis inputs or matching keys",
+        "chrY counts appear in QC only",
+        "chr22_mei.vcf is an excluded HG03086 slice",
+        "unknown never becomes antisense",
+        "no transitive chaining, one carrier per sample",
+        "HG03086 raw 261 is reproduced",
+        ten.CAVEAT,
+        opportunity.TIER2,
+        "NOT carriage denominators",
+    ]
+    missing = [phrase for phrase in required if phrase not in text]
+    assert not missing, f"standing caveats missing from the report: {missing}"
+
+
+def test_report_carries_the_opportunity_caveat_on_every_enrichment_claim(published):
+    """Each of the headline answers must be conditioned, not a bare number."""
+    text = report_text()
+    answers = text.split("## William’s three answers")[1].split("## Standing caveats")[0]
+    for number in (1, 2, 3):
+        line = next(line for line in answers.splitlines()
+                    if line.strip().startswith(f"{number}."))
+        if "enrichment" in line or "x versus" in line:
+            assert ten.CAVEAT in line, f"answer {number} reports a number unconditioned"

@@ -14,6 +14,15 @@ from urllib.parse import urlparse
 import pysam
 
 
+__all__ = [
+    "alignment_path_is_cram",
+    "alignment_open_mode",
+    "resolve_alignment_reference",
+    "bind_alignment_reference",
+    "open_alignment",
+]
+
+
 def alignment_path_is_cram(path: str | Path) -> bool:
     text = str(path).strip()
     parsed = urlparse(text)
