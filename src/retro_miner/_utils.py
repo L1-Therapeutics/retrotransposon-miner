@@ -11,12 +11,24 @@ import warnings
 from pathlib import Path
 from typing import IO
 
+import pandas as pd
+
 
 # Named constants for magic numbers
 _FULL_READ_POLY_AT_MIN_LEN = 140
 _POLY_AT_MIN_LEN_DEFAULT = 25
 _POLY_AT_MIN_FRAC_DEFAULT = 0.90
 _SAFE_LOCUS_CHAR_REPLACEMENT = "_"
+
+
+def read_tsv(path: Path, **kwargs: object) -> pd.DataFrame:
+    """Read a TSV file with sensible defaults.
+
+    Wraps :func:`pandas.read_csv` with ``sep="\t"`` and ``low_memory=False``
+    so callers don't have to repeat them. Additional keyword arguments are
+    forwarded unchanged.
+    """
+    return pd.read_csv(path, sep="\t", low_memory=False, **kwargs)  # type: ignore[arg-type]
 
 
 def safe_locus_id(chrom: str, start: int, end: int) -> str:

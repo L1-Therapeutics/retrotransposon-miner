@@ -574,14 +574,39 @@ def opportunity_diagnostic(
             if float(arr.max()) <= 0.001
             else "repeat_mask_opportunity_differs_from_host_interval"
         ),
-        "consequence": (
+        "consequence": _opportunity_consequence(float(arr.max())),
+    }
+
+
+def _opportunity_consequence(max_residual_mask_bp: float) -> str:
+    """The opportunity diagnostic's consequence, branching on its own verdict.
+
+    This was one fixed string stating that no other repeat intrudes on any
+    measured host interior, so the mappability-scaled variant collapses onto the
+    host-interval null. The verdict beside it is `..._differs_from_host_interval`
+    as soon as a residual mask is measured, which is exactly the case in which
+    that sentence is false -- and it is the branch that would change how the
+    sensitivity analysis is read.
+    """
+    degenerate = (
+        "a strict repeat mask would be degenerate because the host is itself an "
+        "annotated repeat"
+    )
+    if max_residual_mask_bp <= 0.001:
+        return (
             "excluding the host's own RepeatMasker annotation, no other repeat "
             "intrudes on any measured host interior, so the mappability-scaled "
-            "variant collapses onto the host-interval null on this data; a strict "
-            "repeat mask would be degenerate because the host is itself an "
-            "annotated repeat. Recorded as a deviation, not assumed."
-        ),
-    }
+            f"variant collapses onto the host-interval null on this data; {degenerate}. "
+            "Recorded as a deviation, not assumed."
+        )
+    return (
+        f"excluding the host's own RepeatMasker annotation, another repeat intrudes "
+        f"into at least one measured host interior (worst residual mask "
+        f"{max_residual_mask_bp:.3f} of the host interval). The mappability-scaled "
+        "variant is therefore NOT the host-interval null on this data and must be "
+        f"reported as a different quantity; {degenerate}. Recorded as a deviation, "
+        "not assumed."
+    )
 
 
 def write_cells_csv(path: Path, cells: Sequence[dict[str, Any]]) -> None:

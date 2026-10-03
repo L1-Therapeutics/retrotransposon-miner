@@ -16,7 +16,7 @@ import click
 import pandas as pd
 from intervaltree import IntervalTree
 
-from ._utils import _open_textmaybe_gz
+from ._utils import _open_textmaybe_gz, read_tsv
 
 
 __all__ = [
@@ -77,7 +77,7 @@ def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame
     if parquet_path.exists():
         return pd.read_parquet(parquet_path)
     if tsv_path.exists():
-        return pd.read_csv(tsv_path, sep="\t")
+        return read_tsv(tsv_path)
     raise FileNotFoundError(
         f"Missing evidence table for stem={stem} sample={sample}; "
         f"looked for {parquet_path} and {tsv_path}"
@@ -133,7 +133,7 @@ def _read_passing_counts(summary_path: Path) -> dict[str, int]:
             "Run 'rtm extract-split-evidence' first to generate this file."
         )
     try:
-        summary = pd.read_csv(summary_path, sep="\t", usecols=["sample", "passing_reads"])
+        summary = read_tsv(summary_path, usecols=["sample", "passing_reads"])
     except ValueError as exc:
         raise ValueError(
             f"Split evidence summary at '{summary_path}' is missing required columns "

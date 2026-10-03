@@ -50,7 +50,11 @@ def test_every_all_entry_resolves(module_name: str) -> None:
     """`__all__` must not name anything the module does not define."""
     try:
         module = importlib.import_module(f"retro_miner.{module_name}")
-    except Exception as exc:  # pragma: no cover - environment-dependent
+    except Exception as exc:  # noqa: BLE001 - deliberate: the point of this guard
+        # is that a module which cannot even be imported in this environment is
+        # out of scope, and the failure mode is open-ended (optional C extension,
+        # missing data file, syntax error under an older interpreter). Naming the
+        # exception types would just make this a maintenance trap.
         pytest.skip(f"{module_name} is not importable here: {exc}")
     advertised = getattr(module, "__all__", None)
     if advertised is None:
@@ -68,7 +72,7 @@ def test_all_has_no_duplicates(module_name: str) -> None:
     """A repeated entry is a copy-paste slip that hides a missing one."""
     try:
         module = importlib.import_module(f"retro_miner.{module_name}")
-    except Exception as exc:  # pragma: no cover - environment-dependent
+    except Exception as exc:  # noqa: BLE001 - deliberate, see above
         pytest.skip(f"{module_name} is not importable here: {exc}")
     advertised = getattr(module, "__all__", None)
     if not advertised:
