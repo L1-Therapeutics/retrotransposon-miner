@@ -11,7 +11,12 @@ build/
 *.egg-info/
 
 # Environments
+# Bare entries as well as trailing-slash ones: a trailing slash matches only a
+# directory, so a SYMLINK named .venv (pointing at a sibling worktree's venv)
+# slipped past `.venv/` and got committed on this branch.
+.venv
 .venv/
+venv
 venv/
 .env
 .ec2-instance.env
