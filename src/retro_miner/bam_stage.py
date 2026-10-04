@@ -13,18 +13,24 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import uuid
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
-from retro_miner.s3_transfer import download_s3_uri
+from retro_miner.s3_transfer import download_s3_uri, split_s3_uri
 
 HEADROOM_RATIO = 0.10
 MIN_HEADROOM_BYTES = 5 * 1024**3
@@ -77,16 +83,9 @@ def alignment_basename(uri: str) -> str:
     return name
 
 
-def _split_alignment_name(name: str) -> tuple[str, str]:
-    for suffix in (".bam", ".cram"):
-        if name.endswith(suffix):
-            return name[: -len(suffix)], suffix
-    stem, ext = os.path.splitext(name)
-    return stem, ext
-
-
 def _uri_hash(uri: str) -> str:
-    return hashlib.sha1(uri.encode("utf-8")).hexdigest()[:8]
+    # Never persist signed URLs or access tokens in cache metadata.
+    return hashlib.sha256(uri.strip().encode("utf-8")).hexdigest()
 
 
 def staged_alignment_dest(
@@ -95,36 +94,43 @@ def staged_alignment_dest(
     *,
     colliding_basenames: set[str] | None = None,
 ) -> Path:
-    """Local destination path for one remote BAM/CRAM."""
+    """Source-isolated destination; basename collisions cannot cross runs.
+
+    ``colliding_basenames`` is retained for API compatibility. Every source is
+    namespaced, regardless of the other inputs in the current plan.
+    """
     name = alignment_basename(remote_uri)
-    if colliding_basenames and name in colliding_basenames:
-        stem, suffix = _split_alignment_name(name)
-        name = f"{stem}.{_uri_hash(remote_uri)}{suffix}"
-    return Path(stage_dir) / name
+    if name in {".", "..", "manifest.json"}:
+        raise ValueError("Alignment basename must be a file name distinct from manifest.json")
+    return Path(stage_dir) / "objects" / _uri_hash(remote_uri) / name
 
 
 def plan_staged_dests(stage_dir: str | Path, uris: Sequence[str]) -> dict[str, Path]:
-    """Map unique remote URIs to local dests; hash-suffix only on basename clashes."""
-    unique = [u.strip() for u in uris if (u or "").strip()]
-    unique = list(dict.fromkeys(unique))
-    names = [alignment_basename(u) for u in unique]
-    counts: dict[str, int] = {}
-    for name in names:
-        counts[name] = counts.get(name, 0) + 1
-    colliding = {name for name, n in counts.items() if n > 1}
-    return {u: staged_alignment_dest(stage_dir, u, colliding_basenames=colliding) for u in unique}
+    """Map unique remote URIs to stable source-isolated destinations.
+
+    Apply resolves these provisional paths to immutable remote generations.
+    Planning does not access remote storage or create local files.
+    """
+    unique = list(dict.fromkeys(u.strip() for u in uris if (u or "").strip()))
+    return {u: staged_alignment_dest(stage_dir, u) for u in unique}
 
 
 def index_sidecar_uris(alignment_uri: str) -> list[str]:
     """Likely remote index URLs/keys next to a BAM/CRAM."""
-    uri = alignment_uri.rstrip("/")
+    uri = alignment_uri.strip()
+    # HTTP query strings (including signed access tokens) belong after the
+    # modified path. S3 keys, in contrast, can contain literal '?' and '#'.
+    parsed = urllib.parse.urlsplit(uri) if uri.startswith(("http://", "https://")) else None
+    path = parsed.path if parsed is not None else uri
     cands: list[str] = []
-    if uri.endswith(".bam"):
-        cands.extend([uri + ".bai", uri[:-4] + ".bai", uri + ".csi", uri[:-4] + ".csi"])
-    elif uri.endswith(".cram"):
-        cands.extend([uri + ".crai", uri[:-5] + ".crai"])
+    if path.endswith(".bam"):
+        cands.extend([path + ".bai", path[:-4] + ".bai", path + ".csi", path[:-4] + ".csi"])
+    elif path.endswith(".cram"):
+        cands.extend([path + ".crai", path[:-5] + ".crai"])
     else:
-        cands.extend([uri + ".bai", uri + ".csi", uri + ".crai"])
+        cands.extend([path + ".bai", path + ".csi", path + ".crai"])
+    if parsed is not None:
+        cands = [urllib.parse.urlunsplit(parsed._replace(path=cand)) for cand in cands]
     seen: set[str] = set()
     out: list[str] = []
     for cand in cands:
@@ -149,7 +155,7 @@ def index_sidecar_dests(local_alignment: Path) -> list[Path]:
             Path(str(local_alignment) + ".crai"),
             parent / f"{name[:-5]}.crai",
         ]
-    return [Path(str(local_alignment) + ".bai")]
+    return [Path(str(local_alignment) + suffix) for suffix in (".bai", ".csi", ".crai")]
 
 
 def local_copy_is_complete(dest: str | Path, expected_size: int | None) -> bool:
@@ -184,10 +190,6 @@ def format_bytes(n: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{n} B"
-
-
-def _local_index_present(local_alignment: Path) -> bool:
-    return any(p.is_file() and p.stat().st_size > 0 for p in index_sidecar_dests(local_alignment))
 
 
 @dataclass
@@ -229,7 +231,7 @@ def plan_bam_stage(
     rewritten = {}
     for key, value in labels.items():
         if do_stage and is_remote_alignment_uri(value):
-            rewritten[key] = str(dest_by_uri[value])
+            rewritten[key] = str(dest_by_uri[value.strip()])
         else:
             rewritten[key] = value
     return BamStagePlan(
@@ -247,48 +249,122 @@ def _run_cmd(cmd: list[str]) -> None:
         raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{err}")
 
 
-def _default_head_size(uri: str) -> int | None:
+@dataclass(frozen=True)
+class RemoteMetadata:
+    size: int
+    etag: str = ""
+    last_modified: str = ""
+    version_id: str = ""
+
+    @property
+    def reusable(self) -> bool:
+        # Weak HTTP ETags are not byte-identity validators. Last-Modified is
+        # useful as an additional change signal, but not sufficient alone.
+        return bool(self.version_id or (self.etag and not self.etag.startswith("W/")))
+
+
+def _default_head_metadata(uri: str) -> RemoteMetadata | None:
     if uri.startswith("s3://"):
         if shutil.which("aws") is None:
             raise RuntimeError("aws CLI is required to stage s3:// BAMs")
-        rest = uri[len("s3://") :]
-        bucket, _, key = rest.partition("/")
+        bucket, key = split_s3_uri(uri)
         proc = subprocess.run(
-            [
-                "aws",
-                "s3api",
-                "head-object",
-                "--bucket",
-                bucket,
-                "--key",
-                key,
-                "--query",
-                "ContentLength",
-                "--output",
-                "text",
-            ],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            ["aws", "s3api", "head-object", "--bucket", bucket, "--key", key, "--output", "json"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
         )
         if proc.returncode != 0:
             return None
         try:
-            return int((proc.stdout or "").strip())
-        except ValueError:
+            obj = json.loads(proc.stdout)
+            version = obj.get("VersionId") or ""
+            return RemoteMetadata(
+                size=int(obj["ContentLength"]), etag=str(obj.get("ETag") or ""),
+                last_modified=str(obj.get("LastModified") or ""),
+                version_id="" if version == "null" else str(version),
+            )
+        except (ValueError, KeyError, TypeError, AttributeError):
             return None
-        request = urllib.request.Request(
-        uri,
-        method="HEAD",
-        headers={"User-Agent": "retrotransposon-miner/bam-stage"},
+    if not uri.startswith(("http://", "https://")):
+        return None
+    request = urllib.request.Request(
+        uri, method="HEAD", headers={"User-Agent": "retrotransposon-miner/bam-stage", "Accept-Encoding": "identity"},
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as resp:
-            cl = resp.headers.get("Content-Length")
-            return int(cl) if cl else None
-    except Exception:  # noqa: BLE001
+            size = resp.headers.get("Content-Length")
+            return RemoteMetadata(
+                size=int(size), etag=resp.headers.get("ETag", ""),
+                last_modified=resp.headers.get("Last-Modified", ""),
+            ) if size is not None else None
+    except (OSError, ValueError):
         return None
+
+
+def _default_head_size(uri: str) -> int | None:
+    metadata = _default_head_metadata(uri)
+    return metadata.size if metadata is not None else None
+
+
+@contextmanager
+def _stage_lock(stage_dir: Path, timeout: float) -> Iterator[None]:
+    """Serialize staging transactions; the kernel releases locks on exit/crash."""
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("lock_timeout must be finite and >= 0")
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("BAM staging locks require a POSIX filesystem (Linux/macOS)") from exc
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    # Keep this inode: unlinking a lock file lets different processes lock
+    # different inodes and defeats mutual exclusion.
+    with (stage_dir / ".rtm-stage.lock").open("a+b") as handle:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Timed out waiting for BAM staging lock under {stage_dir}") from None
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _file_fingerprint(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "inode": stat.st_ino}
+
+
+def _cache_valid(
+    dest: Path, metadata: RemoteMetadata, manifest: dict[str, object],
+    head: Callable[[str], RemoteMetadata | None], uri: str,
+) -> bool:
+    if not metadata.reusable:
+        return False
+    try:
+        saved = json.loads((dest.parent / "manifest.json").read_text(encoding="utf-8"))
+        if not isinstance(saved, dict) or any(saved.get(k) != v for k, v in manifest.items()):
+            return False
+        index_name = saved.get("index_name")
+        if not isinstance(index_name, str) or index_name not in {p.name for p in index_sidecar_dests(dest)}:
+            return False
+        index = dest.parent / index_name
+        if not (
+            local_copy_is_complete(dest, metadata.size) and index.is_file() and index.stat().st_size > 0
+            and saved.get("alignment_file") == _file_fingerprint(dest)
+            and saved.get("index_file") == _file_fingerprint(index)
+        ):
+            return False
+        candidates = dict(zip((p.name for p in index_sidecar_dests(dest)), index_sidecar_uris(uri)))
+        index_metadata = head(candidates[index_name])
+        return bool(index_metadata is not None and index_metadata.reusable
+                    and index_metadata.size == index.stat().st_size
+                    and saved.get("index_remote") == asdict(index_metadata))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _default_copy(src: str, dest: Path) -> None:
@@ -298,7 +374,11 @@ def _default_copy(src: str, dest: Path) -> None:
         return
     if shutil.which("curl") is None:
         raise RuntimeError("curl is required to stage http(s):// BAMs")
-    _run_cmd(["curl", "-fL", "--retry", "5", "--retry-delay", "5", "-o", str(dest), src])
+    try:
+        _run_cmd(["curl", "-fL", "--retry", "5", "--retry-delay", "5", "-o", str(dest), src])
+    except RuntimeError:
+        # curl stderr and command lines may contain signed URL credentials.
+        raise RuntimeError(f"HTTP alignment/index transfer failed for {dest}") from None
 
 
 def _default_disk_free(path: Path) -> int:
@@ -310,83 +390,132 @@ def apply_bam_stage(
     plan: BamStagePlan,
     *,
     head_size: Callable[[str], int | None] | None = None,
+    head_metadata: Callable[[str], RemoteMetadata | None] | None = None,
     copy_object: Callable[[str, Path], None] | None = None,
     disk_free: Callable[[Path], int] | None = None,
     log: Callable[[str], None] | None = None,
+    lock_timeout: float = 3600,
 ) -> dict[str, str]:
-    """Copy planned remotes if dest size mismatches. Returns rewritten paths."""
+    """Resolve immutable remote generations and stage under a bounded POSIX lock.
+
+    A cache hit requires remote validators plus a matching completion manifest
+    and local file fingerprints. Size-only providers are supported but cannot
+    reuse cached data. The lock covers metadata, disk budgeting and publication.
+    """
     emit = log or (lambda msg: print(msg, file=sys.stderr))
     if not plan.should_stage:
         emit("[bam-stage] skip (single-chrom stream or staging disabled)")
         return dict(plan.rewritten)
+    if head_metadata is not None and head_size is not None:
+        raise ValueError("Provide head_metadata or head_size, not both")
 
-    head = head_size or _default_head_size
-    copy_fn = copy_object or _default_copy
-    free_fn = disk_free or _default_disk_free
-    plan.stage_dir.mkdir(parents=True, exist_ok=True)
+    def head(uri: str) -> RemoteMetadata | None:
+        if head_metadata is not None:
+            return head_metadata(uri)
+        if head_size is not None:
+            size = head_size(uri)
+            return RemoteMetadata(size) if size is not None else None
+        return _default_head_metadata(uri)
 
-    pending: list[tuple[str, Path, int]] = []
-    for uri, dest in plan.dest_by_uri.items():
-        size = head(uri)
-        if size is None:
-            raise RuntimeError(f"Could not determine size of remote BAM: {uri}")
-        if local_copy_is_complete(dest, size) and _local_index_present(dest):
-            emit(f"[bam-stage] reuse {dest} ({format_bytes(size)})")
-            continue
-        pending.append((uri, dest, size))
+    with _stage_lock(plan.stage_dir, lock_timeout):
+        return _apply_locked(plan, head, copy_object or _default_copy, disk_free or _default_disk_free, emit)
 
-    need = required_free_bytes(size for _uri, _dest, size in pending)
+
+def _apply_locked(
+    plan: BamStagePlan,
+    head: Callable[[str], RemoteMetadata | None],
+    copy_fn: Callable[[str, Path], None],
+    free_fn: Callable[[Path], int],
+    emit: Callable[[str], None],
+) -> dict[str, str]:
+    pending: list[tuple[str, Path, RemoteMetadata, dict[str, object]]] = []
+    rewritten = dict(plan.rewritten)
+    for uri in plan.dest_by_uri:
+        metadata = head(uri)
+        if metadata is None or metadata.size <= 0:
+            raise RuntimeError("Could not determine a positive size of remote BAM")
+        source = staged_alignment_dest(plan.stage_dir, uri)
+        generation = hashlib.sha256(json.dumps(asdict(metadata), sort_keys=True).encode()).hexdigest()
+        if not metadata.reusable:
+            emit("[bam-stage] remote has no strong identity validator; cache reuse disabled")
+            # Without a byte-identity validator even same-size objects may
+            # differ. Give every transfer a new generation and never reuse.
+            generation = uuid.uuid4().hex
+        dest = source.parent / generation / source.name
+        manifest: dict[str, object] = {"schema": 1, "source_hash": _uri_hash(uri), "remote": asdict(metadata)}
+        valid = _cache_valid(dest, metadata, manifest, head, uri)
+        if not valid and metadata.reusable and source.parent.exists():
+            for candidate in sorted(source.parent.glob(f"{generation}-*")):
+                if candidate.is_dir() and _cache_valid(candidate / source.name, metadata, manifest, head, uri):
+                    dest = candidate / source.name
+                    valid = True
+                    break
+        if not valid and dest.parent.exists():
+            # Never mutate a published generation: a previous run may be
+            # reading it. Invalid/incomplete generations get a fresh namespace.
+            dest = source.parent / f"{generation}-{uuid.uuid4().hex}" / source.name
+        for label, original in plan.rewritten.items():
+            if original == str(plan.dest_by_uri[uri]):
+                rewritten[label] = str(dest)
+        if valid:
+            emit(f"[bam-stage] reuse {dest} ({format_bytes(metadata.size)})")
+        else:
+            pending.append((uri, dest, metadata, manifest))
+
+    need = required_free_bytes(metadata.size for _uri, _dest, metadata, _manifest in pending)
     free = free_fn(plan.stage_dir)
     if need > free:
         raise RuntimeError(
             "not enough free space to stage remote BAMs.\n"
-            f"  dest: {plan.stage_dir}\n"
-            f"  need: {format_bytes(need)} "
-            f"({format_bytes(sum(s for _u, _d, s in pending))} BAMs + headroom)\n"
+            f"  dest: {plan.stage_dir}\n  need: {format_bytes(need)} (BAMs + headroom)\n"
             f"  free: {format_bytes(free)}\n"
             "Use --bam-stage-dir / RTM_BAM_STAGE_DIR on a larger volume, "
             "or disable with --no-bam-stage / RTM_BAM_STAGE=0."
         )
 
-    def _copy_with_index(uri: str, dest: Path, size: int) -> None:
-        if not local_copy_is_complete(dest, size):
-            emit(f"[bam-stage] copy {uri} -> {dest} ({format_bytes(size)})")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                dest.unlink()
-            copy_fn(uri, dest)
-            if not local_copy_is_complete(dest, size):
-                got = dest.stat().st_size if dest.exists() else 0
-                raise RuntimeError(
-                    f"staged BAM size mismatch for {dest}: expected {size}, got {got}"
-                )
-        if _local_index_present(dest):
-            return
-        last_err: str | None = None
-        for idx_uri in index_sidecar_uris(uri):
-            idx_name = alignment_basename(idx_uri)
-            idx_dest = dest.parent / idx_name
-            try:
-                emit(f"[bam-stage] copy index {idx_uri} -> {idx_dest}")
-                copy_fn(idx_uri, idx_dest)
-                if idx_dest.is_file() and idx_dest.stat().st_size > 0:
-                    return
-            except Exception as exc:  # noqa: BLE001
-                last_err = str(exc)
-                continue
-        raise RuntimeError(
-            f"Could not stage BAI/CSI/CRAI next to {dest}"
-            + (f" ({last_err})" if last_err else "")
-        )
+    def copy_pair(uri: str, dest: Path, metadata: RemoteMetadata, manifest: dict[str, object]) -> None:
+        dest.parent.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".rtm-stage-", dir=dest.parent.parent) as tmp:
+            staged_bam = Path(tmp) / dest.name
+            emit(f"[bam-stage] copy alignment -> {dest} ({format_bytes(metadata.size)})")
+            copy_fn(uri, staged_bam)
+            if not local_copy_is_complete(staged_bam, metadata.size):
+                raise RuntimeError(f"staged BAM size mismatch for {dest}")
+            for idx_uri, idx_dest in zip(index_sidecar_uris(uri), index_sidecar_dests(dest)):
+                staged_index = Path(tmp) / idx_dest.name
+                try:
+                    index_metadata = head(idx_uri)
+                    copy_fn(idx_uri, staged_index)
+                    if staged_index.is_file() and staged_index.stat().st_size > 0:
+                        if index_metadata is not None and not local_copy_is_complete(staged_index, index_metadata.size):
+                            raise ValueError("Index size does not match remote metadata")
+                        if head(idx_uri) != index_metadata:
+                            raise RuntimeError("Remote index changed during staging")
+                        break
+                except Exception:  # noqa: BLE001 - try the next naming convention; do not expose signed URLs
+                    pass
+                staged_index.unlink(missing_ok=True)
+            else:
+                raise RuntimeError(f"Could not stage BAI/CSI/CRAI next to {dest}")
+            # Detect changes during the transfer, including same-size updates.
+            if head(uri) != metadata:
+                raise RuntimeError(f"Remote BAM changed during staging for {dest}; retry the run")
+            saved = dict(manifest)
+            saved.update(index_name=staged_index.name, alignment_file=_file_fingerprint(staged_bam),
+                         index_file=_file_fingerprint(staged_index),
+                         index_remote=asdict(index_metadata) if index_metadata is not None else None)
+            (Path(tmp) / "manifest.json").write_text(json.dumps(saved, sort_keys=True) + "\n", encoding="utf-8")
+            # Publish the complete directory (alignment, index and manifest)
+            # in one rename. No reader can observe half of the pair.
+            Path(tmp).rename(dest.parent)
 
     if pending:
-        workers = min(4, len(pending))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [pool.submit(_copy_with_index, uri, dest, size) for uri, dest, size in pending]
-            for fut in as_completed(futs):
-                fut.result()
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+            futures = [pool.submit(copy_pair, *item) for item in pending]
+            for future in as_completed(futures):
+                future.result()
     emit(f"[bam-stage] ready under {plan.stage_dir}")
-    return dict(plan.rewritten)
+    return rewritten
 
 
 def write_env_file(path: str | Path, rewritten: Mapping[str, str]) -> None:
@@ -396,7 +525,10 @@ def write_env_file(path: str | Path, rewritten: Mapping[str, str]) -> None:
     for key in ("DISEASE_BAM", "CONTROL_BAM", "DISEASE_MATE_BAM", "CONTROL_MATE_BAM"):
         val = rewritten.get(key, "")
         lines.append(f"{key}={_shell_single_quote(val)}")
-    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix=".rtm-env-", dir=dest.parent) as tmp:
+        staged = Path(tmp) / "env"
+        staged.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        staged.replace(dest)
 
 
 def _shell_single_quote(value: str) -> str:
@@ -415,6 +547,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chr-all", action="store_true")
     p.add_argument("--disabled", action="store_true", help="Do not stage (RTM_BAM_STAGE=0).")
     p.add_argument("--out-env", required=True, help="Write DISEASE_BAM=... shell assignments.")
+    p.add_argument("--lock-timeout", type=float, default=3600, help="Seconds to wait for the staging lock (default: 3600).")
     p.add_argument("--apply", action="store_true", help="Copy remotes when the plan says to stage.")
     return p
 
@@ -435,7 +568,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         chr_concurrency=args.chr_concurrency,
         enabled=enabled,
     )
-    rewritten = apply_bam_stage(plan) if args.apply else dict(plan.rewritten)
+    if plan.should_stage and not args.apply:
+        raise ValueError("--apply is required to publish staged paths; a plan has no verified local files")
+    rewritten = apply_bam_stage(plan, lock_timeout=args.lock_timeout) if args.apply else dict(plan.rewritten)
     write_env_file(args.out_env, rewritten)
     return 0
 

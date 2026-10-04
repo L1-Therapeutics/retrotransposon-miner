@@ -58,3 +58,9 @@ dependencies:
 
   - pip:
       - typer>=0.12
+      # Development checks (keep aligned with pyproject [project.optional-dependencies])
+      - pytest>=8
+      - ruff>=0.6
+      - mypy>=1.11
+      - pandas-stubs
+      - boto3-stubs

@@ -26,6 +26,15 @@ dependencies = [
   "rich>=13.7",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "pandas-stubs",
+  "boto3-stubs",
+]
+
 [project.scripts]
 rtm = "retro_miner.cli:cli"
 

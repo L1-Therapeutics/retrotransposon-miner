@@ -536,9 +536,22 @@ Chromosome slices pull a local `.bai` (from S3 or the NCBI sidecar) and use `sam
 
 `--test-bam-mode full` never writes the ~200 GiB BAMs to local disk. Add `--slice-after-full` only when you also want a local `--test-bam-chrom` slice.
 
-S3 copies (cache sync, BAM/BAI staging, S3→S3) use 64 concurrent 64 MiB multipart parts instead of the AWS CLI 10×8 MiB default. Turn concurrency down with `RTM_S3_MAX_CONCURRENCY` (process-local AWS config; `~/.aws/config` is not rewritten). Staging a WGS pair to EBS still needs volume throughput: `bootstrap` gp3 defaults to 1000 MB/s (4000 IOPS). The 125 MB/s gp3 baseline will hold a 200 GiB pair at ~25 min even with the fast copier.
+S3 copies (cache sync, BAM/BAI staging, S3→S3) use 64 concurrent 64 MiB multipart parts instead of the AWS CLI 10×8 MiB default. Turn concurrency down with `RTM_S3_MAX_CONCURRENCY` (process-local AWS config; `~/.aws/config` is not rewritten). The temporary CLI config preserves role/source profiles, credential-process and SSO settings, profile regions, and existing S3 options. It honors `AWS_CONFIG_FILE` and the selected profile (`AWS_DEFAULT_PROFILE` takes precedence over `AWS_PROFILE`). Local S3 downloads are published by atomic rename only after a successful transfer; failed transfers preserve existing files. Staging a WGS pair to EBS still needs volume throughput: `bootstrap` gp3 defaults to 1000 MB/s (4000 IOPS). The 125 MB/s gp3 baseline will hold a 200 GiB pair at ~25 min even with the fast copier.
 
-The candidate pipeline **does** stage remote (`s3://` or `http(s)://`) disease/control BAMs to `${RTM_WORKDIR}/data/bam_stage` when the run is multiple chromosomes, `--chr all`, or `--chr_concurrency > 1`. It skips the copy when the local file already matches the remote size, and refuses to start if free disk is below BAM size plus headroom. Single-chromosome runs keep streaming. Override the dest with `--bam-stage-dir` / `RTM_BAM_STAGE_DIR`, or disable with `--no-bam-stage` / `RTM_BAM_STAGE=0`.
+The candidate pipeline **does** stage remote (`s3://` or `http(s)://`) disease/control BAMs to `${RTM_WORKDIR}/data/bam_stage` when the run is multiple chromosomes, `--chr all`, or `--chr_concurrency > 1`. Single-chromosome runs keep streaming. Override the cache root with `--bam-stage-dir` / `RTM_BAM_STAGE_DIR`, or disable with `--no-bam-stage` / `RTM_BAM_STAGE=0`.
+
+### Verified, concurrency-safe alignment cache
+
+- Cached pairs live under `objects/<source-hash>/<generation>/<alignment-basename>`. Paths are isolated across datasets even when filenames repeat. Source URLs are hashed, not stored in manifests; signed tokens are not written into staging logs or manifests.
+- Reuse requires a completion manifest, matching alignment **and index** remote metadata, matching local file size/mtime/inode fingerprints, and a strong ETag or S3 version ID for both objects. Same-size remote changes invalidate reuse. Weak/missing validators disable reuse; each transfer then gets a fresh generation.
+- Downloads use private temporary directories. Alignment size, nonempty index, index size (when HEAD succeeds), and remote metadata before/after transfer are checked. The complete alignment/index/manifest directory is published with one atomic rename, and environment-path output is also atomic.
+- Generations are immutable: changed inputs and invalid cached pairs get new paths rather than overwriting files an earlier run may be reading. This deliberately favors correctness over index-only repair; an invalid index requires staging a fresh pair and enough disk for another alignment.
+- A POSIX filesystem lock serializes staging transactions sharing a cache root, including disk budgeting, while up to four transfers **within** a transaction remain parallel. Lock wait is bounded (3600 seconds by default; direct module CLI: `--lock-timeout`). Kernel locks are released after process exit or crash; do not delete `.rtm-stage.lock` while processes may be using the cache.
+- HTTP index candidates retain query parameters. Object-specific signed URLs may still need separately authorized index access.
+
+**Migration:** legacy flat-cache files without verified manifests are left untouched and are not adopted, even when sizes match. The first run stages a fresh pair into the new layout. Existing and old generations are retained; remove them only after confirming no running analysis uses their paths. A hard-killed transfer can leave an unpublished `.rtm-stage-*` directory, which is never reused. No automatic cache eviction is performed.
+
+**Validation limits:** ETags/version IDs are server identity validators, not necessarily cryptographic content hashes. File fingerprints catch ordinary local replacement or modification, not deliberate tampering. Before/after metadata checks detect observed remote changes, but do not pin the underlying GET to a server version. Filesystem power-loss durability, semantic index validation, and shared-network filesystem lock/rename behavior are not guaranteed; use a local Linux/macOS cache filesystem. Staging itself is safe to share, but simultaneous pipelines must still use separate output directories.
 
 hs1:
 
@@ -573,6 +586,21 @@ python3 scripts/download_public_data.py \
 - Set `KEY_PATH` if your private key is not `~/.ssh/id_ed25519` or `~/.ssh/<key-name>.pem`.
 - Locked out of an instance you created? `./scripts/ec2_jlab.sh use <instance-id>` then `./scripts/ec2_jlab.sh install-my-key` (needs `ec2-instance-connect:SendSSHPublicKey`). Do not share another user's PEM.
 - For production use, review security hardening, key lifecycle, and cost controls.
+
+## Development
+
+Run the standard checks before submitting changes:
+
+```bash
+conda activate rtm-miner || micromamba activate rtm-miner
+python -m pytest                  # test suite (tests/)
+python -m ruff check src tests     # lint
+python -m mypy                    # static type checking (see pyproject [tool.mypy])
+```
+
+Run checks with the activated environment's Python (3.11+; the Conda environment uses 3.12), not the macOS system Python. Python-only development tools are also available via `python -m pip install -e '.[dev]'` in an existing project environment; external genomics tools still require the environment setup above. The staging and S3 unit tests use fake transfers and do not contact cloud services.
+
+All new modules under `src/retro_miner` must type-check cleanly; see `CONTRIBUTING.md` ("Type checking") for the policy, including the grandfathered legacy modules and the strict flag set enforced on the marker modules.
 
 ## License
 

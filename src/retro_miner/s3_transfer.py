@@ -8,6 +8,7 @@ uses 64 concurrent 64 MiB parts instead. Override concurrency with
 from __future__ import annotations
 
 import argparse
+import configparser
 import os
 import shutil
 import subprocess
@@ -51,12 +52,31 @@ def s3_max_concurrency(raw: str | None = None) -> int:
 
 def s3_transfer_settings(*, max_concurrency: int | None = None) -> dict[str, int]:
     """Return TransferConfig / AWS CLI knobs. Does not include max_bandwidth."""
+    concurrency = s3_max_concurrency(str(max_concurrency) if max_concurrency is not None else None)
     return {
-        "max_concurrency": int(max_concurrency) if max_concurrency is not None else s3_max_concurrency(),
+        "max_concurrency": concurrency,
         "multipart_chunksize": DEFAULT_S3_MULTIPART_CHUNKSIZE,
         "multipart_threshold": DEFAULT_S3_MULTIPART_THRESHOLD,
         "max_queue_size": DEFAULT_S3_MAX_QUEUE_SIZE,
     }
+
+
+def _aws_profile_section() -> str:
+    profile = (os.environ.get("AWS_DEFAULT_PROFILE") or os.environ.get("AWS_PROFILE") or "default").strip()
+    return "default" if not profile or profile == "default" else f"profile {profile}"
+
+
+def _read_aws_config() -> configparser.ConfigParser:
+    # Disable interpolation: credential_process commands and other settings
+    # may contain literal percent signs. Do not fall back to a different
+    # config when the caller explicitly selected AWS_CONFIG_FILE.
+    config = configparser.ConfigParser(interpolation=None)
+    raw_path = (os.environ.get("AWS_CONFIG_FILE") or "").strip()
+    path = Path(raw_path).expanduser() if raw_path else Path.home() / ".aws" / "config"
+    if path.is_file():
+        with path.open(encoding="utf-8") as handle:
+            config.read_file(handle)
+    return config
 
 
 def _aws_region() -> str:
@@ -64,28 +84,7 @@ def _aws_region() -> str:
         val = (os.environ.get(key) or "").strip()
         if val:
             return val
-    cfg_path = (os.environ.get("AWS_CONFIG_FILE") or "").strip()
-    candidates = [Path(cfg_path)] if cfg_path else []
-    candidates.append(Path.home() / ".aws" / "config")
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        in_default = False
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if line.startswith("[") and line.endswith("]"):
-                in_default = line.lower() in {"[default]", "[profile default]"}
-                continue
-            if in_default and line.lower().startswith("region"):
-                _, _, value = line.partition("=")
-                value = value.strip()
-                if value:
-                    return value
-    return ""
+    return _read_aws_config().get(_aws_profile_section(), "region", fallback="").strip()
 
 
 def write_process_local_aws_config(
@@ -94,42 +93,41 @@ def write_process_local_aws_config(
     settings: Mapping[str, int] | None = None,
     region: str | None = None,
 ) -> Path:
-    """Write a temp AWS CLI config. Does not modify ``~/.aws/config``."""
+    """Copy AWS config and override transfer knobs without changing authentication.
+
+    Role, credential-process and SSO profiles are retained. The source config
+    (including a caller-selected ``AWS_CONFIG_FILE``) is never rewritten.
+    """
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     knobs = s3_transfer_settings() if settings is None else dict(settings)
     chunk_mib = max(1, int(knobs["multipart_chunksize"]) // _MIB)
     thresh_mib = max(1, int(knobs["multipart_threshold"]) // _MIB)
     resolved_region = (region if region is not None else _aws_region()).strip()
-    lines = ["[default]"]
-    if resolved_region:
-        lines.append(f"region = {resolved_region}")
-    lines.extend(
-        [
-            "s3 =",
-            f"    max_concurrent_requests = {int(knobs['max_concurrency'])}",
-            f"    multipart_chunksize = {chunk_mib}MB",
-            f"    multipart_threshold = {thresh_mib}MB",
-            f"    max_queue_size = {int(knobs['max_queue_size'])}",
-            "",
-        ]
-    )
-    profile = (os.environ.get("AWS_PROFILE") or "").strip()
-    if profile and profile.lower() != "default":
-        lines.append(f"[profile {profile}]")
-        if resolved_region:
-            lines.append(f"region = {resolved_region}")
-        lines.extend(
-            [
-                "s3 =",
-                f"    max_concurrent_requests = {int(knobs['max_concurrency'])}",
-                f"    multipart_chunksize = {chunk_mib}MB",
-                f"    multipart_threshold = {thresh_mib}MB",
-                f"    max_queue_size = {int(knobs['max_queue_size'])}",
-                "",
-            ]
-        )
-    dest.write_text("\n".join(lines), encoding="utf-8")
+    config = _read_aws_config()
+    selected = _aws_profile_section()
+    transfer_options = {
+        "max_concurrent_requests": str(s3_max_concurrency(str(knobs["max_concurrency"]))),
+        "multipart_chunksize": f"{chunk_mib}MB",
+        "multipart_threshold": f"{thresh_mib}MB",
+        "max_queue_size": str(int(knobs["max_queue_size"])),
+    }
+    for section in dict.fromkeys(("default", selected)):
+        if not config.has_section(section):
+            config.add_section(section)
+        if section == selected and resolved_region:
+            config.set(section, "region", resolved_region)
+        # AWS stores nested S3 options as an indented multiline value. Keep
+        # caller options such as addressing_style and endpoint behavior.
+        options: dict[str, str] = {}
+        for line in config.get(section, "s3", fallback="").splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep:
+                options[key.strip()] = value.strip()
+        options.update(transfer_options)
+        config.set(section, "s3", "\n" + "\n".join(f"{key} = {value}" for key, value in options.items()))
+    with dest.open("w", encoding="utf-8") as handle:
+        config.write(handle)
     return dest
 
 
@@ -201,24 +199,34 @@ def _run_aws_cli(args: list[str], *, env: Mapping[str, str] | None = None) -> No
 
 
 def download_s3_uri(s3_uri: str, dest: str | Path) -> None:
-    """Copy an S3 object to a local path using boto3 TransferConfig, else aws CLI."""
+    """Download with boto3 or the AWS CLI, atomically publishing on success.
+
+    Failed transfers leave an existing destination untouched. Temporary files
+    stay on the destination filesystem so replacement does not copy the object
+    a second time. Empty objects are valid for this generic transfer helper.
+    """
+    bucket, key = split_s3_uri(s3_uri)
     dest_path = Path(dest)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    if boto3_available():
-        bucket, key = split_s3_uri(s3_uri)
-        _boto3_client().download_file(bucket, key, str(dest_path), Config=boto3_transfer_config())
-        return
-    with process_local_aws_config() as env:
-        _run_aws_cli(["s3", "cp", s3_uri, str(dest_path)], env=env)
+    with tempfile.TemporaryDirectory(prefix=".rtm-s3-", dir=dest_path.parent) as tmp:
+        staged = Path(tmp) / dest_path.name
+        if boto3_available():
+            _boto3_client().download_file(bucket, key, str(staged), Config=boto3_transfer_config())
+        else:
+            with process_local_aws_config() as env:
+                _run_aws_cli(["s3", "cp", s3_uri, str(staged)], env=env)
+        if not staged.is_file():
+            raise RuntimeError(f"S3 download output is missing for {dest_path}")
+        staged.replace(dest_path)
 
 
 def copy_s3_uri(src_uri: str, dst: str | Path) -> None:
     """Copy S3→S3 or S3→local with the high-concurrency transfer settings."""
+    src_bucket, src_key = split_s3_uri(src_uri)
     dst_text = str(dst)
     if dst_text.startswith("s3://"):
+        dst_bucket, dst_key = split_s3_uri(dst_text)
         if boto3_available():
-            src_bucket, src_key = split_s3_uri(src_uri)
-            dst_bucket, dst_key = split_s3_uri(dst_text)
             _boto3_client().copy(
                 {"Bucket": src_bucket, "Key": src_key},
                 dst_bucket,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import os
 from pathlib import Path
 
@@ -120,7 +121,11 @@ def test_download_s3_uri_uses_boto3_when_available(
     monkeypatch.setattr("retro_miner.s3_transfer.boto3_transfer_config", lambda settings=None: _Cfg())
     monkeypatch.setattr("retro_miner.s3_transfer._boto3_client", lambda: _Client())
     download_s3_uri("s3://l1tx-data/public/foo.bam", dest)
-    assert calls == [("l1tx-data", "public/foo.bam", str(dest))]
+    assert len(calls) == 1
+    assert calls[0][:2] == ("l1tx-data", "public/foo.bam")
+    assert Path(calls[0][2]).name == dest.name
+    assert Path(calls[0][2]) != dest
+    assert not Path(calls[0][2]).exists()
     assert dest.read_bytes() == b"ok"
 
 
@@ -157,3 +162,121 @@ def test_copy_s3_uri_local_routes_to_download(
     dest = tmp_path / "local.bam"
     copy_s3_uri("s3://bucket/key.bam", dest)
     assert seen == ["s3://bucket/key.bam"]
+
+
+@pytest.mark.parametrize("profile_env", ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"])
+def test_process_config_preserves_authentication_and_s3_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile_env: str,
+) -> None:
+    original = """[default]
+region = us-east-1
+[profile research]
+region = eu-west-1
+role_arn = arn:aws:iam::123456789012:role/research
+source_profile = base
+s3 =
+    addressing_style = path
+    max_concurrent_requests = 10
+[profile base]
+credential_process = example-login --account research
+[sso-session lab]
+sso_start_url = https://example.awsapps.com/start
+sso_region = eu-west-1
+"""
+    config = tmp_path / "original-config"
+    config.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    for key in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(profile_env, "research")
+    with process_local_aws_config() as env:
+        parsed = configparser.ConfigParser(interpolation=None)
+        parsed.read(env["AWS_CONFIG_FILE"])
+        profile = parsed["profile research"]
+        assert profile["role_arn"] == "arn:aws:iam::123456789012:role/research"
+        assert profile["source_profile"] == "base"
+        assert profile["region"] == "eu-west-1"
+        assert parsed["profile base"]["credential_process"] == "example-login --account research"
+        assert parsed["sso-session lab"]["sso_region"] == "eu-west-1"
+        assert "addressing_style = path" in profile["s3"]
+        assert "max_concurrent_requests = 64" in profile["s3"]
+        assert env["AWS_DEFAULT_REGION"] == "eu-west-1"
+        assert parsed["default"]["region"] == "us-east-1"
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_default_profile_takes_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config"
+    config.write_text("[profile selected]\nregion = ap-south-1\n[profile ignored]\nregion = us-east-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    monkeypatch.setenv("AWS_DEFAULT_PROFILE", "selected")
+    monkeypatch.setenv("AWS_PROFILE", "ignored")
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    with process_local_aws_config() as env:
+        assert env["AWS_DEFAULT_REGION"] == "ap-south-1"
+        assert "max_concurrent_requests = 64" in Path(env["AWS_CONFIG_FILE"]).read_text()
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_explicit_transfer_concurrency_must_be_positive(value: int) -> None:
+    with pytest.raises(ValueError, match=">= 1"):
+        s3_transfer_settings(max_concurrency=value)
+
+
+def test_invalid_s3_uri_rejected_before_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("retro_miner.s3_transfer.boto3_available", lambda: False)
+    monkeypatch.setattr("retro_miner.s3_transfer._run_aws_cli",
+                        lambda *_a, **_kw: pytest.fail("invalid URI must not reach AWS"))
+    with pytest.raises(ValueError, match="bucket and key"):
+        download_s3_uri("s3://bucket-only", tmp_path / "out.bam")
+
+
+@pytest.mark.parametrize("backend", ["boto3", "cli"])
+@pytest.mark.parametrize("result", ["success", "interrupted", "missing"])
+def test_s3_download_publishes_only_completed_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, result: str,
+) -> None:
+    dest = tmp_path / "out.bam"
+    dest.write_bytes(b"original")
+    config = tmp_path / "aws-config"
+    config.write_text("[default]\nregion = us-east-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    monkeypatch.setattr("retro_miner.s3_transfer.boto3_available", lambda: backend == "boto3")
+    monkeypatch.setattr("retro_miner.s3_transfer.boto3_transfer_config", lambda: object())
+
+    def transfer(filename: str) -> None:
+        assert Path(filename) != dest
+        assert dest.read_bytes() == b"original"
+        if result != "missing":
+            Path(filename).write_bytes(b"complete" if result == "success" else b"partial")
+        if result == "interrupted":
+            raise RuntimeError("interrupted")
+
+    class Client:
+        def download_file(self, bucket, key, filename, Config=None):
+            transfer(filename)
+
+    monkeypatch.setattr("retro_miner.s3_transfer._boto3_client", lambda: Client())
+    monkeypatch.setattr("retro_miner.s3_transfer._run_aws_cli", lambda args, **_kw: transfer(args[3]))
+    if result == "success":
+        download_s3_uri("s3://bucket/key.bam", dest)
+        assert dest.read_bytes() == b"complete"
+    else:
+        with pytest.raises(RuntimeError, match="interrupted|missing"):
+            download_s3_uri("s3://bucket/key.bam", dest)
+        assert dest.read_bytes() == b"original"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["aws-config", "out.bam"]
+
+
+def test_s3_download_allows_empty_objects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Client:
+        def download_file(self, bucket, key, filename, Config=None):
+            Path(filename).write_bytes(b"")
+
+    monkeypatch.setattr("retro_miner.s3_transfer.boto3_available", lambda: True)
+    monkeypatch.setattr("retro_miner.s3_transfer.boto3_transfer_config", lambda: object())
+    monkeypatch.setattr("retro_miner.s3_transfer._boto3_client", lambda: Client())
+    dest = tmp_path / "empty.txt"
+    download_s3_uri("s3://bucket/empty.txt", dest)
+    assert dest.read_bytes() == b""
