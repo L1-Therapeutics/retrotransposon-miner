@@ -110,14 +110,18 @@ def write_vcf(path, rows, samples=("S1",)):
 # Small test-side helpers
 # ---------------------------------------------------------------------------
 def _groups_for(mod, vcf_dir, merge_bp=50, min_score=0.997, group_first=False):
-    """Mirror main()'s two orders without going through argparse."""
+    """Mirror main()'s two orders without going through argparse.
+
+    Sentinels are reported but NOT withheld from grouping, matching main(): a
+    sentinel call still shows that its sample saw the site.
+    """
     calls, _ = mod.load_calls(vcf_dir)
-    kept, sentinels = mod.split_sentinels(calls)
+    _, sentinels = mod.split_sentinels(calls)
     if group_first:
-        groups = mod.keep_unique_across_samples(kept, merge_bp)
+        groups = mod.keep_unique_across_samples(calls, merge_bp)
         groups, _ = mod._filter_groups_by_confidence(groups, min_score, None)
     else:
-        confident, _ = mod.select_confident_calls(kept, min_score=min_score)
+        confident, _ = mod.select_confident_calls(calls, min_score=min_score)
         groups = mod.keep_unique_across_samples(confident, merge_bp)
     return groups, sentinels
 
@@ -390,6 +394,91 @@ def test_sentinel_excluded_from_sizes_and_counted(tmp_path, fast_plots):
     assert dropped[0]["family"] == "ALU"
     assert dropped[0]["stage"] == "sentinel"
     assert "MEI_5P == -1" in dropped[0]["reason"]
+
+
+def test_sentinel_in_one_sample_does_not_make_a_shared_site_private(tmp_path, fast_plots):
+    """A site seen by two genomes is shared even when one of them is a sentinel.
+
+    Regression test. Sentinels used to be removed before grouping, so the sentinel
+    call never reached the group and the site looked private. A sentinel still
+    establishes that its sample saw the locus; only its SIZE is unusable.
+    """
+    mod = fast_plots
+    write_vcf(tmp_path / "s1.vcf",
+              [dict(pos=1000, family="ALU", five_p=-1, three_p=-1, span=0, score=0.999)],
+              samples="S1")
+    write_vcf(tmp_path / "s2.vcf",
+              [dict(pos=1010, family="ALU", five_p=1, span=280, score=0.999)],
+              samples="S2")
+
+    groups, _ = _groups_for(mod, tmp_path, merge_bp=50)
+    assert len(groups) == 1, "the two calls are 10 bp apart and must form one site"
+    group = groups[0]
+    assert group.n_samples == 2, "the sentinel sample still counts toward site sharing"
+    assert mod.select_site_set(groups, "private") == [], "a two-sample site is not private"
+    assert len(mod.select_site_set(groups, "union")) == 1
+
+    # The size comes from the non-sentinel member, and the sentinel is not plotted.
+    assert group.has_size is True
+    assert group.representative.sample == "S2"
+    assert mod.size_series(groups)["ALU"] == [280]
+
+
+def test_a_site_sentinel_in_every_sample_has_no_size_and_is_not_plotted_as_zero(tmp_path, fast_plots):
+    """When no genome resolved a footprint the site survives grouping but has no size."""
+    mod = fast_plots
+    for name, sample, pos in (("s1.vcf", "S1", 1000), ("s2.vcf", "S2", 1010)):
+        write_vcf(tmp_path / name,
+                  [dict(pos=pos, family="ALU", five_p=-1, three_p=-1, span=0, score=0.999)],
+                  samples=sample)
+
+    groups, _ = _groups_for(mod, tmp_path, merge_bp=50)
+    assert len(groups) == 1 and groups[0].n_samples == 2
+    assert groups[0].has_size is False
+    assert groups[0].sized_calls == []
+    # The critical assertion: no bar at 0. A sentinel's span is 0, not a zero-length
+    # insertion, so it must not enter the size series at all.
+    assert mod.size_series(groups)["ALU"] == []
+
+
+def test_results_are_identical_under_shuffled_rows_and_reversed_file_order(tmp_path, fast_plots):
+    """Worked example F: output must not depend on input order.
+
+    Guards the failure mode that changed a callset in an earlier PR, where sorting
+    positions decoupled cluster labels from the unsorted rows they described.
+    """
+    import random
+
+    mod = fast_plots
+    rng = random.Random(20261010)
+    rows_by_sample = {}
+    for sample in ("S1", "S2", "S3"):
+        rows = []
+        for i in range(12):
+            pos = 1000 + i * 40                      # dense enough that merge_bp=50 chains
+            rows.append(dict(pos=pos + rng.randint(0, 6), family=("ALU", "LINE1", "SVA")[i % 3],
+                             five_p=1, span=100 + 17 * i, score=round(0.9971 + i * 0.0002, 4)))
+        rows_by_sample[sample] = rows
+
+    def run(label, order, shuffle):
+        vcf_dir = tmp_path / label
+        vcf_dir.mkdir()
+        for sample in order:
+            rows = list(rows_by_sample[sample])
+            if shuffle:
+                rng.shuffle(rows)
+            write_vcf(vcf_dir / f"{sample}.vcf", rows, samples=sample)
+        return Path(_main_out(mod, vcf_dir, label, ["--no-score-filter"]))
+
+    forward = run("forward", ["S1", "S2", "S3"], shuffle=False)
+    shuffled = run("shuffled", ["S3", "S2", "S1"], shuffle=True)
+
+    for name in ("size_summary.tsv", "bin_counts.tsv", "dropped_records.tsv"):
+        a = sorted(_read_tsv(forward / name), key=lambda r: sorted(r.items()))
+        b = sorted(_read_tsv(shuffled / name), key=lambda r: sorted(r.items()))
+        assert a == b, f"{name} changed when the input order changed"
+    # The run must actually produce sites, or the comparison above is vacuous.
+    assert any(int(r["n"]) > 0 for r in _read_tsv(forward / "size_summary.tsv"))
 
 
 # ---------------------------------------------------------------------------

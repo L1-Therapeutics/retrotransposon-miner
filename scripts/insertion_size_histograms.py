@@ -140,15 +140,51 @@ class SiteGroup:
         self.n_samples = len(self.samples)
         self.min_pos = self.calls[0].pos
         self.max_pos = self.calls[-1].pos
-        self.representative = _representative(self.calls)
+        # Sentinel calls still establish that a sample saw this site, so they count
+        # toward n_samples, but they carry no usable size. The representative is
+        # therefore chosen from the sized members when the group has any.
+        self.sized_calls = [c for c in self.calls if not is_sentinel_call(c)]
+        self.has_size = bool(self.sized_calls)
+        self.representative = _representative(self.sized_calls or self.calls)
+
+
+def is_sentinel_call(call: Call) -> bool:
+    """True when the call carries no usable consensus footprint.
+
+    The caller reports an unresolved footprint as span 0 with both consensus
+    coordinates set to -1 (``_MIN_REPORTABLE_MEI_SPAN_BP`` demotes spans below
+    20 bp the same way), so a sentinel is not a size of zero and must never be
+    plotted as one.
+    """
+    return bool(sentinel_reason(call))
+
+
+def sentinel_reason(call: Call, size_field: str = DEFAULT_SIZE_FIELD) -> str:
+    """Why this call has no usable footprint, or an empty string if it does.
+
+    Single source of truth for `is_sentinel_call` and `split_sentinels`, so the
+    predicate used during grouping can never drift from the one used to report
+    dropped records.
+    """
+    reasons: list[str] = []
+    if call.mei_5p is None:
+        reasons.append("MEI_5P missing")
+    elif call.mei_5p == -1:
+        reasons.append("MEI_5P == -1")
+    if call.size is None:
+        reasons.append(f"{size_field} missing")
+    elif call.size <= 0:
+        reasons.append(f"{size_field}={call.size} <= 0")
+    return " and ".join(reasons)
 
 
 def _representative(calls: list[Call]) -> Call:
-    """Highest score; ties -> smallest sample, then smallest POS."""
+    """Highest score; ties -> smallest sample, then smallest POS, then smallest size."""
 
     def key(c: Call):
         score = c.score if c.score is not None else float("-inf")
-        return (-score, c.sample, c.pos)
+        size = c.size if c.size is not None else -1
+        return (-score, c.sample, c.pos, size)
 
     return min(calls, key=key)
 
@@ -281,15 +317,7 @@ def split_sentinels(
     kept: list[Call] = []
     dropped: list[Dropped] = []
     for call in calls:
-        no_5p = call.mei_5p is None or call.mei_5p == -1
-        if call.size is None:
-            reason = f"{size_field} missing"
-        elif call.size <= 0:
-            reason = f"{size_field}={call.size} <= 0"
-        else:
-            reason = ""
-        if no_5p:
-            reason = "MEI_5P == -1" + (f" and {reason}" if reason else "")
+        reason = sentinel_reason(call, size_field)
         if reason:
             dropped.append(Dropped(call, "sentinel", reason))
         else:
@@ -427,6 +455,10 @@ def size_series(
     series: dict[str, list[int]] = {f: [] for f in families}
     for group in groups:
         if group.family not in series:
+            continue
+        # `has_size` is the gate, not `size is None`: a sentinel carries size 0,
+        # which would otherwise be plotted as a real zero-length insertion.
+        if not group.has_size:
             continue
         size = group.representative.size
         if size is None:
@@ -701,12 +733,16 @@ def main(argv: list[str] | None = None) -> int:
                 "--tier <value> to filter by CALLTIER instead."
             )
 
-    # --- sentinels (always dropped from the size distribution) --------------
-    kept, sentinel_dropped = split_sentinels(calls, size_field=args.size_field)
+    # --- sentinels ----------------------------------------------------------
+    # Reported and excluded from the SIZE distribution, but deliberately still
+    # passed to grouping: a sentinel call is evidence that its sample saw the
+    # site, so dropping it here would make a shared site look private. Each
+    # group takes its size from a non-sentinel member (SiteGroup.sized_calls).
+    _, sentinel_dropped = split_sentinels(calls, size_field=args.size_field)
 
     # --- confidence + grouping, in the chosen order -------------------------
     if args.group_first:
-        all_groups = keep_unique_across_samples(kept, args.merge_bp, families)
+        all_groups = keep_unique_across_samples(calls, args.merge_bp, families)
         groups, confidence_dropped = _filter_groups_by_confidence(
             all_groups,
             None if (args.no_score_filter or args.tier) else args.min_score,
@@ -714,11 +750,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         min_score = None if (args.no_score_filter or args.tier) else args.min_score
-        confident, confidence_dropped = select_confident_calls(kept, min_score=min_score, tier=args.tier)
+        confident, confidence_dropped = select_confident_calls(calls, min_score=min_score, tier=args.tier)
         groups = keep_unique_across_samples(confident, args.merge_bp, families)
 
     # --- records whose family is outside the plotted set --------------------
-    out_of_scope = [c for c in kept if c.family not in set(families)]
+    out_of_scope = [c for c in calls if c.family not in set(families)]
     scope_dropped = [
         Dropped(c, "out-of-scope", f"MEIFAMILY={c.family!r} not in {list(families)}") for c in out_of_scope
     ]
@@ -834,7 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"VCF files        : {len(metas)}")
     print(f"VCF records      : {len(calls)} calls across {len({c.sample for c in calls})} sample(s)")
-    print(f"Kept for grouping: {len(kept)} non-sentinel calls")
+    print(f"Grouped: {len(calls)} calls ({len(sentinel_dropped)} of them sentinel, "
+          f"counted toward site sharing but excluded from sizes)")
     print(f"Dropped sentinel : {len(sentinel_dropped)}  (from the size distribution)")
     print(f"Dropped confidence: {len(confidence_dropped)}")
     print(f"Out-of-scope family: {len(scope_dropped)}")
