@@ -206,12 +206,23 @@ def test_annotate_vcf_snpeff_offline_with_canned_output(tmp_path):
     headers, recs = ga.read_vcf(out)
     assert any(h.startswith("##INFO=<ID=CSQ,") for h in headers)
     assert any(h.startswith("##INFO=<ID=GENE_STRAND,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=MEI_GENE_ORIENT,") for h in headers)
     assert _chr22_calls(recs) == CHR22_SNPEFF
     ada2 = next(r for r in recs if r.pos == 17224410)
     assert ada2.info["GENE_STRAND"] == "-"
+    assert ada2.info["MEI_GENE_ORIENT"] == "sense"        # ORIENT=- matches ADA2's - strand
     both = next(r for r in recs if r.pos == 17567662)
     assert both.info["GENE"] == "SLC25A18,ENSG00000286195"
     assert both.info["GENE_STRAND"] == "+,-"
+    assert both.info["MEI_GENE_ORIENT"] == "antisense,sense"  # ORIENT=- against +,-
+    # MEI_GENE_ORIENT is written per gene and stays index-aligned with GENEID on every record
+    assert all(
+        len(r.info["MEI_GENE_ORIENT"].split(",")) == len(r.info["GENEID"].split(","))
+        for r in recs if "GENEID" in r.info
+    )
+    assert all(
+        "MEI_GENE_ORIENT" not in r.info for r in recs if "GENEID" not in r.info
+    )
     assert all("ANN" not in r.info for r in recs)         # raw ANN not carried into the shared contract
     assert all("SVLEN" in r.info for r in recs)           # original INFO preserved
     assert tsv.read_text().count("\n") == 31
@@ -368,3 +379,55 @@ def test_a_repeated_symbol_does_not_move_the_symbol_that_follows_it():
     parsed = ga.parse_snpeff_ann(ann)
     assert dict(zip(parsed.gene_ids, parsed.gene_symbols)) == {
         "ENSG00000229391": "HLA-DRB6", "ENSG00000290878": "HLA-DRB6", "ENSG00000251916": "RNU1-61P"}
+
+
+# ------------------------------------------------------- MEI_GENE_ORIENT
+# For each gene ID, MEI_GENE_ORIENT records whether the insertion's ORIENT matches
+# that gene's transcribed strand (sense), differs (antisense), or is unknown (.).
+
+
+def test_mei_gene_orient_is_sense_and_antisense_per_gene():
+    strands = {"ENSG00000182902": "+", "ENSG00000168405": "-"}
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902"),
+        _ann_entry("CMAHP", "ENSG00000168405"),
+    )
+    parsed = ga.parse_snpeff_ann(ann)
+    # ORIENT=+ matches the first strand and differs from the second.
+    assert parsed.info_fields(strands, orient="+")["MEI_GENE_ORIENT"] == "sense,antisense"
+    assert parsed.info_fields(strands, orient="-")["MEI_GENE_ORIENT"] == "antisense,sense"
+
+
+def test_mei_gene_orient_is_index_aligned_with_geneid():
+    strands = {"ENSG00000182902": "+", "ENSG00000286195": "-", "ENSG00000213123": "-"}
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902"),
+        _ann_entry("", "ENSG00000286195"),        # nameless gene
+        _ann_entry("CLTCL1", "ENSG00000213123"),
+    )
+    info = ga.parse_snpeff_ann(ann).info_fields(strands, orient="-")
+    assert info["GENEID"] == "ENSG00000182902,ENSG00000286195,ENSG00000213123"
+    assert len(info["MEI_GENE_ORIENT"].split(",")) == len(info["GENEID"].split(","))
+
+
+def test_mei_gene_orient_dots_where_orient_or_strand_is_missing():
+    ann = _ann(
+        _ann_entry("SLC25A18", "ENSG00000182902"),
+        _ann_entry("CMAHP", "ENSG00000168405"),
+    )
+    parsed = ga.parse_snpeff_ann(ann)
+    # Missing ORIENT -> every position unknown, list length preserved.
+    assert parsed.info_fields({"ENSG00000182902": "+", "ENSG00000168405": "-"})["MEI_GENE_ORIENT"] == ".,."
+    assert parsed.info_fields({"ENSG00000182902": "+", "ENSG00000168405": "-"}, orient=None)["MEI_GENE_ORIENT"] == ".,."
+    assert parsed.info_fields({"ENSG00000182902": "+", "ENSG00000168405": "-"}, orient=".")["MEI_GENE_ORIENT"] == ".,."
+    # Known ORIENT but a gene whose strand is unknown -> dot for that position only.
+    assert parsed.info_fields({"ENSG00000182902": "+"}, orient="-")["MEI_GENE_ORIENT"] == "antisense,."
+    # No strand table at all -> still one dot per gene ID.
+    assert parsed.info_fields(None, orient="-")["MEI_GENE_ORIENT"] == ".,."
+
+
+def test_mei_gene_orient_absent_for_intergenic_records():
+    ann = _ann_entry("LINC01521-RNU6-338P", "ENSG00000213888-ENSG00000206615",
+                     term="intergenic_region", feature="intergenic_region", transcript="")
+    info = ga.parse_snpeff_ann(ann).info_fields({"ENSG00000182902": "+"}, orient="+")
+    assert "MEI_GENE_ORIENT" not in info

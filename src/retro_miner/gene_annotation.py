@@ -83,11 +83,14 @@ ANNOTATION_INFO_HEADERS: tuple[str, ...] = (
     '##INFO=<ID=GENE,Number=.,Type=String,Description="Gene symbols overlapped by the insertion breakpoint (snpEff)">',
     '##INFO=<ID=GENEID,Number=.,Type=String,Description="Ensembl gene IDs overlapped by the insertion breakpoint">',
     '##INFO=<ID=GENE_STRAND,Number=.,Type=String,Description="Transcribed strand (+ or -) of each GENEID, in the same order. An insertion is sense when ORIENT matches this strand">',
+    '##INFO=<ID=MEI_GENE_ORIENT,Number=.,Type=String,Description="Orientation of the insertion (ORIENT) relative to each GENEID transcribed strand, in the same order: sense, antisense, or . when ORIENT or the strand is unknown">',
     '##INFO=<ID=CSQ,Number=1,Type=String,Description="Most severe Sequence Ontology consequence term across overlapping transcripts (snpEff)">',
     '##INFO=<ID=CSQ_TERMS,Number=.,Type=String,Description="All distinct consequence terms across overlapping transcripts">',
     '##INFO=<ID=CSQ_NTX,Number=1,Type=Integer,Description="Number of transcripts overlapping the insertion breakpoint">',
 )
-ANNOTATION_INFO_KEYS: tuple[str, ...] = ("GENE", "GENEID", "GENE_STRAND", "CSQ", "CSQ_TERMS", "CSQ_NTX")
+ANNOTATION_INFO_KEYS: tuple[str, ...] = (
+    "GENE", "GENEID", "GENE_STRAND", "MEI_GENE_ORIENT", "CSQ", "CSQ_TERMS", "CSQ_NTX",
+)
 
 
 @dataclass
@@ -120,16 +123,27 @@ class GeneAnnotation:
     terms: tuple[str, ...]
     n_transcripts: int
 
-    def info_fields(self, gene_strands: Mapping[str, str] | None = None) -> dict[str, str]:
+    def info_fields(
+        self,
+        gene_strands: Mapping[str, str] | None = None,
+        orient: str | None = None,
+    ) -> dict[str, str]:
         out: dict[str, str] = {}
         if self.gene_symbols:
             out["GENE"] = ",".join(self.gene_symbols)
         if self.gene_ids:
             out["GENEID"] = ",".join(self.gene_ids)
+            strands = [
+                gene_strands.get(_gene_id_key(gid)) if gene_strands is not None else None
+                for gid in self.gene_ids
+            ]
             if gene_strands is not None:
-                out["GENE_STRAND"] = ",".join(
-                    gene_strands.get(_gene_id_key(gid), ".") for gid in self.gene_ids
-                )
+                out["GENE_STRAND"] = ",".join(s or "." for s in strands)
+            # One entry per gene ID, so this stays index-aligned with GENEID even
+            # when a strand or the insertion orientation is unknown.
+            out["MEI_GENE_ORIENT"] = ",".join(
+                _gene_orientation(orient, s) for s in strands
+            )
         out["CSQ"] = self.most_severe
         if self.terms:
             out["CSQ_TERMS"] = ",".join(self.terms)
@@ -269,6 +283,17 @@ def _gene_id_key(gene_id: str) -> str:
     return gene_id.split(".", 1)[0]
 
 
+def _gene_orientation(orient: str | None, strand: str | None) -> str:
+    """Return ``sense``/``antisense`` for an insertion on ``orient`` overlapping a gene on ``strand``.
+
+    ``"."`` is returned when either side is unknown (missing, or not ``+``/``-``) so
+    ``MEI_GENE_ORIENT`` stays index-aligned with ``GENEID`` rather than dropping a position.
+    """
+    if orient not in ("+", "-") or strand not in ("+", "-"):
+        return "."
+    return "sense" if orient == strand else "antisense"
+
+
 def load_gene_strands(path: str | Path) -> dict[str, str]:
     """Read gene_id -> ``+``/``-`` from a two-column TSV or an Ensembl GTF.
 
@@ -390,6 +415,7 @@ def annotate_records(
     a canned snpEff output. The raw ``ANN`` field is dropped; run snpEff directly
     for the full per-transcript table. ``GENE_STRAND`` is filled from the bundled
     Ensembl GRCh38.115 table unless ``gene_strands`` or ``gene_gtf`` is passed.
+    ``MEI_GENE_ORIENT`` compares each record's ``ORIENT`` against those strands.
     """
     if run is subprocess.run and shutil.which(snpeff_bin) is None:
         raise FileNotFoundError(f"snpEff launcher {snpeff_bin!r} not found on PATH")
@@ -415,7 +441,7 @@ def annotate_records(
             n_unmatched += 1
         else:
             summary = parse_snpeff_ann(ann)
-            new_info.update(summary.info_fields(strands))
+            new_info.update(summary.info_fields(strands, orient=rec.info.get("ORIENT")))
             n_annot += 1
             n_gene += bool(summary.gene_symbols)
         out.append(VcfRecord(rec.chrom, rec.pos, rec.id, rec.ref, rec.alt, rec.qual, rec.filter, new_info, list(rec.rest)))

@@ -1234,7 +1234,7 @@ def export_vcf_cmd(
 @click.option("--vcf", "vcf_path", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="Input MEI VCF (symbolic <INS:ME:*> ALT alleles; .vcf or .vcf.gz).")
 @click.option("--out", "out_path", required=True, type=click.Path(dir_okay=False, path_type=Path),
-              help="Output VCF with GENE/GENEID/GENE_STRAND/CSQ/CSQ_TERMS/CSQ_NTX added to INFO.")
+              help="Output VCF with GENE/GENEID/GENE_STRAND/MEI_GENE_ORIENT/CSQ/CSQ_TERMS/CSQ_NTX added to INFO.")
 @click.option("--tsv", "tsv_path", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Optional flat TSV (one row per record) alongside the VCF.")
 @click.option("--gene-gtf", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
