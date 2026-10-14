@@ -1,0 +1,32 @@
+--- a/tests/test_gene_annotation.py	2026-10-11 10:38:04
++++ b/tests/test_gene_annotation.py	2026-10-11 10:38:04
+@@ -342,3 +342,29 @@
+     info = parsed.info_fields({"ENSG00000182902": "+"})
+     assert parsed.gene_symbols == () and parsed.gene_ids == () and parsed.n_transcripts == 0
+     assert "GENE" not in info and "GENEID" not in info and "GENE_STRAND" not in info
++
++
++def test_two_gene_ids_sharing_a_symbol_stay_index_aligned():
++    """The 10-genome callset at chr6:25124585: two Ensembl genes are both named CMAHP.
++
++    Deduplicating symbols on their own key collapsed the pair, leaving GENE one entry shorter than
++    GENEID and shifting every later symbol relative to GENE_STRAND (27 calls, 17 loci, 11 symbols).
++    """
++    ann = _ann(
++        _ann_entry("CMAHP", "ENSG00000293489"),
++        _ann_entry("CMAHP", "ENSG00000168405"),
++        _ann_entry("ENSG00000285801", "ENSG00000285801"),
++        _ann_entry("ENSG00000288887", "ENSG00000288887"),
++    )
++    parsed = ga.parse_snpeff_ann(ann)
++    assert parsed.gene_ids == ("ENSG00000293489", "ENSG00000168405", "ENSG00000285801", "ENSG00000288887")
++    assert parsed.gene_symbols == ("CMAHP", "CMAHP", "ENSG00000285801", "ENSG00000288887")
++    assert len(parsed.gene_symbols) == len(parsed.gene_ids)
++
++
++def test_a_repeated_symbol_does_not_move_the_symbol_that_follows_it():
++    ann = _ann(_ann_entry("HLA-DRB6", "ENSG00000229391"), _ann_entry("HLA-DRB6", "ENSG00000290878"),
++               _ann_entry("RNU1-61P", "ENSG00000251916"))
++    parsed = ga.parse_snpeff_ann(ann)
++    assert dict(zip(parsed.gene_ids, parsed.gene_symbols)) == {
++        "ENSG00000229391": "HLA-DRB6", "ENSG00000290878": "HLA-DRB6", "ENSG00000251916": "RNU1-61P"}
