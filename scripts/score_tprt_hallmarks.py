@@ -982,6 +982,20 @@ def stratified_tests(
 # --------------------------------------------------------------------------
 
 
+def _build_histogram_struct(counter: collections.Counter, sort_by_key: bool = True) -> dict[str, Any]:
+    """Build a structured histogram representation with metadata."""
+    if sort_by_key:
+        items = sorted(counter.items())
+    else:
+        items = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+    total = sum(counter.values())
+    return {
+        "bins": [{"bin": k, "count": v, "fraction": v / total if total else 0.0} for k, v in items],
+        "total": total,
+        "n_bins": len(counter),
+    }
+
+
 def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """How well the caller's reported TSD survives contact with the reference.
 
@@ -1019,7 +1033,9 @@ def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "share_at_mismatch_allowance": near_allowance / n_eval if n_eval else None,
         "n_more_than_allowance": sum(v for k, v in mm_hist.items() if k > TSD_MAX_MISMATCH),
         "mismatch_count_histogram": dict(sorted(mm_hist.items())),
+        "mismatch_count_histogram_struct": _build_histogram_struct(mm_hist),
         "mismatch_offset_from_3prime_end_histogram": dict(sorted(offset_hist.items())),
+        "mismatch_offset_from_3prime_end_histogram_struct": _build_histogram_struct(offset_hist),
         "share_of_mismatches_in_last_3_bases": terminal / total_offsets,
         "n_calls_with_all_mismatches_in_last_3_bases": n_all_terminal,
         "share_of_calls_whose_mismatches_are_all_terminal": (
