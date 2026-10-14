@@ -23,7 +23,15 @@ import pysam
 from Bio.Align import PairwiseAligner
 from intervaltree import IntervalTree
 
-from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats, _safe_int, read_tsv
+from ._utils import (
+    _column_or_default,
+    _longest_poly_at_span,
+    _numeric_series,
+    _open_textmaybe_gz,
+    _poly_at_stats,
+    _safe_int,
+    read_tsv,
+)
 
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
@@ -2548,9 +2556,9 @@ def _attach_mei_hits_to_discordant_rows(
     out["target"] = out["target"].fillna("")
     out["family"] = out["family"].fillna("")
     out["target_strand"] = out["target_strand"].fillna("")
-    out["target_start"] = pd.to_numeric(out.get("target_start", 0), errors="coerce").fillna(0).astype(int)
-    out["target_end"] = pd.to_numeric(out.get("target_end", 0), errors="coerce").fillna(0).astype(int)
-    out["mei_score"] = pd.to_numeric(out.get("mei_score", 0.0), errors="coerce").fillna(0.0).astype(float)
+    out["target_start"] = _numeric_series(out, "target_start", 0.0).fillna(0).astype(int)
+    out["target_end"] = _numeric_series(out, "target_end", 0.0).fillna(0).astype(int)
+    out["mei_score"] = _numeric_series(out, "mei_score", 0.0).fillna(0.0).astype(float)
     if "mei_hit_source" not in out.columns:
         out["mei_hit_source"] = ""
     out.loc[out["mei_hit"] & (out["mei_hit_source"].fillna("").astype(str).str.len() == 0), "mei_hit_source"] = "consensus"
@@ -3965,13 +3973,13 @@ def _split_clip_mei_fields(split_df: pd.DataFrame) -> pd.DataFrame:
         else pd.Series(False, index=split_df.index)
     )
     has_mei = mei_hit | mei_hit_coord
-    clip_len = pd.to_numeric(split_df.get("clip_len", 0), errors="coerce").fillna(0).astype(int)
+    clip_len = _numeric_series(split_df, "clip_len", 0.0).fillna(0).astype(int)
     if "target_start_coord" in split_df.columns:
         t_start = pd.to_numeric(split_df["target_start_coord"], errors="coerce").fillna(0).astype(int)
         t_end = pd.to_numeric(split_df["target_end_coord"], errors="coerce").fillna(0).astype(int)
         t_strand = split_df.get("target_strand_coord", pd.Series("", index=split_df.index)).fillna("").astype(str)
         t_family = split_df.get("family_coord", pd.Series("", index=split_df.index)).fillna("").astype(str)
-        t_aln = pd.to_numeric(split_df.get("alnlen_coord", 0), errors="coerce").fillna(0).astype(int)
+        t_aln = _numeric_series(split_df, "alnlen_coord", 0.0).fillna(0).astype(int)
         use_coord = (t_start > 0) | (t_end > 0)
         if "target_start" in split_df.columns:
             t_start = t_start.where(
@@ -3982,16 +3990,16 @@ def _split_clip_mei_fields(split_df: pd.DataFrame) -> pd.DataFrame:
             )
             raw_strand = split_df.get("target_strand", pd.Series("", index=split_df.index)).fillna("").astype(str)
             raw_family = split_df.get("family", pd.Series("", index=split_df.index)).fillna("").astype(str)
-            raw_aln = pd.to_numeric(split_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+            raw_aln = _numeric_series(split_df, "alnlen", 0.0).fillna(0).astype(int)
             t_strand = t_strand.where(use_coord & t_strand.ne(""), raw_strand)
             t_family = t_family.where(use_coord & t_family.ne(""), raw_family)
             t_aln = t_aln.where(use_coord & t_aln.gt(0), raw_aln)
     else:
-        t_start = pd.to_numeric(split_df.get("target_start", 0), errors="coerce").fillna(0).astype(int)
-        t_end = pd.to_numeric(split_df.get("target_end", 0), errors="coerce").fillna(0).astype(int)
+        t_start = _numeric_series(split_df, "target_start", 0.0).fillna(0).astype(int)
+        t_end = _numeric_series(split_df, "target_end", 0.0).fillna(0).astype(int)
         t_strand = split_df.get("target_strand", pd.Series("", index=split_df.index)).fillna("").astype(str)
         t_family = split_df.get("family", pd.Series("", index=split_df.index)).fillna("").astype(str)
-        t_aln = pd.to_numeric(split_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+        t_aln = _numeric_series(split_df, "alnlen", 0.0).fillna(0).astype(int)
     side = (
         split_df["clip_side"].fillna("").astype(str).str.upper().str[:1]
         if "clip_side" in split_df.columns
@@ -5063,7 +5071,7 @@ def _assign_rows_to_candidate_loci(split_df: pd.DataFrame, candidates: pd.DataFr
             continue
         best = min(overlaps, key=lambda iv: (iv.end - iv.begin, abs(((iv.begin + iv.end) // 2) - pos)))
         locus_start, locus_end = best.data
-        as_dict = row._asdict()
+        as_dict = cast(Any, row)._asdict()
         as_dict["window_start"] = locus_start
         as_dict["window_end"] = locus_end
         assigned_rows.append(as_dict)
@@ -5217,7 +5225,7 @@ def _clip_overlap_consistency_stats(group: pd.DataFrame) -> tuple[int, float, fl
     # Keep one representative clip per read (highest MEI score first) so one
     # read with multiple alignments does not dominate overlap statistics.
     if "read_name" in work.columns:
-        work["mei_score_effective"] = pd.to_numeric(work.get("mei_score_effective", 0.0), errors="coerce").fillna(0.0)
+        work["mei_score_effective"] = _numeric_series(work, "mei_score_effective", 0.0).fillna(0.0)
         work = work.sort_values("mei_score_effective", ascending=False).drop_duplicates("read_name", keep="first")
     work = work.head(40).copy()
     side_hint = ""
@@ -5587,8 +5595,7 @@ def _add_candidate_support_info_fields(
         work["raw_side"] = side
 
         agg = (
-            work.groupby(key_cols + ["raw_side"], as_index=False)["read_name"]
-            .nunique()
+            cast(pd.DataFrame, work.groupby(key_cols + ["raw_side"], as_index=False)["read_name"].nunique())
             .pivot_table(index=key_cols, columns="raw_side", values="read_name", fill_value=0)
             .reset_index()
         )
@@ -5625,8 +5632,7 @@ def _add_candidate_support_info_fields(
         pos = pd.to_numeric(work["pos"], errors="coerce").fillna(work["insertion_breakpoint_pos"]).astype(int)
         work["raw_side"] = pd.Series(["L"] * len(work), index=work.index).where(pos <= work["insertion_breakpoint_pos"], "R")
         agg = (
-            work.groupby(key_cols + ["raw_side"], as_index=False)["read_name"]
-            .nunique()
+            cast(pd.DataFrame, work.groupby(key_cols + ["raw_side"], as_index=False)["read_name"].nunique())
             .pivot_table(index=key_cols, columns="raw_side", values="read_name", fill_value=0)
             .reset_index()
         )
@@ -6083,7 +6089,7 @@ def _add_candidate_support_info_fields(
         mei_disc_reads = _mei_read_table(disc_mei_df.iloc[0:0].copy(), disc_mei_df)
         indel_reads = (
             split_support_df.loc[
-                split_support_df.get("evidence_type", "").fillna("").astype(str) == "indel",
+                _column_or_default(split_support_df, "evidence_type", "").fillna("").astype(str) == "indel",
                 key_cols + ["read_name"],
             ].drop_duplicates()
             if ("evidence_type" in split_support_df.columns and "read_name" in split_support_df.columns)
@@ -6193,9 +6199,9 @@ def _add_candidate_support_info_fields(
             .merge(_unique_read_count_table(mei_disc_reads, "mei_disc_reads"), on=key_cols, how="left")
         )
         merged = merged.merge(weakness, on=key_cols, how="left")
-        poly_split_ct = pd.to_numeric(merged.get("poly_split_reads", 0), errors="coerce").fillna(0).astype(int)
-        mei_split_ct = pd.to_numeric(merged.get("mei_split_reads", 0), errors="coerce").fillna(0).astype(int)
-        mei_disc_ct = pd.to_numeric(merged.get("mei_disc_reads", 0), errors="coerce").fillna(0).astype(int)
+        poly_split_ct = _numeric_series(merged, "poly_split_reads", 0.0).fillna(0).astype(int)
+        mei_split_ct = _numeric_series(merged, "mei_split_reads", 0.0).fillna(0).astype(int)
+        mei_disc_ct = _numeric_series(merged, "mei_disc_reads", 0.0).fillna(0).astype(int)
         weak_mei_only_discordant = (mei_split_ct <= 0) & (poly_split_ct <= 0) & (mei_disc_ct <= 2)
         sr_l_raw = pd.to_numeric(merged.get(f"{prefix}_sr_l_raw", 0), errors="coerce").fillna(0).astype(int)
         sr_r_raw = pd.to_numeric(merged.get(f"{prefix}_sr_r_raw", 0), errors="coerce").fillna(0).astype(int)
@@ -6350,33 +6356,33 @@ def _aggregate_side_metrics(
 
     side_df["poly_at_max_run"] = side_df["clip_seq"].fillna("").astype(str).map(poly_at_max_run)
     side_df["poly_at_flag"] = (side_df["poly_at_max_run"] >= 8).astype(int)
-    side_df["mei_score_effective"] = pd.to_numeric(side_df.get("mei_score", 0.0), errors="coerce").fillna(0.0)
+    side_df["mei_score_effective"] = _numeric_series(side_df, "mei_score", 0.0).fillna(0.0)
     if "mei_score_coord" in side_df.columns:
         score_coord = pd.to_numeric(side_df["mei_score_coord"], errors="coerce").fillna(0.0)
         side_df.loc[side_df["mei_score_effective"] <= 0.0, "mei_score_effective"] = score_coord.loc[
             side_df["mei_score_effective"] <= 0.0
         ]
-    side_df["family_effective"] = side_df.get("family", "").fillna("").astype(str)
+    side_df["family_effective"] = _column_or_default(side_df, "family", "").fillna("").astype(str)
     if "family_coord" in side_df.columns:
         coord_family = side_df["family_coord"].fillna("").astype(str)
         side_df.loc[side_df["family_effective"] == "", "family_effective"] = coord_family.loc[side_df["family_effective"] == ""]
-    side_df["target_effective"] = side_df.get("target", "").fillna("").astype(str)
+    side_df["target_effective"] = _column_or_default(side_df, "target", "").fillna("").astype(str)
     if "target_coord" in side_df.columns:
         coord_target = side_df["target_coord"].fillna("").astype(str)
         side_df.loc[side_df["target_effective"] == "", "target_effective"] = coord_target.loc[side_df["target_effective"] == ""]
-    side_df["target_strand_effective"] = side_df.get("target_strand", "").fillna("").astype(str)
+    side_df["target_strand_effective"] = _column_or_default(side_df, "target_strand", "").fillna("").astype(str)
     if "target_strand_coord" in side_df.columns:
         coord_strand = side_df["target_strand_coord"].fillna("").astype(str)
         side_df.loc[side_df["target_strand_effective"] == "", "target_strand_effective"] = coord_strand.loc[
             side_df["target_strand_effective"] == ""
         ]
-    side_df["alnlen_effective"] = pd.to_numeric(side_df.get("alnlen", 0), errors="coerce").fillna(0).astype(int)
+    side_df["alnlen_effective"] = _numeric_series(side_df, "alnlen", 0.0).fillna(0).astype(int)
     if "alnlen_coord" in side_df.columns:
         coord_alnlen = pd.to_numeric(side_df["alnlen_coord"], errors="coerce").fillna(0).astype(int)
         side_df["alnlen_effective"] = pd.concat(
             [side_df["alnlen_effective"], coord_alnlen], axis=1
         ).max(axis=1).astype(int)
-    side_df["target_len_effective"] = pd.to_numeric(side_df.get("target_len", 0), errors="coerce").fillna(0).astype(int)
+    side_df["target_len_effective"] = _numeric_series(side_df, "target_len", 0.0).fillna(0).astype(int)
     if "target_len_coord" in side_df.columns:
         coord_tlen = pd.to_numeric(side_df["target_len_coord"], errors="coerce").fillna(0).astype(int)
         side_df["target_len_effective"] = pd.concat(
@@ -8720,7 +8726,7 @@ def _infer_disease_insertion_metrics(
                     hexamer=hex6,
                     context11bp=ctx11,
                     orientation=str(
-                        _choose_consolidated_insertion_orientation(pd.Series(row._asdict()))
+                        _choose_consolidated_insertion_orientation(pd.Series(cast(Any, row)._asdict()))
                     ),
                 )
                 patt_yy_rrrr = f"{oriented_hex6[:2]}/{oriented_hex6[2:6]}" if len(oriented_hex6) == 6 else ""
@@ -9094,8 +9100,7 @@ def _add_post_assembly_support_info_fields(
         work["post_side"] = side
 
         agg = (
-            work.groupby(key_cols + ["post_side"], as_index=False)["read_name"]
-            .nunique()
+            cast(pd.DataFrame, work.groupby(key_cols + ["post_side"], as_index=False)["read_name"].nunique())
             .pivot_table(index=key_cols, columns="post_side", values="read_name", fill_value=0)
             .reset_index()
         )
@@ -9125,8 +9130,7 @@ def _add_post_assembly_support_info_fields(
         pos = pd.to_numeric(work["pos"], errors="coerce").fillna(work["insertion_breakpoint_pos"]).astype(int)
         work["post_side"] = pd.Series(["L"] * len(work), index=work.index).where(pos <= work["insertion_breakpoint_pos"], "R")
         agg = (
-            work.groupby(key_cols + ["post_side"], as_index=False)["read_name"]
-            .nunique()
+            cast(pd.DataFrame, work.groupby(key_cols + ["post_side"], as_index=False)["read_name"].nunique())
             .pivot_table(index=key_cols, columns="post_side", values="read_name", fill_value=0)
             .reset_index()
         )
@@ -12188,7 +12192,7 @@ def _round_sig_series(series: pd.Series, sig: int) -> pd.Series:
 
 def _estimate_discordant_ref_end(df: pd.DataFrame) -> pd.Series:
     """1-based inclusive mapped end; prefer stored ref_end, else pos+read_len-1."""
-    pos = pd.to_numeric(df.get("pos", 0), errors="coerce").fillna(0).astype(int)
+    pos = _numeric_series(df, "pos", 0.0).fillna(0).astype(int)
     if "ref_end" in df.columns:
         ref_end = pd.to_numeric(df["ref_end"], errors="coerce").fillna(0).astype(int)
     else:
@@ -12494,7 +12498,7 @@ def _apply_discordant_gap_breakpoint_fallback(
         else:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(default).astype(type(default))
 
-    bp = pd.to_numeric(out.get("insertion_breakpoint_pos", 0), errors="coerce").fillna(0).astype(int)
+    bp = _numeric_series(out, "insertion_breakpoint_pos", 0.0).fillna(0).astype(int)
     unresolved = bp.le(0)
     if "breakpoint_evidence_source" not in out.columns:
         out["breakpoint_evidence_source"] = ""
@@ -12749,7 +12753,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     ]
 
     asm_poly = pd.to_numeric(_series_or_default("asm_polyA_max_run", float("nan")), errors="coerce")
-    base_poly = pd.to_numeric(out.get("poly_at_max_run", 0), errors="coerce")
+    base_poly = _numeric_series(out, "poly_at_max_run", 0.0)
     picked_poly = asm_poly.where(asm_has_mei & asm_poly.notna(), base_poly)
     # Observed polyA/T length is a lower bound (read-length limited), not a true max.
     out["consensus_poly_at_min_bp"] = (
@@ -13970,7 +13974,7 @@ def _annotate_g1k_mei_overlap(
         return out
 
     out["row_id"] = out.index.astype(int)
-    row_by_id = {int(row.row_id): pd.Series(row._asdict()) for row in out.itertuples(index=False)}
+    row_by_id = {int(row.row_id): pd.Series(cast(Any, row)._asdict()) for row in out.itertuples(index=False)}
     best_hits: dict[int, dict[str, object]] = {}
 
     with tempfile.TemporaryDirectory(prefix="rtm_g1k_mei_") as tmpdir:
@@ -13983,7 +13987,7 @@ def _annotate_g1k_mei_overlap(
         with query_bed.open("w", encoding="utf-8") as handle:
             for row in out.itertuples(index=False):
                 start_1based, end_1based = _g1k_query_interval_for_row(
-                    pd.Series(row._asdict()),
+                    pd.Series(cast(Any, row)._asdict()),
                     split_padding_bp=split_padding_bp,
                     dpe_padding_min_bp=dpe_padding_min_bp,
                     dpe_padding_max_bp=dpe_padding_max_bp,
@@ -14137,7 +14141,7 @@ def _annotate_lr_mei_overlap(
         return out
 
     out["row_id"] = out.index.astype(int)
-    row_by_id = {int(row.row_id): pd.Series(row._asdict()) for row in out.itertuples(index=False)}
+    row_by_id = {int(row.row_id): pd.Series(cast(Any, row)._asdict()) for row in out.itertuples(index=False)}
     best_hits: dict[int, dict[str, object]] = {}
 
     with tempfile.TemporaryDirectory(prefix="rtm_lr_mei_") as tmpdir:
@@ -14150,7 +14154,7 @@ def _annotate_lr_mei_overlap(
         with query_bed.open("w", encoding="utf-8") as handle:
             for row in out.itertuples(index=False):
                 start_1based, end_1based = _g1k_query_interval_for_row(
-                    pd.Series(row._asdict()),
+                    pd.Series(cast(Any, row)._asdict()),
                     split_padding_bp=split_padding_bp,
                     dpe_padding_min_bp=dpe_padding_min_bp,
                     dpe_padding_max_bp=dpe_padding_max_bp,
@@ -14598,7 +14602,7 @@ def _annotate_nested_retrotransposon(candidates: pd.DataFrame, rmsk_table_path: 
         cand_t0 = time.monotonic()
         with cand_bed.open("w", encoding="utf-8") as hout:
             for i, row in enumerate(out.itertuples(index=False)):
-                as_row = pd.Series(row._asdict())
+                as_row = pd.Series(cast(Any, row)._asdict())
                 chrom = str(row.chrom)
                 pos_1based = int(getattr(row, "insertion_breakpoint_pos", 0) or 0)
                 if pos_1based <= 0:
