@@ -6,12 +6,22 @@ from collections.abc import Iterable
 from pathlib import Path
 import subprocess
 import tempfile
+from typing import Any, TypedDict, cast
 
 import click
 import pandas as pd
 from intervaltree import IntervalTree
 
-from ._utils import _open_textmaybe_gz, read_tsv
+from ._utils import _open_textmaybe_gz, _safe_float, _safe_int, read_tsv
+
+
+class _Locus(TypedDict):
+    """A clustered-evidence locus before it is expanded into windows."""
+
+    positions: list[int]
+    min_pos: int
+    max_pos: int
+    seeded_by_split: bool
 
 
 _RUN_T0: float | None = None
@@ -172,7 +182,7 @@ def _build_loci_from_evidence(
         _progress("no split/discordant evidence found; returning empty loci")
         return pd.DataFrame(columns=["chrom", "window_start", "window_end"])
 
-    loci_by_chrom: dict[str, list[dict[str, object]]] = {}
+    loci_by_chrom: dict[str, list[_Locus]] = {}
 
     if not split_all.empty:
         split_pos = split_all.loc[:, ["chrom", "pos"]].copy()
@@ -307,7 +317,7 @@ def _merge_overlapping_loci(
     n_in = len(loci)
     for chrom, grp in loci.groupby("chrom", sort=False):
         intervals = sorted(
-            (int(r.window_start), int(r.window_end))
+            (_safe_int(r.window_start), _safe_int(r.window_end))
             for r in grp.itertuples(index=False)
         )
         if not intervals:
@@ -345,27 +355,21 @@ def _assign_rows_to_loci(df: pd.DataFrame, loci: pd.DataFrame) -> pd.DataFrame:
     for row in loci.itertuples(index=False):
         chrom = str(row.chrom)
         tree = trees.setdefault(chrom, IntervalTree())
-        try:
-            ws = float(row.window_start)
-            we = float(row.window_end)
-            if not (math.isfinite(ws) and math.isfinite(we)):
-                continue
-            window_start = int(round(ws))
-            window_end = int(round(we))
-        except (TypeError, ValueError, OverflowError):
+        window_start_f = _safe_float(row.window_start)
+        window_end_f = _safe_float(row.window_end)
+        if not (math.isfinite(window_start_f) and math.isfinite(window_end_f)):
             continue
+        window_start = int(round(window_start_f))
+        window_end = int(round(window_end_f))
         tree.addi(window_start, window_end + 1, (window_start, window_end))
 
     assigned_rows: list[dict[str, object]] = []
     for row in df.itertuples(index=False):
         chrom = str(row.chrom)
-        try:
-            posf = float(row.pos)
-            if not math.isfinite(posf):
-                continue
-            pos = int(round(posf))
-        except (TypeError, ValueError, OverflowError):
+        pos_f = _safe_float(row.pos)
+        if not math.isfinite(pos_f):
             continue
+        pos = int(round(pos_f))
         tree = trees.get(chrom)
         if tree is None:
             continue
@@ -375,7 +379,9 @@ def _assign_rows_to_loci(df: pd.DataFrame, loci: pd.DataFrame) -> pd.DataFrame:
         # If a position lands in multiple merged loci, choose the tightest interval.
         best = min(overlaps, key=lambda iv: (iv.end - iv.begin, abs(((iv.begin + iv.end) // 2) - pos)))
         locus_start, locus_end = best.data
-        as_dict = row._asdict()
+        # pandas-stubs types every ``itertuples`` attribute as the bare
+        # ``Scalar`` union, so ``_asdict`` is not seen as callable.
+        as_dict = cast(Any, row)._asdict()
         as_dict["window_start"] = locus_start
         as_dict["window_end"] = locus_end
         assigned_rows.append(as_dict)
@@ -460,7 +466,10 @@ def _aggregate_split_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     )
     rescued_unique = (
         tmp.loc[tmp["poly_tail_rescued_int"] == 1]
-        .groupby(["chrom", "window_start", "window_end"], as_index=False)["read_name"]
+        # ``[["read_name"]]`` keeps this a DataFrameGroupBy (a bare Series
+        # selection is mis-typed by pandas-stubs and returns a Series from
+        # ``nunique()``, which has no ``columns`` to rename).
+        .groupby(["chrom", "window_start", "window_end"], as_index=False)[["read_name"]]
         .nunique()
         .rename(columns={"read_name": f"{prefix}_poly_tail_rescued_unique_reads"})
     )
@@ -536,7 +545,10 @@ def _aggregate_discordant_metrics(df: pd.DataFrame, prefix: str) -> pd.DataFrame
     )
     rescued_unique = (
         tmp.loc[tmp["poly_tail_anchor_rescued_int"] == 1]
-        .groupby(["chrom", "window_start", "window_end"], as_index=False)["read_name"]
+        # ``[["read_name"]]`` keeps this a DataFrameGroupBy (a bare Series
+        # selection is mis-typed by pandas-stubs and returns a Series from
+        # ``nunique()``, which has no ``columns`` to rename).
+        .groupby(["chrom", "window_start", "window_end"], as_index=False)[["read_name"]]
         .nunique()
         .rename(columns={"read_name": f"{prefix}_poly_tail_rescued_unique_reads"})
     )
@@ -607,8 +619,8 @@ def _write_candidate_windows_bed(loci: pd.DataFrame, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8") as handle:
         for row in loci.itertuples(index=False):
             # BED uses 0-based start, half-open end.
-            start0 = row.window_start - 1
-            end0 = row.window_end
+            start0 = _safe_int(row.window_start) - 1
+            end0 = _safe_int(row.window_end)
             handle.write(f"{row.chrom}\t{start0}\t{end0}\t{row.row_id}\n")
 
 
@@ -694,8 +706,8 @@ def _annotate_junk_flags(
         mate_bed = tmp / "candidate_mate_positions.bed"
         with mate_bed.open("w", encoding="utf-8") as handle:
             for row in mate_with_id.itertuples(index=False):
-                start0 = row.mate_pos - 1
-                end0 = row.mate_pos
+                start0 = _safe_int(row.mate_pos) - 1
+                end0 = _safe_int(row.mate_pos)
                 handle.write(f"{row.mate_chrom}\t{start0}\t{end0}\t{row.row_id}\n")
 
         if segdup_bed is not None and segdup_bed.exists():

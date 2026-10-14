@@ -88,6 +88,50 @@ def _safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _safe_float(value: object, default: float = float("nan")) -> float:
+    """Safely convert *value* to float, returning *default* on failure.
+
+    Mirror of :func:`_safe_int` for float-valued fields:
+
+    - non-finite results (``nan``/``inf``) collapse to *default*, so callers
+      can keep ``math.isfinite`` as the single validity test;
+    - strings are stripped and parsed via ``float()``;
+    - integers are converted, but a value too large for a float (e.g.
+      ``10**400``) returns *default* instead of raising ``OverflowError``;
+    - NumPy/pandas scalars are converted even though they do not subclass the
+      builtin ``float``, and the bare ``Scalar`` union returned for
+      ``DataFrame.itertuples`` attribute access is covered by the
+      ``__float__`` fallback;
+    - everything else returns *default*.
+    """
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else default
+    if isinstance(value, numbers.Integral):
+        try:
+            return float(value)
+        except OverflowError:
+            return default
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return default
+        return number if math.isfinite(number) else default
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return number if math.isfinite(number) else default
+    to_float = getattr(value, "__float__", None)
+    if to_float is None:
+        return default
+    try:
+        number = float(to_float())
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if math.isfinite(number) else default
+
+
 def _open_textmaybe_gz(path: Path) -> IO[str]:
     """Return an open text file handle for *path*, decompressing .gz transparently.
 

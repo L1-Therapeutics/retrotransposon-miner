@@ -4,10 +4,19 @@ from __future__ import annotations
 import gzip
 from pathlib import Path
 
+import math
+
 import numpy as np
 import pytest
 
-from retro_miner._utils import _iter_fasta_records, _open_textmaybe_gz, _safe_int, read_tsv, safe_locus_id
+from retro_miner._utils import (
+    _iter_fasta_records,
+    _open_textmaybe_gz,
+    _safe_float,
+    _safe_int,
+    read_tsv,
+    safe_locus_id,
+)
 
 
 class TestSafeInt:
@@ -120,6 +129,67 @@ class TestReadTsv:
         df = read_tsv(p, usecols=lambda c: c in {"read_name", "clip_len", "clip_side"})
         assert list(df.columns) == ["read_name", "clip_len"]
         assert int(df["clip_len"].iloc[0]) == 42
+
+
+class TestSafeFloat:
+    """_safe_float is the float-valued mirror of _safe_int.
+
+    It must return the default for every documented-unsupported input rather
+    than raising, and it collapses non-finite results (nan/inf) to the default
+    so callers can keep ``math.isfinite`` as the single validity test.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "   ", "abc", object(), [1, 2]],
+    )
+    def test_unsupported_inputs_return_default(self, value):
+        assert math.isnan(_safe_float(value))
+        assert _safe_float(value, 7.0) == 7.0
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_inputs_return_default(self, value):
+        assert math.isnan(_safe_float(value))
+        assert _safe_float(value, 7.0) == 7.0
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (7, 7.0),
+            ("12", 12.0),
+            (3.9, 3.9),
+            ("12.7", 12.7),
+            (-3.9, -3.9),
+            ("  12  ", 12.0),
+            (True, 1.0),
+            (False, 0.0),
+        ],
+    )
+    def test_supported_inputs_convert(self, value, expected):
+        assert _safe_float(value) == expected
+
+    def test_huge_int_returns_default(self):
+        # float(10**400) raises OverflowError; it must not propagate.
+        assert math.isnan(_safe_float(10**400))
+        assert _safe_float(10**400, -1.0) == -1.0
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (np.int64(7), 7.0),
+            (np.int32(-3), -3.0),
+            (np.uint16(5), 5.0),
+            (np.bool_(True), 1.0),
+            (np.bool_(False), 0.0),
+            (np.float32(7.5), 7.5),
+            (np.float64(-2.5), -2.5),
+        ],
+    )
+    def test_numpy_scalars_convert(self, value, expected):
+        # DataFrame rows and Series values yield NumPy scalars, which do not
+        # subclass the builtin numeric types; they must convert, not collapse
+        # to the default.
+        assert _safe_float(value) == expected
 
 
 class TestSafeLocusId:
