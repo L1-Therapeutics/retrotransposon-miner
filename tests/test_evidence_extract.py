@@ -176,6 +176,16 @@ def test_longest_poly_at_span_below_purity_threshold() -> None:
     assert length == 0
 
 
+def test_longest_poly_at_span_full_read_purity_describes_returned_span() -> None:
+    # The 8-base polyA window is within n-2 of the read length, so the whole
+    # read is returned as the span; purity must then describe that whole read
+    # (8/10), not the narrower matched window (8/8).
+    seq = "A" * 8 + "CG"
+    length, frac, base, span = _longest_poly_at_span(seq, min_len=8)
+    assert span == seq and length == 10 and base == "A"
+    assert frac == pytest.approx(8 / 10)
+
+
 def test_longest_poly_at_span_high_purity_polya() -> None:
     # ~91% A over 33 bases (3 non-A interspersed)
     seq = ("A" * 10 + "C" + "A" * 10 + "G" + "A" * 10 + "C")
@@ -217,6 +227,16 @@ def test_poly_at_bp_proximal_right_dominates() -> None:
     seq = "C" * 10 + "T" * 10
     run, frac, base, side = _poly_at_breakpoint_proximal_stats(seq, window_bases=10)
     assert side == "R" and base == "T" and run == 10
+    assert frac == 1.0  # purity must come from the chosen (right) window, not the left one
+
+
+def test_poly_at_bp_proximal_right_purity_is_not_the_left_window() -> None:
+    # Left window: run 5, purity 0.5 (A). Right window: run 8, purity 0.8 (T).
+    # The chosen window is the right one, so both run and purity must be right's.
+    seq = "TTTTTAAAAA" + "TTTTTTTTAA"
+    run, frac, base, side = _poly_at_breakpoint_proximal_stats(seq, window_bases=10)
+    assert side == "R" and base == "T" and run == 8
+    assert frac == 0.8
 
 
 def test_poly_at_bp_proximal_empty_seq() -> None:

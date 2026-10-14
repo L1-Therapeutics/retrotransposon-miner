@@ -16,6 +16,9 @@ venv/
 .env
 .ec2-instance.env
 
+# macOS
+.DS_Store
+
 # Data and temporary outputs
 data/
 results/

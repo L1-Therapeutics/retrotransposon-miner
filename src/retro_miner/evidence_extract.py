@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pysam
 
-from ._utils import _longest_poly_at_span, _poly_at_stats
+from ._utils import _longest_poly_at_span, _poly_at_stats, read_tsv
 from .bam_io import open_alignment
 
 
@@ -47,7 +47,7 @@ def clone_sample_evidence_tables(outdir: Path, *, src_sample: str, dst_sample: s
             dst = outdir / f"{prefix}.{dst_sample}{suffix}"
             if not src.exists():
                 continue
-            df = pd.read_parquet(src) if suffix == ".parquet" else pd.read_csv(src, sep="\t")
+            df = pd.read_parquet(src) if suffix == ".parquet" else read_tsv(src)
             if "sample" in df.columns:
                 df = df.copy()
                 df["sample"] = dst_sample
@@ -168,9 +168,9 @@ def _longest_soft_clip_from_read(
     last_op, last_len = read.cigartuples[-1]
     candidates: list[tuple[str, int, int]] = []
     if first_op == 4 and first_len > 0:
-        candidates.append(("L", int(first_len), pos_1based))
+        candidates.append(("L", first_len, pos_1based))
     if last_op == 4 and last_len > 0:
-        candidates.append(("R", int(last_len), ref_end_1based))
+        candidates.append(("R", last_len, ref_end_1based))
     if not candidates:
         return ("", 0, 0, "")
     side, clip_len, clip_pos = max(candidates, key=lambda x: x[1])
@@ -196,8 +196,8 @@ def _poly_at_breakpoint_proximal_stats(
     l_run, l_frac, l_base = _poly_at_stats(left)
     r_run, r_frac, r_base = _poly_at_stats(right)
     if (l_run, l_frac) >= (r_run, r_frac):
-        return (int(l_run), float(l_frac), l_base, "L")
-    return (int(r_run), float(r_frac), r_base, "R")
+        return (l_run, l_frac, l_base, "L")
+    return (r_run, r_frac, r_base, "R")
 
 
 def extract_split_evidence(

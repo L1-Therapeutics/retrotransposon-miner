@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import gzip
 import math
+import numbers
 import re
 import warnings
+import pandas as pd
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import IO
+from typing import Any, IO
 
 
 def safe_locus_id(chrom: str, start: int, end: int) -> str:
@@ -23,6 +26,26 @@ def safe_locus_id(chrom: str, start: int, end: int) -> str:
     return f"{chrom_safe}_{int(start)}_{int(end)}"
 
 
+def read_tsv(
+    path: Path,
+    *,
+    usecols: Sequence[str] | Callable[[str], bool] | None = None,
+    **kwargs: Any,
+) -> pd.DataFrame:
+    """Read a TSV file with sensible defaults.
+
+    Wraps :func:`pandas.read_csv` with ``sep="\t"`` and ``low_memory=False``
+    unless the caller already supplied them. Additional keyword arguments are
+    forwarded unchanged. When ``usecols`` is a sequence, every listed column
+    must exist; a callable selects only the columns present in the file.
+    """
+    kwargs.setdefault("sep", "\t")
+    kwargs.setdefault("low_memory", False)
+    if usecols is not None:
+        kwargs.setdefault("usecols", usecols)
+    return pd.read_csv(path, **kwargs)
+
+
 def _safe_int(value: object, default: int = 0) -> int:
     """Safely convert *value* to int, returning *default* on failure.
 
@@ -30,6 +53,9 @@ def _safe_int(value: object, default: int = 0) -> int:
       like ``10**400`` are preserved exactly).
     - float values are converted if finite, otherwise *default*.
     - strings are stripped and parsed via ``float()`` first.
+    - NumPy/pandas numeric scalars (``np.int64``, ``np.float32``,
+      ``np.bool_``, ...) are converted even though they do not subclass the
+      builtin ``int``/``float``; table rows and Series values produce these.
     - everything else returns *default*.
     """
     if isinstance(value, bool):
@@ -44,7 +70,22 @@ def _safe_int(value: object, default: int = 0) -> int:
         except ValueError:
             return default
         return default if not math.isfinite(number) else int(number)
-    return default
+    # NumPy/pandas scalars do not always subclass the builtin numeric types:
+    # np.int64 is a numbers.Integral but not an int, np.float32 is a
+    # numbers.Real but not a float, and np.bool_ is neither (it still defines
+    # __int__). Without these checks integer table columns were read as 0.
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return default if not math.isfinite(number) else int(number)
+    to_int = getattr(value, "__int__", None)
+    if to_int is None:
+        return default
+    try:
+        return int(to_int())
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _open_textmaybe_gz(path: Path) -> IO[str]:
@@ -138,9 +179,11 @@ def _longest_poly_at_span(
         return (0, 0.0, "", "")
     span = s[best_ij[0] : best_ij[1]]
     if best_len >= 140 or best_len >= n - 2:
-        best_len = n
-        best_frac = float(span.count(best_base)) / float(len(span)) if span else best_frac
+        # Promote to the whole read, then recompute purity over that span —
+        # keeping the matched window's purity would overstate a widened span.
         span = s
+        best_len = n
+        best_frac = float(span.count(best_base)) / float(n)
     return (int(best_len), float(best_frac), best_base, span)
 
 

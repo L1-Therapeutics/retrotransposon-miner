@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import math
+import numbers
 import random
 import re
 import shutil
@@ -22,7 +23,7 @@ import pysam
 from Bio.Align import PairwiseAligner
 from intervaltree import IntervalTree
 
-from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats, _safe_int
+from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats, _safe_int, read_tsv
 
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import generate_gold_read_architecture_plots
@@ -127,7 +128,7 @@ def _load_fragment_to_full_map(path: Path | None) -> dict[str, FragmentToFullMap
     if path is None or not path.exists():
         return {}
     try:
-        df = pd.read_csv(path, sep="\t")
+        df = read_tsv(path)
     except (OSError, pd.errors.ParserError, ValueError):
         return {}
     required = {
@@ -398,7 +399,7 @@ def _load_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame:
     if parquet_path.exists():
         return pd.read_parquet(parquet_path)
     if tsv_path.exists():
-        return pd.read_csv(tsv_path, sep="\t")
+        return read_tsv(tsv_path)
     raise FileNotFoundError(f"Missing {stem} for sample={sample}")
 
 
@@ -794,9 +795,8 @@ def _resolve_full_consensus_fasta(
     if not fai.exists():
         return None
     try:
-        fai_df = pd.read_csv(
+        fai_df = read_tsv(
             fai,
-            sep="\t",
             header=None,
             names=["name", "length", "offset", "line_bases", "line_width"],
             usecols=[0, 1],
@@ -1340,7 +1340,7 @@ def _align_clips_with_minimap2(
     out["clip_id"] = [f"{sample}_{i}" for i in range(len(out))]
     out["clip_seq_coord"] = [
         _trim_poly_at_from_clip(str(seq), str(side))
-        for seq, side in zip(out["clip_seq"].fillna(""), out["clip_side"].fillna(""))
+        for seq, side in zip(out["clip_seq"].fillna(""), out["clip_side"].fillna(""), strict=True)
     ]
     out["mei_query_seq"] = out["clip_seq_coord"].fillna("").astype(str)
     for col, default in (
@@ -1483,7 +1483,7 @@ def _align_discordant_reads_with_minimap2(
         else pd.Series("", index=reads.index)
     )
     reads["mei_query_seq"] = [
-        _trim_poly_at_from_clip(seq, side) for seq, side in zip(raw_query, clip_side)
+        _trim_poly_at_from_clip(seq, side) for seq, side in zip(raw_query, clip_side, strict=True)
     ]
     reads = reads.loc[
         reads["mei_query_seq"].str.len() >= max(_DPE_MEI_REMAP_MIN_CLIP_BP, _MEI_ALIGN_MIN_TRIMMED_BP)
@@ -2033,7 +2033,7 @@ def _load_supporting_reads_detail_table(path: Path) -> pd.DataFrame:
     path = Path(path)
     if path.suffix == ".parquet":
         return pd.read_parquet(path)
-    return pd.read_csv(path, sep="\t", low_memory=False)
+    return read_tsv(path)
 
 
 def _hydrate_sample_mei_hits_from_detail(
@@ -2888,7 +2888,7 @@ def _annotate_vntr_like_split_clips(
         at_sva_locus = pd.Series(
             [
                 (str(c), int(ws), int(we)) in sva_loci
-                for c, ws, we in zip(out["chrom"], out["window_start"], out["window_end"])
+                for c, ws, we in zip(out["chrom"], out["window_start"], out["window_end"], strict=True)
             ],
             index=out.index,
         )
@@ -4322,12 +4322,11 @@ def _build_supporting_reads_detail_table(
 
     def _as_int(val: object, default: int = 0) -> int:
         try:
-            if val is None or (isinstance(val, float) and pd.isna(val)):
+            number = float(val)
+            if not math.isfinite(number):
                 return default
-            if isinstance(val, (str, int, float)):
-                return int(val)
-            return default
-        except (TypeError, ValueError):
+            return math.trunc(number)
+        except (TypeError, ValueError, OverflowError):
             return default
 
     def _as_bool(val: object, default: bool = False) -> bool:
@@ -5146,11 +5145,14 @@ def _clip_to_poly_at_region(seq: str, *, min_dom_frac: float | None = None) -> s
     return span
 
 
-def _normalized_clip_seq(seq: str, *, max_len: int = 80) -> str:
+def _normalized_clip_seq(seq: str, *, max_len: int = 80, from_end: bool = False) -> str:
     s = "".join(ch for ch in (seq or "").upper() if ch in {"A", "C", "G", "T"})
     if not s:
         return ""
-    return s[: int(max_len)]
+    width = max(0, int(max_len))
+    if not width:
+        return ""
+    return s[-width:] if from_end else s[:width]
 
 
 def _clip_shannon_entropy(seq: str) -> float:
@@ -5169,15 +5171,14 @@ def _clip_shannon_entropy(seq: str) -> float:
 
 
 def _breakpoint_proximal_clip_seq(seq: str, side: str, *, max_len: int = 40) -> str:
-    s = _normalized_clip_seq(seq, max_len=200)
-    if not s:
-        return ""
-    side_u = (side or "").upper()
-    if side_u == "L":
-        # L-clips are left-anchored; breakpoint-proximal bases are near clip end.
-        return s[-int(max_len) :]
-    # R-clips are right-anchored; breakpoint-proximal bases are near clip start.
-    return s[: int(max_len)]
+    """Bases next to the clip/reference junction (ACGT only, length <= ``max_len``).
+
+    L-clips are left-anchored, so the junction sits at the clip's 3' end; R-clips
+    are right-anchored, so it sits at the 5' end. Normalizing from the correct
+    end matters for clips longer than the window.
+    """
+    from_end = (side or "").upper() == "L"
+    return _normalized_clip_seq(seq, max_len=max_len, from_end=from_end)
 
 
 def _is_informative_split_clip(seq: str, *, min_len: int = 20, min_non_at_fraction: float = 0.15, min_entropy: float = 1.20) -> bool:
@@ -5205,7 +5206,7 @@ def _pair_clip_similarity(a: str, b: str) -> float:
         return 0.0
     aa = a[:n]
     bb = b[:n]
-    matches = sum(1 for x, y in zip(aa, bb) if x == y)
+    matches = sum(1 for x, y in zip(aa, bb, strict=True) if x == y)
     return float(matches) / float(n)
 
 
@@ -8265,8 +8266,8 @@ def _infer_disease_insertion_metrics(
                 if not chrom:
                     continue
                 try:
-                    ws = int(getattr(row, "window_start"))
-                    we = int(getattr(row, "window_end"))
+                    ws = int(row.window_start)
+                    we = int(row.window_end)
                 except (TypeError, ValueError):
                     continue
                 side = str(getattr(row, "clip_side", "") or "").strip().upper()
@@ -9629,7 +9630,7 @@ def _revcomp(seq: str) -> str:
 def _hamming(a: str, b: str) -> int:
     if len(a) != len(b):
         return max(len(a), len(b))
-    return sum(1 for x, y in zip(a, b) if x != y)
+    return sum(1 for x, y in zip(a, b, strict=True) if x != y)
 
 
 # Motif examples from published analyses; these are supportive mechanism hints,
@@ -13726,48 +13727,41 @@ def _infer_mei_family_from_fields(hit_id: str, family_hint: str, extra_hint: str
     return ""
 
 
-def _extract_float_from_info(value: object, default: float = -1.0) -> float:
+def _finite_float(value: object) -> float | None:
+    """Return *value* as a finite float, or ``None`` when it is not numeric.
+
+    VCF INFO payloads arrive from pysam as a scalar or a tuple and may be
+    ``None``, a missing value (NaN/NA), an infinity, or a non-numeric string.
+    ``numbers.Real`` also matches NumPy scalars (``np.int64``, ``np.float32``)
+    that do not subclass the builtin ``int``/``float``.
+    """
     if value is None:
-        return default
-    if isinstance(value, tuple):
-        vals = [v for v in value if v is not None]
-        if not vals:
-            return default
-        try:
-            numeric_vals = [float(v) for v in vals if isinstance(v, (str, int, float))]
-            if not numeric_vals:
-                return default
-            return float(max(numeric_vals))
-        except (ValueError, TypeError):
-            return default
+        return None
     try:
-        if isinstance(value, (str, int, float)):
-            return float(value)
-        return default
-    except (ValueError, TypeError):
-        return default
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if not isinstance(value, (str, int, float, numbers.Real)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _extract_int_from_info(value: object, default: int = -1) -> int:
-    if value is None:
-        return default
+    """Largest finite integer in a VCF INFO payload, else *default*.
+
+    Non-integral floats truncate toward zero. A tuple (multi-value INFO) yields
+    the maximum of its finite entries, or *default* when it has none.
+    """
     if isinstance(value, tuple):
-        vals = [v for v in value if v is not None]
-        if not vals:
-            return default
-        try:
-            numeric_vals = [int(v) for v in vals if isinstance(v, (str, int, float))]
-            if not numeric_vals:
-                return default
-            return int(max(numeric_vals))
-        except (ValueError, TypeError):
-            return default
-    try:
-        if isinstance(value, (str, int, float)):
-            return int(value)
-        return default
-    except (ValueError, TypeError):
-        return default
+        found = [int(number) for item in value if (number := _finite_float(item)) is not None]
+        return max(found) if found else default
+    number = _finite_float(value)
+    return int(number) if number is not None else default
 
 
 def _is_mei_like_variant(vid: str, alt_txt: str, svtype: str, meinfo: str) -> bool:
@@ -14774,7 +14768,7 @@ def annotate_candidate_loci_with_mei(
     reuse_dir = Path(reuse_mei_annotate_dir) if reuse_mei_annotate_dir is not None else None
     bwa_threads = max(1, int(bwa_threads))
     load_t0 = time.monotonic()
-    candidate = pd.read_csv(candidate_loci_path, sep="\t")
+    candidate = read_tsv(candidate_loci_path)
     split_disease_raw = _load_table(evidence_dir, "split_evidence", "disease")
     split_control_raw = _load_table(evidence_dir, "split_evidence", "control")
     discordant_disease_raw = _load_table(evidence_dir, "discordant_evidence", "disease")

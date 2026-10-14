@@ -5,12 +5,17 @@ No BAM files, pysam, matplotlib, or real data required.
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from retro_miner.read_architecture import (
     _clip_span,
     _connector_endpoints,
+    _enrich_detail_with_clip_lens,
+    _load_split_evidence,
+    _numeric_series,
     _parse_support_counts,
+    _row_int,
     _safe_plot_stem,
     _support_score,
     _target_family,
@@ -203,3 +208,110 @@ def test_safe_plot_stem_sanitises_special_chars() -> None:
     assert " " not in result
     assert "!" not in result
     assert "chr_1" in result
+
+
+# ---------------------------------------------------------------------------
+# _row_int  →  int64 DataFrame columns must not collapse to 0
+# ---------------------------------------------------------------------------
+
+
+def test_row_int_reads_int64_coordinates() -> None:
+    # row[col] on an int64 Series yields np.int64, which does not subclass
+    # Python int; regressions here silently zeroed out every integer table
+    # column (breakpoints, span estimates, window coordinates).
+    row = pd.Series(
+        {
+            "consensus_insertion_breakpoint_pos": 12345678,
+            "window_start": 100,
+            "window_end": 200,
+            "insertion_model_score": 0.875,
+        }
+    )
+    assert _row_int(row, "consensus_insertion_breakpoint_pos") == 12345678
+    assert _row_int(row, "window_start") == 100
+    assert _row_int(row, "window_end") == 200
+    assert _row_int(row, "missing_column", default=-1) == -1
+
+
+def test_row_int_missing_or_na_returns_default() -> None:
+    row = pd.Series({"window_start": pd.NA}, dtype="object")
+    assert _row_int(row, "window_start", default=5) == 5
+
+
+# ---------------------------------------------------------------------------
+# _numeric_series  →  always a Series, even when the column is absent
+# ---------------------------------------------------------------------------
+
+
+def test_numeric_series_present_column_coerces_non_numeric() -> None:
+    frame = pd.DataFrame({"x": ["1", "oops", None]})
+    series = _numeric_series(frame, "x")
+    assert series.iloc[0] == 1.0
+    assert pd.isna(series.iloc[1])
+    assert pd.isna(series.iloc[2])
+
+
+def test_numeric_series_absent_column_returns_constant_series() -> None:
+    # Regression: DataFrame.get(col, 0) yields a bare float for a missing
+    # column, so the old pd.to_numeric(...).fillna(0) chain raised
+    # AttributeError instead of degrading gracefully.
+    frame = pd.DataFrame({"a": [10, 20, 30]})
+    series = _numeric_series(frame, "missing")
+    assert list(series) == [0.0, 0.0, 0.0]
+    assert list(series.index) == [0, 1, 2]
+
+
+def test_numeric_series_absent_column_honours_default() -> None:
+    frame = pd.DataFrame({"a": [1, 2]})
+    assert list(_numeric_series(frame, "missing", default=-1.0)) == [-1.0, -1.0]
+
+
+# ---------------------------------------------------------------------------
+# _enrich_detail_with_clip_lens  →  clip_len fallback without the span columns
+# ---------------------------------------------------------------------------
+
+
+def test_enrich_detail_with_missing_span_columns_does_not_crash() -> None:
+    # Regression: when neither mei_end nor mei_start is present and there is no
+    # split evidence, the fallback span calculation used to raise
+    # AttributeError ('float' object has no attribute 'fillna').
+    detail = pd.DataFrame({"read_name": ["r1"], "evidence_type": ["SR"]})
+    out = _enrich_detail_with_clip_lens(detail, gold_tsv=None, sample="disease")
+    assert "clip_len" in out.columns
+    assert out["clip_len"].notna().all()
+
+
+def test_enrich_detail_fallback_span_uses_mei_coordinates() -> None:
+    detail = pd.DataFrame(
+        {
+            "read_name": ["sr1", "dpe1"],
+            "evidence_type": ["SR", "DPE"],
+            "mei_start": [100, 100],
+            "mei_end": [150, 150],
+        }
+    )
+    out = _enrich_detail_with_clip_lens(detail, gold_tsv=None, sample="disease")
+    # SR rows take the mei_start..mei_end span; non-SR rows keep the 0 default.
+    assert out.loc[out["read_name"] == "sr1", "clip_len"].iloc[0] == 51
+    assert out.loc[out["read_name"] == "dpe1", "clip_len"].iloc[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# _load_split_evidence  →  only the present split-evidence columns
+# ---------------------------------------------------------------------------
+
+
+def test_load_split_evidence_keeps_present_columns(tmp_path) -> None:
+    path = tmp_path / "split_evidence.disease.tsv"
+    path.write_text("read_name\tclip_len\tclip_side\nr1\t111\tR\n", encoding="utf-8")
+    df = _load_split_evidence(path)
+    assert list(df.columns) == ["read_name", "clip_len", "clip_side"]
+    assert int(df["clip_len"].iloc[0]) == 111
+
+
+def test_load_split_evidence_ignores_unexpected_columns(tmp_path) -> None:
+    path = tmp_path / "split_evidence.control.tsv"
+    path.write_text("read_name\tsecret\tpos\nr2\tx\t99\n", encoding="utf-8")
+    df = _load_split_evidence(path)
+    assert list(df.columns) == ["read_name", "pos"]
+

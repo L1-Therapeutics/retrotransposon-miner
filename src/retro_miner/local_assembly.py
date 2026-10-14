@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -35,8 +36,17 @@ _ASSEMBLY_FEATURE_SCHEMA_VERSION = 4
 
 def _window_locus_id_from_row(row: pd.Series) -> str:
     chrom = str(row.get("chrom", ""))
-    window_start = int(row.get("window_start", 1))
-    window_end = int(row.get("window_end", window_start))
+    try:
+        ws = float(row.get("window_start", 1))
+        we = float(row.get("window_end", ws))
+        if not math.isfinite(ws):
+            ws = 1.0
+        if not math.isfinite(we):
+            we = ws
+        window_start = math.trunc(ws)
+        window_end = math.trunc(we)
+    except (TypeError, ValueError, OverflowError):
+        window_start, window_end = 1, 1
     if window_end < window_start:
         window_start, window_end = window_end, window_start
     return _safe_locus_id(chrom, max(1, window_start), max(1, window_end))
@@ -44,12 +54,25 @@ def _window_locus_id_from_row(row: pd.Series) -> str:
 
 def _interval_from_row(row: pd.Series, pad_bp: int) -> tuple[str, int, int]:
     chrom = str(row.get("chrom", ""))
-    window_start = int(row.get("window_start", 1))
-    window_end = int(row.get("window_end", window_start))
-    center = int(row.get("insertion_breakpoint_pos", 0))
-    if center <= 0:
-        center = (window_start + window_end) // 2
-    pad = max(1, int(pad_bp))
+    try:
+        ws = float(row.get("window_start", 1))
+        we = float(row.get("window_end", ws))
+        if not math.isfinite(ws):
+            ws = 1.0
+        if not math.isfinite(we):
+            we = ws
+        window_start = math.trunc(ws)
+        window_end = math.trunc(we)
+    except (TypeError, ValueError, OverflowError):
+        window_start, window_end = 1, 1
+    try:
+        center_f = float(row.get("insertion_breakpoint_pos", 0))
+    except (TypeError, ValueError, OverflowError):
+        center_f = 0.0
+    if not math.isfinite(center_f) or center_f <= 0:
+        center_f = (window_start + window_end) / 2.0
+    center = math.trunc(center_f)
+    pad = max(1, int(float(pad_bp))) if pad_bp is not None else 1
     start = min(window_start, center - pad)
     end = max(window_end, center + pad)
     return chrom, max(1, start), max(1, end)

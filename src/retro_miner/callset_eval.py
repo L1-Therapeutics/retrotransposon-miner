@@ -7,6 +7,7 @@ score/tier cutoff, and list RTM calls that are novel to both truth sets.
 from __future__ import annotations
 
 import gzip
+import math
 import re
 import shutil
 import subprocess
@@ -14,6 +15,10 @@ from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from intervaltree import IntervalTree
+
+from retro_miner._utils import read_tsv
 
 MEI_FAMILIES = frozenset({"ALU", "LINE1", "SVA"})
 _LINE1_TOKEN = re.compile(r"(?:LINE1|L1HS|<INS:ME:L1\b|(?<![A-Z0-9])L1(?![A-Z0-9]))")
@@ -123,10 +128,11 @@ def is_carrier_gt_string(gt: str) -> bool:
 
 
 def padded_interval(pos: int, end: int, pad_bp: int) -> tuple[int, int]:
+    """Represent 1-based inclusive coordinates as a padded half-open interval."""
     lo = min(int(pos), int(end))
     hi = max(int(pos), int(end))
     pad = max(0, int(pad_bp))
-    start = max(0, lo - pad)
+    start = max(0, lo - 1 - pad)
     stop = max(start + 1, hi + pad)
     return start, stop
 
@@ -146,20 +152,35 @@ def match_variants(
     pad_bp: int,
     require_family: bool = False,
 ) -> dict[str, list[Variant]]:
-    """Map each query key to overlapping reference variants."""
+    """Map each query key to overlapping reference variants.
+
+    Index references by chromosome and interval so sparse callsets avoid a
+    full scan of every reference record for every query. Results retain input
+    reference order, matching the original linear-scan contract.
+    """
     hits: dict[str, list[Variant]] = {q.key: [] for q in queries}
     if not queries or not references:
         return hits
-    by_chrom: dict[str, list[Variant]] = {}
-    for ref in references:
-        by_chrom.setdefault(normalize_chrom(ref.chrom), []).append(ref)
+
+    by_chrom: dict[str, IntervalTree] = {}
+    for index, ref in enumerate(references):
+        chrom = normalize_chrom(ref.chrom)
+        tree = by_chrom.get(chrom)
+        if tree is None:
+            tree = by_chrom[chrom] = IntervalTree()
+        start, stop = padded_interval(ref.pos, ref.end, 0)
+        tree.addi(start, stop, index)
+
     for query in queries:
-        cand = by_chrom.get(normalize_chrom(query.chrom), [])
-        for ref in cand:
+        tree = by_chrom.get(normalize_chrom(query.chrom))
+        if tree is None:
+            continue
+        start, stop = padded_interval(query.pos, query.end, pad_bp)
+        for index in sorted(interval.data for interval in tree.overlap(start, stop)):
+            ref = references[index]
             if require_family and query.family and ref.family and query.family != ref.family:
                 continue
-            if intervals_overlap(query, ref, pad_bp):
-                hits[query.key].append(ref)
+            hits[query.key].append(ref)
     return hits
 
 
@@ -197,19 +218,15 @@ def rtm_breakpoint(row: dict[str, Any]) -> int:
         if raw is None:
             continue
         try:
-            pos = int(float(raw))
+            number = float(raw)
+            if not math.isfinite(number):
+                continue
+            pos = int(number) if number >= 0 else -int(-number)  # truncate toward zero
         except (TypeError, ValueError, OverflowError):
-            # int(float("inf")) raises OverflowError, which is neither
-            # TypeError nor ValueError.
             continue
         if pos > 0:
             return pos
-    # A window midpoint fallback used to sit here. It was unreachable: the
-    # loop above already returns for any window_start that parses positive,
-    # and _as_int applies the identical int(float(...)) conversion, so the
-    # `start > 0` guard could never be true. Verified over 583,443 input
-    # combinations with zero behaviour change. Only rows carrying no usable
-    # breakpoint field at all reach this point.
+    # Only rows carrying no usable breakpoint field at all reach this point.
     return 0
 
 
@@ -222,9 +239,7 @@ def rtm_family(row: dict[str, Any]) -> str:
 
 
 def load_rtm_calls(path: Path, chrom: str | None = None) -> tuple[list[Variant], list[dict[str, Any]]]:
-    import pandas as pd
-
-    df = pd.read_csv(path, sep="\t", low_memory=False)
+    df = read_tsv(path)
     want = normalize_chrom(chrom) if chrom else ""
     rows: list[dict[str, Any]] = []
     variants: list[Variant] = []
@@ -269,7 +284,7 @@ def load_melt_sample_meis(
     out: list[Variant] = []
     fmt = "%CHROM\t%POS\t%END\t%ID\t%ALT\t%INFO/SVTYPE\t%INFO/SVLEN\t%INFO/MEINFO\t[%GT]\n"
     for row in _query_vcf_rows(vcf_path, chrom=want, sample=sample, fmt=fmt):
-        chrom_s, pos_s, end_s, vid, alt, svtype, svlen_s, meinfo, gt = _pad_row(row, 9)
+        chrom_s, pos_s, _end_s, vid, alt, svtype, svlen_s, meinfo, gt = _pad_row(row, 9)
         if not is_carrier_gt_string(gt):
             continue
         if not is_melt_mei_insertion(vid, alt, svtype, meinfo):
@@ -305,7 +320,7 @@ def load_ont_sample_meis(
     out: list[Variant] = []
     fmt = "%CHROM\t%POS\t%END\t%ID\t%INFO/SVTYPE\t%INFO/SVLEN\t[%GT]\n"
     for row in _query_vcf_rows(svim_path, chrom=want, sample=sample, fmt=fmt):
-        chrom_s, pos_s, end_s, vid, svtype, svlen_s, gt = _pad_row(row, 7)
+        chrom_s, pos_s, _end_s, vid, svtype, svlen_s, gt = _pad_row(row, 7)
         if not is_carrier_gt_string(gt):
             continue
         if not is_insertion_svtype(svtype):
@@ -455,9 +470,20 @@ def merge_unique_events(
         if left_root != right_root:
             parents[right_root] = left_root
 
-    for left, left_variant in enumerate(variants):
-        for right in range(left + 1, len(variants)):
-            right_variant = variants[right]
+    # Store each earlier record padded, then query with the new record's
+    # unpadded interval. This reproduces intervals_overlap(earlier, newer,
+    # pad_bp) while limiting comparisons to possible overlaps. It also keeps
+    # transitive and blank-family bridge behavior intact.
+    by_chrom: dict[str, IntervalTree] = {}
+    for right, right_variant in enumerate(variants):
+        chrom = normalize_chrom(right_variant.chrom)
+        tree = by_chrom.get(chrom)
+        if tree is None:
+            tree = by_chrom[chrom] = IntervalTree()
+        start, stop = padded_interval(right_variant.pos, right_variant.end, 0)
+        for interval in tree.overlap(start, stop):
+            left = interval.data
+            left_variant = variants[left]
             if (
                 require_family
                 and left_variant.family
@@ -465,8 +491,9 @@ def merge_unique_events(
                 and left_variant.family != right_variant.family
             ):
                 continue
-            if intervals_overlap(left_variant, right_variant, pad_bp):
-                union(left, right)
+            union(left, right)
+        ref_start, ref_stop = padded_interval(right_variant.pos, right_variant.end, pad_bp)
+        tree.addi(ref_start, ref_stop, right)
 
     groups: dict[int, list[Variant]] = {}
     for index, variant in enumerate(variants):
@@ -717,13 +744,20 @@ def _tier_keeps(tier: str, rule: str) -> bool:
 
 def _as_int(value: Any, default: int = 0) -> int:
     try:
-        return int(float(value))
+        number = float(value)
+        if not math.isfinite(number):
+            return default
+        pos = int(number) if number >= 0 else -int(-number)
+        return pos
     except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _as_float(value: Any, default: float | None = None) -> float:
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
         return float("nan") if default is None else default
+    if not math.isfinite(number):
+        return float("nan") if default is None else default
+    return number

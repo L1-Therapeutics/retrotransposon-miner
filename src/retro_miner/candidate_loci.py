@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import math
 from collections.abc import Iterable
 from pathlib import Path
 import subprocess
@@ -10,7 +11,7 @@ import click
 import pandas as pd
 from intervaltree import IntervalTree
 
-from ._utils import _open_textmaybe_gz
+from ._utils import _open_textmaybe_gz, read_tsv
 
 
 _RUN_T0: float | None = None
@@ -29,7 +30,7 @@ def _load_evidence_table(base_dir: Path, stem: str, sample: str) -> pd.DataFrame
     if parquet_path.exists():
         return pd.read_parquet(parquet_path)
     if tsv_path.exists():
-        return pd.read_csv(tsv_path, sep="\t")
+        return read_tsv(tsv_path)
     raise FileNotFoundError(
         f"Missing evidence table for stem={stem} sample={sample}; "
         f"looked for {parquet_path} and {tsv_path}"
@@ -85,14 +86,14 @@ def _read_passing_counts(summary_path: Path) -> dict[str, int]:
             "Run 'rtm extract-split-evidence' first to generate this file."
         )
     try:
-        summary = pd.read_csv(summary_path, sep="\t", usecols=["sample", "passing_reads"])
+        summary = read_tsv(summary_path, usecols=["sample", "passing_reads"])
     except ValueError as exc:
         raise ValueError(
             f"Split evidence summary at '{summary_path}' is missing required columns "
             "['sample', 'passing_reads'].  "
             "Run 'rtm extract-split-evidence' to regenerate it."
         ) from exc
-    return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int)))
+    return dict(zip(summary["sample"].astype(str), summary["passing_reads"].astype(int), strict=True))
 
 
 def _windowize(df: pd.DataFrame, window_size: int) -> pd.DataFrame:
@@ -344,14 +345,27 @@ def _assign_rows_to_loci(df: pd.DataFrame, loci: pd.DataFrame) -> pd.DataFrame:
     for row in loci.itertuples(index=False):
         chrom = str(row.chrom)
         tree = trees.setdefault(chrom, IntervalTree())
-        window_start = int(row.window_start)
-        window_end = int(row.window_end)
+        try:
+            ws = float(row.window_start)
+            we = float(row.window_end)
+            if not (math.isfinite(ws) and math.isfinite(we)):
+                continue
+            window_start = int(round(ws))
+            window_end = int(round(we))
+        except (TypeError, ValueError, OverflowError):
+            continue
         tree.addi(window_start, window_end + 1, (window_start, window_end))
 
     assigned_rows: list[dict[str, object]] = []
     for row in df.itertuples(index=False):
         chrom = str(row.chrom)
-        pos = int(row.pos)
+        try:
+            posf = float(row.pos)
+            if not math.isfinite(posf):
+                continue
+            pos = int(round(posf))
+        except (TypeError, ValueError, OverflowError):
+            continue
         tree = trees.get(chrom)
         if tree is None:
             continue

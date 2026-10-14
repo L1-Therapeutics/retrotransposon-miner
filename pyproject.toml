@@ -26,6 +26,15 @@ dependencies = [
   "rich>=13.7",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "pandas-stubs",
+  "boto3-stubs",
+]
+
 [project.scripts]
 rtm = "retro_miner.cli:cli"
 
@@ -43,7 +52,7 @@ ignore = [
 
 [tool.mypy]
 # Type-checking policy (see README "Development -> Type checking"):
-# everything under src/retro_miner is checked by default; only the four
+# everything under src/retro_miner is checked by default; only the three
 # grandfathered legacy modules below are exempt. New modules must be clean.
 # Matches the runtime floor actually used (environment.yml pins python=3.12);
 # numpy's bundled stubs require 3.12 syntax.
@@ -60,7 +69,6 @@ module = [
   "retro_miner.mei_support",
   "retro_miner.local_assembly",
   "retro_miner.candidate_loci",
-  "retro_miner.read_architecture",
 ]
 ignore_errors = true
 

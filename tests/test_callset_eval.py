@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import retro_miner.callset_eval as callset_eval
 
 from retro_miner.callset_eval import (
     Variant,
+    _as_float,
     catalog_overlap,
     filter_variants_to_regions,
     is_carrier_alleles,
@@ -15,6 +17,7 @@ from retro_miner.callset_eval import (
     is_insertion_svtype,
     is_mei_like_text,
     is_melt_mei_insertion,
+    intervals_overlap,
     normalize_strand,
     strand_from_meinfo,
     label_rtm_calls,
@@ -77,11 +80,73 @@ def test_overlap_with_pad_recovers_nearby_truth() -> None:
     assert miss["t1"] == []
 
 
+def test_inclusive_padding_accepts_exact_distance_boundary() -> None:
+    query = [Variant("chr22", 100, 100, "query", "ALU", "rtm")]
+    boundary = [Variant("22", 110, 110, "at_boundary", "ALU", "truth")]
+    beyond = [Variant("chr22", 111, 111, "beyond_boundary", "ALU", "truth")]
+
+    assert match_variants(query, boundary, pad_bp=10)["query"] == boundary
+    assert match_variants(query, beyond, pad_bp=10)["query"] == []
+    assert intervals_overlap(query[0], boundary[0], pad_bp=10)
+    assert not intervals_overlap(query[0], beyond[0], pad_bp=10)
+
+
+def test_match_variants_interval_tree_preserves_boundaries_and_reference_order() -> None:
+    refs = [
+        Variant("chr22", 101, 101, "boundary", "ALU", "truth"),
+        Variant("22", 100, 100, "overlapping", "ALU", "truth"),
+        Variant("chr22", 90, 90, "outside", "ALU", "truth"),
+    ]
+    queries = [Variant("chr22", 100, 100, "query", "ALU", "call")]
+
+    assert [v.variant_id for v in match_variants(queries, refs, pad_bp=2)["query"]] == [
+        "boundary", "overlapping"
+    ]
+    assert [v.variant_id for v in match_variants(queries, refs, pad_bp=1)["query"]] == [
+        "boundary", "overlapping"
+    ]
+    assert [v.variant_id for v in match_variants(queries, refs, pad_bp=0)["query"]] == [
+        "overlapping"
+    ]
+
+
 def test_family_filter_optional() -> None:
     truth = [Variant("chr22", 1000, 1000, "t1", "ALU", "ont")]
     calls = [Variant("chr22", 1000, 1000, "c1", "SVA", "rtm")]
     assert match_variants(truth, calls, pad_bp=0, require_family=False)["t1"]
     assert match_variants(truth, calls, pad_bp=0, require_family=True)["t1"] == []
+
+
+def test_interval_index_matches_linear_overlap_contract_and_input_order() -> None:
+    truth = [
+        Variant("22", 99, 99, "first", "ALU", "ont"),
+        Variant("chr22", 95, 110, "wide", "ALU", "ont"),
+        Variant("chr1", 100, 100, "other_chrom", "ALU", "ont"),
+        Variant("chr22", 90, 90, "outside", "ALU", "ont"),
+    ]
+    queries = [
+        Variant("chr22", 100, 100, "center", "ALU", "rtm"),
+        Variant("22", 200, 200, "miss", "ALU", "rtm"),
+    ]
+    hits = match_variants(queries, truth, pad_bp=2)
+    assert [variant.variant_id for variant in hits["center"]] == ["first", "wide"]
+    assert hits["miss"] == []
+
+
+def test_interval_index_respects_family_filter_and_padding() -> None:
+    refs = [
+        Variant("chr22", 1000, 1000, "alu", "ALU", "truth"),
+        Variant("chr22", 1000, 1000, "unknown", "", "truth"),
+        Variant("chr22", 1001, 1001, "boundary", "ALU", "truth"),
+        Variant("chr22", 1200, 1200, "sva", "SVA", "truth"),
+    ]
+    query = [Variant("chr22", 1000, 1000, "query", "ALU", "call")]
+    assert [v.variant_id for v in match_variants(query, refs, pad_bp=1, require_family=True)["query"]] == [
+        "alu", "unknown", "boundary"
+    ]
+    assert [v.variant_id for v in match_variants(query, refs, pad_bp=0, require_family=True)["query"]] == [
+        "alu", "unknown"
+    ]
 
 
 def test_recall_and_novel() -> None:
@@ -132,6 +197,26 @@ def test_label_and_suggest_cutoff() -> None:
     assert suggestion["novel_calls"] <= 1
 
 
+def test_non_finite_scores_are_missing_and_do_not_pass_cutoffs() -> None:
+    for value in ("nan", "inf", "-inf", float("nan"), float("inf"), float("-inf")):
+        assert math.isnan(_as_float(value))
+        assert _as_float(value, -1.0) == -1.0
+
+    calls = [
+        {
+            "chrom": "chr22",
+            "pos": 100,
+            "end": 100,
+            "rtm_id": "invalid_score",
+            "family": "ALU",
+            "insertion_model_score": _as_float("nan"),
+        }
+    ]
+    rows = sweep_cutoffs(calls, [], [], pad_bp=0)
+    model_score_rows = [row for row in rows if row["cutoff"] == "insertion_model_score"]
+    assert all(row["n_calls"] == 0 for row in model_score_rows)
+
+
 def test_rtm_breakpoint_and_family_from_row() -> None:
     assert rtm_breakpoint({"consensus_insertion_breakpoint_pos": 123}) == 123
     assert rtm_breakpoint({"window_start": 100, "window_end": 200}) == 100
@@ -148,7 +233,7 @@ def test_strand_from_melt_meinfo() -> None:
 
 def test_padded_interval_is_half_open_positive() -> None:
     start, end = padded_interval(10, 10, 5)
-    assert start == 5
+    assert start == 4
     assert end == 15
 
 
@@ -180,6 +265,37 @@ def test_shared_callable_filter_and_unique_events(tmp_path) -> None:
     assert events[0].source == "melt,ont"
     assert events[0].extra["source_ids"] == {"melt": ["m1"], "ont": ["o1"]}
     assert events[1].variant_id == "ont:o2"
+
+
+def test_merge_unique_events_preserves_transitive_and_family_bridge_semantics() -> None:
+    variants = [
+        Variant("chr22", 100, 100, "alu_left", "ALU", "melt"),
+        Variant("chr22", 103, 103, "untyped_bridge", "", "ont"),
+        Variant("chr22", 106, 106, "sva_right", "SVA", "long_read"),
+    ]
+    assert intervals_overlap(variants[0], variants[1], 4)
+    assert intervals_overlap(variants[1], variants[2], 4)
+    assert not intervals_overlap(variants[0], variants[2], 4)
+
+    # Unknown-family calls are compatible with either side; connected
+    # components remain transitive even though the typed endpoints differ.
+    events = merge_unique_events([variants], pad_bp=4, require_family=True)
+    assert len(events) == 1
+    assert events[0].extra["member_count"] == 3
+    assert events[0].extra["source_ids"] == {
+        "melt": ["alu_left"],
+        "ont": ["untyped_bridge"],
+        "long_read": ["sva_right"],
+    }
+
+
+def test_merge_unique_events_disjoint_inputs_do_not_merge() -> None:
+    variants = [
+        Variant("chr22", pos * 100, pos * 100, f"v{pos}", "ALU", "truth")
+        for pos in range(1, 101)
+    ]
+    events = merge_unique_events([variants], pad_bp=5)
+    assert [event.variant_id for event in events] == [f"truth:v{pos}" for pos in range(1, 101)]
 
 
 def test_whole_genome_query_omits_region(monkeypatch, tmp_path) -> None:

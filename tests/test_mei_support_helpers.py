@@ -9,11 +9,15 @@ from __future__ import annotations
 import pytest
 
 from retro_miner.mei_support import (
+    _breakpoint_proximal_clip_seq,
     _cigar_alignment_spans,
     _cigar_query_len,
     _clip_shannon_entropy,
+    _extract_int_from_info,
+    _finite_float,
     _homopolymer_at_run,
     _is_informative_split_clip,
+    _normalized_clip_seq,
     trim_mei_consensus_terminal_polya,
 )
 
@@ -228,3 +232,77 @@ def test_informative_clip_borderline_non_at_fails() -> None:
     # 22 A + 3 CG in 25 chars: non_at_fraction = 3/25 = 0.12 < 0.15
     seq = "A" * 22 + "CGT"
     assert _is_informative_split_clip(seq) is False
+
+
+# ---------------------------------------------------------------------------
+# _normalized_clip_seq / _breakpoint_proximal_clip_seq
+# ---------------------------------------------------------------------------
+
+
+def test_normalized_clip_seq_head_and_tail() -> None:
+    seq = "NN" + "ACGT" * 5 + "AC"
+    assert _normalized_clip_seq(seq, max_len=8) == "ACGTACGT"
+    assert _normalized_clip_seq(seq, max_len=8, from_end=True) == "GTACGTAC"
+    # non-ACGT stripped; empty input yields ""
+    assert _normalized_clip_seq("NNNN") == ""
+    assert _normalized_clip_seq("", from_end=True) == ""
+
+
+def test_breakpoint_proximal_window_uses_junction_end_for_long_clips() -> None:
+    # 220 bp L-clip whose junction-proximal (3') end is the trailing 40 A's;
+    # the window must come from the end, not from a mid-clip 200 bp prefix.
+    long_l = "C" * 180 + "A" * 40
+    assert _breakpoint_proximal_clip_seq(long_l, "L") == "A" * 40
+    # R-clip is right-anchored: proximal end is the 5' start.
+    long_r = "A" * 40 + "C" * 180
+    assert _breakpoint_proximal_clip_seq(long_r, "R") == "A" * 40
+    # Short clips keep the same behaviour either way.
+    short = "ACGT" * 5
+    assert _breakpoint_proximal_clip_seq(short, "L") == short
+    assert _breakpoint_proximal_clip_seq(short, "R") == short
+
+
+# ---------------------------------------------------------------------------
+# _finite_float / _extract_int_from_info  →  VCF INFO numeric coercion
+# ---------------------------------------------------------------------------
+
+
+def test_finite_float_rejects_missing_and_non_finite() -> None:
+    assert _finite_float(None) is None
+    assert _finite_float(float("nan")) is None
+    assert _finite_float(float("inf")) is None
+    assert _finite_float("not-a-number") is None
+    assert _finite_float([1, 2]) is None  # unhashable/array-like pd.isna is handled
+
+
+def test_finite_float_accepts_strings_and_numpy_scalars() -> None:
+    import numpy as np
+
+    assert _finite_float("300") == 300.0
+    assert _finite_float(np.int64(7)) == 7.0
+    assert _finite_float(np.float32("1.5")) == pytest.approx(1.5)
+
+
+def test_extract_int_scalar_and_truncation() -> None:
+    assert _extract_int_from_info(300) == 300
+    assert _extract_int_from_info("300") == 300
+    assert _extract_int_from_info(300.9) == 300  # truncates toward zero
+    assert _extract_int_from_info(-300.9) == -300
+
+
+def test_extract_int_missing_values_fall_back_to_default() -> None:
+    assert _extract_int_from_info(None, default=-1) == -1
+    assert _extract_int_from_info(float("nan"), default=-1) == -1
+    assert _extract_int_from_info(float("inf"), default=-1) == -1
+    assert _extract_int_from_info("abc", default=-1) == -1
+    assert _extract_int_from_info(None, default=42) == 42
+
+
+def test_extract_int_tuple_returns_max_of_finite_entries() -> None:
+    # pysam returns multi-value INFO fields as a tuple.
+    assert _extract_int_from_info(("120", "310", "95")) == 310
+
+
+def test_extract_int_tuple_ignores_missing_and_non_numeric() -> None:
+    assert _extract_int_from_info((None, "nan", "150", "bad")) == 150
+    assert _extract_int_from_info((None, "nan", "bad"), default=-1) == -1

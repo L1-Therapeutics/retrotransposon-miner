@@ -14,14 +14,16 @@ width is the longest observed polyA/T support at the locus.
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import re
 import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
-from ._utils import _safe_int
+from ._utils import _safe_int, read_tsv
 
 import click
 import matplotlib
@@ -46,20 +48,35 @@ _MAX_POLYA_SINGLE_BP = 151
 _MAX_POLYA_COMBINED_BP = 280
 
 
-def _pair_float(pair: dict[str, object], key: str, default: float = 0.0) -> float:
+def _pair_float(pair: dict[str, Any], key: str, default: float = 0.0) -> float:
     """Safely read a float field from a pair dict."""
     val = pair.get(key, default)
-    if isinstance(val, (str, int, float)):
-        return float(val)
-    return default
+    try:
+        number = float(val)
+        if math.isfinite(number):
+            return number
+        return default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    """Return *column* as a numeric Series, or a constant Series when absent.
+
+    ``DataFrame.get(col, 0)`` yields a bare scalar for a missing column, so the
+    former ``pd.to_numeric(frame.get(col, 0), errors="coerce").fillna(0)`` form
+    raised ``AttributeError`` (``'float' object has no attribute 'fillna'``)
+    whenever the column was genuinely absent, not merely all-NaN.
+    """
+    if column in frame.columns:
+        return pd.to_numeric(frame[column], errors="coerce")
+    return pd.Series(default, index=frame.index, dtype="float64")
 
 
 def _pair_int(pair: dict[str, object], key: str, default: int = 0) -> int:
     """Safely read an int field from a pair dict."""
     val = pair.get(key, default)
-    if isinstance(val, (str, int, float)):
-        return _safe_int(val)
-    return default
+    return _safe_int(val, default)
 
 # Slim columns pulled from candidate_loci.mei.tsv when gold_review lacks them.
 _MEI_ENRICH_COLS = (
@@ -344,7 +361,7 @@ def _mei_coords_from_detail(
             hits = hits.loc[tfam.eq(fam)]
         starts = pd.to_numeric(hits[start_col], errors="coerce").fillna(0).astype(int)
         ends = pd.to_numeric(hits[end_col], errors="coerce").fillna(0).astype(int)
-        for start, end in zip(starts.tolist(), ends.tolist()):
+        for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
             if start > 0:
                 coords.append(start)
             if end > 0:
@@ -417,7 +434,7 @@ def _max_polya_zone_bp(
             s = pd.to_numeric(frame[start_col], errors="coerce").fillna(0).astype(int)
             e = pd.to_numeric(frame[end_col], errors="coerce").fillna(0).astype(int)
             widths.extend(
-                int(ee - ss + 1) for ss, ee in zip(s.tolist(), e.tolist()) if ss > 0 and ee >= ss
+                int(ee - ss + 1) for ss, ee in zip(s.tolist(), e.tolist(), strict=True) if ss > 0 and ee >= ss
             )
 
     if "polya_rescue" in detail.columns:
@@ -478,7 +495,7 @@ def _max_polya_zone_bp(
         )
         anchor_w = clip_lens.combine(run_lens, max)
         mate_w = anc.apply(_mate_polya_width_bp, axis=1)
-        for aw, mw in zip(anchor_w.tolist(), mate_w.tolist()):
+        for aw, mw in zip(anchor_w.tolist(), mate_w.tolist(), strict=True):
             if int(aw) >= 8 and int(mw) >= 12:
                 widths.append(int(aw) + int(mw))
     if not widths:
@@ -539,7 +556,7 @@ def _genomic_insert_size_estimates(
     sizes: list[int] = []
     dpe = detail.loc[detail["evidence_type"].astype(str) == "DPE"]
     for rec in dpe.itertuples(index=False):
-        anchor = int(rec.genomic_pos)
+        anchor = _safe_int(rec.genomic_pos)
         mate_chrom = str(getattr(rec, "mate_chrom", "") or "")
         mate_pos = int(getattr(rec, "mate_genomic_pos", 0) or 0)
         if mate_chrom != chrom or mate_pos <= 0:
@@ -633,20 +650,20 @@ def _insertion_span_from_evidence(
     return 1, 300, 300, "mei_default"
 
 
-def _read_tsv(path: Path, *, usecols: tuple[str, ...] | None = None) -> pd.DataFrame:
-    """Load a TSV, optionally restricting to existing columns in ``usecols``."""
-    if usecols is None:
-        return pd.read_csv(path, sep="\t", low_memory=False)
-    wanted = set(usecols)
-
-    def _keep(name: str) -> bool:
-        return name in wanted
-
-    return pd.read_csv(path, sep="\t", usecols=_keep, low_memory=False)
-
-
 def _load_slim_mei_table(mei_tsv: Path) -> pd.DataFrame:
-    return _read_tsv(mei_tsv, usecols=_MEI_ENRICH_COLS)
+    return read_tsv(mei_tsv, usecols=_MEI_ENRICH_COLS)
+
+
+_SPLIT_EVIDENCE_COLS = frozenset({"read_name", "clip_len", "clip_side", "pos"})
+
+
+def _load_split_evidence(path: Path) -> pd.DataFrame:
+    """Load only the split-evidence columns the read-architecture views use.
+
+    ``usecols`` is a callable so a file that omits an optional column (for
+    example ``pos``) still loads instead of raising.
+    """
+    return read_tsv(path, usecols=lambda column: column in _SPLIT_EVIDENCE_COLS)
 
 
 def _enrich_row_from_mei(
@@ -719,7 +736,7 @@ def _load_locus_row(
     gold_df: pd.DataFrame | None = None,
     mei_df: pd.DataFrame | None = None,
 ) -> pd.Series:
-    df = gold_df if gold_df is not None else _read_tsv(gold_tsv)
+    df = gold_df if gold_df is not None else read_tsv(gold_tsv)
     row = _select_locus_row(df, chrom, pos)
     if mei_df is None:
         mei_tsv = gold_tsv.parent / "candidate_loci.mei.tsv"
@@ -1568,9 +1585,9 @@ def _load_detail_table(path: Path) -> pd.DataFrame:
         except ImportError:
             tsv = path.with_suffix(".tsv")
             if tsv.exists():
-                return _read_tsv(tsv, usecols=_DETAIL_COLS)
+                return read_tsv(tsv, usecols=_DETAIL_COLS)
             raise
-    return _read_tsv(path, usecols=_DETAIL_COLS)
+    return read_tsv(path, usecols=_DETAIL_COLS)
 
 
 def _enrich_detail_with_clip_lens(
@@ -1590,17 +1607,13 @@ def _enrich_detail_with_clip_lens(
     if split_df is None and gold_tsv is not None:
         split_path = gold_tsv.parent / f"split_evidence.{sample}.tsv"
         if split_path.exists():
-            split_df = pd.read_csv(
-                split_path,
-                sep="\t",
-                usecols=lambda c: c in {"read_name", "clip_len", "clip_side", "pos"},
-            )
+            split_df = _load_split_evidence(split_path)
 
     if split_df is None or split_df.empty or "clip_len" not in split_df.columns:
         out["clip_len"] = 0
         mei_span = (
-            pd.to_numeric(out.get("mei_end", 0), errors="coerce").fillna(0).astype(int)
-            - pd.to_numeric(out.get("mei_start", 0), errors="coerce").fillna(0).astype(int)
+            _numeric_series(out, "mei_end").fillna(0).astype(int)
+            - _numeric_series(out, "mei_start").fillna(0).astype(int)
             + 1
         )
         sr_mask = out["evidence_type"].astype(str).eq("SR")
@@ -1616,8 +1629,8 @@ def _enrich_detail_with_clip_lens(
         merged["clip_len"] = pd.to_numeric(merged["clip_len_ev"], errors="coerce")
         merged = merged.drop(columns=["clip_len_ev"])
     mei_span = (
-        pd.to_numeric(merged.get("mei_end", 0), errors="coerce").fillna(0).astype(int)
-        - pd.to_numeric(merged.get("mei_start", 0), errors="coerce").fillna(0).astype(int)
+        _numeric_series(merged, "mei_end").fillna(0).astype(int)
+        - _numeric_series(merged, "mei_start").fillna(0).astype(int)
         + 1
     )
     need = merged["evidence_type"].astype(str).eq("SR") & (
@@ -1774,10 +1787,11 @@ class ReadArchitectureCache:
         we = pd.to_numeric(detail["window_end"], errors="coerce").fillna(-1).astype(int).to_numpy()
         # groupby.indices returns ndarray positions — much cheaper than materializing frames.
         keys = pd.MultiIndex.from_arrays([sample_s, chrom_s, ws, we])
-        self._window_index = {
-            (str(k[0]), str(k[1]), int(k[2]), int(k[3])): idxs
-            for k, idxs in detail.groupby(keys, sort=False).indices.items()
-        }
+        window_index: dict[tuple[str, str, int, int], Any] = {}
+        for key, idxs in detail.groupby(keys, sort=False).indices.items():
+            sample_key, chrom_key, ws_key, we_key = cast("tuple[object, object, object, object]", key)
+            window_index[(str(sample_key), str(chrom_key), _safe_int(ws_key), _safe_int(we_key))] = idxs
+        self._window_index = window_index
 
         hit_mask = _detail_support_mask(detail).to_numpy()
         gpos = pd.to_numeric(detail["genomic_pos"], errors="coerce").fillna(-1).astype(int).to_numpy()
@@ -1800,7 +1814,7 @@ class ReadArchitectureCache:
                 change[1:] = (hit_sample[1:] != hit_sample[:-1]) | (hit_chrom[1:] != hit_chrom[:-1])
                 starts = np.flatnonzero(change)
                 ends = np.append(starts[1:], len(hit_idx))
-                for start, end in zip(starts.tolist(), ends.tolist()):
+                for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
                     key = (str(hit_sample[start]), str(hit_chrom[start]))
                     hit_gpos[key] = hit_pos[start:end]
                     hit_rows[key] = hit_idx[start:end]
@@ -1848,7 +1862,7 @@ class ReadArchitectureCache:
         mei_tsv: Path | None = None,
         load_split_evidence: bool = True,
     ) -> "ReadArchitectureCache":
-        gold_df = _read_tsv(gold_tsv)
+        gold_df = read_tsv(gold_tsv)
         detail_path = supporting_reads_detail or _default_supporting_reads_detail(gold_tsv)
         if detail_path is None or not detail_path.exists():
             raise FileNotFoundError(
@@ -1863,11 +1877,7 @@ class ReadArchitectureCache:
             for sample in ("disease", "control"):
                 split_path = gold_tsv.parent / f"split_evidence.{sample}.tsv"
                 if split_path.exists():
-                    split_by_sample[sample] = pd.read_csv(
-                        split_path,
-                        sep="\t",
-                        usecols=lambda c: c in {"read_name", "clip_len", "clip_side", "pos"},
-                    )
+                    split_by_sample[sample] = _load_split_evidence(split_path)
         cache = cls(
             gold_df=gold_df,
             detail_df=detail_df,
@@ -2049,7 +2059,7 @@ def _pair_segments(
         side_order = 0 if p["side"] == "L" else 1
         type_order = 0 if p.get("evidence_type") == "SR" else 1
         anchor_val = p.get("anchor_pos", 0)
-        anchor_order = _safe_int(anchor_val) if isinstance(anchor_val, (str, int, float)) else 0
+        anchor_order = _safe_int(anchor_val)
         read_name = str(p.get("read_name", ""))
         return (side_order, type_order, anchor_order, read_name)
 
@@ -2545,7 +2555,7 @@ def plot_locus_architecture(
             "Re-run annotate-mei-support after candidate generation."
         )
 
-    bp_l, bp_r, bp = _breakpoint_interval(row)
+    _, _, bp = _breakpoint_interval(row)
     discovery_start = _row_int(row, "discovery_window_start")
     discovery_end = _row_int(row, "discovery_window_end")
     if discovery_start <= 0 or discovery_end <= 0:
@@ -2811,11 +2821,7 @@ def generate_gold_read_architecture_plots(
             for samp in ("disease", "control"):
                 split_path = gold_tsv.parent / f"split_evidence.{samp}.tsv"
                 if split_path.exists():
-                    split_by_sample[samp] = pd.read_csv(
-                        split_path,
-                        sep="\t",
-                        usecols=lambda c: c in {"read_name", "clip_len", "clip_side", "pos"},
-                    )
+                    split_by_sample[samp] = _load_split_evidence(split_path)
 
         cache = ReadArchitectureCache.from_frames(
             gold_df=gold_review,

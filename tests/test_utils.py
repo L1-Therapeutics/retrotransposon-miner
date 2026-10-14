@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import gzip
+from pathlib import Path
 
+import numpy as np
 import pytest
 
-from retro_miner._utils import _iter_fasta_records, _open_textmaybe_gz, _safe_int, safe_locus_id
+from retro_miner._utils import _iter_fasta_records, _open_textmaybe_gz, _safe_int, read_tsv, safe_locus_id
 
 
 class TestSafeInt:
@@ -49,6 +51,75 @@ class TestSafeInt:
     def test_huge_int_is_returned_exactly(self):
         # int(float(...)) would raise OverflowError here
         assert _safe_int(10**400) == 10**400
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (np.int64(7), 7),
+            (np.int32(-3), -3),
+            (np.uint16(5), 5),
+            (np.int64(10**18), 10**18),
+            (np.bool_(True), 1),
+            (np.bool_(False), 0),
+            (np.float32(7.9), 7),
+            (np.float64(-2.5), -2),
+        ],
+    )
+    def test_numpy_scalars_convert(self, value, expected):
+        # DataFrame rows and Series values yield NumPy scalars, which do not
+        # subclass the builtin numeric types (np.int64 is not int, np.float32
+        # is not float, np.bool_ is neither). They must convert, not collapse
+        # to the default -- doing so silently zeroed out integer table columns.
+        assert _safe_int(value) == expected
+
+    def test_numpy_non_finite_returns_default(self):
+        assert _safe_int(np.float32("nan")) == 0
+        assert _safe_int(np.float32("inf"), -1) == -1
+        assert _safe_int(np.float64("-inf"), -1) == -1
+
+
+class TestReadTsv:
+    def test_reads_tab_separated_by_default(self, tmp_path: Path):
+        p = tmp_path / "x.tsv"
+        p.write_text("a\tb\n1\t2\n", encoding="utf-8")
+        df = read_tsv(p)
+        assert list(df.columns) == ["a", "b"]
+        assert int(df["a"].iloc[0]) == 1
+
+    def test_running_header_and_usecols_defaults(self, tmp_path: Path):
+        # Mirrors the .fai parse in mei_support._resolve_full_consensus_fasta.
+        p = tmp_path / "x.fai"
+        p.write_text("chr1\t100\t1\t60\t61\n", encoding="utf-8")
+        df = read_tsv(
+            p,
+            header=None,
+            names=["name", "length", "offset", "line_bases", "line_width"],
+            usecols=[0, 1],
+        )
+        assert list(df.columns) == ["name", "length"]
+        assert df["name"].iloc[0] == "chr1"
+
+    def test_caller_overrides_do_not_duplicate_keywords(self, tmp_path: Path):
+        # Regression: read_tsv used to always emit sep="\t" and low_memory=False,
+        # so a caller forwarding the same keyword crashed with TypeError
+        # ("multiple values for keyword argument"), e.g. the redundant
+        # sep="\t" / low_memory=False arguments at two mei_support call sites.
+        p = tmp_path / "x.tsv"
+        p.write_text("a\tb\n1\t2\n", encoding="utf-8")
+        assert read_tsv(p, sep="\t").shape == (1, 2)
+        assert read_tsv(p, low_memory=False).shape == (1, 2)
+        df = read_tsv(p, sep=",", low_memory=False)
+        assert df.shape == (1, 1)  # single comma-joined column under the wrong separator
+
+    def test_callable_usecols_skips_absent_columns(self, tmp_path: Path):
+        # A callable selects only the columns present, unlike a sequence which
+        # raises when a listed column is missing. split-evidence tables omit
+        # optional columns, so read_architecture relies on this behavior.
+        p = tmp_path / "split.tsv"
+        p.write_text("read_name\tclip_len\nr1\t42\n", encoding="utf-8")
+        df = read_tsv(p, usecols=lambda c: c in {"read_name", "clip_len", "clip_side"})
+        assert list(df.columns) == ["read_name", "clip_len"]
+        assert int(df["clip_len"].iloc[0]) == 42
 
 
 class TestSafeLocusId:
