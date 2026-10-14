@@ -67,7 +67,6 @@ warn_unused_ignores = true
 # up incrementally and move them out of this list. Do not add new entries.
 module = [
   "retro_miner.mei_support",
-  "retro_miner.local_assembly",
 ]
 ignore_errors = true
 

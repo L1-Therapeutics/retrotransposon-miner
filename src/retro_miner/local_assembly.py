@@ -12,6 +12,7 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import cast
 
 import click
 import pandas as pd
@@ -157,7 +158,8 @@ def _write_interval_fastq(
             if rid in seen_ids:
                 return False
             seq = str(read.query_sequence)
-            qual = read.qual if read.qual is not None else ("I" * len(seq))
+            raw_qual = read.query_qualities_str
+            qual = raw_qual if raw_qual is not None else ("I" * len(seq))
             oh.write(f"@{rid}\n{seq}\n+\n{qual}\n")
             seen_ids.add(rid)
             qname = str(read.query_name or "")
@@ -253,14 +255,14 @@ def _extract_microhomology_sequence(
     seq = str(seq_by_name.get(qname, "") or "")
     if not qname or not seq:
         return ""
-    m_qstart = int(mei_hit.get("qstart", 0))
-    m_qend = int(mei_hit.get("qend", 0))
+    m_qstart = _safe_int(mei_hit.get("qstart", 0))
+    m_qend = _safe_int(mei_hit.get("qend", 0))
     if m_qstart < 0 or m_qend <= m_qstart:
         return ""
 
     candidates: list[str] = []
     if left_hit is not None and str(left_hit.get("qname", "")) == qname:
-        left_qend = int(left_hit.get("qend", 0))
+        left_qend = _safe_int(left_hit.get("qend", 0))
         ov = left_qend - m_qstart
         if ov > 0:
             start = max(0, m_qstart)
@@ -268,7 +270,7 @@ def _extract_microhomology_sequence(
             if end > start:
                 candidates.append(str(seq[start:end]).upper())
     if right_hit is not None and str(right_hit.get("qname", "")) == qname:
-        right_qstart = int(right_hit.get("qstart", 0))
+        right_qstart = _safe_int(right_hit.get("qstart", 0))
         ov = m_qend - right_qstart
         if ov > 0:
             start = max(0, right_qstart)
@@ -500,7 +502,11 @@ def _load_fasta_lengths(fasta_path: Path) -> dict[str, int]:
 
 
 def _sort_hit_key(hit: dict[str, object]) -> tuple[int, int, int]:
-    return (int(hit.get("alnlen", 0)), int(hit.get("mapq", 0)), int(hit.get("nmatch", 0)))
+    return (
+        _safe_int(hit.get("alnlen", 0)),
+        _safe_int(hit.get("mapq", 0)),
+        _safe_int(hit.get("nmatch", 0)),
+    )
 
 
 def _infer_breakpoint_from_alignments(
@@ -512,28 +518,35 @@ def _infer_breakpoint_from_alignments(
     if not mei_hit:
         return int(default_pos), "", "", 0
     contig = str(mei_hit.get("qname", ""))
-    m_qstart = int(mei_hit.get("qstart", 0))
-    m_qend = int(mei_hit.get("qend", 0))
+    m_qstart = _safe_int(mei_hit.get("qstart", 0))
+    m_qend = _safe_int(mei_hit.get("qend", 0))
     rh = [h for h in ref_hits if str(h.get("qname", "")) == contig]
     if not rh:
         return int(default_pos), "", "", 0
 
-    left = [h for h in rh if int(h.get("qend", 0)) <= m_qstart + 20]
-    right = [h for h in rh if int(h.get("qstart", 0)) >= m_qend - 20]
-    left_hit = max(left, key=lambda h: int(h.get("qend", 0)), default=None)
-    right_hit = min(right, key=lambda h: int(h.get("qstart", 0)), default=None)
+    left = [h for h in rh if _safe_int(h.get("qend", 0)) <= m_qstart + 20]
+    right = [h for h in rh if _safe_int(h.get("qstart", 0)) >= m_qend - 20]
+    left_hit = max(left, key=lambda h: _safe_int(h.get("qend", 0)), default=None)
+    right_hit = min(right, key=lambda h: _safe_int(h.get("qstart", 0)), default=None)
 
     chrom = ""
     left_bp = 0
     right_bp = 0
     if left_hit is not None:
         chrom = str(left_hit.get("tname", ""))
-        left_bp = int(left_hit.get("tend", 0))  # 1-based endpoint
+        left_bp = _safe_int(left_hit.get("tend", 0))  # 1-based endpoint
     if right_hit is not None:
         chrom = chrom or str(right_hit.get("tname", ""))
-        right_bp = int(right_hit.get("tstart", 0)) + 1  # 1-based start
+        right_bp = _safe_int(right_hit.get("tstart", 0)) + 1  # 1-based start
 
-    if left_bp > 0 and right_bp > 0 and chrom and str(left_hit.get("tname", "")) == str(right_hit.get("tname", "")):
+    if (
+        left_hit is not None
+        and right_hit is not None
+        and left_bp > 0
+        and right_bp > 0
+        and chrom
+        and str(left_hit.get("tname", "")) == str(right_hit.get("tname", ""))
+    ):
         bp = int((left_bp + right_bp) // 2)
         tsd_len = int(right_bp - left_bp + 1) if right_bp >= left_bp else 0
         return bp, chrom, chrom, tsd_len
@@ -550,15 +563,15 @@ def _flank_ref_hits_for_mei(
     if not mei_hit:
         return None, None
     contig = str(mei_hit.get("qname", ""))
-    m_qstart = int(mei_hit.get("qstart", 0))
-    m_qend = int(mei_hit.get("qend", 0))
+    m_qstart = _safe_int(mei_hit.get("qstart", 0))
+    m_qend = _safe_int(mei_hit.get("qend", 0))
     rh = [h for h in ref_hits if str(h.get("qname", "")) == contig]
     if not rh:
         return None, None
-    left = [h for h in rh if int(h.get("qend", 0)) <= m_qstart + 20]
-    right = [h for h in rh if int(h.get("qstart", 0)) >= m_qend - 20]
-    left_hit = max(left, key=lambda h: int(h.get("qend", 0)), default=None)
-    right_hit = min(right, key=lambda h: int(h.get("qstart", 0)), default=None)
+    left = [h for h in rh if _safe_int(h.get("qend", 0)) <= m_qstart + 20]
+    right = [h for h in rh if _safe_int(h.get("qstart", 0)) >= m_qend - 20]
+    left_hit = max(left, key=lambda h: _safe_int(h.get("qend", 0)), default=None)
+    right_hit = min(right, key=lambda h: _safe_int(h.get("qstart", 0)), default=None)
     return left_hit, right_hit
 
 
@@ -582,9 +595,9 @@ def _infer_non_mei_partner(
     side_status: str,
 ) -> tuple[str, int, str]:
     if side_status == "left_only" and left_hit is not None:
-        return str(left_hit.get("tname", "")), int(left_hit.get("tend", 0)), "single_flank_ref_only"
+        return str(left_hit.get("tname", "")), _safe_int(left_hit.get("tend", 0)), "single_flank_ref_only"
     if side_status == "right_only" and right_hit is not None:
-        return str(right_hit.get("tname", "")), int(right_hit.get("tstart", 0)) + 1, "single_flank_ref_only"
+        return str(right_hit.get("tname", "")), _safe_int(right_hit.get("tstart", 0)) + 1, "single_flank_ref_only"
     if side_status != "both" or left_hit is None or right_hit is None:
         return "", -1, ""
 
@@ -592,8 +605,8 @@ def _infer_non_mei_partner(
     rchrom = str(right_hit.get("tname", ""))
     lstrand = str(left_hit.get("strand", ""))
     rstrand = str(right_hit.get("strand", ""))
-    lpos = int(left_hit.get("tend", 0))
-    rpos = int(right_hit.get("tstart", 0)) + 1
+    lpos = _safe_int(left_hit.get("tend", 0))
+    rpos = _safe_int(right_hit.get("tstart", 0)) + 1
     if lchrom and rchrom and lchrom != rchrom:
         return rchrom, rpos, "interchrom_breakend"
     if lstrand in {"+", "-"} and rstrand in {"+", "-"} and lstrand != rstrand:
@@ -620,8 +633,8 @@ def _summarize_complex_topology(
 
     scored: list[tuple[int, int, str]] = []
     for contig in set(list(seq_by_name.keys()) + list(mei_by_contig.keys()) + list(ref_by_contig.keys())):
-        mei_best = max((int(h.get("alnlen", 0)) for h in mei_by_contig.get(contig, [])), default=0)
-        ref_best = max((int(h.get("alnlen", 0)) for h in ref_by_contig.get(contig, [])), default=0)
+        mei_best = max((_safe_int(h.get("alnlen", 0)) for h in mei_by_contig.get(contig, [])), default=0)
+        ref_best = max((_safe_int(h.get("alnlen", 0)) for h in ref_by_contig.get(contig, [])), default=0)
         contig_len = len(seq_by_name.get(contig, ""))
         score = mei_best + ref_best
         scored.append((score, contig_len, contig))
@@ -640,16 +653,24 @@ def _summarize_complex_topology(
     for contig in keep:
         c_mei = sorted(
             mei_by_contig.get(contig, []),
-            key=lambda h: (int(h.get("alnlen", 0)), int(h.get("mapq", 0)), int(h.get("nmatch", 0))),
+            key=lambda h: (
+                _safe_int(h.get("alnlen", 0)),
+                _safe_int(h.get("mapq", 0)),
+                _safe_int(h.get("nmatch", 0)),
+            ),
             reverse=True,
         )
         c_ref = sorted(
             ref_by_contig.get(contig, []),
-            key=lambda h: (int(h.get("alnlen", 0)), int(h.get("mapq", 0)), int(h.get("nmatch", 0))),
+            key=lambda h: (
+                _safe_int(h.get("alnlen", 0)),
+                _safe_int(h.get("mapq", 0)),
+                _safe_int(h.get("nmatch", 0)),
+            ),
             reverse=True,
         )
         has_mei = len(c_mei) > 0
-        strong_ref = [h for h in c_ref if int(h.get("alnlen", 0)) >= 80 and int(h.get("mapq", 0)) >= 20]
+        strong_ref = [h for h in c_ref if _safe_int(h.get("alnlen", 0)) >= 80 and _safe_int(h.get("mapq", 0)) >= 20]
         ref_chroms = {str(h.get("tname", "")) for h in strong_ref if str(h.get("tname", ""))}
         ref_strands = {str(h.get("strand", "")) for h in strong_ref if str(h.get("strand", "")) in {"+", "-"}}
         ref_blocks = len(strong_ref)
@@ -676,7 +697,7 @@ def _summarize_complex_topology(
             this_class = "simple_mei"
         elif ref_blocks >= 3 or len(ref_chroms) > 1 or len(ref_strands) > 1:
             this_class = "multi_junction"
-        contig_mei_aln = int(c_mei[0].get("alnlen", 0)) if has_mei else 0
+        contig_mei_aln = _safe_int(c_mei[0].get("alnlen", 0)) if has_mei else 0
         sort_key = (
             class_rank.get(this_class, 0),
             side_rank.get(side_status, 0),
@@ -708,7 +729,7 @@ def _sample_complexity_key(feat: dict[str, object]) -> tuple[int, int, int, int]
         class_rank.get(str(feat.get("complex_class", "unknown")), 0),
         side_rank.get(str(feat.get("breakpoint_side_status", "none")), 0),
         1 if str(feat.get("non_mei_partner_type", "")) else 0,
-        int(feat.get("mei_aln_len", 0)),
+        _safe_int(feat.get("mei_aln_len", 0)),
     )
 
 
@@ -716,14 +737,14 @@ def _choose_consensus_features(
     d_feat: dict[str, object], n_feat: dict[str, object]
 ) -> tuple[dict[str, object], str, dict[str, object], str]:
     def _coord_ok(feat: dict[str, object]) -> bool:
-        s = int(feat.get("insertion_mei_start", -1))
-        e = int(feat.get("insertion_mei_end", -1))
+        s = _safe_int(feat.get("insertion_mei_start", -1))
+        e = _safe_int(feat.get("insertion_mei_end", -1))
         return s > 0 and e > 0 and s >= e
 
     def _pick_score(feat: dict[str, object]) -> tuple[int, int, int, int]:
-        left_aln = int(feat.get("left_support_mei_aln_len", 0))
-        right_aln = int(feat.get("right_support_mei_aln_len", 0))
-        mei_len = int(feat.get("mei_aln_len", 0))
+        left_aln = _safe_int(feat.get("left_support_mei_aln_len", 0))
+        right_aln = _safe_int(feat.get("right_support_mei_aln_len", 0))
+        mei_len = _safe_int(feat.get("mei_aln_len", 0))
         side_anchors = int(left_aln >= _MIN_SIDE_ANCHOR_ALN_LEN) + int(right_aln >= _MIN_SIDE_ANCHOR_ALN_LEN)
         coord_model = str(feat.get("coord_model", ""))
         is_informative_model = 0 if coord_model in {"", "no_contigs", "no_mei_hits"} else 1
@@ -884,14 +905,14 @@ def _extract_sample_assembly_features(
             "coord_logic_version": int(_ASSEMBLY_FEATURE_SCHEMA_VERSION),
         }
 
-    best = max(mei_hits, key=lambda h: (int(h["alnlen"]), int(h["mapq"]), int(h["nmatch"])))
-    best_lo = int(best["tstart"]) + 1
-    best_hi = int(best["tend"])
+    best = max(mei_hits, key=lambda h: (_safe_int(h["alnlen"]), _safe_int(h["mapq"]), _safe_int(h["nmatch"])))
+    best_lo = _safe_int(best["tstart"]) + 1
+    best_hi = _safe_int(best["tend"])
     mei_strand = str(best["strand"]) if str(best["strand"]) in {"+", "-"} else ""
     left_cands: list[dict[str, object]] = []
     right_cands: list[dict[str, object]] = []
     for hit in mei_hits:
-        if int(hit.get("alnlen", 0)) < int(_MIN_SIDE_ANCHOR_ALN_LEN):
+        if _safe_int(hit.get("alnlen", 0)) < int(_MIN_SIDE_ANCHOR_ALN_LEN):
             continue
         side_status = _breakpoint_side_status(hit, ref_hits)
         if side_status in {"left_only", "both"}:
@@ -901,10 +922,10 @@ def _extract_sample_assembly_features(
     left_hit = max(left_cands, key=_sort_hit_key, default=None)
     right_hit = max(right_cands, key=_sort_hit_key, default=None)
 
-    left_lo = int(left_hit.get("tstart", -1)) + 1 if left_hit is not None else -1
-    left_hi = int(left_hit.get("tend", -1)) if left_hit is not None else -1
-    right_lo = int(right_hit.get("tstart", -1)) + 1 if right_hit is not None else -1
-    right_hi = int(right_hit.get("tend", -1)) if right_hit is not None else -1
+    left_lo = _safe_int(left_hit.get("tstart", -1)) + 1 if left_hit is not None else -1
+    left_hi = _safe_int(left_hit.get("tend", -1)) if left_hit is not None else -1
+    right_lo = _safe_int(right_hit.get("tstart", -1)) + 1 if right_hit is not None else -1
+    right_hi = _safe_int(right_hit.get("tend", -1)) if right_hit is not None else -1
 
     poly_max = max((_poly_at_max_run(seq) for _n, seq in records), default=0)
     mei_lengths = _load_fasta_lengths(mei_fasta)
@@ -1027,8 +1048,8 @@ def _extract_sample_assembly_features(
             lchrom = str(left_hit.get("tname", ""))
             rchrom = str(right_hit.get("tname", ""))
             if lchrom and rchrom and lchrom == rchrom:
-                left_bp = int(left_hit.get("tend", 0))  # 1-based endpoint
-                right_bp = int(right_hit.get("tstart", 0)) + 1  # 1-based start
+                left_bp = _safe_int(left_hit.get("tend", 0))  # 1-based endpoint
+                right_bp = _safe_int(right_hit.get("tstart", 0)) + 1  # 1-based start
                 alt_tsd_len = int(right_bp - left_bp + 1) if right_bp >= left_bp else 0
                 if alt_tsd_len >= 4:
                     bp = int((left_bp + right_bp) // 2)
@@ -1069,8 +1090,8 @@ def _extract_sample_assembly_features(
             lchrom = str(left_hit.get("tname", ""))
             rchrom = str(right_hit.get("tname", ""))
             if lchrom and rchrom and lchrom == rchrom:
-                left_bp = int(left_hit.get("tend", 0))  # 1-based endpoint
-                right_bp = int(right_hit.get("tstart", 0)) + 1  # 1-based start
+                left_bp = _safe_int(left_hit.get("tend", 0))  # 1-based endpoint
+                right_bp = _safe_int(right_hit.get("tstart", 0)) + 1  # 1-based start
                 if right_bp <= left_bp:
                     mh_len = int(left_bp - right_bp + 1)
                     if 1 <= mh_len <= 25:
@@ -1088,8 +1109,8 @@ def _extract_sample_assembly_features(
         qname = str(best.get("qname", ""))
         seq = str(seq_by_name.get(qname, "") or "")
         if seq:
-            m_qstart = int(best.get("qstart", 0))
-            m_qend = int(best.get("qend", 0))
+            m_qstart = _safe_int(best.get("qstart", 0))
+            m_qend = _safe_int(best.get("qend", 0))
             s0 = max(0, m_qstart - 8)
             e0 = min(len(seq), m_qstart + 17)
             seq_left = str(seq[s0:e0]).upper() if e0 > s0 else ""
@@ -1114,10 +1135,10 @@ def _extract_sample_assembly_features(
         "breakpoint_chrom": str(bp_left_chrom),
         "tsd_len": int(max(0, tsd_len)),
         "tsd_seq": str(tsd_seq),
-        "mei_aln_len": int(best["alnlen"]),
+        "mei_aln_len": _safe_int(best["alnlen"]),
         "complex_class": str(cx.get("complex_class", "simple_mei")),
         "non_mei_partner_chrom": str(cx.get("non_mei_partner_chrom", "")),
-        "non_mei_partner_pos": int(cx.get("non_mei_partner_pos", -1)),
+        "non_mei_partner_pos": _safe_int(cx.get("non_mei_partner_pos", -1)),
         "non_mei_partner_type": str(cx.get("non_mei_partner_type", "")),
         "breakpoint_side_status": str(cx.get("breakpoint_side_status", _breakpoint_side_status(best, ref_hits))),
         "top_contigs": str(cx.get("top_contigs", "")),
@@ -1128,8 +1149,8 @@ def _extract_sample_assembly_features(
         "left_support_mei_end": int(left_lo if left_hit is not None else -1),
         "right_support_mei_start": int(right_hi if right_hit is not None else -1),
         "right_support_mei_end": int(right_lo if right_hit is not None else -1),
-        "left_support_mei_aln_len": int(left_hit.get("alnlen", 0) if left_hit is not None else 0),
-        "right_support_mei_aln_len": int(right_hit.get("alnlen", 0) if right_hit is not None else 0),
+        "left_support_mei_aln_len": _safe_int(left_hit.get("alnlen", 0) if left_hit is not None else 0),
+        "right_support_mei_aln_len": _safe_int(right_hit.get("alnlen", 0) if right_hit is not None else 0),
         "microhomology_sequence": str(microhomology_sequence),
         "junction_overlap_sequence": str(junction_overlap_sequence),
         "coord_model": str(coord_model),
@@ -1147,12 +1168,18 @@ def _parse_existing_manifest(manifest_path: Path) -> dict[str, object] | None:
         return None
 
 
+def _manifest_interval(manifest: dict[str, object]) -> dict[str, object]:
+    """Return the manifest's ``interval`` mapping, or ``{}`` when absent or malformed."""
+    interval = manifest.get("interval")
+    return interval if isinstance(interval, dict) else {}
+
+
 def _has_assembled_cache(locus_dir: Path, manifest: dict[str, object] | None, *, interval_pad_bp: int) -> bool:
     if manifest is None:
         return False
     if not str(manifest.get("status", "")).startswith("assembled"):
         return False
-    cached_pad = int(manifest.get("interval", {}).get("pad_bp", interval_pad_bp))
+    cached_pad = _safe_int(_manifest_interval(manifest).get("pad_bp", interval_pad_bp), interval_pad_bp)
     d_out = locus_dir / f"disease.spades.pad{int(cached_pad)}"
     n_out = locus_dir / f"control.spades.pad{int(cached_pad)}"
     return bool((d_out / "contigs.fasta").exists() or (n_out / "contigs.fasta").exists())
@@ -1255,18 +1282,20 @@ def _process_single_locus(
     escalated_max_reads = 1000
     cache_hit = False
 
-    if reuse_existing and _has_assembled_cache(locus_dir, manifest, interval_pad_bp=interval_pad_bp):
-        cached_pad = int(manifest.get("interval", {}).get("pad_bp", interval_pad_bp))
+    if reuse_existing and manifest is not None and _has_assembled_cache(
+        locus_dir, manifest, interval_pad_bp=interval_pad_bp
+    ):
+        cached_pad = _safe_int(_manifest_interval(manifest).get("pad_bp", interval_pad_bp), interval_pad_bp)
         chosen_pad = cached_pad
         chrom, current_start, current_end = _interval_from_row(as_row, cached_pad)
         status = str(manifest.get("status", "assembled"))
         retry_used = bool(manifest.get("retry_used", False))
-        d_reads = int(manifest.get("disease_reads_extracted", 0))
-        n_reads = int(manifest.get("control_reads_extracted", 0))
-        d_cc = int(manifest.get("disease_contigs", 0))
-        n_cc = int(manifest.get("control_contigs", 0))
-        d_max = int(manifest.get("disease_max_contig_len", 0))
-        n_max = int(manifest.get("control_max_contig_len", 0))
+        d_reads = _safe_int(manifest.get("disease_reads_extracted", 0))
+        n_reads = _safe_int(manifest.get("control_reads_extracted", 0))
+        d_cc = _safe_int(manifest.get("disease_contigs", 0))
+        n_cc = _safe_int(manifest.get("control_contigs", 0))
+        d_max = _safe_int(manifest.get("disease_max_contig_len", 0))
+        n_max = _safe_int(manifest.get("control_max_contig_len", 0))
         d_names_cached = manifest.get("disease_recruited_evidence_read_names", [])
         n_names_cached = manifest.get("control_recruited_evidence_read_names", [])
         if isinstance(d_names_cached, list):
@@ -1500,7 +1529,9 @@ def _process_single_locus(
                     pick_hi, pick_source_hi, complex_pick_hi, complex_source_hi = _choose_consensus_features(d_feat_hi, n_feat_hi)
                     improved = (
                         str(pick_source_hi or "") != str(pick_source or "")
-                        or int(pick_hi.get("mei_aln_len", 0) if pick_hi else 0) > int(pick.get("mei_aln_len", 0) if pick else 0)
+                        or _safe_int(pick_hi.get("mei_aln_len", 0) if pick_hi else 0) > _safe_int(
+                            pick.get("mei_aln_len", 0) if pick else 0
+                        )
                         or _sample_complexity_key(complex_pick_hi) > _sample_complexity_key(complex_pick)
                     )
                     if improved:
@@ -1572,9 +1603,9 @@ def _process_single_locus(
         "asm_disease_primary_contig_id": str(d_feat.get("primary_contig_id", "")),
         "asm_control_primary_contig_id": str(n_feat.get("primary_contig_id", "")),
         "asm_consensus_primary_contig_id": str(pick.get("primary_contig_id", "") if pick else ""),
-        "asm_disease_breakpoint_pos": int(d_feat.get("breakpoint_pos", fallback_bp)),
-        "asm_control_breakpoint_pos": int(n_feat.get("breakpoint_pos", fallback_bp)),
-        "asm_consensus_breakpoint_pos": int(pick.get("breakpoint_pos", fallback_bp) if pick else fallback_bp),
+        "asm_disease_breakpoint_pos": _safe_int(d_feat.get("breakpoint_pos", fallback_bp)),
+        "asm_control_breakpoint_pos": _safe_int(n_feat.get("breakpoint_pos", fallback_bp)),
+        "asm_consensus_breakpoint_pos": _safe_int(pick.get("breakpoint_pos", fallback_bp) if pick else fallback_bp),
         "asm_breakpoint_source": pick_source,
         "asm_tsd_seq": str(pick.get("tsd_seq", "") if pick else ""),
         "asm_tsd_len": _safe_int(pick.get("tsd_len", 0) if pick else 0, 0),
@@ -1777,7 +1808,7 @@ def annotate_silver_with_local_assembly(
         f"minimap2_threads={max(1, int(minimap2_threads))} "
         f"locus_workers={workers}"
     )
-    row_records = silver.to_dict(orient="records")
+    row_records = cast("list[dict[str, object]]", silver.to_dict(orient="records"))
     if workers == 1:
         for idx, row_data in enumerate(row_records, start=1):
             result, log_line = _process_single_locus(

@@ -56,7 +56,7 @@ python -m mypy
 The policy is:
 
 - **Every module under `src/retro_miner` is type-checked by default.** New modules must be clean; do not add entries to the grandfather list.
-- Two legacy pipeline modules (`mei_support`, `local_assembly`) are temporarily exempt via `ignore_errors` while their dynamic-pandas usage is cleaned up incrementally. `read_architecture` and `candidate_loci` graduated out of that list and are now checked.
+- One legacy pipeline module (`mei_support`) is temporarily exempt via `ignore_errors` while its dynamic-pandas usage is cleaned up incrementally. `read_architecture`, `candidate_loci`, and `local_assembly` graduated out of that list and are now checked.
 - The literature-anchored marker modules (`mei_markers`, `transduction_tags`) are held to a strict flag set (`disallow_untyped_defs`, `disallow_incomplete_defs`, `warn_return_any`). The flags are spelled out individually rather than via `strict = true`, which leaks across modules on some mypy builds.
 - Type stubs (`pandas-stubs`, `boto3-stubs`) are listed in `environment.yml`; install them in your env or mypy will report missing-import noise.
 - When a legacy module is fully clean, remove it from the `ignore_errors` override in the same PR. When a new module earns strict status, add it to the strict override.
