@@ -609,7 +609,8 @@ def _get_overlapping_row_ids(a_bed: Path, b_bed: Path, min_fraction: float | Non
     ]
     if min_fraction is not None:
         cmd.extend(["-f", str(min_fraction)])
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    from ._utils import run_subprocess
+    proc = run_subprocess(cmd, label="bedtools intersect")
     row_ids: set[int] = set()
     for line in proc.stdout.splitlines():
         parts = line.split("\t")

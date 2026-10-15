@@ -26,7 +26,6 @@ from ._utils import _longest_poly_at_span, _open_textmaybe_gz, _poly_at_stats
 from retro_miner.igv_plots import generate_gold_review_igv_plots
 from retro_miner.read_architecture import (
     _clustered_coord_extent,
-    _robust_coord_extent,
     generate_gold_read_architecture_plots,
 )
 from retro_miner.local_assembly import annotate_silver_with_local_assembly
@@ -777,13 +776,10 @@ def _resolve_full_consensus_fasta(
     ]
     for cand in packaged:
         if cand.exists() and cand.stat().st_size > 0:
-            fai = cand.with_suffix(cand.suffix + ".fai")
-            if not fai.exists():
-                try:
-                    subprocess.run(["samtools", "faidx", str(cand)], check=False, capture_output=True, text=True)
-                except OSError:
-                    pass
-            return cand
+            fai = cand.with_suffix(cand.suffix + ".fai")    if not fai.exists():
+        from ._utils import run_subprocess_ignore_error
+        run_subprocess_ignore_error(["samtools", "faidx", str(cand)], label="samtools faidx")
+        return cand
 
     if not mei_fasta.exists():
         return None
@@ -854,10 +850,8 @@ def _resolve_full_consensus_fasta(
                 out.write(seq[i : i + 60] + "\n")
     if not full_fa.exists() or full_fa.stat().st_size == 0:
         return None
-    try:
-        subprocess.run(["samtools", "faidx", str(full_fa)], check=False, capture_output=True, text=True)
-    except OSError:
-        pass
+    from ._utils import run_subprocess_ignore_error
+    run_subprocess_ignore_error(["samtools", "faidx", str(full_fa)], label="samtools faidx")
     return full_fa
 
 
@@ -1284,10 +1278,11 @@ def _align_queries_to_mei_bwa(
     bwa_threads: int = 1,
 ) -> pd.DataFrame:
     """Remap query FASTA to MEI consensus with ``bwa mem -k10 -T10``."""
+    from ._utils import run_subprocess
     remap_fa = _ensure_polya_trimmed_mei_fasta(mei_fasta)
     _ensure_bwa_index(remap_fa)
     cmd = ["bwa", *_bwa_mem_mei_args(bwa_threads=bwa_threads), str(remap_fa), str(query_fa)]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    proc = run_subprocess(cmd, label=f"bwa mem (threads={bwa_threads})", timeout=7200.0)
     return _best_hits_from_sam(proc.stdout or "")
 
 
@@ -3901,8 +3896,8 @@ def _best_ungapped_identity(query: str, subject: str) -> float:
         for i in range(lim):
             window = s[i : i + n]
             mism = 0
-            for a, b in zip(probe, window, strict=True):
-                if a != b:
+            for j in range(n):
+                if probe[j] != window[j]:
                     mism += 1
             ident = 1.0 - (mism / n)
             if ident > best:
@@ -3971,14 +3966,12 @@ def _gapped_local_match(
             if target_step > 0 and probe_step > 0:
                 if target_step != probe_step:
                     return False
-                mismatches += sum(
-                    a != b
-                    for a, b in zip(
-                        s[target_start:target_end],
-                        probe[probe_start:probe_end],
-                        strict=True,
-                    )
-                )
+                mism = 0
+                n = target_end - target_start
+                for i in range(n):
+                    if s[target_start + i] != probe[probe_start + i]:
+                        mism += 1
+                mismatches += mism
             else:
                 gap = max(target_step, probe_step)
                 gap_bases += gap
@@ -8198,9 +8191,15 @@ def _collect_window_breakpoint_evidence(
         we = pd.to_numeric(sdf["window_end"], errors="coerce").fillna(0).astype(int)
         pos = pd.to_numeric(sdf["pos"], errors="coerce").fillna(0).astype(int)
         names = sdf["read_name"].fillna("").astype(str)
-        for chrom_i, ws_i, we_i, pos_i, name_i, is_mei, is_polya in zip(
-            chrom, ws, we, pos, names, mei, polya, strict=False
-        ):
+        n = len(chrom)
+        for i in range(n):
+            chrom_i = str(chrom.iloc[i])
+            ws_i = int(ws.iloc[i])
+            we_i = int(we.iloc[i])
+            pos_i = int(pos.iloc[i])
+            name_i = str(names.iloc[i])
+            is_mei = bool(mei.iloc[i])
+            is_polya = bool(polya.iloc[i])
             if int(pos_i) <= 0 or not str(name_i):
                 continue
             if bool(is_mei):
@@ -8234,7 +8233,14 @@ def _collect_window_breakpoint_evidence(
             soft = pd.to_numeric(work["soft_clip_pos"], errors="coerce").fillna(0).astype(int)
             pos = pos.where(soft.le(0), soft)
         names = work["read_name"].fillna("").astype(str)
-        for chrom_i, ws_i, we_i, pos_i, name_i in zip(chrom, ws, we, pos, names, strict=False):
+        # Reset index so positional indexing works after .loc filtering
+        n = len(chrom)
+        for i in range(n):
+            chrom_i = str(chrom.iloc[i])
+            ws_i = int(ws.iloc[i])
+            we_i = int(we.iloc[i])
+            pos_i = int(pos.iloc[i])
+            name_i = str(names.iloc[i])
             if int(pos_i) <= 0 or not str(name_i):
                 continue
             rows.append(
@@ -12022,7 +12028,8 @@ def _sample_random_windows_with_bedtools(
             _write_intervals_dict_to_bed(allowed, incl_path)
             cmd.extend(["-incl", str(incl_path)])
 
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        from ._utils import run_subprocess
+        proc = run_subprocess(cmd, label="bedtools shuffle")
         shuffled_path.write_text(proc.stdout, encoding="utf-8")
         rows: list[dict[str, int | str]] = []
         for line in proc.stdout.splitlines():
@@ -15165,23 +15172,8 @@ def _run_bedtools_checked(
     label: str,
 ) -> subprocess.CompletedProcess[str]:
     """Run bedtools and raise with stderr/stdout if it fails."""
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if int(proc.returncode) == 0:
-        return proc
-    err = (proc.stderr or "").strip()
-    out = (proc.stdout or "").strip()
-    click.echo(
-        f"[mei-annotate] {label} failed exit={proc.returncode} cmd={' '.join(cmd)}"
-    )
-    if err:
-        click.echo(f"[mei-annotate] {label} stderr:\n{err}")
-    if out:
-        click.echo(f"[mei-annotate] {label} stdout (truncated):\n{out[:2000]}")
-    raise RuntimeError(
-        f"{label} failed (exit={proc.returncode}): {' '.join(cmd)}"
-        + (f"\nstderr:\n{err}" if err else "")
-        + (f"\nstdout (truncated):\n{out[:2000]}" if out else "")
-    )
+    from ._utils import run_subprocess
+    return run_subprocess(cmd, label=label)
 
 
 def _normalize_bed_chrom_style(input_bed: Path, output_bed: Path, target_has_chr_prefix: bool) -> None:

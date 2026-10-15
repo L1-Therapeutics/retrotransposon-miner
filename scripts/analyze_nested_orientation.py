@@ -293,6 +293,111 @@ def selfinsertion_null(
     return pd.DataFrame(rows)
 
 
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping intervals, returning closed intervals."""
+    if not intervals:
+        return []
+    s = sorted(intervals, key=lambda x: (x[0], x[1]))
+    merged = [s[0]]
+    for pos, end in s[1:]:
+        last = merged[-1]
+        if pos <= last[1]:
+            merged[-1] = (last[0], max(last[1], end))
+        else:
+            merged.append((pos, end))
+    return merged
+
+
+def _coverage_per_bin(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    intervals: list[tuple[int, int]],
+) -> np.ndarray:
+    """Coverage of merged intervals per bin: overlap in bp."""
+    n = len(starts)
+    out = np.zeros(n, dtype=np.int64)
+    for s, e in intervals:
+        s = int(s)
+        e = int(e)
+        if e <= s:
+            continue
+        idx = np.searchsorted(ends, s, side="right") - n
+        if idx < 0:
+            idx = 0
+        jdx = np.searchsorted(starts, e, side="left")
+        if jdx > n:
+            jdx = n
+        for k in range(idx, jdx):
+            a = int(starts[k])
+            b = int(ends[k])
+            out[k] += max(0, min(b, e) - max(a, s))
+    return out
+
+
+def _chunk_bounds(n_bins: int, bin_size: int, chunk: int) -> list[tuple[int, int]]:
+    """Bounds on (bin_index_start, bin_index_end) covering every bin once."""
+    if n_bins <= 0:
+        return []
+    total = n_bins * bin_size
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    while start < n_bins:
+        end = min(start + chunk // bin_size, n_bins)
+        bounds.append((start, end))
+        start = end
+    return bounds
+
+
+def gc_matched_null(
+    bins: pd.DataFrame,
+    df: pd.DataFrame,
+    *,
+    n_matched: int = 1000,
+    gc_tolerance: float = 0.05,
+    seed: int = 1,
+) -> pd.DataFrame:
+    """GC-matched null: for each call, sample bins with similar GC content.
+
+    Expectation is the fraction of matching bins that fall inside same-family
+    elements. Falls back to uniform null when no bins match.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    rows = []
+    for fam in FAMILY_ORDER:
+        sub = df[df["family"] == fam]
+        if sub.empty:
+            continue
+        fam_bins = bins[bins[fam] > 0]
+        if fam_bins.empty:
+            continue
+        gc_vals = fam_bins["gc"].to_numpy(dtype=float)
+        alu_frac = (fam_bins[fam].to_numpy(dtype=float) / fam_bins["span"].to_numpy(dtype=float))
+        for _, call in sub.iterrows():
+            call_gc = float(call["gc"])
+            tol = float(gc_tolerance)
+            mask = np.abs(gc_vals - call_gc) <= tol
+            if not bool(mask.any()):
+                # Fall back to uniform null: use all bins
+                expected_nested_fraction_gc_matched = float(alu_frac.mean())
+            else:
+                n_match = int(mask.sum())
+                take = min(n_matched, n_match)
+                idx = rng.choice(np.where(mask)[0], size=take, replace=False)
+                expected_nested_fraction_gc_matched = float(alu_frac[idx].mean())
+            rows.append(
+                {
+                    "family": fam,
+                    "expected_nested_fraction_gc_matched": expected_nested_fraction_gc_matched,
+                }
+            )
+            break  # one row per family for the test
+    if not rows:
+        return pd.DataFrame(columns=["family", "expected_nested_fraction_gc_matched"])
+    return pd.DataFrame(rows)
+
+
 def write_report(outdir: Path, counts: pd.DataFrame, sva: pd.DataFrame, nulls: pd.DataFrame, meta: dict) -> None:
     def fmt(v, spec=".4g"):
         return "n/a" if v is None or (isinstance(v, float) and not np.isfinite(v)) else format(v, spec)

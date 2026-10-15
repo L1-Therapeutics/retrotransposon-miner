@@ -67,11 +67,10 @@ def ensure_bwa_index(fasta: Path, *, force: bool = False) -> dict[str, Any]:
         raise RuntimeError("bwa not found on PATH; cannot index MEI remap FASTA")
     if force:
         drop_bwa_index(fasta)
-    subprocess.run(
+    from ._utils import run_subprocess
+    run_subprocess(
         ["bwa", "index", str(fasta)],
-        check=True,
-        capture_output=True,
-        text=True,
+        label=f"bwa index {fasta.name}",
     )
     return {"status": "indexed", "path": str(fasta)}
 

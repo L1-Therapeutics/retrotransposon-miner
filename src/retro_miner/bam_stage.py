@@ -241,10 +241,8 @@ def plan_bam_stage(
 
 
 def _run_cmd(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{err}")
+    from ._utils import run_subprocess
+    run_subprocess(cmd, label=' '.join(cmd[:3]) if len(cmd) >= 3 else cmd[0])
 
 
 def _default_head_size(uri: str) -> int | None:
