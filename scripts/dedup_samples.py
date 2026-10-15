@@ -1126,17 +1126,38 @@ def run(args: argparse.Namespace) -> None:
         for family in FAMILIES:
             family_sites = [site for site in sweep_sites if site.representative.family == family]
             hist = Counter(len(site.samples) for site in family_sites)
+            family_hist_total = sum(hist.values())
             family_sensitivity.append({
                 "window_bp": window, "family": family, "unique_sites": len(family_sites),
                 "shared_sites": sum(count >= 2 for count in (len(site.samples) for site in family_sites)),
                 "private_sites": hist[1], "carrier_histogram": "/".join(str(hist[n]) for n in range(1, 6)),
+                "carrier_histogram_struct": {
+                    "bins": [{"bin": n, "count": hist[n], "fraction": hist[n] / family_hist_total if family_hist_total else 0.0} for n in range(1, 6)],
+                    "total": family_hist_total,
+                    "n_bins": 5,
+                },
             })
     carrier_hist = Counter(len(site.samples) for site in sites)
     family_carrier_hist = {family: Counter(len(site.samples) for site in sites if site.representative.family == family) for family in FAMILIES}
+    carrier_hist_dict = {str(n): carrier_hist[n] for n in range(1, 6)}
+    carrier_hist_total = sum(carrier_hist.values())
+    family_carrier_hist_dict = {family: {str(n): family_carrier_hist[family][n] for n in range(1, 6)} for family in FAMILIES}
     audit = {"sensitivity": sensitivity, "family_sensitivity": family_sensitivity,
              "within_sample_duplicates_collapsed": n_collapsed,
-             "carrier_histogram": {str(n): carrier_hist[n] for n in range(1, 6)},
-             "family_carrier_histogram": {family: {str(n): family_carrier_hist[family][n] for n in range(1, 6)} for family in FAMILIES}}
+             "carrier_histogram": carrier_hist_dict,
+             "carrier_histogram_struct": {
+                 'bins': [{'bin': n, 'count': carrier_hist[n], 'fraction': carrier_hist[n] / carrier_hist_total if carrier_hist_total else 0.0} for n in range(1, 6)],
+                 'total': carrier_hist_total,
+                 'n_bins': 5,
+             },
+             "family_carrier_histogram": family_carrier_hist_dict,
+             "family_carrier_histogram_struct": {
+                 family: {
+                     'bins': [{'bin': n, 'count': family_carrier_hist[family][n], 'fraction': family_carrier_hist[family][n] / sum(family_carrier_hist[family].values()) if sum(family_carrier_hist[family].values()) else 0.0} for n in range(1, 6)],
+                     'total': sum(family_carrier_hist[family].values()),
+                     'n_bins': 5,
+                 } for family in FAMILIES
+             }}
 
     lengths = {chrom: qc_length for chrom, qc_length in args.chrom_sizes.items() if chrom in PRIMARY_CHROMS}
     merged_cov = {}

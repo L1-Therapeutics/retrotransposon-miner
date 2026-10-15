@@ -1016,6 +1016,20 @@ def stratified_tests(
 # --------------------------------------------------------------------------
 
 
+def _build_histogram_struct(counter: collections.Counter, sort_by_key: bool = True) -> dict[str, Any]:
+    """Build a structured histogram representation with metadata."""
+    if sort_by_key:
+        items = sorted(counter.items())
+    else:
+        items = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+    total = sum(counter.values())
+    return {
+        "bins": [{"bin": k, "count": v, "fraction": v / total if total else 0.0} for k, v in items],
+        "total": total,
+        "n_bins": len(counter),
+    }
+
+
 def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """How well the caller's reported TSD survives contact with the reference.
 
@@ -1056,6 +1070,14 @@ def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
     if deep:
         offset_report[f"{TSD_OFFSET_DETAIL_MAX + 1}_or_more_bases_from_3prime_end"] = deep
+    # Build structured histograms
+    mm_hist_struct = _build_histogram_struct(mm_hist)
+    # Compute fractions for offset_report based on total_offsets
+    offset_hist_struct = {
+        "bins": [{"bin": k, "count": v, "fraction": v / total_offsets if total_offsets else 0.0} for k, v in offset_report.items()],
+        "total": total_offsets,
+        "n_bins": len(offset_report),
+    }
     return {
         "n_evaluable": n_eval,
         "n_exact_match": n_exact,
@@ -1064,7 +1086,9 @@ def tsd_verification(scored: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "share_at_mismatch_allowance": near_allowance / n_eval if n_eval else None,
         "n_more_than_allowance": sum(v for k, v in mm_hist.items() if k > TSD_MAX_MISMATCH),
         "mismatch_count_histogram": dict(sorted(mm_hist.items())),
+        "mismatch_count_histogram_struct": mm_hist_struct,
         "mismatch_offset_from_3prime_end_histogram": offset_report,
+        "mismatch_offset_from_3prime_end_histogram_struct": offset_hist_struct,
         "deepest_mismatch_offset_from_3prime_end": max(all_offsets) if all_offsets else None,
         # A share of 0 here would read as "none of the mismatches are terminal",
         # which is not what zero mismatches means. The siblings above already

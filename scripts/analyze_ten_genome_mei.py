@@ -16,7 +16,9 @@ import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -280,14 +282,30 @@ def l1_event_projection(engine, calls, fasta, sequences, metadata):
     return {(r['sample'], r['source_index']): r for r in rows}, rows
 
 
+def _build_histogram_struct(counts: Counter, bins: Iterable[int] | None = None) -> dict[str, Any]:
+    """Build a structured histogram representation with metadata."""
+    if bins is None:
+        items = sorted(counts.items())
+    else:
+        items = [(b, counts.get(b, 0)) for b in bins]
+    total = sum(v for _, v in items)
+    return {
+        "bins": [{"bin": k, "count": v, "fraction": v / total if total else 0.0} for k, v in items],
+        "total": total,
+        "n_bins": len(items),
+    }
+
+
 def layer_counts(sites):
     layers = {'private': [s for s in sites if len(s.samples) == 1], 'union': sites}
     rows = []
     for family in FAMILIES:
         sub = [s for s in sites if s.representative.family == family]
         counts = Counter(len(s.samples) for s in sub)
+        carrier_hist = {str(i): counts[i] for i in range(1, 11)}
         row = {'family': family, 'private': counts[1], 'union': len(sub), 'shared': sum(v for k, v in counts.items() if k >= 2),
-               'carrier_histogram': {str(i): counts[i] for i in range(1, 11)}}
+               'carrier_histogram': carrier_hist,
+               'carrier_histogram_struct': _build_histogram_struct(counts, bins=range(1, 11))}
         for label, members in layers.items():
             row[f'{label}_states'] = dict(Counter(s.representative.nested_state for s in members if s.representative.family == family))
         rows.append(row)
