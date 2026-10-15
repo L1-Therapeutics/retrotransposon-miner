@@ -130,6 +130,23 @@ def test_twobit_round_trip_and_bounds(tmp_path: Path):
     assert ref.fetch("nope", 1, 10) == ""
 
 
+def test_twobit_reads_a_multi_sequence_index(tmp_path: Path):
+    # Regression: the index must be read whole before any record is sought.  A
+    # one-sequence file parses either way, so only a multi-sequence file catches a
+    # parser that seeks to a record in the middle of the index loop.
+    first = _random_seq(100)
+    second = _random_seq(250)
+    third = _random_seq(64)
+    path = tmp_path / "multi.2bit"
+    _write_2bit(path, {"chr1": first, "chr2": second, "chrM": third})
+    ref = TwoBitReference(path)
+    assert ref.chroms() == ("chr1", "chr2", "chrM")
+    assert ref.fetch("chr1", 1, 100) == first
+    assert ref.fetch("chr2", 1, 250) == second
+    assert ref.fetch("chrM", 1, 64) == third
+    assert ref.fetch("chr2", 200, 250) == second[199:250]
+
+
 def test_twobit_accepts_bare_and_chr_prefixed_names(tmp_path: Path):
     seq = _random_seq(60)
     path = tmp_path / "tiny.2bit"
@@ -153,6 +170,32 @@ def test_twobit_n_blocks_override_packed_bases(tmp_path: Path):
     assert ref.fetch("chr1", 10, 40) == with_n[9:40]
     # A window straddling the block keeps its non-N bases.
     assert ref.fetch("chr1", 30, 34) == with_n[29:34]
+
+
+def test_twobit_two_n_blocks_are_starts_then_sizes_not_interleaved(tmp_path: Path):
+    # Regression, caught on the real hg38 file: the table is two arrays (all
+    # nBlockStarts, then all nBlockSizes), so a reader that zips them into
+    # (start, size) pairs feeds starts in as sizes and gives each block an end
+    # borrowed from the next block's start -- megabytes of real sequence reported
+    # as N.  One block parses either way, so the fixture needs two whose starts,
+    # sizes and next-starts all differ.
+    seq = _random_seq(400)
+    blocks = [(40, 10), (300, 25)]
+    bases = list(seq)
+    for start, size in blocks:
+        for i in range(start, start + size):
+            bases[i] = "N"
+    with_n = "".join(bases)
+    path = tmp_path / "two_blocks.2bit"
+    _write_2bit(path, {"chr1": with_n}, n_blocks={"chr1": blocks})
+    ref = TwoBitReference(path)
+    assert ref.fetch("chr1", 1, 400) == with_n
+    # First block ends at 50, not at the second block's start.
+    assert ref.fetch("chr1", 45, 60) == with_n[44:60]
+    assert ref.fetch("chr1", 305, 330) == with_n[304:330]
+    # The sequence between the two blocks is still reference sequence.
+    assert ref.fetch("chr1", 60, 290) == seq[59:290]
+    assert "N" not in ref.fetch("chr1", 60, 290)
 
 
 def test_twobit_rejects_a_file_that_is_not_2bit(tmp_path: Path):
@@ -408,13 +451,15 @@ def test_repeat_like_segment_is_rejected():
 def test_segment_below_the_length_floor_is_unevaluable():
     genome, source, _piece = _l1_fixture(random.Random(9))
     index = build_source_index([source])
-    short = _random_seq(DEFAULT_MIN_SEGMENT_BP - 5)
+    # Ends on G so no base of the segment itself is swallowed by the tail run.
+    short = _random_seq(DEFAULT_MIN_SEGMENT_BP - 6) + "G"
+    assert len(short) == DEFAULT_MIN_SEGMENT_BP - 5
     call = detect_junction_transduction("c", "LINE1", short, index)
     assert call.outcome == UNEVALUABLE and call.reason == "segment_below_floor"
     with_tail = detect_junction_transduction("c", "LINE1", short + "A" * 20, index)
     assert with_tail.outcome == UNEVALUABLE
     assert with_tail.reason == "segment_below_floor_after_tail_strip"
-    assert with_tail.segment_bp == len(short)
+    assert with_tail.segment_bp == len(short) and with_tail.tail_run_bp == 20
 
 
 def test_missing_inputs_are_unevaluable_never_negative():

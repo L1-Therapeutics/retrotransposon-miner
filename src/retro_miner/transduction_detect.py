@@ -38,7 +38,10 @@ Gates, each one a place this measurement could lie
   ``not_transduction``, which would claim absence from silence.
 * **Poly(A/T) extension.**  A pure A/T run at the junction is the signature of a
   transcript that terminated at its own signal, so it is positive evidence of a
-  *non*-transduced junction and reports as ``not_transduction``.
+  *non*-transduced junction and reports as ``not_transduction``.  Where the
+  segment's own terminal bases are A/T the boundary between segment and tail is
+  not knowable from sequence alone, so the whole terminal run is treated as tail
+  and every reported transduced length is a lower bound.
 * **Low complexity.**  Repeat-derived sequence matches many donors equally and
   is screened out before donor search, because a false donor is worse than none.
 * **Both orientations.**  A stored junction sequence may be the reverse
@@ -69,7 +72,7 @@ import gzip
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import IO, Iterable, Iterator, Mapping, Sequence, cast
 
 from retro_miner.transduction_tags import (
     DEFAULT_KMER,
@@ -171,21 +174,47 @@ class TwoBitReference:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._index: dict[str, tuple[int, int]] | None = None
+        self._handle: IO[bytes] | None = None
+        self._records: dict[str, tuple[int, int, tuple[tuple[int, int], ...]]] = {}
+
+    def _open(self) -> IO[bytes]:
+        """One handle, kept open: base-by-base fetching is the normal access pattern."""
+        if self._handle is None or self._handle.closed:
+            self._handle = self.path.open("rb")
+        return self._handle
+
+    def close(self) -> None:
+        if self._handle is not None and not self._handle.closed:
+            self._handle.close()
+        self._handle = None
+
+    def __enter__(self) -> "TwoBitReference":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
     def _load_index(self) -> dict[str, tuple[int, int]]:
         if self._index is not None:
             return self._index
         index: dict[str, tuple[int, int]] = {}
-        with self.path.open("rb") as handle:
+        with self.path.open("rb") as handle:   # index is read once; records reuse _open()
             signature, version, count, _reserved = struct.unpack("<IIII", handle.read(16))
             if signature != self._SIGNATURE:
                 raise ValueError(f"{self.path}: not a 2bit file (signature {signature:#x})")
             if version != 0:
                 raise ValueError(f"{self.path}: unsupported 2bit version {version}")
+            # Read the whole index before seeking: each entry's record offset is
+            # followed by the *next* entry's name, so seeking to a record mid-loop
+            # would land the next read inside that record (it did -- the real hg38
+            # file caught this, and a one-sequence test file cannot).
+            entries: list[tuple[str, int]] = []
             for _ in range(count):
                 name_len = handle.read(1)[0]
                 name = handle.read(name_len).decode("ascii")
                 offset = struct.unpack("<I", handle.read(4))[0]
+                entries.append((name, offset))
+            for name, offset in entries:
                 handle.seek(offset)
                 dna_size = struct.unpack("<I", handle.read(4))[0]
                 index[name] = (offset, int(dna_size))
@@ -195,40 +224,57 @@ class TwoBitReference:
     def chroms(self) -> tuple[str, ...]:
         return tuple(self._load_index())
 
-    def _resolve(self, chrom: str) -> tuple[int, int] | None:
+    def _resolve_name(self, chrom: str) -> str | None:
         index = self._load_index()
         for candidate in (chrom, f"chr{chrom}", chrom[3:] if chrom.startswith("chr") else chrom):
             if candidate in index:
-                return index[candidate]
+                return candidate
         return None
+
+    def _layout(self, name: str) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+        """Return ``(packed_offset, dna_size, n_blocks)`` for a chromosome, cached."""
+        cached = self._records.get(name)
+        if cached is not None:
+            return cached
+        offset, dna_size = self._load_index()[name]
+        handle = self._open()
+        handle.seek(offset)
+        handle.read(4)  # dna size, already known from the index
+        n_block_count = struct.unpack("<I", handle.read(4))[0]
+        raw = struct.unpack(f"<{2 * n_block_count}I", handle.read(8 * n_block_count)) \
+            if n_block_count else ()
+        # The table is two arrays -- all `nBlockStarts`, then all `nBlockSizes` --
+        # not interleaved (start, size) pairs.  Pairing the halves against each
+        # other feeds starts in as sizes, which turns each block's *end* into the
+        # next block's *size*: the real hg38 file then reports megabase-scale N
+        # runs that swallow real sequence (chr22:45.59 Mb went all-N, which is
+        # where the fixture reads align).  A one-block test file parses either
+        # way, so only a multi-block table catches it.
+        n_blocks = tuple(zip(raw[:n_block_count], raw[n_block_count:]))
+        mask_count = struct.unpack("<I", handle.read(4))[0]
+        handle.read(8 * mask_count)  # mask starts + sizes, parsed past
+        handle.read(4)  # reserved
+        layout = (handle.tell(), int(dna_size), n_blocks)
+        self._records[name] = layout
+        return layout
 
     def fetch(self, chrom: str, start: int, end: int) -> str:
         """Return reference bases for 1-based inclusive ``[start, end]``."""
-        resolved = self._resolve(chrom)
-        if resolved is None or start > end:
+        name = self._resolve_name(chrom)
+        if name is None or start > end:
             return ""
-        offset, dna_size = resolved
+        packed_offset, dna_size, n_blocks = self._layout(name)
         start = max(1, int(start))
         end = min(int(end), dna_size)
         if end < start:
             return ""
         n_start = start - 1  # 0-based inclusive
         n_end = end          # 0-based exclusive
-        with self.path.open("rb") as handle:
-            handle.seek(offset)
-            handle.read(4)  # dna size, already known
-            n_block_count = struct.unpack("<I", handle.read(4))[0]
-            n_starts = struct.unpack(f"<{2 * n_block_count}I", handle.read(8 * n_block_count))
-            n_block_starts, n_block_sizes = n_starts[0::2], n_starts[1::2]
-            mask_count = struct.unpack("<I", handle.read(4))[0]
-            handle.read(8 * mask_count)  # mask starts + sizes, parsed past
-            handle.read(4)  # reserved
-            packed_offset = handle.tell()
-
-            first_byte = n_start // 4
-            last_byte = (n_end - 1) // 4
-            handle.seek(packed_offset + first_byte)
-            packed = handle.read(last_byte - first_byte + 1)
+        handle = self._open()
+        first_byte = n_start // 4
+        last_byte = (n_end - 1) // 4
+        handle.seek(packed_offset + first_byte)
+        packed = handle.read(last_byte - first_byte + 1)
 
         codes = ("T", "C", "A", "G")
         bases: list[str] = []
@@ -239,7 +285,7 @@ class TwoBitReference:
         lead = n_start - 4 * first_byte
         seq = bases[lead : lead + (n_end - n_start)]
 
-        for block_start, block_size in zip(n_block_starts, n_block_sizes):
+        for block_start, block_size in n_blocks:
             block_end = block_start + block_size
             lo = max(block_start, n_start)
             hi = min(block_end, n_end)
@@ -251,7 +297,7 @@ class TwoBitReference:
         return self.fetch(chrom, start, end)
 
 
-def fasta_fetcher(path: str | Path) -> object:
+def fasta_fetcher(path: str | Path) -> SequenceFetcher:
     """pyfaidx-backed ``SequenceFetcher``; the adapter ``transduction_tags`` documents."""
     import pyfaidx  # lazy: the module stays importable without it
 
@@ -281,7 +327,7 @@ RMSK_COLUMNS = (
 def rmsk_rows(path: str | Path) -> Iterator[dict[str, str]]:
     """Yield RepeatMasker rows as dicts, handling the optional leading ``bin``."""
     opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(str(path), "rt", encoding="utf-8") as handle:  # type: ignore[operator]
+    with opener(str(path), "rt", encoding="utf-8") as handle:
         for line in handle:
             fields = line.rstrip("\n").split("\t")
             # A real table has no header; skip one if it is there.  The names are
@@ -741,7 +787,7 @@ def annotate_transduction(
 # --- CLI ---------------------------------------------------------------------
 
 
-def _open_reference(path: str) -> object:
+def _open_reference(path: str) -> SequenceFetcher:
     if str(path).endswith(".2bit"):
         return TwoBitReference(path)
     return fasta_fetcher(path)
@@ -775,8 +821,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_elements=args.max_elements,
     )
     calls = pd.read_csv(args.calls, sep="\t", low_memory=False)
-    results = annotate_transduction(calls.to_dict("records"), index,
-                                    min_segment_bp=args.min_segment_bp)
+    results = annotate_transduction(
+        cast("Iterable[Mapping[str, object]]", calls.to_dict("records")),
+        index,
+        min_segment_bp=args.min_segment_bp,
+    )
     frame = pd.DataFrame([r.to_dict() for r in results])
     frame.to_csv(args.out, sep="\t", index=False)
 
