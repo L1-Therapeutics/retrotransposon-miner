@@ -23,7 +23,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from ._utils import _safe_int, read_tsv
+from ._utils import (
+    _column_or_default,
+    _numeric_series,
+    _safe_float,
+    _safe_int,
+    read_tsv,
+)
 
 import click
 import matplotlib
@@ -65,8 +71,7 @@ def _numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> p
 
     ``DataFrame.get(col, 0)`` yields a bare scalar for a missing column, so the
     former ``pd.to_numeric(frame.get(col, 0), errors="coerce").fillna(0)`` form
-    raised ``AttributeError`` (``'float' object has no attribute 'fillna'``)
-    whenever the column was genuinely absent, not merely all-NaN.
+    raised ``AttributeError`` whenever the column was genuinely absent.
     """
     if column in frame.columns:
         return pd.to_numeric(frame[column], errors="coerce")

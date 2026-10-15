@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retrotransposon-miner"
+version = "0.1.0"
+description = "High-sensitivity retrotransposon insertion calling scaffold"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "retrotransposon-miner contributors" }
+]
+dependencies = [
+  "click>=8.1",
+  "pysam>=0.22",
+  "pandas>=2.2",
+  "pyarrow>=16",        # implicit pandas Parquet engine
+  "numpy>=1.26",
+  "matplotlib>=3.9",   # read_architecture.py plots
+  "biopython>=1.84",
+  "pyfaidx>=0.8",
+  "intervaltree>=3.1",
+  "pyyaml>=6.0",        # scripts/download_public_data.py
+  "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "pandas-stubs",
+  "boto3-stubs",
+]
+
+[project.scripts]
+rtm = "retro_miner.cli:cli"
+
+[tool.ruff]
+target-version = "py311"
+line-length    = 120
+exclude        = ["scripts"]   # standalone scripts, not part of the installable package
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "BLE"]
+ignore = [
+  "E501",   # long lines are common in generated/table-heavy modules
+  "E731",   # lambda aliases (s = lambda ...) are intentional shorthand in large pipeline functions
+]
+
+[tool.mypy]
+# Type-checking policy (see README "Development -> Type checking"):
+# everything under src/retro_miner is checked by default; only the two
+# grandfathered legacy modules below are exempt. New modules must be clean.
+# Matches the runtime floor actually used (environment.yml pins python=3.12);
+# numpy's bundled stubs require 3.12 syntax.
+python_version = "3.12"
+files = ["src/retro_miner"]
+mypy_path = ["src"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Literature-anchored marker modules: held to a strict flag set.
+# NOTE: the shorthand `strict = true` here leaks those checks to other
+# modules under some mypy builds (observed on 2.3.1), so the strict flags
+# are spelled out individually instead.
+module = [
+  "retro_miner.mei_markers",
+  "retro_miner.transduction_tags",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = ["intervaltree.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths  = ["tests"]
+addopts    = ["-q", "--tb=short"]
+# Prepend this checkout's src/ so tests import the code in this working tree.
+# Without it, an editable install of a *sibling* git worktree wins on sys.path
+# and the suite silently exercises another branch's code.
+pythonpath = ["src"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+retro_miner = ["data/*.json"]

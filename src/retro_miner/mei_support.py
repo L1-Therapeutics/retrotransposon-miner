@@ -77,6 +77,20 @@ def _hit_field(hit: dict[str, object] | None, key: str, default: object) -> obje
         return default
     return hit.get(key, default)
 
+def _nunique_df(
+    frame: pd.DataFrame,
+    by: list[str] | str,
+    value_col: str,
+    as_index: bool = False,
+) -> pd.DataFrame:
+    """`groupby(..., as_index=as_index)[value_col].nunique()` returns a DataFrame.
+
+    The pandas-stubs type this as Series in some overloads; casting keeps
+    downstream calls (e.g. ``.rename(columns=...)``) type-correct.
+    """
+    res = frame.groupby(by, as_index=as_index)[value_col].nunique()
+    return cast("pd.DataFrame", res)
+
 
 @dataclass(frozen=True)
 class FragmentToFullMap:
@@ -6203,10 +6217,10 @@ def _add_candidate_support_info_fields(
         mei_split_ct = _numeric_series(merged, "mei_split_reads", 0.0).fillna(0).astype(int)
         mei_disc_ct = _numeric_series(merged, "mei_disc_reads", 0.0).fillna(0).astype(int)
         weak_mei_only_discordant = (mei_split_ct <= 0) & (poly_split_ct <= 0) & (mei_disc_ct <= 2)
-        sr_l_raw = pd.to_numeric(merged.get(f"{prefix}_sr_l_raw", 0), errors="coerce").fillna(0).astype(int)
-        sr_r_raw = pd.to_numeric(merged.get(f"{prefix}_sr_r_raw", 0), errors="coerce").fillna(0).astype(int)
-        dpe_l_raw = pd.to_numeric(merged.get(f"{prefix}_dpe_l_raw", 0), errors="coerce").fillna(0).astype(int)
-        dpe_r_raw = pd.to_numeric(merged.get(f"{prefix}_dpe_r_raw", 0), errors="coerce").fillna(0).astype(int)
+        sr_l_raw = _numeric_series(merged, f"{prefix}_sr_l_raw", 0).fillna(0).astype(int)
+        sr_r_raw = _numeric_series(merged, f"{prefix}_sr_r_raw", 0).fillna(0).astype(int)
+        dpe_l_raw = _numeric_series(merged, f"{prefix}_dpe_l_raw", 0).fillna(0).astype(int)
+        dpe_r_raw = _numeric_series(merged, f"{prefix}_dpe_r_raw", 0).fillna(0).astype(int)
         sr_total_raw = sr_l_raw + sr_r_raw
         dpe_total_raw = dpe_l_raw + dpe_r_raw
         weak_window_only_dpe = (sr_total_raw <= 0) & (dpe_total_raw <= 2) & (poly_split_ct <= 0)
@@ -6216,11 +6230,11 @@ def _add_candidate_support_info_fields(
             | weak_window_only_dpe
         )
 
-        dpe_l_strict = pd.to_numeric(merged.get(f"{prefix}_dpe_l_strict", 0), errors="coerce").fillna(0).astype(int)
-        dpe_r_strict = pd.to_numeric(merged.get(f"{prefix}_dpe_r_strict", 0), errors="coerce").fillna(0).astype(int)
-        mei_mapped_total = pd.to_numeric(merged.get(f"{prefix}_mei_mapped", 0), errors="coerce").fillna(0).astype(int)
-        polya_mapped_total = pd.to_numeric(merged.get(f"{prefix}_polya_mapped", 0), errors="coerce").fillna(0).astype(int)
-        vntr_mapped_total = pd.to_numeric(merged.get(f"{prefix}_vntr_mapped", 0), errors="coerce").fillna(0).astype(int)
+        mei_disc_ct = _numeric_series(merged, f"{prefix}_disc_mei_raw", 0).fillna(0).astype(int)
+        poly_disc_ct = _numeric_series(merged, f"{prefix}_disc_poly_raw", 0).fillna(0).astype(int)
+        mei_split_ct = _numeric_series(merged, f"{prefix}_sr_mei_raw", 0).fillna(0).astype(int)
+        poly_split_ct = _numeric_series(merged, f"{prefix}_sr_poly_raw", 0).fillna(0).astype(int)
+        vntr_split_ct = _numeric_series(merged, f"{prefix}_sr_vntr_raw", 0).fillna(0).astype(int)
 
         # SR is always informative-only; strict_mode still gates DPE raw vs strict.
         sr_l = sr_l_raw.where(has_locus_mei_support, 0)

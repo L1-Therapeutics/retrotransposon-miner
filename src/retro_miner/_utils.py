@@ -46,46 +46,32 @@ def read_tsv(
     return pd.read_csv(path, **kwargs)
 
 
-def _safe_int(value: object, default: int = 0) -> int:
-    """Safely convert *value* to int, returning *default* on failure.
+def _numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    """Return *column* as a numeric Series, or a constant Series when absent.
 
-    - int values are returned directly (no float round-trip, so huge ints
-      like ``10**400`` are preserved exactly).
-    - float values are converted if finite, otherwise *default*.
-    - strings are stripped and parsed via ``float()`` first.
-    - NumPy/pandas numeric scalars (``np.int64``, ``np.float32``,
-      ``np.bool_``, ...) are converted even though they do not subclass the
-      builtin ``int``/``float``; table rows and Series values produce these.
-    - everything else returns *default*.
+    ``DataFrame.get(col, 0)`` yields a bare scalar for a missing column, so
+    code such as ``pd.to_numeric(frame.get(col, 0), errors="coerce").fillna(0)``
+    raised ``AttributeError`` (``'float' object has no attribute 'fillna'``)
+    whenever the column was genuinely absent, not merely all-NaN.
     """
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return default if not math.isfinite(value) else int(value)
-    if isinstance(value, str):
-        try:
-            number = float(value.strip())
-        except ValueError:
-            return default
-        return default if not math.isfinite(number) else int(number)
-    # NumPy/pandas scalars do not always subclass the builtin numeric types:
-    # np.int64 is a numbers.Integral but not an int, np.float32 is a
-    # numbers.Real but not a float, and np.bool_ is neither (it still defines
-    # __int__). Without these checks integer table columns were read as 0.
-    if isinstance(value, numbers.Integral):
-        return int(value)
-    if isinstance(value, numbers.Real):
-        number = float(value)
-        return default if not math.isfinite(number) else int(number)
-    to_int = getattr(value, "__int__", None)
-    if to_int is None:
-        return default
-    try:
-        return int(to_int())
-    except (TypeError, ValueError, OverflowError):
-        return default
+    if column in frame.columns:
+        return pd.to_numeric(frame[column], errors="coerce")
+    return pd.Series(default, index=frame.index, dtype="float64")
+
+
+def _column_or_default(frame: pd.DataFrame, column: str, default: object) -> pd.Series:
+    """Return *column* as a Series, or a constant Series when absent.
+
+    This helper is useful for non-numeric columns where ``pd.to_numeric`` is
+    not appropriate (e.g. strings). The returned Series preserves the frame's
+    index so downstream methods like ``.fillna`` behave correctly.
+    """
+    if column in frame.columns:
+        return frame[column]
+    # Ensure a sensible dtype for string defaults to avoid object churn.
+    if isinstance(default, str) and default == "":
+        return pd.Series(default, index=frame.index, dtype="string")
+    return pd.Series(default, index=frame.index)
 
 
 def _safe_float(value: object, default: float = float("nan")) -> float:
