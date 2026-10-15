@@ -190,7 +190,7 @@ def test_rmsk_rows_handles_both_column_arities(tmp_path: Path):
     with gzip.open(without_bin, "wt") as handle:
         handle.write("\t".join(_HEADER[1:]) + "\n" + "\t".join(_L1MC5A.split("\t")[1:]) + "\n")
     rows = list(rmsk_rows(without_bin))
-    assert len(rows) == 1 and rows[0]["repFamily"] == "L1" and rows[0]["bin"] not in rows[0]
+    assert len(rows) == 1 and rows[0]["repFamily"] == "L1" and "bin" not in rows[0]
 
 
 def test_family_of_repclass_maps_only_the_two_transducible_families():
@@ -299,6 +299,17 @@ def test_strip_poly_at_ends_cases():
 # --- donor search ----------------------------------------------------------------
 
 
+def _clean_piece(flank: str, length: int = 200) -> str:
+    """A flank window starting and ending on G/C, so no incidental A/T run blurs
+    where the tail begins -- otherwise a trailing run of the piece merges with the
+    poly(A) tail being tested and the assertion measures the fixture, not the code."""
+    for start in range(0, len(flank) - length):
+        window = flank[start : start + length]
+        if window[0] in "CG" and window[-1] in "CG":
+            return window
+    raise AssertionError("fixture flank has no clean window")
+
+
 def _l1_fixture(rng: random.Random) -> tuple[object, object, str]:
     """Return (genome, source element, a unique 200 bp piece of its 3' flank)."""
     body = _random_seq(1000, rng)
@@ -306,7 +317,7 @@ def _l1_fixture(rng: random.Random) -> tuple[object, object, str]:
     genome = _DictGenome({"chrL": _random_seq(200, rng) + body + downstream})
     source = extract_source_flank("L1SRC", "LINE1", "chrL", "+", 200, 1200, genome)
     assert source is not None
-    return genome, source, source.flank_seq[100:300]
+    return genome, source, _clean_piece(source.flank_seq)
 
 
 def test_find_donors_names_the_source_and_locates_the_match():
@@ -317,8 +328,11 @@ def test_find_donors_names_the_source_and_locates_the_match():
     best = ranked[0]
     assert best.source_id == "L1SRC" and best.orientation == "sense"
     assert best.matched_bp == len(piece)
-    assert best.donor_start0 == source.flank_start0 + 100
-    assert best.donor_end0 == source.flank_start0 + 300
+    # The matched region is located inside the donor's flank, not merely named.
+    offset = source.flank_seq.find(piece)
+    assert offset >= 0
+    assert best.donor_start0 == source.flank_start0 + offset
+    assert best.donor_end0 == source.flank_start0 + offset + len(piece)
 
 
 def test_find_donors_reports_the_reverse_orientation():
@@ -343,6 +357,7 @@ def test_partnered_transduction_with_tail_is_named():
     assert call.tail_run_bp == 25 and call.tail_side == "3p"
     assert call.transduced_bp == len(piece)
     assert call.unexplained_excess_bp == 400 - len(piece)
+    assert call.donor.matched_bp == len(piece)
 
 
 def test_partnered_transduction_detected_when_stored_in_reverse_orientation():
@@ -443,7 +458,10 @@ def test_equal_donors_tie_and_no_source_is_named():
     src_b = extract_source_flank("SB", "LINE1", "chrB", "+", 50, 450, genome)
     assert src_a is not None and src_b is not None
     index = build_source_index([src_a, src_b])
-    segment = flank_a[100:200] + _random_seq(20, rng) + flank_b[100:200]
+    # A poly-C spacer contributes seeds to neither flank, so the two donors really
+    # do carry equal evidence -- a random spacer can straddle into one flank's
+    # continuation and silently break the tie (it did, before this comment).
+    segment = flank_a[100:200] + "C" * 30 + flank_b[100:200]
     call = detect_junction_transduction("c", "LINE1", segment, index)
     assert call.outcome == SOURCE_AMBIGUOUS and call.reason == "donor_tie"
     assert call.donor is None and call.n_donor_candidates == 2
@@ -472,7 +490,10 @@ def test_observed_excess_is_recorded_even_without_a_donor():
     call = detect_junction_transduction("c", "LINE1", _random_seq(120, random.Random(18)),
                                         index, observed_excess_bp=300)
     assert call.observed_excess_bp == 300
-    assert call.unexplained_excess_bp is None  # nothing matched to compare against
+    # An orphan still measures: the segment itself is the only candidate, so the
+    # excess beyond it stays visible rather than being silently attributed.
+    assert call.transduced_bp == 120
+    assert call.unexplained_excess_bp == 180
 
 
 # --- result shape ----------------------------------------------------------------
@@ -533,7 +554,7 @@ def test_cli_builds_the_index_and_annotates_a_calls_table(tmp_path: Path):
     rmsk_path = tmp_path / "rmsk.tsv"
     rmsk_path.write_text("\t".join(_HEADER) + "\n" + "\t".join(_rmsk_row().values()) + "\n")
 
-    junction = downstream[100:300] + "A" * 20
+    junction = _clean_piece(downstream) + "A" * 20
     calls_path = tmp_path / "calls.tsv"
     with calls_path.open("w") as handle:
         handle.write("call_id\tfamily\tjunction_seq\tobserved_excess_bp\n")

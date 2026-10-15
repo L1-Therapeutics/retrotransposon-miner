@@ -6048,7 +6048,8 @@ def _add_candidate_support_info_fields(
         work = work.loc[work["read_name"].str.len() > 0]
         if work.empty:
             return pd.DataFrame(columns=key_cols + [out_col])
-        return work.groupby(key_cols, as_index=False)["read_name"].nunique().rename(columns={"read_name": out_col})
+        res = work.groupby(key_cols, as_index=False)["read_name"].nunique()
+        return cast(pd.DataFrame, res).rename(columns={"read_name": out_col})
 
     disease_gate = _mei_gate(split_disease_mei, discordant_disease_mei, "disease")
     control_gate = _mei_gate(split_control_mei, discordant_control_mei, "control")
