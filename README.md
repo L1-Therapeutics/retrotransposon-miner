@@ -501,7 +501,7 @@ can import it instead of repeating the pandas defaults.
 
 Run checks with the activated environment's Python (3.11+; the Conda environment uses 3.12), not the macOS system Python. Python-only development tools are also available via `python -m pip install -e '.[dev]'` in an existing project environment; external genomics tools still require the environment setup above. The staging and S3 unit tests use fake transfers and do not contact cloud services.
 
-All new modules under `src/retro_miner` must type-check cleanly; see `CONTRIBUTING.md` ("Type checking") for the policy, including the grandfathered legacy modules and the strict flag set enforced on the marker modules.
+All new modules under `src/retro_miner` must type-check cleanly; see `CONTRIBUTING.md` ("Type checking") for the policy, including the strict flag set enforced on the marker modules.
 
 ## License
 

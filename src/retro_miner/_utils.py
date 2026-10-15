@@ -135,7 +135,7 @@ def _safe_float(value: object, default: float = float("nan")) -> float:
     if isinstance(value, bool):
         return float(value)
     if isinstance(value, float):
-        return value if math.isfinite(value) else default
+        return float(value) if math.isfinite(value) else default
     if isinstance(value, numbers.Integral):
         try:
             return float(value)

@@ -13,6 +13,7 @@ from retro_miner.mei_support import (
     _cigar_alignment_spans,
     _cigar_query_len,
     _clip_shannon_entropy,
+    _deletion_cluster_is_candidate,
     _extract_int_from_info,
     _finite_float,
     _homopolymer_at_run,
@@ -306,3 +307,41 @@ def test_extract_int_tuple_returns_max_of_finite_entries() -> None:
 def test_extract_int_tuple_ignores_missing_and_non_numeric() -> None:
     assert _extract_int_from_info((None, "nan", "150", "bad")) == 150
     assert _extract_int_from_info((None, "nan", "bad"), default=-1) == -1
+
+
+def test_deletion_cluster_candidate_reads_a_series_row() -> None:
+    """Regression: the helper must accept a per-locus row, not a DataFrame.
+
+    It previously called the DataFrame-oriented ``_numeric_series(row, ...)``,
+    which raised ``AttributeError: 'Series' object has no attribute 'columns'``
+    for every candidate row.
+    """
+    import pandas as pd
+
+    row = pd.Series(
+        {
+            "disease_deletion_cluster_reads": 5,
+            "disease_deletion_cluster_fraction": 0.9,
+            "disease_deletion_cluster_width_bp": 100,
+            "disease_deletion_span_bp": 5000,
+        }
+    )
+    assert _deletion_cluster_is_candidate(row, "disease") is True
+
+
+def test_deletion_cluster_candidate_rejects_weak_rows() -> None:
+    import pandas as pd
+
+    strong = {
+        "control_deletion_cluster_reads": 5,
+        "control_deletion_cluster_fraction": 0.9,
+        "control_deletion_cluster_width_bp": 100,
+        "control_deletion_span_bp": 5000,
+    }
+    # Too few reads.
+    assert _deletion_cluster_is_candidate(pd.Series({**strong, "control_deletion_cluster_reads": 1}), "control") is False
+    # Span below the minimum gap.
+    assert _deletion_cluster_is_candidate(pd.Series({**strong, "control_deletion_span_bp": 10}), "control") is False
+    # Missing columns fall back to 0 (never raising).
+    assert _deletion_cluster_is_candidate(pd.Series({}), "control") is False
+

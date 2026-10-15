@@ -24,9 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ._utils import (
-    _column_or_default,
     _numeric_series,
-    _safe_float,
     _safe_int,
     read_tsv,
 )
@@ -64,18 +62,6 @@ def _pair_float(pair: dict[str, Any], key: str, default: float = 0.0) -> float:
         return default
     except (TypeError, ValueError, OverflowError):
         return default
-
-
-def _numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
-    """Return *column* as a numeric Series, or a constant Series when absent.
-
-    ``DataFrame.get(col, 0)`` yields a bare scalar for a missing column, so the
-    former ``pd.to_numeric(frame.get(col, 0), errors="coerce").fillna(0)`` form
-    raised ``AttributeError`` whenever the column was genuinely absent.
-    """
-    if column in frame.columns:
-        return pd.to_numeric(frame[column], errors="coerce")
-    return pd.Series(default, index=frame.index, dtype="float64")
 
 
 def _pair_int(pair: dict[str, object], key: str, default: int = 0) -> int:

@@ -52,8 +52,8 @@ ignore = [
 
 [tool.mypy]
 # Type-checking policy (see README "Development -> Type checking"):
-# everything under src/retro_miner is checked by default; only the two
-# grandfathered legacy modules below are exempt. New modules must be clean.
+# everything under src/retro_miner is checked by default; there are no
+# grandfathered exemptions left, so new modules must be clean from the start.
 # Matches the runtime floor actually used (environment.yml pins python=3.12);
 # numpy's bundled stubs require 3.12 syntax.
 python_version = "3.12"
@@ -61,14 +61,6 @@ files = ["src/retro_miner"]
 mypy_path = ["src"]
 warn_redundant_casts = true
 warn_unused_ignores = true
-
-[[tool.mypy.overrides]]
-# Pre-existing pipeline modules with heavy dynamic-pandas usage; clean these
-# up incrementally and move them out of this list. Do not add new entries.
-module = [
-  "retro_miner.mei_support",
-]
-ignore_errors = true
 
 [[tool.mypy.overrides]]
 # Literature-anchored marker modules: held to a strict flag set.
@@ -84,7 +76,7 @@ disallow_incomplete_defs = true
 warn_return_any = true
 
 [[tool.mypy.overrides]]
-module = ["intervaltree.*"]
+module = ["intervaltree.*", "pyfaidx.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
