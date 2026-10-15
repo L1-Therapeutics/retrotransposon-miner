@@ -581,9 +581,9 @@ def _discordant_mate_ok_for_mei_identity(df: pd.DataFrame) -> pd.Series:
         if "mate_chrom" in df.columns
         else pd.Series("", index=df.index)
     )
-    pos = pd.to_numeric(df["pos"] if "pos" in df.columns else 0, errors="coerce").fillna(0).astype(int)
+    pos = pd.to_numeric(_numeric_series(df, "pos", 0), errors="coerce").fillna(0).astype(int)
     mate_pos = pd.to_numeric(
-        df["mate_pos"] if "mate_pos" in df.columns else 0,
+        _numeric_series(df, "mate_pos", 0),
         errors="coerce",
     ).fillna(0).astype(int)
     valid_mate = (mate_chrom != "") & (mate_chrom != "*") & mate_pos.gt(0)
@@ -1773,7 +1773,7 @@ def _fetch_discordant_mate_sequences(
             continue
         seen_qnames.add(qname)
         mate_chrom = str(rec.mate_chrom)
-        mate_pos = int(rec.mate_pos)
+        mate_pos = _safe_int(rec.mate_pos)
         start0 = max(0, mate_pos - 1)
         windows.append((mate_chrom, start0, start0 + _MATE_FETCH_QUERY_BP, qname))
 
@@ -2869,7 +2869,7 @@ def _annotate_vntr_like_split_clips(
     if all(c in out.columns for c in key_cols):
         split_sva = out.loc[mei_hit & ~demote & fam.isin(_VNTR_RESCUE_FAMILIES), key_cols]
         for row in split_sva.itertuples(index=False):
-            sva_loci.add((str(row.chrom), int(row.window_start), int(row.window_end)))
+            sva_loci.add((str(row.chrom), _safe_int(row.window_start), _safe_int(row.window_end)))
         if discordant_df is not None and not discordant_df.empty:
             d = discordant_df
             d_mapped = _discordant_row_mei_mapped(d) if not d.empty else pd.Series(dtype=bool)
@@ -2890,7 +2890,7 @@ def _annotate_vntr_like_split_clips(
                 for row in d.loc[d_mapped & d_fam.isin(_VNTR_RESCUE_FAMILIES), key_cols].itertuples(
                     index=False
                 ):
-                    sva_loci.add((str(row.chrom), int(row.window_start), int(row.window_end)))
+                    sva_loci.add((str(row.chrom), _safe_int(row.window_start), _safe_int(row.window_end)))
     at_sva_locus = pd.Series(False, index=out.index)
     if sva_loci and all(c in out.columns for c in key_cols):
         at_sva_locus = pd.Series(
@@ -3933,7 +3933,7 @@ def _enrich_split_hits_with_mate_positions(
             if qname in fetched:
                 continue
             chrom = str(rec.chrom)
-            pos = int(rec.pos)
+            pos = _safe_int(rec.pos)
             if chrom not in bam.references:
                 continue
             start0 = max(0, pos - 1)
@@ -4191,7 +4191,7 @@ def _annotate_short_mei_seed_rescue(
             )
         )
         for row in sr_seeds.itertuples(index=False):
-            sr_sides.add((str(row.chrom), int(row.window_start), int(row.window_end), str(row.side)))
+            sr_sides.add((str(row.chrom), _safe_int(row.window_start), _safe_int(row.window_end), str(row.side)))
         cand = work.loc[short_mask].reset_index().merge(sr_seeds, on=key_cols + ["side"], how="inner")
         if not cand.empty:
             gap = int(_SHORT_MEI_RESCUE_MAX_COORD_GAP_BP)
@@ -4213,7 +4213,7 @@ def _annotate_short_mei_seed_rescue(
             if sr_sides:
                 keep_rows = []
                 for row in dpe_seeds.itertuples(index=False):
-                    key = (str(row.chrom), int(row.window_start), int(row.window_end), str(row.side))
+                    key = (str(row.chrom), _safe_int(row.window_start), _safe_int(row.window_end), str(row.side))
                     if key not in sr_sides:
                         keep_rows.append(True)
                     else:
@@ -4396,10 +4396,10 @@ def _build_supporting_reads_detail_table(
                     "evidence_type": "SR",
                     "read_name": str(rec.read_name),
                     "chrom": str(rec.chrom),
-                    "window_start": int(rec.window_start),
-                    "window_end": int(rec.window_end),
+                    "window_start": _safe_int(rec.window_start),
+                    "window_end": _safe_int(rec.window_end),
                     "anchor_side": str(getattr(rec, "clip_side", "") or ""),
-                    "genomic_pos": int(rec.pos),
+                    "genomic_pos": _safe_int(rec.pos),
                     "mate_chrom": str(getattr(rec, "mate_chrom", "") or ""),
                     "mate_genomic_pos": _as_int(getattr(rec, "mate_pos", 0), 0),
                     "mei_start": _as_int(getattr(rec, start_col, 0), 0) if mei_hit else 0,
@@ -4418,7 +4418,7 @@ def _build_supporting_reads_detail_table(
                     "clip_len": int(clip_len),
                     "soft_clip_len": int(clip_len),
                     "soft_clip_side": str(getattr(rec, "clip_side", "") or ""),
-                    "soft_clip_pos": int(rec.pos),
+                    "soft_clip_pos": _safe_int(rec.pos),
                     "poly_tail_rescued": bool(poly_rescued),
                     "clip_poly_at_run": int(poly_run),
                     "polya_base": poly_base,
@@ -4437,21 +4437,21 @@ def _build_supporting_reads_detail_table(
             # Keep detail focused on MEI-supporting discordants (consensus or rescue).
             if not (mei_hit or mate_mei_hit or vntr_rescue or polya_rescue):
                 continue
-            key = (str(rec.chrom), int(rec.window_start), int(rec.window_end))
+            key = (str(rec.chrom), _safe_int(rec.window_start), _safe_int(rec.window_end))
             if key not in mid_cache:
-                mid_cache[key] = (int(rec.window_start) + int(rec.window_end)) // 2
-            anchor_side = "L" if int(rec.pos) <= mid_cache[key] else "R"
+                mid_cache[key] = (_safe_int(rec.window_start) + _safe_int(rec.window_end)) // 2
+            anchor_side = "L" if _safe_int(rec.pos) <= mid_cache[key] else "R"
             soft_clip_pos = int(getattr(rec, "soft_clip_pos", 0) or 0)
             ref_end = int(getattr(rec, "ref_end", 0) or 0)
             if ref_end <= 0:
                 read_seq = str(getattr(rec, "read_seq", "") or "")
-                ref_end = int(rec.pos) + max(0, len(read_seq) - 1) if read_seq else int(rec.pos)
+                ref_end = _safe_int(rec.pos) + max(0, len(read_seq) - 1) if read_seq else _safe_int(rec.pos)
             if soft_clip_pos > 0:
                 genomic_pos = soft_clip_pos
             elif anchor_side == "L":
                 genomic_pos = ref_end
             else:
-                genomic_pos = int(rec.pos)
+                genomic_pos = _safe_int(rec.pos)
             hit_source = str(getattr(rec, "mei_hit_source", "") or "")
             if not hit_source:
                 if polya_rescue:
@@ -4470,8 +4470,8 @@ def _build_supporting_reads_detail_table(
                     "evidence_type": "DPE",
                     "read_name": str(rec.read_name),
                     "chrom": str(rec.chrom),
-                    "window_start": int(rec.window_start),
-                    "window_end": int(rec.window_end),
+                    "window_start": _safe_int(rec.window_start),
+                    "window_end": _safe_int(rec.window_end),
                     "anchor_side": anchor_side,
                     "genomic_pos": int(genomic_pos),
                     "mate_chrom": str(getattr(rec, "mate_chrom", "")),
@@ -5057,12 +5057,12 @@ def _assign_rows_to_candidate_loci(split_df: pd.DataFrame, candidates: pd.DataFr
     for row in loci.itertuples(index=False):
         chrom = str(row.chrom)
         tree = trees.setdefault(chrom, IntervalTree())
-        tree.addi(int(row.window_start), int(row.window_end) + 1, (int(row.window_start), int(row.window_end)))
+        tree.addi(_safe_int(row.window_start), _safe_int(row.window_end) + 1, (_safe_int(row.window_start), _safe_int(row.window_end)))
 
     assigned_rows: list[dict[str, object]] = []
     for row in split_df.itertuples(index=False):
         chrom = str(row.chrom)
-        pos = int(row.pos)
+        pos = _safe_int(row.pos)
         tree = trees.get(chrom)
         if tree is None:
             continue
@@ -5321,8 +5321,8 @@ def _collect_indel_breakpoint_evidence(
     span_by_chrom: dict[str, tuple[int, int]] = {}
     for row in loci.itertuples(index=False):
         chrom = str(row.chrom)
-        start = int(row.window_start)
-        end = int(row.window_end)
+        start = _safe_int(row.window_start)
+        end = _safe_int(row.window_end)
         tree = trees.setdefault(chrom, IntervalTree())
         tree.addi(start, end + 1, (start, end))
         if chrom not in span_by_chrom:
@@ -5498,7 +5498,7 @@ def _build_locus_read_name_map(df: pd.DataFrame) -> dict[tuple[str, int, int], s
         read_name = str(row.read_name).strip()
         if not read_name:
             continue
-        key = (str(row.chrom), int(row.window_start), int(row.window_end))
+        key = (str(row.chrom), _safe_int(row.window_start), _safe_int(row.window_end))
         out[key].add(read_name)
     return dict(out)
 
@@ -8272,8 +8272,8 @@ def _infer_disease_insertion_metrics(
                 if not chrom:
                     continue
                 try:
-                    ws = int(row.window_start)
-                    we = int(row.window_end)
+                    ws = _safe_int(row.window_start)
+                    we = _safe_int(row.window_end)
                 except (TypeError, ValueError):
                     continue
                 side = str(getattr(row, "clip_side", "") or "").strip().upper()
@@ -8680,7 +8680,7 @@ def _infer_disease_insertion_metrics(
             yyrrrr_best_offsets: list[int] = []
             yyrrrr_shift1_mt_adj_scores: list[float] = []
             for row in out.itertuples(index=False):
-                if int(row.tsd_len_estimate) <= 0:
+                if _safe_int(row.tsd_len_estimate) <= 0:
                     seqs.append("")
                 else:
                     chrom = str(row.chrom)
@@ -10889,7 +10889,7 @@ def _sample_random_windows(
     for row in candidates.loc[:, ["chrom", "window_start", "window_end"]].itertuples(index=False):
         chrom = str(row.chrom)
         tree = excluded_trees.setdefault(chrom, IntervalTree())
-        tree.addi(int(row.window_start), int(row.window_end) + 1, 1)
+        tree.addi(_safe_int(row.window_start), _safe_int(row.window_end) + 1, 1)
 
     reference_lengths = {str(chrom): int(length) for chrom, length in zip(bam.references, bam.lengths)}
     target_chroms = [str(c) for c in candidates["chrom"].astype(str).unique().tolist() if str(c) in reference_lengths]
@@ -13828,7 +13828,7 @@ def _build_g1k_mei_bed_from_vcf(vcf_path: Path, out_bed_path: Path) -> int:
                 chrom = str(rec.contig or "")
                 if not chrom:
                     continue
-                pos1 = int(rec.pos)
+                pos1 = _safe_int(rec.pos)
                 ref = str(rec.ref or "")
                 rid = str(rec.id or "")
                 alts = [str(a) for a in (rec.alts or ())]
@@ -13974,7 +13974,7 @@ def _annotate_g1k_mei_overlap(
         return out
 
     out["row_id"] = out.index.astype(int)
-    row_by_id = {int(row.row_id): pd.Series(cast(Any, row)._asdict()) for row in out.itertuples(index=False)}
+    row_by_id = {_safe_int(row.row_id): pd.Series(cast(Any, row)._asdict()) for row in out.itertuples(index=False)}
     best_hits: dict[int, dict[str, object]] = {}
 
     with tempfile.TemporaryDirectory(prefix="rtm_g1k_mei_") as tmpdir:
@@ -14092,7 +14092,7 @@ def _build_lr_mei_bed_from_vcf(vcf_path: Path, out_bed_path: Path) -> int:
                 if not is_insertion_like:
                     continue
 
-                pos1 = int(rec.pos)
+                pos1 = _safe_int(rec.pos)
                 ref = str(rec.ref or "")
                 end1 = _extract_int_from_info(_safe_info_get(info, "END", None), default=pos1 + max(1, len(ref)) - 1)
                 end1 = max(end1, pos1)
@@ -14141,7 +14141,7 @@ def _annotate_lr_mei_overlap(
         return out
 
     out["row_id"] = out.index.astype(int)
-    row_by_id = {int(row.row_id): pd.Series(cast(Any, row)._asdict()) for row in out.itertuples(index=False)}
+    row_by_id = {_safe_int(row.row_id): pd.Series(cast(Any, row)._asdict()) for row in out.itertuples(index=False)}
     best_hits: dict[int, dict[str, object]] = {}
 
     with tempfile.TemporaryDirectory(prefix="rtm_lr_mei_") as tmpdir:
@@ -15229,7 +15229,7 @@ def annotate_candidate_loci_with_mei(
         subset = subset.loc[subset[target_col].str.len() > 0]
         out_map: dict[tuple[str, int, int], str] = {}
         for row in subset.itertuples(index=False):
-            out_map[(str(row.chrom), int(row.window_start), int(row.window_end))] = str(getattr(row, target_col))
+            out_map[(str(row.chrom), _safe_int(row.window_start), _safe_int(row.window_end))] = str(getattr(row, target_col))
         return out_map
 
     disease_pref_target = _preferred_map_from_discordant(disc_t, "disease_discordant_mei_subfamily")
