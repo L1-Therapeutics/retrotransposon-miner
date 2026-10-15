@@ -74,6 +74,48 @@ def _column_or_default(frame: pd.DataFrame, column: str, default: object) -> pd.
     return pd.Series(default, index=frame.index)
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    """Safely convert *value* to int, returning *default* on failure.
+
+    - int values are returned directly (no float round-trip, so huge ints
+      like ``10**400`` are preserved exactly).
+    - float values are converted if finite, otherwise *default*.
+    - strings are stripped and parsed via ``float()`` first.
+    - NumPy/pandas numeric scalars (``np.int64``, ``np.float32``,
+      ``np.bool_``, ...) are converted even though they do not subclass the
+      builtin ``int``/``float``; table rows and Series values produce these.
+    - everything else returns *default*.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return default if not math.isfinite(value) else int(value)
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return default
+        return default if not math.isfinite(number) else int(number)
+    # NumPy/pandas scalars do not always subclass the builtin numeric types:
+    # np.int64 is a numbers.Integral but not an int, np.float32 is a
+    # numbers.Real but not a float, and np.bool_ is neither (it still defines
+    # __int__). Without these checks integer table columns were read as 0.
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return default if not math.isfinite(number) else int(number)
+    to_int = getattr(value, "__int__", None)
+    if to_int is None:
+        return default
+    try:
+        return int(to_int())
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _safe_float(value: object, default: float = float("nan")) -> float:
     """Safely convert *value* to float, returning *default* on failure.
 
