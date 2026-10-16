@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from retro_miner.transduction_detect import (
+    DEFAULT_MIN_MATCHED_BP,
     DEFAULT_MIN_SEGMENT_BP,
     NOT_TRANSDUCTION,
     ORPHAN_CANDIDATE,
@@ -514,6 +515,73 @@ def test_equal_donors_tie_and_no_source_is_named():
     assert call.is_transduction
 
 
+# --- matched-span specificity ---------------------------------------------------
+
+
+def test_a_short_shared_span_is_not_named_as_a_donor():
+    # The seed floors are counts, so a short piece can clear them: at k = 25 a 30 bp
+    # segment yields 6 seed windows.  Naming the only indexed carrier of such a
+    # piece reports which copies the index happened to hold, so the detector
+    # refuses -- the same 28 bp span that exposed this on real hg38 is carried by
+    # 46 genome-wide 3'-competent L1 flanks.
+    genome, source, _piece = _l1_fixture(random.Random(24))
+    index = build_source_index([source])
+    short = _clean_piece(source.flank_seq, length=DEFAULT_MIN_MATCHED_BP - 20)
+    call = detect_junction_transduction("c", "LINE1", short, index)
+    assert call.segment_bp == len(short) and call.transduced_bp == len(short)
+    assert call.outcome == SOURCE_AMBIGUOUS
+    assert call.reason == "matched_span_below_specificity_floor"
+    assert call.donor is None and call.n_donor_candidates == 1
+    # Still a candidate: the segment matched, the donor is what is unsupported.
+    assert call.is_transduction
+    # The same flank names its donor once the matched span clears the floor.
+    long_enough = _clean_piece(source.flank_seq, length=DEFAULT_MIN_MATCHED_BP + 50)
+    named = detect_junction_transduction("c2", "LINE1", long_enough, index)
+    assert named.outcome == PARTNERED and named.donor is not None
+    assert named.donor.source_id == "L1SRC"
+
+
+def test_a_long_junction_whose_donor_match_is_short_is_refused():
+    # A long junction does not make a short match specific: only the supported span
+    # is counted, so a 120 bp segment carrying a 30 bp piece of a donor flank is
+    # refused while the same segment carrying 100 bp of it is named.
+    genome, source, _piece = _l1_fixture(random.Random(25))
+    index = build_source_index([source])
+    spacer = _random_seq(45, random.Random(26)) + "C"
+    short_piece = _clean_piece(source.flank_seq, length=DEFAULT_MIN_MATCHED_BP - 20)
+    refused = detect_junction_transduction("c", "LINE1", spacer + short_piece + spacer, index)
+    assert refused.segment_bp == len(spacer) * 2 + len(short_piece)
+    assert refused.reason == "matched_span_below_specificity_floor"
+    assert refused.donor is None
+    assert refused.transduced_bp == len(short_piece)
+    long_piece = _clean_piece(source.flank_seq, length=100)
+    named = detect_junction_transduction("c2", "LINE1", spacer + long_piece + spacer, index)
+    assert named.outcome == PARTNERED and named.donor is not None
+    assert named.transduced_bp == len(long_piece)
+
+
+def test_several_carriers_of_a_short_span_are_counted_and_none_named():
+    # The real-hg38 shape: many copies carry the same short piece, so a rank order
+    # between them is an artifact of indexing.  The count stays visible even though
+    # no donor is named.
+    rng = random.Random(27)
+    piece = _random_seq(DEFAULT_MIN_MATCHED_BP - 20, rng)
+    genomes = {}
+    for name in ("CA", "CB", "CC"):
+        flank = piece + "C" + _random_seq(500, rng)
+        genomes[name] = _random_seq(50, rng) + _random_seq(400, rng) + flank
+    genome = _DictGenome(genomes)
+    sources = [extract_source_flank(f"S{name}", "LINE1", name, "+", 50, 450, genome)
+               for name in ("CA", "CB", "CC")]
+    assert all(source is not None for source in sources)
+    index = build_source_index([source for source in sources if source is not None])
+    call = detect_junction_transduction("c", "LINE1", piece, index)
+    assert call.outcome == SOURCE_AMBIGUOUS
+    assert call.reason == "matched_span_below_specificity_floor"
+    assert call.donor is None and call.n_donor_candidates == 3
+    assert call.is_transduction
+
+
 def test_a_donor_of_another_family_is_never_named():
     rng = random.Random(16)
     upstream = _random_seq(900, rng)
@@ -617,3 +685,28 @@ def test_cli_builds_the_index_and_annotates_a_calls_table(tmp_path: Path):
     assert result.loc[0, "donor_chrom"] == "chr1"
     assert int(result.loc[0, "transduced_bp"]) == 200
     assert int(result.loc[0, "unexplained_excess_bp"]) == 300
+
+
+def test_cli_min_matched_bp_is_settable(tmp_path: Path):
+    rng = random.Random(28)
+    body = _random_seq(6000, rng)
+    downstream = _random_seq(900, rng)
+    ref_path = tmp_path / "tiny.2bit"
+    _write_2bit(ref_path, {"chr1": _random_seq(200, rng) + body + downstream})
+    rmsk_path = tmp_path / "rmsk.tsv"
+    rmsk_path.write_text("\t".join(_HEADER) + "\n" + "\t".join(_rmsk_row().values()) + "\n")
+    piece = _clean_piece(downstream, length=DEFAULT_MIN_MATCHED_BP - 20)
+    calls_path = tmp_path / "calls.tsv"
+    calls_path.write_text("call_id\tfamily\tjunction_seq\n"
+                          f"callA\tLINE1\t{piece}\n")
+
+    def _run(extra: list[str]) -> str:
+        out_path = tmp_path / f"out_{len(extra)}.tsv"
+        assert main(["--rmsk", str(rmsk_path), "--reference", str(ref_path),
+                     "--calls", str(calls_path), "--out", str(out_path), *extra]) == 0
+        import pandas as pd
+
+        return str(pd.read_csv(out_path, sep="\t").loc[0, "outcome"])
+
+    assert _run([]) == SOURCE_AMBIGUOUS
+    assert _run(["--min-matched-bp", str(len(piece))]) == PARTNERED

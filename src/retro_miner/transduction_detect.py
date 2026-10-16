@@ -50,6 +50,16 @@ Gates, each one a place this measurement could lie
 * **Tie refusal.**  Two donors with equal seed evidence produce
   ``transduction_source_ambiguous``: a candidate transduction with no named
   source.
+* **Matched-span specificity.**  The seed floors are counts, and a count can be
+  met inside a very short span: at ``k = 25`` a 28 bp shared piece yields exactly
+  the 4 seed windows ``DEFAULT_MIN_SEED_SITES`` asks for.  Such a piece is not
+  specific to one copy -- the one this gate was calibrated against is carried by
+  46 genome-wide 3'-competent L1 flanks -- so naming the top-scoring carrier
+  reports which copies happened to be indexed, not which element transduced.
+  A match shorter than ``min_matched_bp`` therefore produces
+  ``transduction_source_ambiguous`` with reason
+  ``matched_span_below_specificity_floor``: still a candidate transduction, with
+  no nameable donor.
 
 Reference access is a :class:`~retro_miner.transduction_tags.SequenceFetcher`
 (1-based inclusive), so the detector is pure logic over a sequence source.  Two
@@ -91,6 +101,7 @@ __all__ = [
     "OUTCOMES",
     "DEFAULT_MIN_SEGMENT_BP",
     "DEFAULT_MIN_TAIL_RUN",
+    "DEFAULT_MIN_MATCHED_BP",
     "DEFAULT_END_TOLERANCE_BP",
     "DEFAULT_MIN_MODEL_COVERAGE",
     "PARTNERED",
@@ -138,6 +149,14 @@ DEFAULT_END_TOLERANCE_BP = 150
 #: Fraction of the consensus model a candidate source copy must cover.  A
 #: fragment-derived row is not a competent source element.
 DEFAULT_MIN_MODEL_COVERAGE = 0.95
+
+#: Shortest seed-supported span that can single out one donor.  Set at two k-mer
+#: lengths because a span of one k-mer's width carries one seed window whatever
+#: the seed count says, and the seed floors are satisfied by counts alone: on real
+#: hg38 a 28 bp span cleared ``min_seed_sites`` (4 windows at k = 25) while being
+#: carried by 46 genome-wide 3'-competent L1 flanks.  A named donor is worth less
+#: than none, so a span under this floor is refused rather than resolved by rank.
+DEFAULT_MIN_MATCHED_BP = 2 * DEFAULT_KMER
 
 _COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
@@ -661,6 +680,7 @@ def detect_junction_transduction(
     min_tail_run: int = DEFAULT_MIN_TAIL_RUN,
     min_seed_sites: int = DEFAULT_MIN_SEED_SITES,
     min_hits: int = DEFAULT_MIN_SEED_HITS,
+    min_matched_bp: int = DEFAULT_MIN_MATCHED_BP,
     max_dominant_fraction: float = 0.9,
     min_unique_fraction: float = DEFAULT_MIN_UNIQUE_FRACTION,
 ) -> TransductionCall:
@@ -673,7 +693,8 @@ def detect_junction_transduction(
     compared against the seed-supported transduced length so an excess larger
     than its explanation stays visible.  ``local_reference_seq`` is the reference
     sequence immediately beyond the insertion site: a segment matching *that* is
-    an overhang, not a transduction.
+    an overhang, not a transduction.  ``min_matched_bp`` is the shortest span a
+    donor may be named from; see :data:`DEFAULT_MIN_MATCHED_BP`.
     """
     junction = _bases(junction_seq)
     core, tail_run, tail_side = strip_poly_at_ends(junction, min_run=min_tail_run)
@@ -722,6 +743,15 @@ def detect_junction_transduction(
             return call(NOT_TRANSDUCTION, "overhang_matches_local_reference", transduced_bp=0)
         return call(ORPHAN_CANDIDATE, "no_reference_match", n_candidates=0,
                     transduced_bp=len(core))
+    specific = [candidate for candidate in ranked if candidate.matched_bp >= min_matched_bp]
+    if not specific:
+        # Matched, but only over a span several unrelated copies also carry: the
+        # candidates are reported as a count, and the span as the lower bound it
+        # is, without turning whichever one ranked first into a named source.
+        return call(SOURCE_AMBIGUOUS, "matched_span_below_specificity_floor",
+                    n_candidates=len(ranked),
+                    transduced_bp=max(candidate.matched_bp for candidate in ranked))
+    ranked = specific
     if _is_tie(ranked):
         return call(SOURCE_AMBIGUOUS, "donor_tie", n_candidates=len(ranked),
                     transduced_bp=max(ranked[0].matched_bp, ranked[1].matched_bp))
@@ -808,6 +838,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--families", default="LINE1,SVA")
     parser.add_argument("--min-model-coverage", type=float, default=DEFAULT_MIN_MODEL_COVERAGE)
     parser.add_argument("--min-segment-bp", type=int, default=DEFAULT_MIN_SEGMENT_BP)
+    parser.add_argument("--min-matched-bp", type=int, default=DEFAULT_MIN_MATCHED_BP)
     parser.add_argument("--end-tolerance-bp", type=int, default=DEFAULT_END_TOLERANCE_BP)
     parser.add_argument("--max-elements", type=int, default=None)
     args = parser.parse_args(argv)
@@ -825,6 +856,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cast("Iterable[Mapping[str, object]]", calls.to_dict("records")),
         index,
         min_segment_bp=args.min_segment_bp,
+        min_matched_bp=args.min_matched_bp,
     )
     frame = pd.DataFrame([r.to_dict() for r in results])
     frame.to_csv(args.out, sep="\t", index=False)
