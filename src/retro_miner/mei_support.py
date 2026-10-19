@@ -776,10 +776,11 @@ def _resolve_full_consensus_fasta(
     ]
     for cand in packaged:
         if cand.exists() and cand.stat().st_size > 0:
-            fai = cand.with_suffix(cand.suffix + ".fai")    if not fai.exists():
-        from ._utils import run_subprocess_ignore_error
-        run_subprocess_ignore_error(["samtools", "faidx", str(cand)], label="samtools faidx")
-        return cand
+            fai = cand.with_suffix(cand.suffix + ".fai")
+            if not fai.exists():
+                from ._utils import run_subprocess_ignore_error
+                run_subprocess_ignore_error(["samtools", "faidx", str(cand)], label="samtools faidx")
+            return cand
 
     if not mei_fasta.exists():
         return None

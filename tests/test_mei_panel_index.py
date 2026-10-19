@@ -41,7 +41,7 @@ def test_has_bwa_index_false_until_all_sidecars_exist(tmp_path: Path) -> None:
 def test_ensure_bwa_index_skips_when_complete(tmp_path: Path) -> None:
     fasta = _write_fasta(tmp_path / "panel.fa")
     _touch_index(fasta)
-    with patch("retro_miner.mei_panel_index.subprocess.run") as run:
+    with patch("subprocess.run") as run:
         result = ensure_bwa_index(fasta)
     assert result["status"] == "skipped_exists"
     run.assert_not_called()
@@ -56,7 +56,7 @@ def test_ensure_bwa_index_runs_bwa_when_missing(tmp_path: Path) -> None:
 
     with (
         patch("retro_miner.mei_panel_index.shutil.which", return_value="/usr/bin/bwa"),
-        patch("retro_miner.mei_panel_index.subprocess.run", side_effect=_fake_bwa) as run,
+        patch("subprocess.run", side_effect=_fake_bwa) as run,
     ):
         result = ensure_bwa_index(fasta)
     assert result["status"] == "indexed"
@@ -73,13 +73,13 @@ def test_ensure_mei_remap_bwa_index_writes_nopolya_then_indexes(tmp_path: Path) 
 
     with (
         patch("retro_miner.mei_panel_index.shutil.which", return_value="/usr/bin/bwa"),
-        patch("retro_miner.mei_panel_index.subprocess.run", side_effect=_fake_bwa),
+        patch("subprocess.run", side_effect=_fake_bwa),
     ):
         result = ensure_mei_remap_bwa_index(src)
     assert sidecar.exists()
     assert result["nopolya_fasta"] == str(sidecar)
     assert has_bwa_index(sidecar)
-    with patch("retro_miner.mei_panel_index.subprocess.run") as run:
+    with patch("subprocess.run") as run:
         again = ensure_mei_remap_bwa_index(src)
     assert again["status"] == "skipped_exists"
     run.assert_not_called()
@@ -94,7 +94,7 @@ def test_index_public_mei_remap_fastas_indexes_present_dfam_only(tmp_path: Path)
 
     with (
         patch("retro_miner.mei_panel_index.shutil.which", return_value="/usr/bin/bwa"),
-        patch("retro_miner.mei_panel_index.subprocess.run", side_effect=_fake_bwa),
+        patch("subprocess.run", side_effect=_fake_bwa),
     ):
         result = index_public_mei_remap_fastas(tmp_path)
     assert result["status"] == "ok"

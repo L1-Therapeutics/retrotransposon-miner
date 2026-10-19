@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable
 from pathlib import Path
-import subprocess
 import tempfile
 
 import click

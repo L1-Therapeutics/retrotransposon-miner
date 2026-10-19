@@ -6,7 +6,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed

@@ -4,7 +4,14 @@ This module intentionally has no intra-package imports so it can be used
 by any module in the package without risk of circular imports.
 """
 
+from __future__ import annotations
+
+import gzip
+import re
 import subprocess
+import warnings
+from pathlib import Path
+from typing import IO
 
 
 def run_subprocess(
@@ -27,7 +34,7 @@ def run_subprocess(
     label : str
         Human-readable label for error messages (e.g. "bwa mem", "bedtools intersect").
     check : bool
-        If True, raise :exc:`RuntimeError` on non-zero exit. If False, return the
+        If True, raise RuntimeError on non-zero exit. If False, return the
         completed process and let the caller check ``returncode``.
     timeout : float | None
         Optional timeout in seconds. Pass ``None`` for no timeout, or use
@@ -75,7 +82,7 @@ def run_subprocess(
             f"{label} timed out after {effective_timeout:.1f}s: {' '.join(cmd)}"
         ) from exc
 
-    if check and proc.returncode != 0:
+    if check and proc is not None and proc.returncode != 0:
         err = (proc.stderr or "").strip()
         out = (proc.stdout or "").strip()
         msg = f"{label} failed (exit={proc.returncode}): {' '.join(cmd)}"
@@ -118,14 +125,6 @@ def run_subprocess_ignore_error(
         return run_subprocess(cmd, label=label, check=False, timeout=timeout)
     except (RuntimeError, FileNotFoundError, subprocess.TimeoutExpired):
         return None
-
-from __future__ import annotations
-
-import gzip
-import re
-import warnings
-from pathlib import Path
-from typing import IO
 
 
 def safe_locus_id(chrom: str, start: int, end: int) -> str:
