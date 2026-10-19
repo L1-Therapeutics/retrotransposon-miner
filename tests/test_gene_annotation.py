@@ -20,48 +20,72 @@ FIXTURE = Path(__file__).parent / "data" / "chr22_mei.vcf"
 
 def test_fixture_reads_30_records_and_headers():
     headers, records = ga.read_vcf(FIXTURE)
-    assert headers[-1].startswith("#CHROM")
-    assert len(records) == 30
-    assert all(r.alt.startswith("<INS:ME:") for r in records)
-    assert {r.info["SVTYPE"] for r in records} == {"INS"}
+    assert headers[-1].startswith("#CHROM"), "last header should be the #CHROM column line"
+    assert len(records) == 30, f"expected 30 VCF records, got {len(records)}"
+    assert all(r.alt.startswith("<INS:ME:") for r in records), (
+        "expected all alts to be INS:ME:*"
+    )
+    assert {r.info["SVTYPE"] for r in records} == {"INS"}, (
+        "expected all SVTYPEs to be INS"
+    )
 
 
 def test_parse_info_handles_flags_and_values():
     d = ga.parse_info("SVTYPE=INS;IMPRECISE;SVLEN=10")
-    assert d == {"SVTYPE": "INS", "IMPRECISE": None, "SVLEN": "10"}
-    assert ga.parse_info(".") == {}
+    assert d == {"SVTYPE": "INS", "IMPRECISE": None, "SVLEN": "10"}, (
+        f"parse_info returned {d}"
+    )
+    assert ga.parse_info(".") == {}, "parse_info('.') should return empty dict"
 
 
 def test_record_roundtrip_preserves_columns(tmp_path):
     headers, records = ga.read_vcf(FIXTURE)
     out = tmp_path / "rt.vcf"
     ga.write_vcf(out, headers, records)
-    assert [ln.rstrip("\n") for ln in open(FIXTURE) if ln.strip()] == [ln.rstrip("\n") for ln in open(out) if ln.strip()]
+    orig = [ln.rstrip("\n") for ln in open(FIXTURE) if ln.strip()]
+    rt = [ln.rstrip("\n") for ln in open(out) if ln.strip()]
+    assert orig == rt, "VCF roundtrip should preserve all non-empty lines"
 
 
 def test_add_info_headers_inserts_before_chrom_and_is_idempotent():
     headers = ["##fileformat=VCFv4.4", "#CHROM\tPOS"]
     once = ga.add_info_headers(headers)
-    assert once[-1].startswith("#CHROM")
-    assert sum(h.startswith("##INFO=<ID=GENE,") for h in once) == 1
+    assert once[-1].startswith("#CHROM"), "last header should remain #CHROM"
+    assert sum(h.startswith("##INFO=<ID=GENE,") for h in once) == 1, (
+        "add_info_headers should insert exactly one GENE header"
+    )
     twice = ga.add_info_headers(once)
-    assert twice == once
+    assert twice == once, "add_info_headers should be idempotent"
 
 
 # ----------------------------------------------------------------- consequence summary
 
 
 def test_most_severe_term_follows_ensembl_ranking():
-    assert ga.most_severe_term(["intron_variant", "coding_sequence_variant", "downstream_gene_variant"]) == "coding_sequence_variant"
-    assert ga.most_severe_term(["intron_variant", "splice_acceptor_variant"]) == "splice_acceptor_variant"
-    assert ga.most_severe_term([]) == "intergenic_variant"
-    assert ga.most_severe_term(["made_up_term", "intron_variant"]) == "intron_variant"
+    assert ga.most_severe_term(["intron_variant", "coding_sequence_variant", "downstream_gene_variant"]) == "coding_sequence_variant", (
+        "coding_sequence_variant should outrank downstream_gene_variant"
+    )
+    assert ga.most_severe_term(["intron_variant", "splice_acceptor_variant"]) == "splice_acceptor_variant", (
+        "splice_acceptor_variant should outrank intron_variant"
+    )
+    assert ga.most_severe_term([]) == "intergenic_variant", (
+        "empty list should return intergenic_variant"
+    )
+    assert ga.most_severe_term(["made_up_term", "intron_variant"]) == "intron_variant", (
+        "unknown term should be ignored, intron_variant should win"
+    )
 
 
 def test_severity_table_has_no_duplicates_and_expected_endpoints():
-    assert len(set(ga.CONSEQUENCE_SEVERITY)) == len(ga.CONSEQUENCE_SEVERITY)
-    assert ga.CONSEQUENCE_SEVERITY[0] == "transcript_ablation"
-    assert ga.CONSEQUENCE_SEVERITY[-1] == "sequence_variant"
+    assert len(set(ga.CONSEQUENCE_SEVERITY)) == len(ga.CONSEQUENCE_SEVERITY), (
+        "CONSEQUENCE_SEVERITY should have no duplicates"
+    )
+    assert ga.CONSEQUENCE_SEVERITY[0] == "transcript_ablation", (
+        "most severe term should be transcript_ablation"
+    )
+    assert ga.CONSEQUENCE_SEVERITY[-1] == "sequence_variant", (
+        "least severe term should be sequence_variant"
+    )
 
 
 # ----------------------------------------------------------------- snpEff

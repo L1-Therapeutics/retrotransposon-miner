@@ -6,7 +6,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -299,7 +298,8 @@ def _run_spades(
         "-m",
         str(max(1, int(memory_gb))),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    from ._utils import run_subprocess
+    proc = run_subprocess(cmd, label=f"SPAdes (threads={threads}, mem={memory_gb}GB)", timeout=14400.0)
     stderr_tail = (proc.stderr or "")[-2000:]
     stdout_tail = (proc.stdout or "")[-2000:]
     combined = "\n".join([x for x in [stdout_tail, stderr_tail] if x]).strip()
@@ -369,11 +369,12 @@ def _run_minimap2_paf(
                 digest = hashlib.sha1(target_key.encode("utf-8")).hexdigest()[:16]
                 idx_path = idx_dir / f"{target_fa.stem}.{digest}.mmi"
             if not idx_path.exists():
-                build = subprocess.run(
+                from ._utils import run_subprocess
+                build = run_subprocess(
                     ["minimap2", "-d", str(idx_path), str(target_fa)],
-                    capture_output=True,
-                    text=True,
+                    label=f"minimap2 -d {idx_path.name}",
                     check=False,
+                    timeout=600.0,
                 )
                 if build.returncode == 0 and idx_path.exists():
                     _MINIMAP2_INDEX_CACHE[target_key] = idx_path
@@ -382,7 +383,8 @@ def _run_minimap2_paf(
                 _MINIMAP2_INDEX_CACHE[target_key] = idx_path
                 target_arg = str(idx_path)
     cmd = ["minimap2", "-x", preset, "--secondary=no", "-c", "-t", str(max(1, int(threads))), target_arg, str(query_fa)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    from ._utils import run_subprocess
+    proc = run_subprocess(cmd, label=f"minimap2 -x {preset}", check=False, timeout=3600.0)
     if proc.returncode != 0:
         return []
     rows: list[dict[str, object]] = []

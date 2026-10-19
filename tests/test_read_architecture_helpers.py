@@ -203,3 +203,37 @@ def test_safe_plot_stem_sanitises_special_chars() -> None:
     assert " " not in result
     assert "!" not in result
     assert "chr_1" in result
+
+
+# ---------------------------------------------------------------------------
+# _mei_coords_from_detail  →  NaN hit flags must not count as hits
+# ---------------------------------------------------------------------------
+
+
+def test_nan_hit_flag_is_not_treated_as_a_hit() -> None:
+    """NaN is truthy under astype(bool), so a missing flag entered the span."""
+    import numpy as np
+    import pandas as pd
+
+    from retro_miner.read_architecture import _mei_coords_from_detail
+
+    rows = []
+    for start, end, hit in ((100, 200, True), (9000, 9500, np.nan), (12000, 12500, False)):
+        rows.append(
+            {
+                "chrom": "chr1",
+                "mei_start": start,
+                "mei_end": end,
+                "mei_hit": hit,
+                "mate_mei_start": 0,
+                "mate_mei_end": 0,
+                "mate_mei_hit": False,
+                "mei_target": "AluY#SINE/Alu",
+                "read_name": f"r{start}",
+            }
+        )
+    detail = pd.DataFrame(rows)
+
+    plot = _mei_coords_from_detail(detail, family="ALU")
+    # The only true hit is 100-200, so the extent must not reach 12500.
+    assert plot[1] < 1000

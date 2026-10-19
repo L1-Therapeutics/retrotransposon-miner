@@ -45,23 +45,37 @@ def _load_locus(catalog_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 def test_overlap_pile_is_written_on_gold_review(catalog_id: str, expected_overlap: int) -> None:
     gold, detail = _load_locus(catalog_id)
     scored = annotate_mei_overlap_piles(gold, detail)
-    assert "mei_consensus_overlap_reads" in scored.columns
-    assert int(scored["mei_consensus_overlap_reads"].iloc[0]) == expected_overlap
+    assert "mei_consensus_overlap_reads" in scored.columns, (
+        "annotate_mei_overlap_piles did not write mei_consensus_overlap_reads"
+    )
+    assert int(scored["mei_consensus_overlap_reads"].iloc[0]) == expected_overlap, (
+        f"{catalog_id}: expected {expected_overlap} overlap reads, got {scored['mei_consensus_overlap_reads'].iloc[0]}"
+    )
     review = _build_gold_review_table(scored, empirical_stage=False)
-    assert "mei_consensus_overlap_reads" in review.columns
-    assert int(review["mei_consensus_overlap_reads"].iloc[0]) == expected_overlap
+    assert "mei_consensus_overlap_reads" in review.columns, (
+        "_build_gold_review_table dropped mei_consensus_overlap_reads"
+    )
+    assert int(review["mei_consensus_overlap_reads"].iloc[0]) == expected_overlap, (
+        f"{catalog_id}: review table expected {expected_overlap} overlap reads, got {review['mei_consensus_overlap_reads'].iloc[0]}"
+    )
 
 
 def test_low_overlap_does_not_fail_gold() -> None:
     gold, detail = _load_locus("rank072_chr19_877655")
     scored = annotate_mei_overlap_piles(gold, detail)
-    assert int(scored["mei_consensus_overlap_reads"].iloc[0]) == 3
+    assert int(scored["mei_consensus_overlap_reads"].iloc[0]) == 3, (
+        f"rank072: expected 3 overlap reads, got {scored['mei_consensus_overlap_reads'].iloc[0]}"
+    )
     scored["mei_consensus_overlap_reads"] = 1
     scored["silver_stage_pass"] = True
     out = _assign_gold_stage(scored, empirical_stage=False)
     reasons = out["gold_stage_fail_reason"].fillna("").astype(str).iloc[0]
-    assert "scattered_mei_no_overlap_pile" not in reasons
-    assert bool(out["gold_stage_pass"].iloc[0])
+    assert "scattered_mei_no_overlap_pile" not in reasons, (
+        f"rank072: unexpected scattered_mei_no_overlap_pile in fail_reason: {reasons}"
+    )
+    assert bool(out["gold_stage_pass"].iloc[0]), (
+        f"rank072: expected gold_stage_pass=True with overlap=1, got fail_reason={out['gold_stage_fail_reason'].iloc[0]}"
+    )
 
 
 @pytest.mark.parametrize("catalog_id,expected_overlap", REAL_LOCI)
@@ -80,4 +94,4 @@ def test_fixture_bam_contains_named_detail_read(catalog_id: str, expected_overla
         bam_names = {read.query_name for read in bam.fetch()}
     finally:
         bam.close()
-    assert read_name in bam_names
+    assert read_name in bam_names, f"read {read_name} not found in BAM {bam_path}"

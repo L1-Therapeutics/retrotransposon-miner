@@ -3,13 +3,128 @@
 This module intentionally has no intra-package imports so it can be used
 by any module in the package without risk of circular imports.
 """
+
 from __future__ import annotations
 
 import gzip
 import re
+import subprocess
 import warnings
 from pathlib import Path
 from typing import IO
+
+
+def run_subprocess(
+    cmd: list[str],
+    *,
+    label: str = "command",
+    check: bool = True,
+    timeout: float | None = None,
+    capture_output: bool = True,
+    text: bool = True,
+    env: dict[str, str] | None = None,
+    timeout_default: float | None = 3600.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess with consistent error handling and logging.
+
+    Parameters
+    ----------
+    cmd : list[str]
+        Command and arguments to run.
+    label : str
+        Human-readable label for error messages (e.g. "bwa mem", "bedtools intersect").
+    check : bool
+        If True, raise RuntimeError on non-zero exit. If False, return the
+        completed process and let the caller check ``returncode``.
+    timeout : float | None
+        Optional timeout in seconds. Pass ``None`` for no timeout, or use
+        ``timeout_default`` for a sensible default.
+    capture_output : bool
+        If True, capture stdout and stderr.
+    text : bool
+        If True, return stdout/stderr as strings instead of bytes.
+    env : dict[str, str] | None
+        Optional environment variables to pass to the subprocess.
+    timeout_default : float | None
+        Default timeout in seconds when ``timeout`` is ``None``. Pass ``None``
+        to allow no timeout. Defaults to 1 hour for long-running bioinformatics tools.
+
+    Returns
+    -------
+    subprocess.CompletedProcess[str]
+        The completed process. When ``check=False``, the caller should check
+        ``proc.returncode`` and inspect ``proc.stderr`` on failure.
+
+    Raises
+    ------
+    RuntimeError
+        When ``check=True`` and the command exits non-zero, or when the command
+        times out.
+    FileNotFoundError
+        When the executable is not found on PATH.
+    """
+    effective_timeout = timeout if timeout is not None else timeout_default
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=capture_output,
+            text=text,
+            timeout=effective_timeout,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{label} not found: {cmd[0]!r} — is it on PATH?"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{label} timed out after {effective_timeout:.1f}s: {' '.join(cmd)}"
+        ) from exc
+
+    if check and proc is not None and proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        out = (proc.stdout or "").strip()
+        msg = f"{label} failed (exit={proc.returncode}): {' '.join(cmd)}"
+        if err:
+            msg += f"\nstderr:\n{err}"
+        if out:
+            truncated = out if len(out) <= 2000 else out[:2000] + "\n... (truncated)"
+            msg += f"\nstdout (truncated):\n{truncated}"
+        raise RuntimeError(msg)
+
+    return proc
+
+
+def run_subprocess_ignore_error(
+    cmd: list[str],
+    *,
+    label: str = "command",
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a subprocess, returning None on any failure.
+
+    Use for best-effort operations where failure is acceptable (e.g. indexing
+    a FASTA file that may already be indexed).
+
+    Parameters
+    ----------
+    cmd : list[str]
+        Command and arguments to run.
+    label : str
+        Human-readable label for log messages.
+    timeout : float | None
+        Optional timeout in seconds.
+
+    Returns
+    -------
+    subprocess.CompletedProcess[str] | None
+        The completed process on success, or ``None`` on failure.
+    """
+    try:
+        return run_subprocess(cmd, label=label, check=False, timeout=timeout)
+    except (RuntimeError, FileNotFoundError, subprocess.TimeoutExpired):
+        return None
 
 
 def safe_locus_id(chrom: str, start: int, end: int) -> str:
@@ -32,8 +147,8 @@ def _open_textmaybe_gz(path: Path) -> IO[str]:
                 ...
     """
     if str(path).endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")  # type: ignore[return-value]
-    return path.open("r", encoding="utf-8")  # type: ignore[return-value]
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
 
 
 def _poly_at_stats(seq: str) -> tuple[int, float, str]:

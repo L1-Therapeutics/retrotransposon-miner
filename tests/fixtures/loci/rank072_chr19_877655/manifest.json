@@ -13,7 +13,7 @@
   "source_cram": "/home/ec2-user/retrotransposon-workdir/data/bam_stage/HG00100.final.cram",
   "plot_rank": 72,
   "family": "LINE1",
-  "old_span": 6010,
-  "old_5p": 303,
+  "old_span": 6002,
+  "old_5p": 311,
   "old_3p": 6312
 }

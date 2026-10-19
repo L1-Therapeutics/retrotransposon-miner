@@ -15,7 +15,6 @@ from pathlib import Path
 
 import click
 import pandas as pd
-import pysam
 
 from ._utils import _iter_fasta_records, safe_locus_id as _safe_locus_id
 from .bam_io import alignment_path_is_cram, open_alignment, resolve_alignment_reference
@@ -224,10 +223,8 @@ def _run_samtools(args: list[str]) -> None:
     exe = shutil.which("samtools")
     if exe is None:
         raise FileNotFoundError("samtools not found on PATH (required to convert CRAM for IGV snapshots)")
-    result = subprocess.run([exe, *args], check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        detail = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-1500:]
-        raise RuntimeError(f"samtools {' '.join(args[:3])} failed: {detail}")
+    from ._utils import run_subprocess
+    run_subprocess([exe, *args], label=f"samtools {' '.join(args[:3])}" if len(args) >= 3 else f"samtools {' '.join(args)}")
 
 
 def _materialize_alignment_for_igv(

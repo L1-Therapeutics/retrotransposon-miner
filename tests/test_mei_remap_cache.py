@@ -51,14 +51,24 @@ def test_remap_cache_hits_same_evidence_and_misses_a_new_read(tmp_path):
     _write_mei_remap_cache(tmp_path, "germline", split, disc, result)
 
     loaded = _load_mei_remap_cache(tmp_path, "germline", split, disc, sample="control")
-    assert loaded is not None
-    assert loaded["split_summary"].paf_hits == 1
-    assert loaded["split_summary"].clip_count == 4
-    assert loaded["disc_mate_summary"].sample == "control_mate"
-    assert list(loaded["split_hits"]["read_name"]) == ["r1"]
+    assert loaded is not None, "expected cache hit for unchanged evidence"
+    assert loaded["split_summary"].paf_hits == 1, (
+        f"expected 1 paf hit, got {loaded['split_summary'].paf_hits}"
+    )
+    assert loaded["split_summary"].clip_count == 4, (
+        f"expected 4 clip count, got {loaded['split_summary'].clip_count}"
+    )
+    assert loaded["disc_mate_summary"].sample == "control_mate", (
+        f"expected control_mate sample, got {loaded['disc_mate_summary'].sample}"
+    )
+    assert list(loaded["split_hits"]["read_name"]) == ["r1"], (
+        f"expected read_name ['r1'], got {list(loaded['split_hits']['read_name'])}"
+    )
 
     changed = _split_row("r9")
-    assert _load_mei_remap_cache(tmp_path, "germline", changed, disc, sample="control") is None
+    assert _load_mei_remap_cache(tmp_path, "germline", changed, disc, sample="control") is None, (
+        "expected cache miss for changed split evidence"
+    )
 
 
 def test_indel_cache_hits_same_windows_and_misses_a_shifted_window(tmp_path):
@@ -77,10 +87,14 @@ def test_indel_cache_hits_same_windows_and_misses_a_shifted_window(tmp_path):
     _write_indel_evidence_cache(indels, tmp_path, "germline", candidates)
 
     loaded = _load_indel_evidence_cache(tmp_path, "germline", candidates)
-    assert loaded is not None
-    assert len(loaded) == 1
-    assert int(loaded.iloc[0]["indel_len"]) == 20
+    assert loaded is not None, "expected indel cache hit for unchanged window"
+    assert len(loaded) == 1, f"expected 1 indel row, got {len(loaded)}"
+    assert int(loaded.iloc[0]["indel_len"]) == 20, (
+        f"expected indel_len 20, got {loaded.iloc[0]['indel_len']}"
+    )
 
     shifted = candidates.copy()
     shifted["window_end"] = [50]
-    assert _load_indel_evidence_cache(tmp_path, "germline", shifted) is None
+    assert _load_indel_evidence_cache(tmp_path, "germline", shifted) is None, (
+        "expected indel cache miss for shifted window"
+    )

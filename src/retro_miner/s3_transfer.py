@@ -10,8 +10,6 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -187,17 +185,8 @@ def _run_aws_cli(args: list[str], *, env: Mapping[str, str] | None = None) -> No
             "On EC2, attach an instance profile instead of copying local AWS keys."
         )
     cmd = ["aws", *args]
-    proc = subprocess.run(
-        cmd,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=dict(env) if env else None,
-    )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{err}")
+    from ._utils import run_subprocess
+    run_subprocess(cmd, label='aws ' + args[0] if args else 'aws', env=env)
 
 
 def download_s3_uri(s3_uri: str, dest: str | Path) -> None:

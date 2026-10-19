@@ -78,7 +78,7 @@ BLANK_OPTIONAL_ROW = {
     "known_mei_polymorphism_id": "",
     "known_mei_polymorphism_source": "",
     "consensus_insertion_orientation": "-",
-    "nested_in_same_MEI": "nested",
+    "nested_in_same_MEI": "nested_sense",
     "consensus_insertion_mei_span_full": "281",
     "consensus_insertion_mei_5p_coord_full": "1",
     "consensus_insertion_mei_3p_coord_full": "281",
@@ -88,117 +88,144 @@ BLANK_OPTIONAL_ROW = {
 class TestBuildVcfRecord:
     def test_field_count_matches_column_header(self):
         rec = build_vcf_record(SVA_ROW)
-        assert len(rec.split("\t")) == len(VCF_COLUMN_HEADER.split("\t"))
+        assert len(rec.split("\t")) == len(VCF_COLUMN_HEADER.split("\t")), (
+            f"expected {len(VCF_COLUMN_HEADER.split(chr(9)))} fields, got {len(rec.split(chr(9)))}"
+        )
 
     def test_chrom_pos_from_row(self):
         rec = build_vcf_record(SVA_ROW)
         fields = rec.split("\t")
-        assert fields[0] == "chr22"
-        assert fields[1] == "49029650"
+        assert fields[0] == "chr22", f"expected chr22, got {fields[0]}"
+        assert fields[1] == "49029650", f"expected 49029650, got {fields[1]}"
 
     def test_alt_allele_maps_known_family(self):
-        assert build_vcf_record(SVA_ROW).split("\t")[4] == "<INS:ME:SVA>"
-        assert build_vcf_record(LINE1_ROW).split("\t")[4] == "<INS:ME:LINE1>"
-        assert build_vcf_record(BLANK_OPTIONAL_ROW).split("\t")[4] == "<INS:ME:ALU>"
+        assert build_vcf_record(SVA_ROW).split("\t")[4] == "<INS:ME:SVA>", (
+            "SVA row should map to SVA alt allele"
+        )
+        assert build_vcf_record(LINE1_ROW).split("\t")[4] == "<INS:ME:LINE1>", (
+            "LINE1 row should map to LINE1 alt allele"
+        )
+        assert build_vcf_record(BLANK_OPTIONAL_ROW).split("\t")[4] == "<INS:ME:ALU>", (
+            "ALU row should map to ALU alt allele"
+        )
 
     def test_unknown_family_falls_back_to_generic_symbolic_allele(self):
         row = dict(SVA_ROW, consensus_mei_family="UNKNOWN_NEW_FAMILY")
-        assert build_vcf_record(row).split("\t")[4] == "<INS:ME>"
+        assert build_vcf_record(row).split("\t")[4] == "<INS:ME>", (
+            "unknown family should fall back to generic <INS:ME>"
+        )
 
     def test_id_is_l1tx_chrom_pos_family(self):
-        assert build_vcf_record(SVA_ROW).split("\t")[2] == "L1TX-chr22-49029650-SVA"
-        assert build_vcf_record(LINE1_ROW).split("\t")[2] == "L1TX-chr22-19223382-LINE1"
-        assert build_vcf_record(BLANK_OPTIONAL_ROW).split("\t")[2] == "L1TX-chr22-31355872-ALU"
+        assert build_vcf_record(SVA_ROW).split("\t")[2] == "L1TX-chr22-49029650-SVA", (
+            "SVA ID should be L1TX-chr22-49029650-SVA"
+        )
+        assert build_vcf_record(LINE1_ROW).split("\t")[2] == "L1TX-chr22-19223382-LINE1", (
+            "LINE1 ID should be L1TX-chr22-19223382-LINE1"
+        )
+        assert build_vcf_record(BLANK_OPTIONAL_ROW).split("\t")[2] == "L1TX-chr22-31355872-ALU", (
+            "ALU ID should be L1TX-chr22-31355872-ALU"
+        )
 
     def test_id_is_dot_when_breakpoint_is_missing(self):
         row = dict(SVA_ROW, consensus_insertion_breakpoint_pos="")
-        assert build_vcf_record(row).split("\t")[2] == "."
+        assert build_vcf_record(row).split("\t")[2] == ".", (
+            "ID should be '.' when breakpoint is missing"
+        )
 
     def test_genotype_is_always_blank_missing_not_fabricated(self):
         for row in (SVA_ROW, LINE1_ROW, BLANK_OPTIONAL_ROW):
             fields = build_vcf_record(row).split("\t")
             fmt, sample_val = fields[8], fields[9]
-            assert fmt == "GT:GQ"
-            assert sample_val == "./.:."
+            assert fmt == "GT:GQ", f"expected FORMAT 'GT:GQ', got '{fmt}'"
+            assert sample_val == "./.:.", f"expected missing genotype './.:.', got '{sample_val}'"
 
     def test_qual_and_filter_are_missing_not_fabricated(self):
         fields = build_vcf_record(SVA_ROW).split("\t")
-        assert fields[5] == "."  # QUAL
-        assert fields[6] == "."  # FILTER
+        assert fields[5] == ".", f"expected QUAL '.', got '{fields[5]}'"
+        assert fields[6] == ".", f"expected FILTER '.', got '{fields[6]}'"
 
     def test_catalog_ids_are_split_into_their_own_info_fields(self):
         info_field = build_vcf_record(LINE1_ROW).split("\t")[7]
-        assert "NSSV=" not in info_field
-        assert "G1K=nssv14064681" in info_field
-        assert "LR=chr22-19600083-INS->s899391<s914453>s899392-6059" in info_field
-        assert "KNOWN_ID=" not in info_field
+        assert "NSSV=" not in info_field, "NSSV should not appear in LINE1 INFO"
+        assert "G1K=nssv14064681" in info_field, "expected G1K catalog ID in INFO"
+        assert "LR=chr22-19600083-INS->s899391<s914453>s899392-6059" in info_field, (
+            "expected LR catalog ID in INFO"
+        )
+        assert "KNOWN_ID=" not in info_field, "KNOWN_ID should not appear in INFO"
         for kv in info_field.split(";"):
             if "=" in kv:
                 _, value = kv.split("=", 1)
-                assert ";" not in value
+                assert ";" not in value, f"INFO value contains unescaped ';': {value}"
 
         sva_info = build_vcf_record(SVA_ROW).split("\t")[7]
-        assert "NSSV=" not in sva_info
-        assert "G1K=nssv14064350" in sva_info
-        assert "LR=" not in sva_info
+        assert "NSSV=" not in sva_info, "NSSV should not appear in SVA INFO"
+        assert "G1K=nssv14064350" in sva_info, "expected G1K catalog ID in SVA INFO"
+        assert "LR=" not in sva_info, "LR should not appear in SVA INFO"
         sva_keys = [kv.split("=", 1)[0] for kv in sva_info.split(";") if "=" in kv]
-        assert "CTRL_SUPPORT" in sva_keys
-        assert "DISEASE_SUPPORT" in sva_keys
-        assert "SUPPORT" not in sva_keys
+        assert "CTRL_SUPPORT" in sva_keys, "expected CTRL_SUPPORT in SVA INFO keys"
+        assert "DISEASE_SUPPORT" in sva_keys, "expected DISEASE_SUPPORT in SVA INFO keys"
+        assert "SUPPORT" not in sva_keys, "SUPPORT should not appear as a key"
 
     def test_comma_separated_evidence_string_is_sanitized(self):
-        # Both ',' and internal '=' must be escaped: VCF INFO reserves '='
-        # for the top-level KEY=VALUE split, so an inner "SR_L=0" cannot be
-        # left with a raw '=' either, or a parser would split there too.
         rec = build_vcf_record(SVA_ROW)
         info_field = rec.split("\t")[7]
-        assert "CTRL_SUPPORT=SR_L:0|SR_R:0|DPE_L:2|DPE_R:152|MEI_MAPPED:127|polyA_MAPPED:46|VNTR_MAPPED:0|polyA_side:L" in info_field
+        expected = "CTRL_SUPPORT=SR_L:0|SR_R:0|DPE_L:2|DPE_R:152|MEI_MAPPED:127|polyA_MAPPED:46|VNTR_MAPPED:0|polyA_side:L"
+        assert expected in info_field, f"expected sanitized evidence in INFO, got: {info_field}"
 
     def test_blank_optional_fields_are_omitted_from_info_not_padded(self):
         rec = build_vcf_record(BLANK_OPTIONAL_ROW)
         info_field = rec.split("\t")[7]
-        assert "G1K=" not in info_field
-        assert "LR=" not in info_field
-        assert "KNOWN_SRC=" not in info_field
+        assert "G1K=" not in info_field, "blank G1K should be omitted from INFO"
+        assert "LR=" not in info_field, "blank LR should be omitted from INFO"
+        assert "KNOWN_SRC=" not in info_field, "blank KNOWN_SRC should be omitted from INFO"
 
     def test_no_info_field_ever_contains_a_raw_comma(self):
-        # A raw unescaped comma inside a Number=1 INFO value is invalid VCF.
         for row in (SVA_ROW, LINE1_ROW, BLANK_OPTIONAL_ROW):
             info_field = build_vcf_record(row).split("\t")[7]
             for kv in info_field.split(";"):
                 if "=" in kv:
                     _, value = kv.split("=", 1)
-                    assert "," not in value
+                    assert "," not in value, f"INFO value contains unescaped comma: {value}"
 
     def test_missing_breakpoint_pos_becomes_dot_not_zero(self):
         row = dict(SVA_ROW, consensus_insertion_breakpoint_pos="")
-        assert build_vcf_record(row).split("\t")[1] == "."
+        assert build_vcf_record(row).split("\t")[1] == ".", (
+            "missing breakpoint should become '.' in POS, not '0'"
+        )
 
 
 class TestExportVcf:
     def test_writes_header_and_one_line_per_row(self, tmp_path: Path):
         out_path = tmp_path / "out.vcf"
         n = export_vcf([SVA_ROW, LINE1_ROW, BLANK_OPTIONAL_ROW], out_path)
-        assert n == 3
+        assert n == 3, f"expected 3 rows written, got {n}"
         text = out_path.read_text()
         lines = text.splitlines()
-        assert lines[: len(VCF_HEADER_LINES)] == VCF_HEADER_LINES
-        assert lines[len(VCF_HEADER_LINES)] == VCF_COLUMN_HEADER.format(sample="SAMPLE")
+        assert lines[: len(VCF_HEADER_LINES)] == VCF_HEADER_LINES, (
+            "VCF header lines mismatch"
+        )
+        assert lines[len(VCF_HEADER_LINES)] == VCF_COLUMN_HEADER.format(sample="SAMPLE"), (
+            "VCF column header mismatch"
+        )
         data_lines = lines[len(VCF_HEADER_LINES) + 1 :]
-        assert len(data_lines) == 3
+        assert len(data_lines) == 3, f"expected 3 data lines, got {len(data_lines)}"
 
     def test_custom_sample_name_in_column_header(self, tmp_path: Path):
         out_path = tmp_path / "out.vcf"
         export_vcf([SVA_ROW], out_path, sample_name="tumor_normal_pool")
         text = out_path.read_text()
-        assert "\ttumor_normal_pool" in text
+        assert "\ttumor_normal_pool" in text, (
+            "custom sample name should appear in VCF column header"
+        )
 
     def test_empty_rows_still_produces_valid_header_only_vcf(self, tmp_path: Path):
         out_path = tmp_path / "out.vcf"
         n = export_vcf([], out_path)
-        assert n == 0
+        assert n == 0, f"expected 0 rows written, got {n}"
         text = out_path.read_text()
-        assert text.splitlines()[-1] == VCF_COLUMN_HEADER.format(sample="SAMPLE")
+        assert text.splitlines()[-1] == VCF_COLUMN_HEADER.format(sample="SAMPLE"), (
+            "header-only VCF should end with column header"
+        )
 
 
 class TestExportVcfFromTsv:
@@ -212,10 +239,10 @@ class TestExportVcfFromTsv:
 
         out_path = tmp_path / "out.vcf"
         n = export_vcf_from_tsv(tsv_path, out_path)
-        assert n == 2
+        assert n == 2, f"expected 2 rows from TSV, got {n}"
         text = out_path.read_text()
-        assert "chr22\t49029650" in text
-        assert "chr22\t19223382" in text
+        assert "chr22\t49029650" in text, "SVA breakpoint missing from VCF"
+        assert "chr22\t19223382" in text, "LINE1 breakpoint missing from VCF"
 
     def test_missing_input_file_raises(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError):

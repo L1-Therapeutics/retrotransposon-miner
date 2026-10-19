@@ -228,3 +228,41 @@ def test_informative_clip_borderline_non_at_fails() -> None:
     # 22 A + 3 CG in 25 chars: non_at_fraction = 3/25 = 0.12 < 0.15
     seq = "A" * 22 + "CGT"
     assert _is_informative_split_clip(seq) is False
+
+
+# ---------------------------------------------------------------------------
+# _row_is_polya_evidence  →  run-length rule must cover both evidence tables
+#
+# Split evidence carries clip_poly_at_run; discordant evidence carries
+# anchor_poly_at_run for the same concept. Checking only the split column left
+# every discordant row out of the run-length rule.
+# ---------------------------------------------------------------------------
+
+
+def test_polya_run_rule_applies_to_split_evidence() -> None:
+    import pandas as pd
+
+    from retro_miner.mei_support import _row_is_polya_evidence
+
+    df = pd.DataFrame({"poly_tail_rescued": [False, False], "clip_poly_at_run": [3, 20]})
+    assert list(_row_is_polya_evidence(df)) == [False, True]
+
+
+def test_polya_run_rule_applies_to_discordant_evidence() -> None:
+    import pandas as pd
+
+    from retro_miner.mei_support import _row_is_polya_evidence
+
+    df = pd.DataFrame(
+        {"poly_tail_anchor_rescued": [False, False], "anchor_poly_at_run": [3, 20]}
+    )
+    assert list(_row_is_polya_evidence(df)) == [False, True]
+
+
+def test_polya_rescue_flag_still_honoured_without_run_column() -> None:
+    import pandas as pd
+
+    from retro_miner.mei_support import _row_is_polya_evidence
+
+    df = pd.DataFrame({"poly_tail_anchor_rescued": [True, False]})
+    assert list(_row_is_polya_evidence(df)) == [True, False]
