@@ -114,6 +114,53 @@ class TestBuildVcfRecord:
         row = dict(SVA_ROW, consensus_insertion_breakpoint_pos="")
         assert build_vcf_record(row).split("\t")[2] == "."
 
+    def test_twin_priming_flag_and_consensus_segment_coordinates_export(self):
+        row = dict(
+            SVA_ROW,
+            twin_priming_inv="True",
+            inv_5p_start="101",
+            inv_5p_end="450",
+            noninv_5p_start="451",
+            noninv_3p_end="1366",
+            twin_priming_junction_gap_bp="0",
+            twin_priming_confidence_score="0.871",
+            twin_priming_confidence_tier="high",
+            twin_priming_audit_trail="sample:disease|axis:SVA_D|inv_arm:L(+)[101-450|n:4]|direct_arm:R(-)[451-1366|n:5]|junction_gap_bp:0|conf:0.871(high)",
+        )
+        fields = build_vcf_record(row).split("\t")
+        info = fields[7].split(";")
+        assert "TWIN_PRIMING_INV" in info
+        assert "INV_5P_START=101" in info
+        assert "INV_5P_END=450" in info
+        assert "NONINV_5P_START=451" in info
+        assert "NONINV_3P_END=1366" in info
+        assert "TWIN_PRIMING_GAP_BP=0" in info
+        assert "TWIN_PRIMING_CONF=0.871" in info
+        assert "TWIN_PRIMING_TIER=high" in info
+        assert any(part.startswith("TWIN_PRIMING_AUDIT=sample:disease|axis:SVA_D|") for part in info)
+        assert any(line.startswith("##INFO=<ID=INV_5P_START,") for line in VCF_HEADER_LINES)
+        assert any(line.startswith("##INFO=<ID=TWIN_PRIMING_GAP_BP,") for line in VCF_HEADER_LINES)
+        assert any(line.startswith("##INFO=<ID=TWIN_PRIMING_CONF,") for line in VCF_HEADER_LINES)
+        assert any(line.startswith("##INFO=<ID=TWIN_PRIMING_TIER,") for line in VCF_HEADER_LINES)
+        assert any(line.startswith("##INFO=<ID=TWIN_PRIMING_AUDIT,") for line in VCF_HEADER_LINES)
+
+    def test_false_twin_priming_flag_is_not_emitted(self):
+        for raw in ("False", "0", "", None):
+            info = build_vcf_record(
+                dict(
+                    SVA_ROW,
+                    twin_priming_inv=raw,
+                    twin_priming_confidence_score="0.871",
+                    twin_priming_confidence_tier="high",
+                    twin_priming_audit_trail="sample:disease",
+                )
+            ).split("\t")[7]
+            assert "TWIN_PRIMING_INV" not in info
+            assert "TWIN_PRIMING_GAP_BP=" not in info
+            assert "TWIN_PRIMING_CONF=" not in info
+            assert "TWIN_PRIMING_TIER=" not in info
+            assert "TWIN_PRIMING_AUDIT=" not in info
+
     def test_genotype_is_always_blank_missing_not_fabricated(self):
         for row in (SVA_ROW, LINE1_ROW, BLANK_OPTIONAL_ROW):
             fields = build_vcf_record(row).split("\t")
@@ -346,6 +393,80 @@ class TestPysamRoundTrip:
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "vcf"
 CLASSIFIER_SLICE = FIXTURE_DIR / "hg03086_classifier_slice.tsv"
 GOLD_SLICE = FIXTURE_DIR / "hg03086_gold_slice.tsv"
+
+
+def test_gold_review_twin_priming_fields_round_trip_with_pysam(tmp_path: Path):
+    """Preserve twin-priming evidence from a real gold-review TSV through VCF parsing."""
+    pysam = pytest.importorskip("pysam")
+    with GOLD_SLICE.open(encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    twin_priming_fields = [
+        "twin_priming_inv",
+        "inv_5p_start",
+        "inv_5p_end",
+        "noninv_5p_start",
+        "noninv_3p_end",
+        "twin_priming_junction_gap_bp",
+        "twin_priming_confidence_score",
+        "twin_priming_confidence_tier",
+        "twin_priming_audit_trail",
+    ]
+    audit_str = (
+        "sample:disease|axis:L1HS_full|inv_arm:L(-)[100-500|n:4]"
+        "|direct_arm:R(+)[501-6018|n:5]|junction_gap_bp:0|conf:0.871(high)"
+        "|inv_reads:r_inv_1(-:100-500)/r_inv_2(-:110-495)"
+        "|direct_reads:r_dir_1(+:501-6018)"
+    )
+    line1 = next(row for row in rows if row["chrom"] == "chr4" and row["consensus_mei_family"] == "LINE1")
+    line1.update(
+        twin_priming_inv="True",
+        inv_5p_start="100",
+        inv_5p_end="500",
+        noninv_5p_start="501",
+        noninv_3p_end="6018",
+        twin_priming_junction_gap_bp="0",
+        twin_priming_confidence_score="0.871",
+        twin_priming_confidence_tier="high",
+        twin_priming_audit_trail=audit_str,
+    )
+    for row in rows:
+        for field in twin_priming_fields:
+            row.setdefault(field, "")
+    fieldnames.extend(field for field in twin_priming_fields if field not in fieldnames)
+
+    tsv_path = tmp_path / "candidate_loci.mei.gold_review.tsv"
+    with tsv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    out_path = tmp_path / "gold.vcf"
+    assert export_vcf_from_tsv(tsv_path, out_path, sample_name="HG03086") == 4
+    records = list(pysam.VariantFile(str(out_path)))
+    by_id = {record.id: record for record in records}
+    twin = by_id["L1TX-chr4-102422592-LINE1"]
+    assert twin.info["TWIN_PRIMING_INV"] is True
+    assert {
+        key: twin.info[key]
+        for key in ("INV_5P_START", "INV_5P_END", "NONINV_5P_START", "NONINV_3P_END")
+    } == {
+        "INV_5P_START": 100,
+        "INV_5P_END": 500,
+        "NONINV_5P_START": 501,
+        "NONINV_3P_END": 6018,
+    }
+    assert twin.info["TWIN_PRIMING_GAP_BP"] == 0
+    assert twin.info["TWIN_PRIMING_CONF"] == pytest.approx(0.871, abs=1e-4)
+    assert twin.info["TWIN_PRIMING_TIER"] == "high"
+    assert twin.info["TWIN_PRIMING_AUDIT"] == audit_str
+    assert all("TWIN_PRIMING_INV" not in record.info for record in records if record is not twin)
+    assert all("TWIN_PRIMING_GAP_BP" not in record.info for record in records if record is not twin)
+    assert all("TWIN_PRIMING_CONF" not in record.info for record in records if record is not twin)
+    assert all("TWIN_PRIMING_TIER" not in record.info for record in records if record is not twin)
+    assert all("TWIN_PRIMING_AUDIT" not in record.info for record in records if record is not twin)
 
 
 def test_gold_review_export_has_no_rank_pct_without_classifier(tmp_path: Path):

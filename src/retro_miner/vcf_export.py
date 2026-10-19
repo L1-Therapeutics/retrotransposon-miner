@@ -125,6 +125,150 @@ _EXTRA_INFO_FIELDS: tuple[tuple[str, str, str, str], ...] = (
         "String",
         "Whether the call overlaps a known MEI polymorphism",
     ),
+    (
+        "SPLICE_DIST",
+        "splice_dist",
+        "Integer",
+        "Distance in bp to the nearest annotated splice donor or acceptor site",
+    ),
+    (
+        "DIST_TO_SPLICE_DONOR",
+        "dist_to_splice_donor",
+        "Integer",
+        "Distance in bp to the upstream splice donor junction in the primary overlapping intron",
+    ),
+    (
+        "DIST_TO_SPLICE_ACCEPTOR",
+        "dist_to_splice_acceptor",
+        "Integer",
+        "Distance in bp to the downstream splice acceptor junction in the primary overlapping intron",
+    ),
+    (
+        "SPLICE_SIDE",
+        "splice_side",
+        "String",
+        "Nearest splice junction type: donor, acceptor, or exonic",
+    ),
+    (
+        "MEI_EXONIZATION_RISK",
+        "mei_exonization_risk",
+        "String",
+        "Risk of alternative pseudo-exon inclusion or transcript truncation (HIGH, MODERATE, NONE)",
+    ),
+    (
+        "ALU_EXONIZATION_RISK",
+        "alu_exonization_risk",
+        "String",
+        "Antisense Alu cryptic 3-prime splice acceptor exonization risk (HIGH, MODERATE, NONE)",
+    ),
+    (
+        "L1_TRUNCATION_RISK",
+        "l1_truncation_risk",
+        "String",
+        "Sense LINE-1 premature polyadenylation or internal donor splicing truncation risk (HIGH, MODERATE, NONE)",
+    ),
+    (
+        "SVA_EXON_TRAPPING_RISK",
+        "sva_exon_trapping_risk",
+        "String",
+        "SVA cryptic splice site activation and exon trapping risk in sense or antisense orientation (HIGH, MODERATE, NONE)",
+    ),
+    (
+        "CRYPTIC_DONOR_COUNT",
+        "cryptic_donor_count",
+        "Integer",
+        "Count of strong cryptic 5-prime splice donor (9-mer GT) motifs on the transcribed pre-mRNA strand of the assembled insertion sequence",
+    ),
+    (
+        "CRYPTIC_ACCEPTOR_COUNT",
+        "cryptic_acceptor_count",
+        "Integer",
+        "Count of strong cryptic 3-prime splice acceptor (polypyrimidine + AG 23-mer) motifs on the transcribed pre-mRNA strand of the assembled insertion sequence",
+    ),
+    (
+        "CRYPTIC_PSEUDOEXON_PAIRS",
+        "cryptic_pseudoexon_pairs",
+        "Integer",
+        "Count of candidate internal pseudo-exon pairs (3-prime acceptor followed 40-350 bp downstream by a 5-prime donor) in the transcribed insertion sequence",
+    ),
+    (
+        "CRYPTIC_SPLICE_MAX_SCORE",
+        "cryptic_splice_max_score",
+        "Float",
+        "Maximum normalized consensus splice motif score (0.00-1.00) across scanned cryptic 5-prime donor and 3-prime acceptor sites",
+    ),
+    (
+        "INV_5P_START",
+        "inv_5p_start",
+        "Integer",
+        "Start coordinate of the inverted 5-prime segment on the full-length MEI consensus axis",
+    ),
+    (
+        "INV_5P_END",
+        "inv_5p_end",
+        "Integer",
+        "End coordinate of the inverted 5-prime segment on the full-length MEI consensus axis",
+    ),
+    (
+        "NONINV_5P_START",
+        "noninv_5p_start",
+        "Integer",
+        "Start coordinate of the non-inverted segment on the full-length MEI consensus axis",
+    ),
+    (
+        "NONINV_3P_END",
+        "noninv_3p_end",
+        "Integer",
+        "End coordinate of the non-inverted segment on the full-length MEI consensus axis",
+    ),
+    (
+        "TWIN_PRIMING_GAP_BP",
+        "twin_priming_junction_gap_bp",
+        "Integer",
+        "Signed base-pair gap between the inverted 5-prime end and the non-inverted 3-prime start (negative values indicate overlap)",
+    ),
+    (
+        "TWIN_PRIMING_CONF",
+        "twin_priming_confidence_score",
+        "Float",
+        "Confidence score (0.0-1.0) for the twin-priming 5-prime inversion call",
+    ),
+    (
+        "TWIN_PRIMING_TIER",
+        "twin_priming_confidence_tier",
+        "String",
+        "Confidence tier (high, medium, low) for the twin-priming 5-prime inversion call",
+    ),
+    (
+        "TWIN_PRIMING_AUDIT",
+        "twin_priming_audit_trail",
+        "String",
+        "Read-level and arm-level audit trail for the twin-priming 5-prime inversion call",
+    ),
+    (
+        "INV_JUNCTION_SPLICE_COUNT",
+        "inv_junction_splice_count",
+        "Integer",
+        "Count of chimeric cryptic 5-prime donor and 3-prime acceptor splice motifs spanning or adjacent to the 5-prime inversion junction",
+    ),
+    (
+        "INV_JUNCTION_SPLICE_MAX_SCORE",
+        "inv_junction_splice_max_score",
+        "Float",
+        "Maximum normalized consensus splice motif score (0.00-1.00) across the twin-priming 5-prime inversion junction window",
+    ),
+    (
+        "EXON_RANK",
+        "exon_rank",
+        "String",
+        "Exon rank (e.g. 3/10) when the primary affected transcript consequence is exonic",
+    ),
+    (
+        "INTRON_RANK",
+        "intron_rank",
+        "String",
+        "Intron rank (e.g. 3/10) when the primary affected transcript consequence is intronic",
+    ),
 )
 
 #: ID-only contig declarations (no lengths -- this tool does not carry
@@ -181,6 +325,11 @@ VCF_HEADER_LINES = [
         f'##INFO=<ID={info_id},Number=1,Type={_VCF_TYPE.get(kind, kind)},Description="{desc}">'
         for info_id, _column, kind, desc in _EXTRA_INFO_FIELDS
     ],
+    '##INFO=<ID=SPLICE_REGION,Number=0,Type=Flag,Description="Insertion breakpoint falls within canonical splice site or region (<=8bp)">',
+    '##INFO=<ID=TWIN_PRIMING_INV,Number=0,Type=Flag,Description="Insertion exhibits a twin-priming 5-prime inversion junction (5-prime inverted segment joined to 3-prime non-inverted segment)">',
+    '##INFO=<ID=TX_ID,Number=.,Type=String,Description="Transcript IDs impacted by the insertion breakpoint">',
+    '##INFO=<ID=TX_BIOTYPE,Number=.,Type=String,Description="Biotypes of affected transcripts">',
+    '##INFO=<ID=TX_RANK,Number=.,Type=String,Description="Exon or intron rank (e.g. 3/10) in the primary affected transcript">',
     '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype (unset: this table reports pooled disease-vs-control read support, not per-individual diploid genotypes)">',
     '##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype Quality (unset: no validated genotyping model for MEI evidence yet -- see module docstring)">',
 ]
@@ -237,6 +386,18 @@ def _support_info_fields(row: dict[str, Any]) -> list[str | None]:
     ]
 
 
+def _truthy_flag(raw: Any) -> bool:
+    """Interpret TSV booleans/VCF-style flags without treating 'false' as true."""
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in {"", "0", "false", "f", "no", "n", "nan", "."}:
+        return False
+    return text in {"1", "true", "t", "yes", "y"}
+
+
 def _info_field(key: str, value: str) -> str | None:
     """Return ``KEY=value`` or None if value is empty (omit rather than fabricate)."""
     if value == "":
@@ -254,6 +415,14 @@ def _info_int(key: str, raw: Any) -> str | None:
         return None
 
 
+def _info_positive_int(key: str, raw: Any) -> str | None:
+    """Write a positive coordinate, omitting zero/negative missing sentinels."""
+    value = _info_int(key, raw)
+    if value is None or int(value.split("=", 1)[1]) <= 0:
+        return None
+    return value
+
+
 def _info_float(key: str, raw: Any) -> str | None:
     text = _vcf_safe(raw)
     if text == "":
@@ -261,6 +430,22 @@ def _info_float(key: str, raw: Any) -> str | None:
     try:
         float(text)
     except ValueError:
+        return None
+    return f"{key}={text}"
+
+
+def _info_positive_float(key: str, raw: Any) -> str | None:
+    """Write a positive float value, omitting zero/negative missing sentinels."""
+    value = _info_float(key, raw)
+    if value is None or float(value.split("=", 1)[1]) <= 0.0:
+        return None
+    return value
+
+
+def _info_non_none_tier(key: str, raw: Any) -> str | None:
+    """Write a confidence tier string, omitting empty or 'none' sentinels."""
+    text = _vcf_safe(raw)
+    if text == "" or text.lower() == "none":
         return None
     return f"{key}={text}"
 
@@ -520,6 +705,7 @@ def build_vcf_record(row: dict[str, Any], *, mark_pass: bool = False) -> str:
     qual = "."
     filt = "PASS" if mark_pass else "."
 
+    twin_priming_inv = _truthy_flag(row.get("twin_priming_inv", row.get("TWIN_PRIMING_INV")))
     info_parts = [
         _info_field("SVTYPE", "INS"),
         _info_int("END", pos) if pos != "." else None,
@@ -534,6 +720,23 @@ def build_vcf_record(row: dict[str, Any], *, mark_pass: bool = False) -> str:
         _info_int("MEI_SPAN", row.get("consensus_insertion_mei_span_full")),
         _info_int("MEI_5P", row.get("consensus_insertion_mei_5p_coord_full")),
         _info_int("MEI_3P", row.get("consensus_insertion_mei_3p_coord_full")),
+        *(["TWIN_PRIMING_INV"] if twin_priming_inv else []),
+        _info_positive_int("INV_5P_START", row.get("inv_5p_start")) if twin_priming_inv else None,
+        _info_positive_int("INV_5P_END", row.get("inv_5p_end")) if twin_priming_inv else None,
+        _info_positive_int("NONINV_5P_START", row.get("noninv_5p_start")) if twin_priming_inv else None,
+        _info_positive_int("NONINV_3P_END", row.get("noninv_3p_end")) if twin_priming_inv else None,
+        _info_int("TWIN_PRIMING_GAP_BP", row.get("twin_priming_junction_gap_bp"))
+        if twin_priming_inv
+        else None,
+        _info_positive_float("TWIN_PRIMING_CONF", row.get("twin_priming_confidence_score", row.get("TWIN_PRIMING_CONF")))
+        if twin_priming_inv
+        else None,
+        _info_non_none_tier("TWIN_PRIMING_TIER", row.get("twin_priming_confidence_tier", row.get("TWIN_PRIMING_TIER")))
+        if twin_priming_inv
+        else None,
+        _info_field("TWIN_PRIMING_AUDIT", _vcf_safe(row.get("twin_priming_audit_trail", row.get("TWIN_PRIMING_AUDIT"))))
+        if twin_priming_inv
+        else None,
         _info_field("G1K", _vcf_safe(known.get("g1k"))),
         _info_field("LR", _vcf_safe(known.get("lr"))),
         _info_field("KNOWN_SRC", _vcf_safe(row.get("known_mei_polymorphism_source"))),
@@ -541,6 +744,17 @@ def build_vcf_record(row: dict[str, Any], *, mark_pass: bool = False) -> str:
         *_support_info_fields(row),
     ]
     for info_id, column, kind, _desc in _EXTRA_INFO_FIELDS:
+        if info_id in {
+            "INV_5P_START",
+            "INV_5P_END",
+            "NONINV_5P_START",
+            "NONINV_3P_END",
+            "TWIN_PRIMING_GAP_BP",
+            "TWIN_PRIMING_CONF",
+            "TWIN_PRIMING_TIER",
+            "TWIN_PRIMING_AUDIT",
+        }:
+            continue
         raw = row.get(column)
         if kind == "Integer":
             info_parts.append(_info_int(info_id, raw))

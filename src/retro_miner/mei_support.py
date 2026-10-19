@@ -10051,6 +10051,16 @@ def _row_int(row: pd.Series, key: str, default: int = 0) -> int:
         return default
 
 
+def _row_float(row: pd.Series, key: str, default: float = 0.0) -> float:
+    val = row.get(key, default)
+    if pd.isna(val):
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def _row_bool(row: pd.Series, key: str, default: bool = False) -> bool:
     val = row.get(key, default)
     if pd.isna(val):
@@ -10178,6 +10188,543 @@ def _sample_has_bilateral_discordant_support(row: pd.Series, prefix: str) -> boo
     left = _row_int(row, f"{prefix}_discordant_mei_left_supported_reads")
     right = _row_int(row, f"{prefix}_discordant_mei_right_supported_reads")
     return left >= 1 and right >= 1
+
+
+_TWIN_PRIMING_REVIEW_COLUMNS = (
+    "twin_priming_inv",
+    "inv_5p_start",
+    "inv_5p_end",
+    "noninv_5p_start",
+    "noninv_3p_end",
+    "twin_priming_junction_gap_bp",
+    "twin_priming_confidence_score",
+    "twin_priming_confidence_tier",
+    "twin_priming_audit_trail",
+)
+
+
+def _compute_twin_priming_confidence(
+    *,
+    inv_support: int,
+    direct_support: int,
+    inv_start: int,
+    inv_end: int,
+    direct_start: int,
+    direct_end: int,
+    inv_purity: float = 1.0,
+    direct_purity: float = 1.0,
+    inv_mode_frac: float = 1.0,
+    direct_mode_frac: float = 1.0,
+) -> tuple[float, str]:
+    """Compute a [0.0, 1.0] confidence score and tier for a twin-priming inversion call."""
+    min_supp = max(0, min(int(inv_support), int(direct_support)))
+    tot_supp = max(0, int(inv_support) + int(direct_support))
+    f_support = min(1.0, min_supp / 6.0) * 0.65 + min(1.0, tot_supp / 14.0) * 0.35
+
+    gap_bp = int(direct_start) - int(inv_end) - 1
+    abs_gap = abs(gap_bp)
+    if abs_gap <= 15:
+        f_junction = 1.0
+    elif abs_gap <= 75:
+        f_junction = 0.85
+    elif abs_gap <= 250:
+        f_junction = 0.65
+    elif abs_gap <= 600:
+        f_junction = 0.45
+    else:
+        f_junction = 0.25
+
+    inv_span = max(0, int(inv_end) - int(inv_start) + 1)
+    direct_span = max(0, int(direct_end) - int(direct_start) + 1)
+    f_span = 0.5 * min(1.0, inv_span / 80.0) + 0.5 * min(1.0, direct_span / 80.0)
+
+    p_inv = min(1.0, max(0.0, float(inv_purity))) if inv_purity > 0 else 1.0
+    p_dir = min(1.0, max(0.0, float(direct_purity))) if direct_purity > 0 else 1.0
+    m_inv = min(1.0, max(0.0, float(inv_mode_frac))) if inv_mode_frac > 0 else 1.0
+    m_dir = min(1.0, max(0.0, float(direct_mode_frac))) if direct_mode_frac > 0 else 1.0
+    f_coherence = 0.25 * (p_inv + p_dir + m_inv + m_dir)
+
+    score = round(
+        min(
+            1.0,
+            max(
+                0.0,
+                0.45 * f_support + 0.25 * f_junction + 0.15 * f_span + 0.15 * f_coherence,
+            ),
+        ),
+        3,
+    )
+    if score >= 0.75 and min_supp >= 3:
+        tier = "high"
+    elif score >= 0.50 and min_supp >= 2:
+        tier = "medium"
+    elif score > 0.0:
+        tier = "low"
+    else:
+        tier = "none"
+    return score, tier
+
+
+def _collect_twin_priming_arm_reads(
+    locus_detail: pd.DataFrame | None,
+    *,
+    sample: str,
+    side: str,
+    strand: str,
+    family: str,
+    max_reads: int = 4,
+) -> list[str]:
+    """Return deterministic audit tokens for supporting SR reads on one inversion arm."""
+    if locus_detail is None or locus_detail.empty:
+        return []
+    df = locus_detail
+    if "sample" in df.columns:
+        df = df.loc[df["sample"].fillna("").astype(str).eq(sample)]
+    if df.empty:
+        return []
+    if "evidence_type" in df.columns:
+        sr = df.loc[df["evidence_type"].fillna("").astype(str).eq("SR")]
+        if not sr.empty:
+            df = sr
+    if "anchor_side" in df.columns:
+        sided = df.loc[df["anchor_side"].fillna("").astype(str).eq(side)]
+        if not sided.empty:
+            df = sided
+    if "mei_hit" in df.columns:
+        hits = df.loc[df["mei_hit"].fillna(False).astype(bool)]
+        if not hits.empty:
+            df = hits
+    if "mei_strand" in df.columns and strand in {"+", "-"}:
+        strands = df.loc[df["mei_strand"].fillna("").astype(str).eq(strand)]
+        if not strands.empty:
+            df = strands
+    if "mei_target" in df.columns and family:
+        fams = df["mei_target"].fillna("").astype(str).map(_normalize_mei_family_token)
+        fam_matched = df.loc[fams.str.upper().eq(family.upper())]
+        if not fam_matched.empty:
+            df = fam_matched
+    if df.empty or "read_name" not in df.columns:
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for rec in df.itertuples(index=False):
+        rname = str(getattr(rec, "read_name", "") or "").strip()
+        if not rname or rname in seen:
+            continue
+        seen.add(rname)
+        def _coord_int(val: object) -> int:
+            try:
+                if val is None or pd.isna(val):
+                    return 0
+                return int(float(val))
+            except (TypeError, ValueError):
+                return 0
+
+        m_start = _coord_int(getattr(rec, "mei_start", 0))
+        m_end = _coord_int(getattr(rec, "mei_end", 0))
+        r_strand = str(getattr(rec, "mei_strand", strand) or strand).strip()
+        if m_start > 0 and m_end > 0:
+            lo, hi = (m_start, m_end) if m_start <= m_end else (m_end, m_start)
+            tokens.append(f"{rname}({r_strand}:{lo}-{hi})")
+        else:
+            tokens.append(rname)
+    tokens.sort()
+    return tokens[:max_reads]
+
+
+def _format_twin_priming_audit_trail(
+    *,
+    sample: str,
+    axis: str,
+    inv_side: str,
+    inv_strand: str,
+    inv_start: int,
+    inv_end: int,
+    inv_support: int,
+    direct_side: str,
+    direct_strand: str,
+    direct_start: int,
+    direct_end: int,
+    direct_support: int,
+    score: float,
+    tier: str,
+    inv_reads: list[str] | None = None,
+    direct_reads: list[str] | None = None,
+) -> str:
+    """Format a VCF-safe per-arm and per-read audit trail for a twin-priming call."""
+    gap_bp = int(direct_start) - int(inv_end) - 1
+    parts = [
+        f"sample:{sample}",
+        f"axis:{axis or 'unknown'}",
+        f"inv_arm:{inv_side}({inv_strand})[{inv_start}-{inv_end}|n:{inv_support}]",
+        f"direct_arm:{direct_side}({direct_strand})[{direct_start}-{direct_end}|n:{direct_support}]",
+        f"junction_gap_bp:{gap_bp}",
+        f"conf:{score:.3f}({tier})",
+    ]
+    if inv_reads:
+        parts.append(f"inv_reads:{'/'.join(inv_reads)}")
+    if direct_reads:
+        parts.append(f"direct_reads:{'/'.join(direct_reads)}")
+    return "|".join(parts)
+
+
+def _infer_twin_priming_inversion_from_read_evidence(
+    row: pd.Series,
+    *,
+    fragment_to_full_map: dict[str, FragmentToFullMap] | None = None,
+    locus_detail: pd.DataFrame | None = None,
+) -> dict[str, object]:
+    """Infer an L1/SVA 5-prime inversion from opposite-strand split-read arms.
+
+    Each arm must have mapped consensus coordinates and read support on the
+    same MEI family axis. The arm matching the poly(A)-bearing insertion
+    orientation is treated as the non-inverted 3-prime segment; the opposite
+    arm is the candidate inverted 5-prime segment. Fragment coordinates are
+    projected independently before comparing or exporting them.
+    """
+    result: dict[str, object] = {
+        "twin_priming_inv": False,
+        "inv_5p_start": -1,
+        "inv_5p_end": -1,
+        "noninv_5p_start": -1,
+        "noninv_3p_end": -1,
+        "twin_priming_junction_gap_bp": -1,
+        "twin_priming_confidence_score": 0.0,
+        "twin_priming_confidence_tier": "none",
+        "twin_priming_audit_trail": "",
+    }
+    family = _row_consensus_mei_family(row).upper()
+    if family not in {"LINE1", "SVA"}:
+        return result
+
+    frag_map = fragment_to_full_map or {}
+    consensus_orientation = str(
+        row.get("consensus_insertion_orientation", "") or ""
+    ).strip()
+    if consensus_orientation not in {"+", "-"}:
+        consensus_orientation = ""
+
+    candidates: list[dict[str, object]] = []
+    for sample in ("disease", "control"):
+        arms: dict[str, dict[str, object]] = {}
+        for side in ("L", "R"):
+            strand = str(row.get(f"{sample}_{side}_mei_strand", "") or "").strip()
+            start = _row_int(row, f"{sample}_{side}_mei_start", -1)
+            end = _row_int(row, f"{sample}_{side}_mei_end", -1)
+            support = _row_int(row, f"{sample}_{side}_mei_supported_reads")
+            target = str(row.get(f"{sample}_{side}_mei_subfamily", "") or "").strip()
+            if strand not in {"+", "-"} or support < 2 or start <= 0 or end <= 0:
+                continue
+            if end < start:
+                start, end = end, start
+            side_family = _normalize_mei_family_token(target)
+            if side_family and side_family.upper() != family:
+                continue
+            axis = target.split("|", 1)[0].split("#", 1)[0].strip()
+            projected = _project_panel_coords_to_full(start, end, target, frag_map) if target and frag_map else None
+            if projected is not None:
+                start, end, axis = int(projected[0]), int(projected[1]), str(projected[2])
+            purity = _row_float(row, f"{sample}_{side}_mei_subfamily_purity", 1.0)
+            mode_frac = _row_float(row, f"{sample}_{side}_mei_breakpoint_mode_fraction", 1.0)
+            arms[side] = {
+                "strand": strand,
+                "start": start,
+                "end": end,
+                "support": support,
+                "axis": axis,
+                "projected": projected is not None,
+                "target": target,
+                "purity": purity if purity > 0.0 else 1.0,
+                "mode_frac": mode_frac if mode_frac > 0.0 else 1.0,
+            }
+
+        if set(arms) != {"L", "R"}:
+            continue
+        left, right = arms["L"], arms["R"]
+        if left["strand"] == right["strand"]:
+            continue
+        # Distinct panel fragments are only comparable after both arms project
+        # onto the same full-length consensus axis.
+        if left["axis"] != right["axis"]:
+            continue
+        if (left["projected"] or right["projected"]) and not (left["projected"] and right["projected"]):
+            continue
+
+        direct_orientation = consensus_orientation
+        if not direct_orientation:
+            for orientation_col in (f"{sample}_insertion_orientation", "insertion_orientation"):
+                candidate_orientation = str(row.get(orientation_col, "") or "").strip()
+                if candidate_orientation in {"+", "-"}:
+                    direct_orientation = candidate_orientation
+                    break
+        if not direct_orientation:
+            poly_support = {
+                side: _row_int(row, f"{sample}_{side}_poly_at_reads")
+                for side in ("L", "R")
+            }
+            if poly_support["L"] != poly_support["R"]:
+                direct_side = max(poly_support, key=poly_support.get)
+                direct_orientation = str(arms[direct_side]["strand"])
+        if not direct_orientation:
+            continue
+        direct_side = next((side for side, arm in arms.items() if arm["strand"] == direct_orientation), None)
+        inv_side = next((side for side, arm in arms.items() if arm["strand"] != direct_orientation), None)
+        if direct_side is None or inv_side is None:
+            continue
+
+        inverted = arms[inv_side]
+        noninverted = arms[direct_side]
+        inv_start, inv_end = int(inverted["start"]), int(inverted["end"])
+        direct_start, direct_end = int(noninverted["start"]), int(noninverted["end"])
+        # The inverted 5-prime segment must lie upstream of the direct 3-prime
+        # arm on the canonical consensus axis; midpoint ordering tolerates a
+        # small breakpoint overlap without accepting reversed arms.
+        if (inv_start + inv_end) >= (direct_start + direct_end):
+            continue
+        inv_support = int(inverted["support"])
+        direct_support = int(noninverted["support"])
+        score, tier = _compute_twin_priming_confidence(
+            inv_support=inv_support,
+            direct_support=direct_support,
+            inv_start=inv_start,
+            inv_end=inv_end,
+            direct_start=direct_start,
+            direct_end=direct_end,
+            inv_purity=float(inverted["purity"]),
+            direct_purity=float(noninverted["purity"]),
+            inv_mode_frac=float(inverted["mode_frac"]),
+            direct_mode_frac=float(noninverted["mode_frac"]),
+        )
+        inv_reads = _collect_twin_priming_arm_reads(
+            locus_detail,
+            sample=sample,
+            side=inv_side,
+            strand=str(inverted["strand"]),
+            family=family,
+        )
+        direct_reads = _collect_twin_priming_arm_reads(
+            locus_detail,
+            sample=sample,
+            side=direct_side,
+            strand=str(noninverted["strand"]),
+            family=family,
+        )
+        audit_trail = _format_twin_priming_audit_trail(
+            sample=sample,
+            axis=str(inverted["axis"]),
+            inv_side=inv_side,
+            inv_strand=str(inverted["strand"]),
+            inv_start=inv_start,
+            inv_end=inv_end,
+            inv_support=inv_support,
+            direct_side=direct_side,
+            direct_strand=str(noninverted["strand"]),
+            direct_start=direct_start,
+            direct_end=direct_end,
+            direct_support=direct_support,
+            score=score,
+            tier=tier,
+            inv_reads=inv_reads,
+            direct_reads=direct_reads,
+        )
+        candidates.append(
+            {
+                "combined_support": inv_support + direct_support,
+                "min_support": min(inv_support, direct_support),
+                "score": score,
+                "tier": tier,
+                "inv_5p_start": inv_start,
+                "inv_5p_end": inv_end,
+                "noninv_5p_start": direct_start,
+                "noninv_3p_end": direct_end,
+                "audit_trail": audit_trail,
+            }
+        )
+
+    if candidates:
+        best = max(
+            candidates,
+            key=lambda item: (
+                int(item["combined_support"]),
+                int(item["min_support"]),
+                float(item["score"]),
+            ),
+        )
+        result.update(
+            {
+                "twin_priming_inv": True,
+                "inv_5p_start": int(best["inv_5p_start"]),
+                "inv_5p_end": int(best["inv_5p_end"]),
+                "noninv_5p_start": int(best["noninv_5p_start"]),
+                "noninv_3p_end": int(best["noninv_3p_end"]),
+                "twin_priming_junction_gap_bp": int(best["noninv_5p_start"]) - int(best["inv_5p_end"]) - 1,
+                "twin_priming_confidence_score": float(best["score"]),
+                "twin_priming_confidence_tier": str(best["tier"]),
+                "twin_priming_audit_trail": str(best["audit_trail"]),
+            }
+        )
+        return result
+
+    # Preserve complete, explicit inversion evidence supplied by an upstream
+    # source, but do not infer a flag from partial coordinate fragments alone.
+    if _row_bool(row, "twin_priming_inv") or _row_bool(row, "TWIN_PRIMING_INV"):
+        result["twin_priming_inv"] = True
+        for col in ("inv_5p_start", "inv_5p_end", "noninv_5p_start", "noninv_3p_end"):
+            value = _row_int(row, col, -1)
+            result[col] = value if value > 0 else -1
+        result["twin_priming_junction_gap_bp"] = _row_int(
+            row,
+            "twin_priming_junction_gap_bp",
+            _row_int(row, "TWIN_PRIMING_GAP_BP", -1),
+        )
+        if result["twin_priming_junction_gap_bp"] == -1:
+            inv_end = int(result["inv_5p_end"])
+            noninv_start = int(result["noninv_5p_start"])
+            if inv_end > 0 and noninv_start > 0:
+                result["twin_priming_junction_gap_bp"] = noninv_start - inv_end - 1
+        explicit_score = _row_float(
+            row,
+            "twin_priming_confidence_score",
+            _row_float(row, "TWIN_PRIMING_CONF", -1.0),
+        )
+        explicit_tier = str(
+            row.get("twin_priming_confidence_tier", row.get("TWIN_PRIMING_TIER", "")) or ""
+        ).strip().lower()
+        explicit_audit = str(
+            row.get("twin_priming_audit_trail", row.get("TWIN_PRIMING_AUDIT", "")) or ""
+        ).strip()
+        if explicit_score < 0.0:
+            if all(int(result[c]) > 0 for c in ("inv_5p_start", "inv_5p_end", "noninv_5p_start", "noninv_3p_end")):
+                explicit_score, inferred_tier = _compute_twin_priming_confidence(
+                    inv_support=2,
+                    direct_support=2,
+                    inv_start=int(result["inv_5p_start"]),
+                    inv_end=int(result["inv_5p_end"]),
+                    direct_start=int(result["noninv_5p_start"]),
+                    direct_end=int(result["noninv_3p_end"]),
+                )
+                if not explicit_tier or explicit_tier == "none":
+                    explicit_tier = inferred_tier
+            else:
+                explicit_score = 0.5
+        if explicit_tier not in {"high", "medium", "low"}:
+            explicit_tier = "high" if explicit_score >= 0.75 else "medium" if explicit_score >= 0.50 else "low"
+        if not explicit_audit:
+            explicit_audit = (
+                f"source:upstream|inv_5p:{result['inv_5p_start']}-{result['inv_5p_end']}"
+                f"|noninv:{result['noninv_5p_start']}-{result['noninv_3p_end']}"
+                f"|conf:{explicit_score:.3f}({explicit_tier})"
+            )
+        if int(result["inv_5p_end"]) > 0 and int(result["noninv_5p_start"]) > 0:
+            result["twin_priming_junction_gap_bp"] = (
+                int(result["noninv_5p_start"]) - int(result["inv_5p_end"]) - 1
+            )
+        result["twin_priming_confidence_score"] = round(float(explicit_score), 3)
+        result["twin_priming_confidence_tier"] = explicit_tier
+        result["twin_priming_audit_trail"] = explicit_audit
+    return result
+
+
+def _annotate_twin_priming_inversion_fields(
+    candidates: pd.DataFrame,
+    *,
+    fragment_to_full_map: dict[str, FragmentToFullMap] | None = None,
+    supporting_reads_detail: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Add auditable twin-priming flag, confidence score/tier, and read-level audit trail."""
+    out = candidates.copy()
+    if out.empty:
+        for col in _TWIN_PRIMING_REVIEW_COLUMNS:
+            if col == "twin_priming_inv":
+                out[col] = pd.Series(dtype="bool")
+            elif col == "twin_priming_confidence_score":
+                out[col] = pd.Series(dtype="float64")
+            elif col == "twin_priming_junction_gap_bp":
+                out[col] = pd.Series(dtype="int64")
+            elif col in {"twin_priming_confidence_tier", "twin_priming_audit_trail"}:
+                out[col] = pd.Series(dtype="object")
+            else:
+                out[col] = pd.Series(dtype="int64")
+        return out
+
+    detail_by_locus: dict[tuple[str, int, int], pd.DataFrame] = {}
+    if (
+        supporting_reads_detail is not None
+        and not supporting_reads_detail.empty
+        and {"chrom", "window_start", "window_end"}.issubset(supporting_reads_detail.columns)
+    ):
+        work_detail = supporting_reads_detail.copy()
+        work_detail["_ws"] = pd.to_numeric(work_detail["window_start"], errors="coerce").fillna(-1).astype(int)
+        work_detail["_we"] = pd.to_numeric(work_detail["window_end"], errors="coerce").fillna(-1).astype(int)
+        for (chrom, ws, we), grp in work_detail.groupby(["chrom", "_ws", "_we"], sort=False):
+            detail_by_locus[(str(chrom), int(ws), int(we))] = grp
+
+    def _lookup_locus_detail(row: pd.Series) -> pd.DataFrame | None:
+        if not detail_by_locus:
+            return None
+        chrom = str(row.get("chrom", "") or "")
+        for ws_col, we_col in (("discovery_window_start", "discovery_window_end"), ("window_start", "window_end")):
+            ws = _row_int(row, ws_col, -1)
+            we = _row_int(row, we_col, -1)
+            if ws > 0 and we > 0 and (chrom, ws, we) in detail_by_locus:
+                return detail_by_locus[(chrom, ws, we)]
+        return None
+
+    inferred = out.apply(
+        lambda row: _infer_twin_priming_inversion_from_read_evidence(
+            row,
+            fragment_to_full_map=fragment_to_full_map,
+            locus_detail=_lookup_locus_detail(row),
+        ),
+        axis=1,
+        result_type="expand",
+    )
+    for col in _TWIN_PRIMING_REVIEW_COLUMNS:
+        out[col] = inferred[col]
+    out["twin_priming_inv"] = out["twin_priming_inv"].fillna(False).astype(bool)
+    for col in (
+        "inv_5p_start",
+        "inv_5p_end",
+        "noninv_5p_start",
+        "noninv_3p_end",
+        "twin_priming_junction_gap_bp",
+    ):
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(-1).astype(int)
+    out["twin_priming_confidence_score"] = (
+        pd.to_numeric(out["twin_priming_confidence_score"], errors="coerce").fillna(0.0).round(3)
+    )
+    out["twin_priming_confidence_tier"] = (
+        out["twin_priming_confidence_tier"].fillna("none").astype(str).replace({"": "none"})
+    )
+    out["twin_priming_audit_trail"] = out["twin_priming_audit_trail"].fillna("").astype(str)
+    return out
+
+
+def _merge_full_axis_side_metrics(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Use full-consensus remaps to fill split-read arms before inversion inference."""
+    out = candidates.copy()
+    for sample in ("disease", "control"):
+        for side in ("L", "R"):
+            for field in ("mei_start", "mei_end", "mei_supported_reads", "mei_strand", "mei_subfamily"):
+                base_col = f"{sample}_{side}_{field}"
+                full_col = f"{sample}_full_{side}_{field}"
+                if full_col not in out.columns:
+                    continue
+                if base_col not in out.columns:
+                    out[base_col] = out[full_col]
+                    continue
+                current = out[base_col]
+                if field in {"mei_start", "mei_end", "mei_supported_reads"}:
+                    cur_num = pd.to_numeric(current, errors="coerce").fillna(0)
+                    full_num = pd.to_numeric(out[full_col], errors="coerce").fillna(0)
+                    use_full = cur_num.le(0) & full_num.gt(0)
+                    out.loc[use_full, base_col] = full_num.loc[use_full]
+                else:
+                    cur_text = current.fillna("").astype(str)
+                    full_text = out[full_col].fillna("").astype(str)
+                    use_full = cur_text.eq("") & full_text.ne("")
+                    out.loc[use_full, base_col] = full_text.loc[use_full]
+    return out
 
 
 def _choose_consolidated_insertion_orientation(row: pd.Series) -> str:
@@ -13780,9 +14327,9 @@ def _tighten_windows_to_breakpoint_interval(
 
     ws = pd.to_numeric(out["discovery_window_start"], errors="coerce")
     we = pd.to_numeric(out["discovery_window_end"], errors="coerce")
-    bp = pd.to_numeric(out.get(breakpoint_pos_col, 0), errors="coerce")
-    lo = pd.to_numeric(out.get(interval_start_col, float("nan")), errors="coerce")
-    hi = pd.to_numeric(out.get(interval_end_col, float("nan")), errors="coerce")
+    bp = pd.to_numeric(out[breakpoint_pos_col], errors="coerce") if breakpoint_pos_col in out.columns else pd.Series(0, index=out.index)
+    lo = pd.to_numeric(out[interval_start_col], errors="coerce") if interval_start_col in out.columns else pd.Series(float("nan"), index=out.index)
+    hi = pd.to_numeric(out[interval_end_col], errors="coerce") if interval_end_col in out.columns else pd.Series(float("nan"), index=out.index)
 
     # Prefer explicit interval when valid.
     valid_interval = lo.notna() & hi.notna() & lo.gt(0) & hi.gt(0) & hi.ge(lo)
@@ -13797,8 +14344,8 @@ def _tighten_windows_to_breakpoint_interval(
     new_we = new_we.where(~point, bp)
 
     # One-sided / unresolved DPE: shrink to observed junction-tip span on that side.
-    side_lo = pd.to_numeric(out.get("dpe_side_window_start", float("nan")), errors="coerce")
-    side_hi = pd.to_numeric(out.get("dpe_side_window_end", float("nan")), errors="coerce")
+    side_lo = pd.to_numeric(out["dpe_side_window_start"], errors="coerce") if "dpe_side_window_start" in out.columns else pd.Series(float("nan"), index=out.index)
+    side_hi = pd.to_numeric(out["dpe_side_window_end"], errors="coerce") if "dpe_side_window_end" in out.columns else pd.Series(float("nan"), index=out.index)
     unresolved = (~valid_interval) & (bp.isna() | bp.le(0))
     use_side = unresolved & side_lo.notna() & side_hi.notna() & side_lo.gt(0) & side_hi.ge(side_lo)
     new_ws = new_ws.where(~use_side, side_lo)
@@ -13913,8 +14460,14 @@ def _derive_breakpoint_interval_fields(
     return out
 
 
-def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = False, fragment_to_full_map: dict[str, FragmentToFullMap] | None = None) -> pd.DataFrame:
-    out = _ensure_candidate_schema_defaults(candidates)
+def _build_gold_review_table(
+    candidates: pd.DataFrame,
+    empirical_stage: bool = False,
+    fragment_to_full_map: dict[str, FragmentToFullMap] | None = None,
+    supporting_reads_detail: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    twin_priming_source = _merge_full_axis_side_metrics(_ensure_candidate_schema_defaults(candidates))
+    out = twin_priming_source.copy()
     def _series_or_default(col: str, default: object) -> pd.Series:
         if col in out.columns:
             return out[col]
@@ -14837,6 +15390,15 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "consensus_insertion_mei_span_full",
         "consensus_insertion_mei_5p_coord_full",
         "consensus_insertion_mei_3p_coord_full",
+        "twin_priming_inv",
+        "inv_5p_start",
+        "inv_5p_end",
+        "noninv_5p_start",
+        "noninv_3p_end",
+        "twin_priming_junction_gap_bp",
+        "twin_priming_confidence_score",
+        "twin_priming_confidence_tier",
+        "twin_priming_audit_trail",
     ]
     full_cols = [
         "analysis_stage_tier",
@@ -14987,6 +15549,50 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
     for col in sig3_cols:
         if col in review.columns:
             review[col] = _round_sig_series(review[col], sig=3)
+
+    review = _merge_full_axis_side_metrics(review)
+    evidence = _annotate_twin_priming_inversion_fields(
+        twin_priming_source,
+        fragment_to_full_map=fragment_to_full_map,
+        supporting_reads_detail=supporting_reads_detail,
+    )
+    evidence_cols = ["chrom", "window_start", "window_end", *_TWIN_PRIMING_REVIEW_COLUMNS]
+    evidence = evidence.loc[:, evidence_cols].drop_duplicates(
+        ["chrom", "window_start", "window_end"],
+        keep="first",
+    )
+    review = review.drop(columns=[c for c in _TWIN_PRIMING_REVIEW_COLUMNS if c in review.columns], errors="ignore")
+    review = review.merge(evidence, on=["chrom", "window_start", "window_end"], how="left")
+    for col in _TWIN_PRIMING_REVIEW_COLUMNS:
+        if col not in review.columns:
+            if col == "twin_priming_inv":
+                review[col] = False
+            elif col == "twin_priming_confidence_score":
+                review[col] = 0.0
+            elif col == "twin_priming_junction_gap_bp":
+                review[col] = -1
+            elif col == "twin_priming_confidence_tier":
+                review[col] = "none"
+            elif col == "twin_priming_audit_trail":
+                review[col] = ""
+            else:
+                review[col] = -1
+    review["twin_priming_inv"] = review["twin_priming_inv"].fillna(False).astype(bool)
+    for col in (
+        "inv_5p_start",
+        "inv_5p_end",
+        "noninv_5p_start",
+        "noninv_3p_end",
+        "twin_priming_junction_gap_bp",
+    ):
+        review[col] = pd.to_numeric(review[col], errors="coerce").fillna(-1).astype(int)
+    review["twin_priming_confidence_score"] = (
+        pd.to_numeric(review["twin_priming_confidence_score"], errors="coerce").fillna(0.0).round(3)
+    )
+    review["twin_priming_confidence_tier"] = (
+        review["twin_priming_confidence_tier"].fillna("none").astype(str).replace({"": "none"})
+    )
+    review["twin_priming_audit_trail"] = review["twin_priming_audit_trail"].fillna("").astype(str)
 
     prioritized = _prioritize_mei_candidates(review, stage_first=True)
     return prioritized.loc[:, selected_cols]
@@ -16907,7 +17513,12 @@ def annotate_candidate_loci_with_mei(
     write_t0 = time.monotonic()
     candidate_tsv.to_csv(out_path, sep="\t", index=False)
     candidate.to_parquet(out_path.with_suffix(".parquet"), index=False)
-    gold_review = _build_gold_review_table(candidate, empirical_stage=empirical_stage, fragment_to_full_map=frag_map)
+    gold_review = _build_gold_review_table(
+        candidate,
+        empirical_stage=empirical_stage,
+        fragment_to_full_map=frag_map,
+        supporting_reads_detail=supporting_reads_detail,
+    )
     gold_review_path = out_path.with_name(out_path.stem + ".gold_review.tsv")
     gold_review_tsv = _stable_tsv_export_frame(gold_review)
     gold_review_tsv.to_csv(gold_review_path, sep="\t", index=False)

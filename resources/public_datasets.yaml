@@ -142,6 +142,32 @@ datasets:
     target_path: retrotransposon_db/ucsc_repeatbrowser/hg38reps.fa
     required: true
 
+  # Derived, not downloaded: built by scripts/fetch_dfam_mei_panel.py from the
+  # RepeatMasker-format library of the same Dfam release. The h5/famdb route above
+  # needs a multi-gigabyte archive and a FamDB checkout, which is why every consumer
+  # recorded this file as absent; this route is one 15.8 MB request whose md5 Dfam
+  # publishes. `download_public_data.py` now falls back to the same builder.
+  # The same command also derives retrotransposon_db/full_consensus/
+  # mei_full_canonical.panel.fa, which is the axis the MEI_5P/MEI_3P coordinates
+  # are on (a L1HS_5end call reports MEI_3P up to 6018, the L1HS_full length, not its
+  # own 2136 bp).  Per-record accessions, clades and hashes: the .manifest.json
+  # written next to each FASTA.
+  - id: dfam_human_mei_panel_fasta
+    category: retrotransposon_db
+    description: >-
+      Human MEI (L1/Alu/SVA) consensus panel: Dfam RepeatMasker-library records whose
+      clade is on the human lineage, terminal poly(A) trimmed, headers name#class/family
+    source: Dfam (Dfam-RepeatMasker.lib.gz)
+    url: https://www.dfam.org/releases/current/families/Dfam-RepeatMasker.lib.gz
+    target_path: retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta
+    required: true
+    derived: true
+    builder: scripts/fetch_dfam_mei_panel.py
+    records: 207
+    sha256: 4b67dec1e4b4310d7039562b3cadc357918ac3aa7b0bc7cd66d876d1867a9336
+    built_from_md5: 8095b88e8bb837b310f65d4114a3f91d
+    built_at: 2026-10-16
+
   # -------------------------------------------------------------------------
   # Extended candidate resources (optional for now)
   # -------------------------------------------------------------------------

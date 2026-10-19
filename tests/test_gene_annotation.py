@@ -177,14 +177,16 @@ def test_bundled_gene_strands_match_chr22_genes():
 
 
 def test_snpeff_command_shape():
-    cmd = ga.snpeff_command("in.vcf", "GRCh38.99", config="/x/snpEff.config", xmx="4g")
+    cmd = ga.snpeff_command("in.vcf", "GRCh38.99", config="/x/snpEff.config", xmx="8g")
     assert cmd == [
-        "snpEff", "-Xmx4g", "-noStats", "-noHgvs",
-        "-spliceSiteSize", "0", "-spliceRegionExonSize", "0",
-        "-spliceRegionIntronMin", "0", "-spliceRegionIntronMax", "0",
+        "snpEff", "-Xmx8g", "-noStats", "-noHgvs",
+        "-spliceSiteSize", "2", "-spliceRegionExonSize", "3",
+        "-spliceRegionIntronMin", "3", "-spliceRegionIntronMax", "8",
         "-c", "/x/snpEff.config", "GRCh38.99", "in.vcf",
     ]
     assert "-c" not in ga.snpeff_command("in.vcf", "GRCh38.99")
+    assert not hasattr(ga, "SNPEFF_NO_SPLICE")
+    assert "An insertion is not a splice-site variant" not in (ga.__doc__ or "")
 
 
 def test_annotate_vcf_snpeff_offline_with_canned_output(tmp_path):
@@ -207,14 +209,30 @@ def test_annotate_vcf_snpeff_offline_with_canned_output(tmp_path):
     assert any(h.startswith("##INFO=<ID=CSQ,") for h in headers)
     assert any(h.startswith("##INFO=<ID=GENE_STRAND,") for h in headers)
     assert any(h.startswith("##INFO=<ID=MEI_GENE_ORIENT,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=SPLICE_DIST,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=SPLICE_SIDE,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=SPLICE_REGION,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=MEI_EXONIZATION_RISK,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=TX_ID,") for h in headers)
+    assert any(h.startswith("##INFO=<ID=TX_RANK,") for h in headers)
     assert _chr22_calls(recs) == CHR22_SNPEFF
     ada2 = next(r for r in recs if r.pos == 17224410)
     assert ada2.info["GENE_STRAND"] == "-"
     assert ada2.info["MEI_GENE_ORIENT"] == "sense"        # ORIENT=- matches ADA2's - strand
+    assert ada2.info["TX_RANK"] == "1/11"
+    assert ada2.info["INTRON_RANK"] == "1/11"
+    assert "ENST00000696197.1" in ada2.info["TX_ID"].split(",")
+    assert ada2.info["MEI_EXONIZATION_RISK"] == "NONE"
+    assert ada2.info["ALU_EXONIZATION_RISK"] == "NONE"
     both = next(r for r in recs if r.pos == 17567662)
     assert both.info["GENE"] == "SLC25A18,ENSG00000286195"
     assert both.info["GENE_STRAND"] == "+,-"
     assert both.info["MEI_GENE_ORIENT"] == "antisense,sense"  # ORIENT=- against +,-
+    assert both.info["MEI_EXONIZATION_RISK"] == "HIGH"
+    assert both.info["ALU_EXONIZATION_RISK"] == "HIGH"
+    l1_cltcl1 = next(r for r in recs if r.pos == 19223382)
+    assert l1_cltcl1.info["MEI_GENE_ORIENT"] == "antisense"
+    assert l1_cltcl1.info["L1_TRUNCATION_RISK"] == "NONE"
     # MEI_GENE_ORIENT is written per gene and stays index-aligned with GENEID on every record
     assert all(
         len(r.info["MEI_GENE_ORIENT"].split(",")) == len(r.info["GENEID"].split(","))
@@ -225,6 +243,7 @@ def test_annotate_vcf_snpeff_offline_with_canned_output(tmp_path):
     )
     assert all("ANN" not in r.info for r in recs)         # raw ANN not carried into the shared contract
     assert all("SVLEN" in r.info for r in recs)           # original INFO preserved
+    assert all(r.info.get("END") == str(r.pos) for r in recs)
     assert tsv.read_text().count("\n") == 31
 
 
@@ -234,7 +253,7 @@ def test_annotate_vcf_snpeff_reports_nonzero_exit(tmp_path):
     def fake_run(cmd, **kw):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="java.lang.OutOfMemoryError: Java heap space")
 
-    with pytest.raises(RuntimeError, match="OutOfMemoryError"):
+    with pytest.raises(RuntimeError, match=r"OutOfMemoryError.*--snpeff-xmx"):
         ga.annotate_vcf(FIXTURE, tmp_path / "o.vcf", "GRCh38.99", run=fake_run)
 
 

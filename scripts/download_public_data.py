@@ -1816,6 +1816,25 @@ def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dic
     }
 
 
+def _prepare_dfam_mei_subset_without_famdb(
+    outdir: Path, *, timeout_sec: int, force: bool, reason: str
+) -> dict[str, Any]:
+    """Build the human MEI subset from Dfam's RepeatMasker library.
+
+    The h5 path above needs a multi-gigabyte archive and a FamDB checkout; where
+    either is missing this produces the same file from a 15.8 MB library whose md5
+    Dfam publishes.  Both routes write ``dfam_human_mei_l1_alu_sva.fasta``, which is
+    the file every other consumer looks for.
+    """
+    from fetch_dfam_mei_panel import PANEL_RELPATH, build_panel
+
+    out_path = outdir / PANEL_RELPATH
+    if out_path.exists() and out_path.stat().st_size > 0 and not force:
+        return {"status": "skipped_exists", "path": str(out_path), "fallback_reason": reason}
+    manifest = build_panel(out_path, force=force, timeout=timeout_sec)
+    return {"status": "prepared_without_famdb", "fallback_reason": reason, **manifest}
+
+
 def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_sec: int, force: bool) -> dict[str, Any]:
     ds = ds_map.get("dfam_human_families_embl")
     if not ds:
@@ -1823,7 +1842,9 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
 
     archive_path = outdir / ds.target_path
     if not archive_path.exists():
-        return {"status": "skipped_missing_archive", "path": str(archive_path)}
+        return _prepare_dfam_mei_subset_without_famdb(
+            outdir, timeout_sec=timeout_sec, force=force, reason="missing_archive"
+        )
 
     decompressed_h5 = archive_path.with_suffix("")
     if decompressed_h5.suffix != ".h5":
@@ -1846,7 +1867,9 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
     famdb_tools_dir = dfam_dir / "tools" / "FamDB"
     famdb_py, tool_status = _ensure_famdb_repo(famdb_tools_dir, timeout_sec=timeout_sec)
     if famdb_py is None:
-        return {"status": "failed", "error": tool_status, "db_dir": str(db_dir)}
+        return _prepare_dfam_mei_subset_without_famdb(
+            outdir, timeout_sec=timeout_sec, force=force, reason=tool_status
+        )
 
     curated_fasta = dfam_dir / "dfam_human_curated.fasta"
     curated_missing_or_empty = (not curated_fasta.exists()) or (curated_fasta.stat().st_size <= 0)
@@ -2019,7 +2042,16 @@ def _build_mei_full_consensus_panel(outdir: Path, ds_map: dict[str, Dataset], ti
         for src_hdr, norm, fam in missing_records:
             writer.writerow([src_hdr, norm, fam])
 
-    _run_cmd(["samtools", "faidx", str(panel_fa)], required=True)
+    # The .fai is an accelerator, not part of the panel: pyfaidx builds one on
+    # demand and the pure-Python readers in this pipeline (panel length lookup)
+    # never touch it.  Requiring it here made the whole step fail on machines
+    # without samtools even though the panel FASTA had already been written, and
+    # a failed step is how every consumer concluded the panel was absent.
+    if shutil.which("samtools"):
+        _run_cmd(["samtools", "faidx", str(panel_fa)], required=True)
+        faidx_status = "written"
+    else:
+        faidx_status = "skipped_missing_samtools"
 
     line1_lengths = [r[4] for r in selected_records if r[3] == "LINE1"]
     alu_lengths = [r[4] for r in selected_records if r[3] == "ALU"]
@@ -2028,6 +2060,7 @@ def _build_mei_full_consensus_panel(outdir: Path, ds_map: dict[str, Dataset], ti
         "status": "prepared",
         "panel_fasta": str(panel_fa),
         "panel_fai": str(panel_fa.with_suffix(panel_fa.suffix + ".fai")),
+        "panel_faidx": faidx_status,
         "panel_metadata_tsv": str(panel_meta),
         "selected_total": len(selected_records),
         "selected_line1": len(line1_lengths),

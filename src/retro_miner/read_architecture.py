@@ -64,6 +64,14 @@ _MEI_ENRICH_COLS = (
     "consensus_insertion_mei_5p_coord_full",
     "consensus_insertion_mei_3p_coord_full",
     "consensus_insertion_mei_span_full",
+    "twin_priming_inv",
+    "inv_5p_start",
+    "inv_5p_end",
+    "noninv_5p_start",
+    "noninv_3p_end",
+    "twin_priming_confidence_score",
+    "twin_priming_confidence_tier",
+    "twin_priming_audit_trail",
 )
 
 _DETAIL_COLS = (
@@ -83,6 +91,8 @@ _DETAIL_COLS = (
     "mate_mei_end",
     "mei_target",
     "mate_mei_target",
+    "mei_strand",
+    "mate_mei_strand",
     "family",
     "mei_hit",
     "mate_mei_hit",
@@ -124,6 +134,60 @@ class LocusLayout:
     orientation: str = "+"
     # Dedicated polyA/T tail zone beyond MEI 3' (max observed polyA length).
     polya_zone_bp: int = 0
+    # Twin-priming 5' inversion annotations (consensus coordinates on the MEI axis).
+    twin_priming_inv: bool = False
+    inv_5p_start: int = -1
+    inv_5p_end: int = -1
+    noninv_5p_start: int = -1
+    noninv_3p_end: int = -1
+    twin_priming_confidence_score: float = 0.0
+    twin_priming_confidence_tier: str = "none"
+    twin_priming_audit_trail: str = ""
+
+    @property
+    def has_twin_priming_segments(self) -> bool:
+        return (
+            bool(self.twin_priming_inv)
+            and self.inv_5p_start > 0
+            and self.inv_5p_end >= self.inv_5p_start
+        )
+
+    @property
+    def twin_priming_junction_gap_bp(self) -> int | None:
+        if not self.has_twin_priming_segments or self.noninv_5p_start <= 0:
+            return None
+        return int(self.noninv_5p_start) - int(self.inv_5p_end) - 1
+
+    @property
+    def inv_5p_span_x(self) -> tuple[float, float] | None:
+        if not self.has_twin_priming_segments:
+            return None
+        x0 = self.mei_coord_to_x(self.inv_5p_start)
+        x1 = self.mei_coord_to_x(self.inv_5p_end)
+        return (min(x0, x1), max(x0, x1))
+
+    @property
+    def noninv_3p_span_x(self) -> tuple[float, float] | None:
+        if (
+            not self.has_twin_priming_segments
+            or self.noninv_5p_start <= 0
+            or self.noninv_3p_end < self.noninv_5p_start
+        ):
+            return None
+        x0 = self.mei_coord_to_x(self.noninv_5p_start)
+        x1 = self.mei_coord_to_x(self.noninv_3p_end)
+        return (min(x0, x1), max(x0, x1))
+
+    @property
+    def twin_priming_junction_span_x(self) -> tuple[float, float] | None:
+        inv_span = self.inv_5p_span_x
+        if inv_span is None:
+            return None
+        inv_junction_x = self.mei_coord_to_x(self.inv_5p_end)
+        if self.noninv_5p_start > 0:
+            noninv_junction_x = self.mei_coord_to_x(self.noninv_5p_start)
+            return (min(inv_junction_x, noninv_junction_x), max(inv_junction_x, noninv_junction_x))
+        return (inv_junction_x, inv_junction_x)
 
     @property
     def left_flank_bp(self) -> int:
@@ -252,6 +316,36 @@ def _row_int(row: pd.Series, col: str, default: int = 0) -> int:
         return int(float(val))
     except (TypeError, ValueError):
         return default
+
+
+def _row_float(row: pd.Series, col: str, default: float = 0.0) -> float:
+    if col not in row.index:
+        return default
+    val = row[col]
+    if pd.isna(val):
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _row_bool(row: pd.Series, col: str, default: bool = False) -> bool:
+    if col not in row.index:
+        return default
+    val = row[col]
+    if pd.isna(val):
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    txt = str(val).strip().lower()
+    if txt in {"true", "t", "1", "yes", "y"}:
+        return True
+    if txt in {"false", "f", "0", "no", "n", "", "nan"}:
+        return False
+    return default
 
 
 def _target_family(target: str) -> str:
@@ -881,6 +975,34 @@ def _layout_from_row(
     except (TypeError, ValueError):
         gold_poly = 0
     polya_zone_bp = _max_polya_zone_bp(detail, consensus_poly_at_min_bp=gold_poly)
+    twin_inv = _row_bool(row, "twin_priming_inv", _row_bool(row, "TWIN_PRIMING_INV", False))
+    inv_5p_start = _row_int(row, "inv_5p_start", _row_int(row, "INV_5P_START", -1))
+    inv_5p_end = _row_int(row, "inv_5p_end", _row_int(row, "INV_5P_END", -1))
+    noninv_5p_start = _row_int(row, "noninv_5p_start", _row_int(row, "NONINV_5P_START", -1))
+    noninv_3p_end = _row_int(row, "noninv_3p_end", _row_int(row, "NONINV_3P_END", -1))
+    twin_conf = _row_float(
+        row,
+        "twin_priming_confidence_score",
+        _row_float(row, "TWIN_PRIMING_CONF", 0.0),
+    )
+    twin_tier = str(
+        row.get("twin_priming_confidence_tier", row.get("TWIN_PRIMING_TIER", "none")) or "none"
+    ).strip().lower()
+    if not twin_tier or twin_tier == "nan":
+        twin_tier = "none"
+    twin_audit = str(
+        row.get("twin_priming_audit_trail", row.get("TWIN_PRIMING_AUDIT", "")) or ""
+    ).strip()
+    if twin_inv and inv_5p_start > 0 and inv_5p_end >= inv_5p_start:
+        # Ensure the plotted MEI axis covers both the inverted 5' and non-inverted 3' segments.
+        seg_lo = inv_5p_start
+        seg_hi = max(inv_5p_end, noninv_3p_end if noninv_3p_end > 0 else inv_5p_end)
+        if mei_5p <= 0 or mei_3p <= 0:
+            mei_5p, mei_3p = seg_lo, seg_hi
+        else:
+            mei_5p = min(mei_5p, seg_lo)
+            mei_3p = max(mei_3p, seg_hi)
+        mei_span = max(1, mei_3p - mei_5p + 1)
     return LocusLayout(
         chrom=chrom,
         window_start=ws,
@@ -896,6 +1018,14 @@ def _layout_from_row(
         insert_size_estimates=insert_sizes,
         orientation=orientation,
         polya_zone_bp=polya_zone_bp,
+        twin_priming_inv=twin_inv,
+        inv_5p_start=inv_5p_start,
+        inv_5p_end=inv_5p_end,
+        noninv_5p_start=noninv_5p_start,
+        noninv_3p_end=noninv_3p_end,
+        twin_priming_confidence_score=twin_conf,
+        twin_priming_confidence_tier=twin_tier,
+        twin_priming_audit_trail=twin_audit,
     )
 
 
@@ -1402,6 +1532,97 @@ def _clip_len_from_rec(rec) -> int:
     return 0
 
 
+def _normalize_strand_token(raw: object) -> str:
+    if raw is None:
+        return ""
+    try:
+        if pd.isna(raw):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    txt = str(raw).strip()
+    if txt in {"+", "-"}:
+        return txt
+    if txt in {"−", "rev", "reverse", "-1"}:
+        return "-"
+    if txt in {"fwd", "forward", "+1", "1"}:
+        return "+"
+    return ""
+
+
+def _bar_maps_to_inverted_5p_arm(
+    start: int,
+    end: int,
+    strand: str,
+    layout: LocusLayout,
+    *,
+    is_polya: bool = False,
+) -> bool:
+    """True when an SR or DPE MEI hit maps onto the twin-priming 5'-inverted arm."""
+    if is_polya or not layout.has_twin_priming_segments:
+        return False
+    lo = min(int(start), int(end))
+    hi = max(int(start), int(end))
+    if lo <= 0 or hi <= 0:
+        return False
+    inv_lo = min(int(layout.inv_5p_start), int(layout.inv_5p_end))
+    inv_hi = max(int(layout.inv_5p_start), int(layout.inv_5p_end))
+    overlap = max(0, min(hi, inv_hi) - max(lo, inv_lo) + 1)
+    if overlap <= 0:
+        return False
+    if layout.noninv_5p_start > 0 and layout.noninv_3p_end >= layout.noninv_5p_start:
+        noninv_lo = min(int(layout.noninv_5p_start), int(layout.noninv_3p_end))
+        noninv_hi = max(int(layout.noninv_5p_start), int(layout.noninv_3p_end))
+        noninv_overlap = max(0, min(hi, noninv_hi) - max(lo, noninv_lo) + 1)
+        if noninv_overlap > overlap:
+            return False
+    norm_strand = _normalize_strand_token(strand)
+    direct_strand = "-" if layout.reverse_oriented else "+"
+    if norm_strand in {"+", "-"} and norm_strand == direct_strand:
+        return False
+    return True
+
+
+def _inverted_arm_arrow_label(strand: str, layout: LocusLayout) -> str:
+    """Compact arrow + strand indicator for a 5'-inverted MEI read bar."""
+    norm_strand = _normalize_strand_token(strand)
+    if not norm_strand:
+        norm_strand = "+" if layout.reverse_oriented else "-"
+    # Forward insertion (+) has 3' direct arm → right, so 5' inverted arm points ←.
+    # Reverse insertion (-) has 3' direct arm ← left, so 5' inverted arm points →.
+    arrow = "→" if layout.reverse_oriented else "←"
+    return f"{arrow}{norm_strand}"
+
+
+def _draw_inverted_arm_indicator(
+    ax,
+    *,
+    x0: float,
+    x1: float,
+    yi: float,
+    strand: str,
+    layout: LocusLayout,
+) -> None:
+    """Draw a compact strand-arrow indicator on a 5'-inverted MEI bar."""
+    span = float(x1) - float(x0)
+    if span < 6.0:
+        return
+    label = _inverted_arm_arrow_label(strand, layout)
+    fs = 5.0 if span >= 45.0 else 4.2
+    ax.text(
+        (float(x0) + float(x1)) / 2.0,
+        float(yi),
+        label,
+        ha="center",
+        va="center",
+        fontsize=fs,
+        color=COLOR_BLACK,
+        fontweight="bold",
+        zorder=5,
+        clip_on=True,
+    )
+
+
 def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> dict[str, object] | None:
     """Split read using real soft-clip length from evidence.
 
@@ -1463,6 +1684,16 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
             return None
         remote_kind = "sr_mei"
 
+    mei_start_val = int(getattr(rec, "mei_start", 0) or 0)
+    mei_end_val = int(getattr(rec, "mei_end", 0) or 0)
+    mei_strand_val = _normalize_strand_token(getattr(rec, "mei_strand", ""))
+    inv_5p_arm = _bar_maps_to_inverted_5p_arm(
+        mei_start_val,
+        mei_end_val,
+        mei_strand_val,
+        layout,
+        is_polya=polya_clip,
+    )
     pair: dict[str, object] = {
         "anchor_pos": junction,
         "ref_start": ref_start,
@@ -1474,8 +1705,10 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
         "remote_x": (mei[0] + mei[1]) / 2.0,
         "remote_mei_x0": mei[0],
         "remote_mei_x1": mei[1],
-        "mei_start": int(getattr(rec, "mei_start", 0) or 0),
-        "mei_end": int(getattr(rec, "mei_end", 0) or 0),
+        "mei_start": mei_start_val,
+        "mei_end": mei_end_val,
+        "mei_strand": mei_strand_val,
+        "inv_5p_arm": inv_5p_arm,
         "side": plot_side,
         "interchrom": False,
         "mei_mapped": bool(mei_hit),
@@ -1491,15 +1724,25 @@ def _pair_from_sr_row(rec, layout: LocusLayout, *, read_width_bp: int = 150) -> 
         "short_mei_seed_rescued": _flag_true(rec, "short_mei_seed_rescued"),
     }
     if bool(getattr(rec, "mate_mei_hit", False)):
+        mate_start_val = int(getattr(rec, "mate_mei_start", 0) or 0)
+        mate_end_val = int(getattr(rec, "mate_mei_end", 0) or 0)
+        mate_strand_val = _normalize_strand_token(getattr(rec, "mate_mei_strand", ""))
         mate_mei = _mei_span_x(
-            int(getattr(rec, "mate_mei_start", 0) or 0),
-            int(getattr(rec, "mate_mei_end", 0) or 0),
+            mate_start_val,
+            mate_end_val,
             layout,
         )
         if mate_mei is not None:
             pair["mate_mei_x0"] = mate_mei[0]
             pair["mate_mei_x1"] = mate_mei[1]
             pair["mate_in_mei"] = True
+            pair["mate_mei_strand"] = mate_strand_val
+            pair["mate_inv_5p_arm"] = _bar_maps_to_inverted_5p_arm(
+                mate_start_val,
+                mate_end_val,
+                mate_strand_val,
+                layout,
+            )
     return pair
 
 
@@ -1620,6 +1863,23 @@ def _pair_from_dpe_row(rec, layout: LocusLayout) -> dict[str, object] | None:
             anchor_polya_base = _dpe_anchor_polya_base(rec)
             anchor_polya_label = _polya_tail_label(aw, anchor_polya_base)
 
+    mei_strand_val = ""
+    if remote_kind == "mate_mei":
+        mei_strand_val = _normalize_strand_token(getattr(rec, "mate_mei_strand", "")) or _normalize_strand_token(
+            getattr(rec, "mei_strand", "")
+        )
+    elif remote_kind == "anchor_mei":
+        mei_strand_val = _normalize_strand_token(getattr(rec, "mei_strand", "")) or _normalize_strand_token(
+            getattr(rec, "mate_mei_strand", "")
+        )
+    inv_5p_arm = _bar_maps_to_inverted_5p_arm(
+        mei_start,
+        mei_end,
+        mei_strand_val,
+        layout,
+        is_polya=(rescue_kind == "polya"),
+    )
+
     return {
         "anchor_pos": anchor_pos,
         "anchor_x": layout.genomic_to_x(anchor_pos),
@@ -1628,6 +1888,8 @@ def _pair_from_dpe_row(rec, layout: LocusLayout) -> dict[str, object] | None:
         "remote_mei_x1": remote_mei_x1,
         "mei_start": mei_start,
         "mei_end": mei_end,
+        "mei_strand": mei_strand_val,
+        "inv_5p_arm": inv_5p_arm,
         "side": anchor_side,
         "interchrom": mate_chrom not in {"", "*", layout.chrom},
         "mei_mapped": True,
@@ -2024,6 +2286,7 @@ def _pair_segments(
         "dpe_plotted": 0,
         "polya_rescue_plotted": 0,
         "vntr_rescue_plotted": 0,
+        "inv_5p_plotted": 0,
     }
     for rec in detail.itertuples(index=False):
         if str(rec.evidence_type) == "SR":
@@ -2033,6 +2296,8 @@ def _pair_segments(
             else:
                 stats["sr_plotted"] += 1
                 pairs.append(pair)
+                if bool(pair.get("inv_5p_arm")) or bool(pair.get("mate_inv_5p_arm")):
+                    stats["inv_5p_plotted"] += 1
                 rk = str(pair.get("rescue_kind", "") or "")
                 if rk == "polya":
                     stats["polya_rescue_plotted"] += 1
@@ -2044,6 +2309,8 @@ def _pair_segments(
                 stats["dpe_skipped"] += 1
             else:
                 stats["dpe_plotted"] += 1
+                if bool(pair.get("inv_5p_arm")):
+                    stats["inv_5p_plotted"] += 1
                 rk = str(pair.get("rescue_kind", "") or "")
                 if rk == "polya":
                     stats["polya_rescue_plotted"] += 1
@@ -2055,8 +2322,39 @@ def _pair_segments(
     cap = max(1, int(max_pairs))
     sampler = rng if rng is not None else random.Random(0)
     if len(pairs) > cap:
-        sr_pairs = [p for p in pairs if p.get("evidence_type") == "SR"]
-        dpe_pairs = [p for p in pairs if p.get("evidence_type") != "SR"]
+        def _is_inverted_pair(pair: dict[str, object]) -> bool:
+            return bool(pair.get("inv_5p_arm")) or bool(pair.get("mate_inv_5p_arm"))
+
+        inverted_pairs = [p for p in pairs if _is_inverted_pair(p)]
+        keep_inverted: list[dict[str, object]]
+
+        def _sample_inverted(items: list[dict[str, object]], n: int) -> list[dict[str, object]]:
+            """Prioritize inverted reads, retaining SR and DPE evidence when possible."""
+            if n <= 0 or not items:
+                return []
+            if len(items) <= n:
+                return list(items)
+            chosen: list[dict[str, object]] = []
+            chosen_ids: set[int] = set()
+            # If there is room, reserve one inverted read from each evidence class.
+            for evidence_type in ("SR", "DPE"):
+                group = [p for p in items if p.get("evidence_type") == evidence_type]
+                if group and len(chosen) < n:
+                    picked = sampler.choice(group)
+                    chosen.append(picked)
+                    chosen_ids.add(id(picked))
+            remaining = [p for p in items if id(p) not in chosen_ids]
+            if len(chosen) < n:
+                chosen.extend(sampler.sample(remaining, min(n - len(chosen), len(remaining))))
+            return chosen
+
+        # Keep every inverted-arm pair when it fits; if inverted evidence itself
+        # exceeds the cap, sample it first and balance SR/DPE when possible.
+        keep_inverted = _sample_inverted(inverted_pairs, cap)
+        remaining_cap = cap - len(keep_inverted)
+        normal_pairs = [p for p in pairs if not _is_inverted_pair(p)]
+        sr_pairs = [p for p in normal_pairs if p.get("evidence_type") == "SR"]
+        dpe_pairs = [p for p in normal_pairs if p.get("evidence_type") != "SR"]
 
         def _sample_stratified(items: list[dict[str, object]], n: int) -> list[dict[str, object]]:
             """Keep a mix of MEI / polyA SR (and both clip sides) under the cap."""
@@ -2104,14 +2402,14 @@ def _pair_segments(
             return chosen[:n]
 
         # Prefer keeping all split reads; reserve a small DPE slice only when SR
-        # alone would consume the whole cap (common after polyA expansion).
-        dpe_reserve = min(len(dpe_pairs), max(0, min(30, cap // 5))) if dpe_pairs else 0
-        sr_budget = min(len(sr_pairs), max(0, cap - dpe_reserve))
+        # alone would consume the remaining cap (common after polyA expansion).
+        dpe_reserve = min(len(dpe_pairs), max(0, min(30, remaining_cap // 5))) if dpe_pairs else 0
+        sr_budget = min(len(sr_pairs), max(0, remaining_cap - dpe_reserve))
         if len(sr_pairs) > sr_budget:
             keep_sr = _sample_stratified(sr_pairs, sr_budget)
         else:
             keep_sr = list(sr_pairs)
-        remaining = max(0, cap - len(keep_sr))
+        remaining = max(0, remaining_cap - len(keep_sr))
         dpe_left = [p for p in dpe_pairs if p["side"] == "L"]
         dpe_right = [p for p in dpe_pairs if p["side"] == "R"]
         n_left = min(len(dpe_left), remaining // 2)
@@ -2124,7 +2422,7 @@ def _pair_segments(
             leftover -= extra
         if leftover > 0 and len(dpe_right) > n_right:
             n_right += min(leftover, len(dpe_right) - n_right)
-        chosen = list(keep_sr)
+        chosen = list(keep_inverted) + list(keep_sr)
         if n_left:
             chosen.extend(sampler.sample(dpe_left, n_left))
         if n_right:
@@ -2138,6 +2436,10 @@ def _pair_segments(
             )
             chosen.extend(extra_sr)
         pairs = chosen
+
+    stats["inv_5p_plotted"] = sum(
+        1 for p in pairs if bool(p.get("inv_5p_arm")) or bool(p.get("mate_inv_5p_arm"))
+    )
     # Stable visual order: left then right, SR before DPE, then genomic position.
     pairs.sort(
         key=lambda p: (
@@ -2352,18 +2654,22 @@ def _draw_bar_span(
     yi: float,
     color: str,
     height: float = 0.45,
+    hatch: str = "",
+    edgecolor: str = "none",
+    linewidth: float = 0.0,
 ) -> None:
     if x1 <= x0:
         return
-    # Match SR/DPE bar thickness. Skip contrasting edges: white strokes on black
-    # bars change perceived height under antialiasing on short/long spans.
+    # Match SR/DPE bar thickness. Skip contrasting edges on plain bars; allow
+    # hatching/stroke on 5'-inverted MEI bars so they stand out clearly.
     rect = Rectangle(
         (x0, yi - height / 2.0),
         x1 - x0,
         height,
         facecolor=color,
-        edgecolor="none",
-        linewidth=0.0,
+        edgecolor=edgecolor if (hatch or linewidth > 0.0) else "none",
+        linewidth=linewidth if (hatch or linewidth > 0.0) else 0.0,
+        hatch=hatch or None,
         alpha=1.0,
         zorder=3,
     )
@@ -2404,8 +2710,18 @@ def _draw_read_pair(
             polya_clip=polya_clip,
         )
         mei_color = COLOR_LIGHT_ORANGE if polya_clip else COLOR_DARK_ORANGE
+        inv_arm = (not polya_clip) and bool(pair.get("inv_5p_arm", False))
         _draw_bar_span(ax, x0=ref_span[0], x1=ref_span[1], yi=yi, color=COLOR_BLACK)
-        _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=mei_color)
+        _draw_bar_span(
+            ax,
+            x0=mei_span[0],
+            x1=mei_span[1],
+            yi=yi,
+            color=mei_color,
+            hatch="///" if inv_arm else "",
+            edgecolor=COLOR_BLACK if inv_arm else "none",
+            linewidth=0.6 if inv_arm else 0.0,
+        )
         if polya_clip:
             label = str(pair.get("polya_label", "") or "")
             if not label:
@@ -2414,6 +2730,15 @@ def _draw_read_pair(
                     str(pair.get("polya_base", "A") or "A"),
                 )
             _draw_polya_label(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, label=label)
+        elif inv_arm:
+            _draw_inverted_arm_indicator(
+                ax,
+                x0=mei_span[0],
+                x1=mei_span[1],
+                yi=yi,
+                strand=str(pair.get("mei_strand", "") or ""),
+                layout=layout,
+            )
         # Tick at the genomic junction the mapped portion abuts.
         j = layout.insertion_right_x if clip_side == "L" else layout.insertion_left_x
         ax.plot([j, j], [yi - 0.32, yi + 0.32], color=COLOR_BLACK, lw=2.2, zorder=4)
@@ -2501,6 +2826,7 @@ def _draw_read_pair(
                     )
                 _draw_polya_label(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, label=label)
         else:
+            inv_arm = bool(pair.get("inv_5p_arm", False))
             mei_span = _mei_read_bar(
                 mei_x0=mate_mei[0],
                 mei_x1=mate_mei[1],
@@ -2508,7 +2834,25 @@ def _draw_read_pair(
                 layout=layout,
                 anchor_side=side,
             )
-            _draw_bar_span(ax, x0=mei_span[0], x1=mei_span[1], yi=yi, color=mei_color)
+            _draw_bar_span(
+                ax,
+                x0=mei_span[0],
+                x1=mei_span[1],
+                yi=yi,
+                color=mei_color,
+                hatch="///" if inv_arm else "",
+                edgecolor=COLOR_BLACK if inv_arm else "none",
+                linewidth=0.6 if inv_arm else 0.0,
+            )
+            if inv_arm:
+                _draw_inverted_arm_indicator(
+                    ax,
+                    x0=mei_span[0],
+                    x1=mei_span[1],
+                    yi=yi,
+                    strand=str(pair.get("mei_strand", "") or ""),
+                    layout=layout,
+                )
 
     if overhang is not None:
         _draw_bar_span(ax, x0=overhang[0], x1=overhang[1], yi=yi, color=COLOR_DARK_ORANGE)
@@ -2530,13 +2874,32 @@ def _draw_read_pair(
         _draw_connector(ax, x0=c0, x1=c1, yi=yi)
 
     if pair.get("mate_in_mei"):
+        mate_inv = bool(pair.get("mate_inv_5p_arm", False))
         mate_mei_span = _mei_read_bar(
             mei_x0=float(pair.get("mate_mei_x0", 0)),
             mei_x1=float(pair.get("mate_mei_x1", 0)),
             width_bp=read_width_bp,
             layout=layout,
         )
-        _draw_bar_span(ax, x0=mate_mei_span[0], x1=mate_mei_span[1], yi=yi, color=COLOR_DARK_ORANGE)
+        _draw_bar_span(
+            ax,
+            x0=mate_mei_span[0],
+            x1=mate_mei_span[1],
+            yi=yi,
+            color=COLOR_DARK_ORANGE,
+            hatch="///" if mate_inv else "",
+            edgecolor=COLOR_BLACK if mate_inv else "none",
+            linewidth=0.6 if mate_inv else 0.0,
+        )
+        if mate_inv:
+            _draw_inverted_arm_indicator(
+                ax,
+                x0=mate_mei_span[0],
+                x1=mate_mei_span[1],
+                yi=yi,
+                strand=str(pair.get("mate_mei_strand", "") or ""),
+                layout=layout,
+            )
 
 
 def _mei_axis_ticks(layout: LocusLayout) -> tuple[list[float], list[str]]:
@@ -2545,12 +2908,49 @@ def _mei_axis_ticks(layout: LocusLayout) -> tuple[list[float], list[str]]:
     right_coord = layout.mei_5p if layout.reverse_oriented else layout.mei_3p
     ticks = [layout.mei_region_start_x, layout.mei_region_end_x]
     labels = [str(left_coord), str(right_coord)]
+    if layout.has_twin_priming_segments:
+        boundary_coords: list[int] = [layout.inv_5p_end]
+        if layout.noninv_5p_start > 0 and abs(layout.noninv_5p_start - layout.inv_5p_end) >= 25:
+            boundary_coords.append(layout.noninv_5p_start)
+        for coord in boundary_coords:
+            if coord in {left_coord, right_coord}:
+                continue
+            bx = layout.mei_coord_to_x(coord)
+            if all(abs(bx - tx) >= 15.0 for tx in ticks):
+                ticks.append(bx)
+                labels.append(str(coord))
+        paired = sorted(zip(ticks, labels), key=lambda item: item[0])
+        return [p[0] for p in paired], [p[1] for p in paired]
     if layout.mei_span_bp >= 300:
         mid_coord = (layout.mei_5p + layout.mei_3p) // 2
         mid_x = layout.mei_coord_to_x(mid_coord)
         ticks.insert(1, mid_x)
         labels.insert(1, str(mid_coord))
     return ticks, labels
+
+
+def _twin_priming_summary_label(layout: LocusLayout) -> str:
+    """Compact summary string for twin-priming 5' inversion, junction gap, and confidence tier."""
+    if not layout.twin_priming_inv:
+        return ""
+    tier = (layout.twin_priming_confidence_tier or "none").strip().lower()
+    score = float(layout.twin_priming_confidence_score or 0.0)
+    parts = ["twin_priming_5p_inv"]
+    if layout.has_twin_priming_segments:
+        parts.append(f"inv_5p={layout.inv_5p_start}-{layout.inv_5p_end}")
+    if layout.noninv_5p_start > 0 and layout.noninv_3p_end >= layout.noninv_5p_start:
+        parts.append(f"noninv_3p={layout.noninv_5p_start}-{layout.noninv_3p_end}")
+    gap = layout.twin_priming_junction_gap_bp
+    if gap is not None:
+        parts.append(f"junction_gap={gap}bp")
+    if tier and tier != "none":
+        if score > 0.0:
+            parts.append(f"conf={score:.3f}({tier})")
+        else:
+            parts.append(f"tier={tier}")
+    elif score > 0.0:
+        parts.append(f"conf={score:.3f}")
+    return " ".join(parts)
 
 
 def _safe_plot_stem(
@@ -2715,6 +3115,11 @@ def plot_locus_architecture(
             f"detail_rows={pair_stats['detail_rows']})"
         ),
     ]
+    twin_summary = _twin_priming_summary_label(layout)
+    if twin_summary:
+        if pair_stats.get("inv_5p_plotted", 0) > 0:
+            twin_summary = f"{twin_summary} inv_reads_plotted={pair_stats['inv_5p_plotted']}"
+        title_lines.append(twin_summary)
     # Half-width figure (~700px @ 100dpi): wrap conservatively — bold 8.4pt is
     # wider than monospace char estimates, so 95 chars still clips on the right.
     title_fs = 8.4
@@ -2760,6 +3165,44 @@ def plot_locus_architecture(
         alpha=0.55,
         zorder=0,
     )
+    if layout.has_twin_priming_segments:
+        inv_span = layout.inv_5p_span_x
+        if inv_span is not None and inv_span[1] > inv_span[0]:
+            ax.axvspan(
+                inv_span[0],
+                inv_span[1],
+                facecolor=COLOR_DARK_ORANGE,
+                edgecolor=COLOR_BLACK,
+                hatch="///",
+                alpha=0.38,
+                lw=0.6,
+                zorder=1,
+            )
+        junc_span = layout.twin_priming_junction_span_x
+        if junc_span is not None:
+            jx0, jx1 = junc_span
+            if jx1 - jx0 >= 1.0:
+                ax.axvspan(
+                    jx0,
+                    jx1,
+                    facecolor=COLOR_WHITE,
+                    edgecolor=COLOR_BLACK,
+                    hatch="...",
+                    alpha=0.85,
+                    lw=0.8,
+                    zorder=1,
+                )
+                ax.axvline(jx0, color=COLOR_BLACK, ls="-.", lw=1.3, alpha=0.9, zorder=2)
+                ax.axvline(jx1, color=COLOR_BLACK, ls="-.", lw=1.3, alpha=0.9, zorder=2)
+            else:
+                ax.axvline(
+                    (jx0 + jx1) / 2.0,
+                    color=COLOR_BLACK,
+                    ls="-.",
+                    lw=1.5,
+                    alpha=0.95,
+                    zorder=2,
+                )
     ax.axvspan(layout.insertion_right_x, layout.total_width, color=COLOR_WHITE, alpha=1.0, zorder=0)
     ax.axvline(layout.mei_region_start_x, color=COLOR_DARK_ORANGE, ls="--", lw=1.2, alpha=0.9)
     ax.axvline(layout.mei_region_end_x, color=COLOR_DARK_ORANGE, ls="--", lw=1.2, alpha=0.9)
@@ -2779,9 +3222,27 @@ def plot_locus_architecture(
     polya_note = (
         f"; polyA zone {layout.polya_zone_bp} bp beyond 3′" if layout.polya_zone_bp > 0 else ""
     )
+    twin_xlabel_note = ""
+    if layout.has_twin_priming_segments:
+        gap = layout.twin_priming_junction_gap_bp
+        gap_txt = f", gap {gap} bp" if gap is not None else ""
+        tier_txt = (
+            f", {layout.twin_priming_confidence_tier} tier"
+            if layout.twin_priming_confidence_tier not in {"", "none"}
+            else ""
+        )
+        twin_xlabel_note = (
+            f"; twin-priming 5′ inv {layout.inv_5p_start}–{layout.inv_5p_end}"
+            + (
+                f" | 3′ non-inv {layout.noninv_5p_start}–{layout.noninv_3p_end}"
+                if layout.noninv_5p_start > 0 and layout.noninv_3p_end >= layout.noninv_5p_start
+                else ""
+            )
+            + f"{gap_txt}{tier_txt}"
+        )
     ax.set_xlabel(
         f"MEI insertion 5′–3′ ({layout.mei_5p}–{layout.mei_3p}, {layout.mei_span_bp} bp, {ori_label})"
-        f"{polya_note}; "
+        f"{twin_xlabel_note}{polya_note}; "
         f"flanks are {layout.flank_bp} bp each side of breakpoint",
         color=COLOR_BLACK,
         fontsize=8,
@@ -2812,11 +3273,42 @@ def plot_locus_architecture(
     right_end = "5′" if layout.reverse_oriented else "3′"
     region_labels: list[tuple[float, str]] = [
         (layout.insertion_left_x / 2.0, f"{layout.chrom}\nleft flank"),
-        (
-            layout.mei_region_start_x + layout.mei_span_bp / 2.0,
-            f"MEI ({ori_label})\n{left_end} {left_lab}…{right_lab} {right_end}",
-        ),
     ]
+    if layout.has_twin_priming_segments:
+        inv_span = layout.inv_5p_span_x
+        noninv_span = layout.noninv_3p_span_x
+        if (
+            inv_span is not None
+            and noninv_span is not None
+            and (inv_span[1] - inv_span[0]) >= 35.0
+            and (noninv_span[1] - noninv_span[0]) >= 35.0
+        ):
+            region_labels.append(
+                (
+                    (inv_span[0] + inv_span[1]) / 2.0,
+                    f"5′ inv\n{layout.inv_5p_start}…{layout.inv_5p_end}",
+                )
+            )
+            region_labels.append(
+                (
+                    (noninv_span[0] + noninv_span[1]) / 2.0,
+                    f"3′ non-inv\n{layout.noninv_5p_start}…{layout.noninv_3p_end}",
+                )
+            )
+        else:
+            region_labels.append(
+                (
+                    layout.mei_region_start_x + layout.mei_span_bp / 2.0,
+                    f"MEI ({ori_label}, 5′ inv {layout.inv_5p_start}–{layout.inv_5p_end})\n{left_end} {left_lab}…{right_lab} {right_end}",
+                )
+            )
+    else:
+        region_labels.append(
+            (
+                layout.mei_region_start_x + layout.mei_span_bp / 2.0,
+                f"MEI ({ori_label})\n{left_end} {left_lab}…{right_lab} {right_end}",
+            )
+        )
     if layout.polya_zone_bp > 0:
         region_labels.append(
             (
@@ -2857,6 +3349,30 @@ def plot_locus_architecture(
         bbox=dict(boxstyle="round,pad=0.25", facecolor=COLOR_LIGHT_ORANGE, edgecolor=COLOR_BLACK, linewidth=1.0),
         zorder=10,
     )
+    if layout.twin_priming_inv:
+        tier_badge = (layout.twin_priming_confidence_tier or "none").strip().upper()
+        gap = layout.twin_priming_junction_gap_bp
+        gap_part = f" | gap {gap}bp" if gap is not None else ""
+        tier_part = f" [{tier_badge}]" if tier_badge and tier_badge != "NONE" else ""
+        badge_text = f"5′ INV{tier_part}{gap_part}"
+        ax.text(
+            0.99,
+            0.98,
+            badge_text,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8.5,
+            fontweight="bold",
+            color=COLOR_BLACK,
+            bbox=dict(
+                boxstyle="round,pad=0.25",
+                facecolor=COLOR_DARK_ORANGE,
+                edgecolor=COLOR_BLACK,
+                linewidth=1.0,
+            ),
+            zorder=10,
+        )
 
     for spine in ax.spines.values():
         spine.set_color(COLOR_BLACK)
@@ -2973,6 +3489,19 @@ def generate_gold_read_architecture_plots(
                 "sample_status_label": _sample_status_label(row),
                 "consensus_mei_family": row.get("consensus_mei_family", ""),
                 "consensus_mei_subfamily": row.get("consensus_mei_subfamily", ""),
+                "twin_priming_inv": _row_bool(row, "twin_priming_inv", _row_bool(row, "TWIN_PRIMING_INV", False)),
+                "inv_5p_start": _row_int(row, "inv_5p_start", _row_int(row, "INV_5P_START", -1)),
+                "inv_5p_end": _row_int(row, "inv_5p_end", _row_int(row, "INV_5P_END", -1)),
+                "noninv_5p_start": _row_int(row, "noninv_5p_start", _row_int(row, "NONINV_5P_START", -1)),
+                "noninv_3p_end": _row_int(row, "noninv_3p_end", _row_int(row, "NONINV_3P_END", -1)),
+                "twin_priming_confidence_score": _row_float(
+                    row,
+                    "twin_priming_confidence_score",
+                    _row_float(row, "TWIN_PRIMING_CONF", 0.0),
+                ),
+                "twin_priming_confidence_tier": str(
+                    row.get("twin_priming_confidence_tier", row.get("TWIN_PRIMING_TIER", "none")) or "none"
+                ).strip(),
                 "png": str(out_png) if status == "ok" else "",
                 "status": status,
                 "error": err,
