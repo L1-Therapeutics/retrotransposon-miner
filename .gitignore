@@ -37,3 +37,6 @@ tmp/
 # Chromosome-sized VCF examples linked from the README.
 !docs/examples/*.vcf
 *.tbi
+
+# macOS
+.DS_Store
