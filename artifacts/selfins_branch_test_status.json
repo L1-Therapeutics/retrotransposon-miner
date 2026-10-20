@@ -1,0 +1,25 @@
+{
+ "suites": [
+  "tests/test_nested_rmsk_bedtools.py",
+  "tests/test_vcf_export.py"
+ ],
+ "passed": 45,
+ "skipped": 1,
+ "per_file": {
+  "tests/test_nested_rmsk_bedtools.py": {
+   "passed": 16,
+   "skipped": 0
+  },
+  "tests/test_vcf_export.py": {
+   "passed": 29,
+   "skipped": 1
+  }
+ },
+ "nested_file_history": {
+  "origin/main": 5,
+  "after_first_three_commits": 11,
+  "after_all_five_commits": 16
+ },
+ "bedtools": "v2.31.1 present",
+ "branch_head": "e523fd4"
+}

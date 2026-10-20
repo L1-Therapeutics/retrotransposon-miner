@@ -1,0 +1,7 @@
+family,category,n_calls,observed,expected,enrichment,p_two_sided,null
+ALU,nested_sense,1555,202,81.274,2.4854196914142284,3.389651189098414e-29,uniform
+ALU,nested_antisense,1555,37,81.274,0.4552501414966656,6.164740461656793e-08,uniform
+LINE1,nested_sense,222,53,24.433,2.1691973969631237,7.557412993195034e-07,GC-matched
+LINE1,nested_antisense,222,19,24.433,0.7776368026848934,0.3175184467060712,GC-matched
+SVA,nested_sense,75,9,0.153,58.82352941176471,2.206629217664784e-13,GC-matched
+SVA,nested_antisense,75,0,0.153,0.0,1.0,GC-matched
