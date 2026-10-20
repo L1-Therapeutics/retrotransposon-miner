@@ -42,14 +42,19 @@ ignore = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts   = ["-q", "--tb=short"]
+testpaths  = ["tests"]
+addopts    = ["-q", "--tb=short"]
+# Prepend this checkout's src/ so tests import the code in this working tree.
+# Without it, an editable install of a *sibling* git worktree wins on sys.path
+# and the suite silently exercises another branch's code.
+pythonpath = ["src"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-retro_miner = ["data/*.tsv.gz"]
+retro_miner = ["data/*.json"]
