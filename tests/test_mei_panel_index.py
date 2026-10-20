@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 from retro_miner.mei_panel_index import (
     PUBLIC_MEI_REMAP_FASTA_RELPATHS,

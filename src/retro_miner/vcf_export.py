@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import csv
 import re
-from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Context, InvalidOperation
 from pathlib import Path
 from typing import Any
 

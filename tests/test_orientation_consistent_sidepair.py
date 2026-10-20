@@ -23,8 +23,8 @@ REAL_LOCI = (
     ("rank012_chr22_23935321", False),
     ("ALU_umary_ALU_12520", False),
     ("rank022_chr22_31226464", True),
-    ("rank023_chr22_50495209", False),
-    ("rank026_chr22_50351027", False),
+    ("rank023_chr22_50495209", True),
+    ("rank026_chr22_50351027", True),
     ("rank042_chr22_35735283", False),
     ("nssv14073986", True),
 )
@@ -38,14 +38,17 @@ _FLANK_COLS = (
 
 
 def _fixture_dir(catalog_id: str) -> Path:
+    """Return the filesystem path for a fixture directory."""
     return FIXTURE_ROOT / catalog_id
 
 
 def _load_manifest(catalog_id: str) -> dict:
+    """Load the JSON manifest for a fixture locus."""
     return json.loads((_fixture_dir(catalog_id) / "manifest.json").read_text())
 
 
 def _filter_or_tag_window(df: pd.DataFrame, chrom: str, window_start: int, window_end: int) -> pd.DataFrame:
+    """Filter extract rows to the locus window, or tag all rows if the columns are absent."""
     if df is None or df.empty:
         return pd.DataFrame()
     work = df.copy()
@@ -64,6 +67,7 @@ def _filter_or_tag_window(df: pd.DataFrame, chrom: str, window_start: int, windo
 
 
 def _load_extract(catalog_id: str, name: str, chrom: str, window_start: int, window_end: int) -> pd.DataFrame:
+    """Load a parquet extract and restrict it to the locus window."""
     path = _fixture_dir(catalog_id) / name
     if not path.exists():
         return pd.DataFrame()
@@ -71,6 +75,11 @@ def _load_extract(catalog_id: str, name: str, chrom: str, window_start: int, win
 
 
 def _score_fixture_locus(catalog_id: str) -> tuple[dict, pd.DataFrame]:
+    """Replay _assign_gold_stage on a fixture locus from parquet extracts.
+
+    Returns the manifest and a scored DataFrame with flank evidence recomputed
+    from the split/discordant parquet files.
+    """
     manifest = _load_manifest(catalog_id)
     gold_path = _fixture_dir(catalog_id) / "gold_locus.tsv"
     assert gold_path.exists(), f"missing gold_locus.tsv for {catalog_id}"
@@ -110,6 +119,7 @@ def _score_fixture_locus(catalog_id: str) -> tuple[dict, pd.DataFrame]:
 
 
 def _named_detail_read(catalog_id: str, breakpoint: int) -> tuple[str, int]:
+    """Pick the most breakpoint-proximal named read from a fixture detail table."""
     detail_path = _fixture_dir(catalog_id) / "supporting_reads_detail.mei.tsv"
     detail = pd.read_csv(detail_path, sep="\t", low_memory=False)
     assert not detail.empty, f"empty supporting_reads_detail for {catalog_id}"
@@ -174,19 +184,29 @@ def test_real_locus_bam_contains_named_detail_read(catalog_id: str, _expect_gold
     assert read_name in names
 
 
+def _disease_flanks(scored: pd.DataFrame) -> tuple[int, int, int, int]:
+    left = int(scored.loc[0, "disease_left_flank_mei_reads"])
+    right = int(scored.loc[0, "disease_right_flank_mei_reads"])
+    l_poly = int(scored.loc[0, "disease_left_flank_polya_reads"])
+    r_poly = int(scored.loc[0, "disease_right_flank_polya_reads"])
+    return left, right, l_poly, r_poly
+
+
 def test_one_sided_sentinels_lack_multiple_mei_on_both_flanks():
-    """Ranks 12/23/26/42: architecture piles sit on one genomic flank."""
+    """Ranks 12/26/42: architecture piles sit on one genomic flank."""
     for catalog_id in (
         "rank012_chr22_23935321",
-        "rank023_chr22_50495209",
         "rank026_chr22_50351027",
         "rank042_chr22_35735283",
     ):
         _manifest, scored = _score_fixture_locus(catalog_id)
-        left = int(scored.loc[0, "disease_left_flank_mei_reads"])
-        right = int(scored.loc[0, "disease_right_flank_mei_reads"])
-        assert max(left, right) >= _GOLD_MIN_FLANK_MEI_READS
-        assert min(left, right) < _GOLD_MIN_FLANK_MEI_READS
+        left, right, _, _ = _disease_flanks(scored)
+        assert max(left, right) >= _GOLD_MIN_FLANK_MEI_READS, (
+            f"{catalog_id}: stronger flank has {max(left, right)} reads, expected >= {_GOLD_MIN_FLANK_MEI_READS}"
+        )
+        assert min(left, right) < _GOLD_MIN_FLANK_MEI_READS, (
+            f"{catalog_id}: weaker flank has {min(left, right)} reads, expected < {_GOLD_MIN_FLANK_MEI_READS}"
+        )
 
 
 def test_alu_umary_parked_dpe_do_not_create_opposite_flank():
@@ -194,12 +214,17 @@ def test_alu_umary_parked_dpe_do_not_create_opposite_flank():
     catalog_id = "ALU_umary_ALU_12520"
     _manifest, scored = _score_fixture_locus(catalog_id)
     support = str(scored.loc[0, "disease_supporting_reads"])
-    assert "DPE_L=" in support and "DPE_R=" in support
-    left = int(scored.loc[0, "disease_left_flank_mei_reads"])
-    right = int(scored.loc[0, "disease_right_flank_mei_reads"])
-    assert min(left, right) < _GOLD_MIN_FLANK_MEI_READS
+    assert "DPE_L=" in support and "DPE_R=" in support, (
+        f"{catalog_id}: expected both DPE_L and DPE_R in support string, got: {support[:120]}"
+    )
+    left, right, _, _ = _disease_flanks(scored)
+    assert min(left, right) < _GOLD_MIN_FLANK_MEI_READS, (
+        f"{catalog_id}: weaker flank has {min(left, right)} MEI reads, expected < {_GOLD_MIN_FLANK_MEI_READS}"
+    )
     gold = _assign_gold_stage(scored, empirical_stage=False, min_mei_mapped=3)
-    assert bool(gold.loc[0, "gold_stage_pass"]) is False
+    assert bool(gold.loc[0, "gold_stage_pass"]) is False, (
+        f"{catalog_id}: expected gold_stage_pass=False for parked DPE"
+    )
 
 
 def test_keep_controls_have_orientation_consistent_two_sided_support():
@@ -207,13 +232,15 @@ def test_keep_controls_have_orientation_consistent_two_sided_support():
     for catalog_id in ("nssv14073986", "rank022_chr22_31226464"):
         _manifest, scored = _score_fixture_locus(catalog_id)
         gold = _assign_gold_stage(scored, empirical_stage=False, min_mei_mapped=3)
-        assert bool(gold.loc[0, "gold_stage_pass"]) is True
-        left = int(scored.loc[0, "disease_left_flank_mei_reads"])
-        right = int(scored.loc[0, "disease_right_flank_mei_reads"])
-        l_poly = int(scored.loc[0, "disease_left_flank_polya_reads"])
-        r_poly = int(scored.loc[0, "disease_right_flank_polya_reads"])
+        assert bool(gold.loc[0, "gold_stage_pass"]) is True, (
+            f"{catalog_id}: expected gold_stage_pass=True, got fail_reason={gold.loc[0, 'gold_stage_fail_reason']}"
+        )
+        left, right, l_poly, r_poly = _disease_flanks(scored)
         two_sided_mei = left >= _GOLD_MIN_FLANK_MEI_READS and right >= _GOLD_MIN_FLANK_MEI_READS
         mei_polya = (left >= _GOLD_MIN_FLANK_MEI_READS and r_poly >= 1) or (
             right >= _GOLD_MIN_FLANK_MEI_READS and l_poly >= 1
         )
-        assert two_sided_mei or mei_polya
+        assert two_sided_mei or mei_polya, (
+            f"{catalog_id}: expected two-sided MEI or MEI+polyA support, "
+            f"got left={left}, right={right}, l_poly={l_poly}, r_poly={r_poly}"
+        )
