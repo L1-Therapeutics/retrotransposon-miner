@@ -1,0 +1,17 @@
+---
+description: How many parallel ENA streams to use for mouse FASTQ downloads
+globs: scripts/run_mouse_public_data_download.sh
+alwaysApply: false
+---
+
+# Mouse ENA FASTQ concurrency
+
+From us-east-1, each HTTPS connection to ftp.sra.ebi.ac.uk stays near 1 MB/s (about 78 ms round trip, congestion window stuck near 10). Measured on i-010cee6bc0c380966:
+
+- 2 streams: about 2 MB/s
+- 12 streams: about 21 MB/s, no errors
+- 24 streams: slower, and ENA starts refusing connections
+
+Use `--download-workers 12` for `--include-mouse-test-fastqs`. Do not drop back to 2, and do not raise past 12. Stream with curl into `aws s3 cp`. Do not write the FASTQs to the instance disk.
+
+A short S3 object is a failed stream, not a finished FASTQ. Hazen mates are about 35–60 GB. If the object is smaller than that, delete it before a retry. The downloader skips any object whose size is non-zero.

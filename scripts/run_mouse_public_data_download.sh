@@ -26,10 +26,12 @@ run python scripts/download_public_data.py \
   --outdir "${OUT}" \
   --download-workers 4
 
+# 12 is the measured ENA concurrency from us-east-1. Two streams are about
+# 2 MB/s. Twenty-four gets slower and connections start being refused.
 run python scripts/download_public_data.py \
   --references mm39 \
   --include-mouse-test-fastqs \
   --skip-postprocess \
   --s3-cache-prefix "${RTM_S3_CACHE}" \
   --outdir "${OUT}" \
-  --download-workers 2
+  --download-workers 12
