@@ -5,10 +5,18 @@ from __future__ import annotations
 import pytest
 
 from retro_miner.mouse_public_data import (
+    ENA_MATCHING_QUAL_DEFLINE,
+    ENA_MATCHING_SEQ_DEFLINE,
+    bwa_mem_command,
     ena_fastq_subdir,
     ena_fastq_url,
+    fasterq_dump_command,
     mgp_insertion_bed_fields,
     mouse_ucsc_chrom,
+    ncbi_sra_s3_uri,
+    s3_cp_command,
+    s3_single_file_config_text,
+    scratch_bytes_for_sra,
 )
 
 
@@ -24,6 +32,44 @@ def test_ena_fastq_url_nine_character_drr_has_no_extra_subdir() -> None:
     url = ena_fastq_url("DRR697908", 2)
     assert url == "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR697/DRR697908/DRR697908_2.fastq.gz"
     assert ena_fastq_subdir("DRR697908") == "DRR697"
+
+
+def test_ncbi_sra_object_is_the_free_public_run() -> None:
+    assert ncbi_sra_s3_uri("SRR3184315") == "s3://sra-pub-run-odp/sra/SRR3184315/SRR3184315"
+    assert ncbi_sra_s3_uri(" DRR697908 ") == "s3://sra-pub-run-odp/sra/DRR697908/DRR697908"
+    with pytest.raises(ValueError):
+        ncbi_sra_s3_uri("SRR3184315_1")
+
+
+def test_s3_copy_targets_one_file_at_disk_speed() -> None:
+    config = s3_single_file_config_text()
+    assert "preferred_transfer_client = crt" in config
+    assert "target_bandwidth = 10Gb/s" in config
+    cmd = s3_cp_command(
+        "s3://sra-pub-run-odp/sra/SRR3184315/SRR3184315",
+        "/tmp/SRR3184315",
+        anonymous=True,
+    )
+    assert cmd[-1] == "--no-sign-request"
+    signed = s3_cp_command("/tmp/a.bam", "s3://l1tx-data/mouse/align/mm39/a.bam", anonymous=False)
+    assert "--no-sign-request" not in signed
+
+
+def test_dump_and_align_commands_match_the_ena_reads() -> None:
+    dump = fasterq_dump_command("/tmp/SRR3184315", "/tmp/fq", "/tmp/scratch", 16)
+    assert ENA_MATCHING_SEQ_DEFLINE in dump
+    assert ENA_MATCHING_QUAL_DEFLINE in dump
+    assert dump[dump.index("--threads") + 1] == "16"
+    align = bwa_mem_command("/ref/mm39.fa", "/tmp/r1.fq", "/tmp/r2.fq", 14, "hazen2016_b2")
+    assert align[:4] == ["bwa", "mem", "-t", "14"]
+    assert "ID:hazen2016_b2" in align[align.index("-R") + 1]
+    assert align[-2:] == ["/tmp/r1.fq", "/tmp/r2.fq"]
+
+
+def test_scratch_reserves_dump_temp_and_sort_room() -> None:
+    assert scratch_bytes_for_sra(1000) == 9000 + 80 * 1024**3
+    with pytest.raises(ValueError):
+        scratch_bytes_for_sra(-1)
 
 
 def test_ena_fastq_url_rejects_bad_mate() -> None:

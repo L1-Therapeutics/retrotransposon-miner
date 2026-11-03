@@ -26,12 +26,17 @@ run python scripts/download_public_data.py \
   --outdir "${OUT}" \
   --download-workers 4
 
-# 12 is the measured ENA concurrency from us-east-1. Two streams are about
-# 2 MB/s. Twenty-four gets slower and connections start being refused.
-run python scripts/download_public_data.py \
-  --references mm39 \
-  --include-mouse-test-fastqs \
-  --skip-postprocess \
-  --s3-cache-prefix "${RTM_S3_CACHE}" \
-  --outdir "${OUT}" \
-  --download-workers 12
+# ENA HTTPS drops the FASTQ streams. The same reads are the public SRA object
+# in us-east-1; one CRT copy fills the disk, then fasterq-dump feeds bwa mem.
+# This run is the test batch only: Hazen clone B2, its matched thymus, and
+# two Sugo sister clones from mouse A. The rest of the catalog waits.
+run python scripts/align_mouse_sra.py \
+  --config resources/public_datasets.yaml \
+  --reference "${OUT}/reference/mm39/mm39.fa" \
+  --workdir "${HOME}/retrotransposon-workdir/mouse-align" \
+  --s3-prefix "${RTM_S3_BUCKET}/mouse/align/mm39" \
+  --threads 16 \
+  --accession SRR3184315 \
+  --accession SRR3184314 \
+  --accession DRR697908 \
+  --accession DRR697909

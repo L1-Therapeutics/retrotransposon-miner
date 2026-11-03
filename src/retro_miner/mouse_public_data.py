@@ -44,6 +44,116 @@ def ena_fastq_url(accession: str, mate: int) -> str:
     return f"https://ftp.sra.ebi.ac.uk/vol1/fastq/{sub}/{acc}/{acc}_{mate}.fastq.gz"
 
 
+# Free public SRA runs in us-east-1. The FASTQs themselves are not in this bucket.
+NCBI_SRA_BUCKET = "sra-pub-run-odp"
+
+# gp3 on the mouse instance tops out at 1000 MiB/s. The CRT client sizes its
+# one-file transfer from this target. 10 Gb/s is enough to fill that disk.
+S3_SINGLE_FILE_TARGET_BANDWIDTH = "10Gb/s"
+
+# ENA FASTQ records use this defline. Checked against SRR3184315 and DRR697908:
+# the sequence, quality, and the BAM QNAME (the token before the first space)
+# match a dump of the public SRA object.
+ENA_MATCHING_SEQ_DEFLINE = "@$ac.$si $sn/$ri"
+ENA_MATCHING_QUAL_DEFLINE = "+"
+
+# fasterq-dump keeps a temporary copy of the uncompressed FASTQ beside the
+# final files, and the SRA has to stay on disk while it reads. A WGS run
+# expands to about four times the archive size per copy.
+FASTERQ_SRA_SCRATCH_FACTOR = 9
+BAM_SORT_HEADROOM_BYTES = 80 * 1024**3
+
+
+def validate_run_accession(accession: str) -> str:
+    """Return a bare SRA run accession."""
+    acc = (accession or "").strip()
+    if len(acc) < 9 or not acc.startswith(("SRR", "ERR", "DRR")) or not acc[3:].isdigit():
+        raise ValueError(f"Not an SRA run accession: {accession!r}")
+    return acc
+
+
+def ncbi_sra_s3_uri(accession: str) -> str:
+    """URI of the free ``.sra`` object for one run."""
+    acc = validate_run_accession(accession)
+    return f"s3://{NCBI_SRA_BUCKET}/sra/{acc}/{acc}"
+
+
+def scratch_bytes_for_sra(sra_size: int) -> int:
+    """Bytes of free disk to hold one run through dump and sort."""
+    if sra_size < 0:
+        raise ValueError(f"SRA size must be >= 0, got {sra_size}")
+    return sra_size * FASTERQ_SRA_SCRATCH_FACTOR + BAM_SORT_HEADROOM_BYTES
+
+
+def s3_single_file_config_text() -> str:
+    """AWS CLI config that pushes one object as fast as the instance disk allows."""
+    return (
+        "[default]\n"
+        "region = us-east-1\n"
+        "s3 =\n"
+        "    preferred_transfer_client = crt\n"
+        f"    target_bandwidth = {S3_SINGLE_FILE_TARGET_BANDWIDTH}\n"
+        "    multipart_chunksize = 64MB\n"
+        "    max_concurrent_requests = 20\n"
+    )
+
+
+def s3_cp_command(src: str, dest: str, *, anonymous: bool) -> list[str]:
+    """Copy one object. Anonymous is for the public SRA bucket."""
+    cmd = ["aws", "s3", "cp", src, dest]
+    if anonymous:
+        cmd.append("--no-sign-request")
+    return cmd
+
+
+def fasterq_dump_command(
+    sra_path: str,
+    outdir: str,
+    tempdir: str,
+    threads: int,
+) -> list[str]:
+    """Dump paired FASTQ with the ENA read names."""
+    return [
+        "fasterq-dump",
+        "--split-files",
+        "--force",
+        "--progress",
+        "--seq-defline",
+        ENA_MATCHING_SEQ_DEFLINE,
+        "--qual-defline",
+        ENA_MATCHING_QUAL_DEFLINE,
+        "--threads",
+        str(threads),
+        "--temp",
+        tempdir,
+        "--outdir",
+        outdir,
+        sra_path,
+    ]
+
+
+def bwa_mem_command(
+    reference: str,
+    read1: str,
+    read2: str,
+    threads: int,
+    sample: str,
+) -> list[str]:
+    """Align a pair. The read group does not change the alignment."""
+    read_group = f"@RG\tID:{sample}\tSM:{sample}\tPL:ILLUMINA"
+    return [
+        "bwa",
+        "mem",
+        "-t",
+        str(threads),
+        "-R",
+        read_group,
+        reference,
+        read1,
+        read2,
+    ]
+
+
 def mouse_ucsc_chrom(token: str) -> str:
     """Map an Ensembl or UCSC mouse sequence name to a UCSC ``chr*`` name.
 
