@@ -323,6 +323,8 @@ def test_hg38_download_includes_1kg_mei_genotype_callsets(dl) -> None:
     selected = dl._select_dataset_ids_for_references(("hg38",))
     missing = sorted(HG38_MEI_GENOTYPE_IDS - selected)
     assert missing == []
+    assert "mm39_reference_fasta" not in selected
+    assert "mm10_reference_fasta" not in selected
 
     cfg = Path(__file__).resolve().parents[1] / "resources" / "public_datasets.yaml"
     catalog = {ds.dataset_id: ds for ds in dl._load_config(cfg)}
@@ -330,3 +332,127 @@ def test_hg38_download_includes_1kg_mei_genotype_callsets(dl) -> None:
         assert ds_id in catalog, ds_id
         assert catalog[ds_id].category == "mei_polymorphism"
         assert catalog[ds_id].required is True
+
+
+HAZEN2016_ACCESSIONS = {
+    "SRR3184315",
+    "SRR3184320",
+    "SRR3184323",
+    "SRR3184308",
+    "SRR3184309",
+    "SRR3184313",
+    "SRR3184375",
+    "SRR3184314",
+    "SRR3184307",
+    "SRR3184310",
+    "SRR3184327",
+}
+SUGO2025_ACCESSIONS = {f"DRR6979{n:02d}" for n in range(8, 31)}
+
+
+def _catalog(dl):
+    cfg = Path(__file__).resolve().parents[1] / "resources" / "public_datasets.yaml"
+    return {ds.dataset_id: ds for ds in dl._load_config(cfg)}
+
+
+def test_default_references_stay_human(dl) -> None:
+    assert dl._resolve_selected_references(None) == ("hg19", "hg38", "hs1")
+    assert dl._resolve_selected_references([]) == ("hg19", "hg38", "hs1")
+
+
+def test_mm39_selection_adds_mouse_tracks_and_skips_human_smoke_bams(dl) -> None:
+    selected = dl._select_dataset_ids_for_references(("mm39",))
+    required = {
+        "mm39_reference_fasta",
+        "mm39_repeatmasker_rmsk",
+        "gencode_vm39_gtf",
+        "ferraj2023_merged_sv_vcf_zip",
+        "mgp_v5_sv_insertions_bed",
+        "mgp_v5_sv_insertions_bed_tbi",
+        "dfam_human_families_embl",
+        "mm10_segmental_duplications",
+        "mm10_blacklist",
+        "mm10_to_mm39_chain",
+        "mm9_to_mm39_chain",
+        "mm39_mappability_100bp_bw",
+        "mm39_gap",
+        "mm39_simple_repeat",
+    }
+    assert required <= selected
+    assert "mm10_reference_fasta" not in selected
+    assert "seqc2_control_bam" not in selected
+    assert "gnomad_v41_sv_non_neuro_bb" not in selected
+    assert "hazen2016_b2_r1" not in selected
+
+
+def test_mouse_test_fastqs_match_hazen_and_sugo_libraries(dl) -> None:
+    catalog = _catalog(dl)
+    fastqs = [ds for ds in catalog.values() if ds.category == "test_fastq"]
+    assert len(fastqs) == 68
+    accessions = set()
+    for ds in fastqs:
+        assert ds.target_path.startswith("test_data/mouse_wgs/")
+        accession = Path(ds.target_path).name.split("_", 1)[0]
+        accessions.add(accession)
+    assert accessions == HAZEN2016_ACCESSIONS | SUGO2025_ACCESSIONS
+    assert catalog["hazen2016_b2_r1"].url.endswith("/SRR318/005/SRR3184315/SRR3184315_1.fastq.gz")
+    assert "/DRR697/DRR697908/DRR697908_1.fastq.gz" in catalog["sugo2025_a1_r1"].url
+    assert "Hazen2016/SRR3184308_1.fastq.gz" in catalog["hazen2016_c1_r1"].target_path
+
+    ids = {ds.dataset_id for ds in fastqs}
+    selected = dl._select_dataset_ids_for_references(
+        ("mm39",),
+        include_mouse_test_fastqs=True,
+        mouse_test_fastq_ids=ids,
+    )
+    assert ids <= selected
+    without = dl._select_dataset_ids_for_references(("mm39",))
+    assert ids.isdisjoint(without)
+
+
+def test_s3_sync_excludes_mouse_wgs(dl) -> None:
+    source = Path(dl.__file__).read_text(encoding="utf-8")
+    assert '"test_data/mouse_wgs/*"' in source
+    assert '"*/test_data/mouse_wgs/*"' in source
+
+
+def test_write_mgp_insertion_beds_splits_retroseq(dl, tmp_path: Path) -> None:
+    import gzip
+
+    src = tmp_path / "mgp.bed.gz"
+    with gzip.open(src, "wt", encoding="utf-8") as handle:
+        handle.write("#chr\tstart\tend\ttype\n")
+        handle.write("1\t100\t300\tINS\t1:100-300;INS;NA;1/1:NA:NA:retroseq\n")
+        handle.write("Y\t5\t15\tINS\t0/0\n")
+    all_bed = tmp_path / "all.bed"
+    mei_bed = tmp_path / "mei.bed"
+    result = dl._write_mgp_insertion_beds(src, all_bed, mei_bed, force=True)
+    assert result["rows"] == 2
+    assert result["mei_rows"] == 1
+    assert all_bed.read_text(encoding="utf-8").splitlines() == [
+        "chr1\t100\t300\tINS",
+        "chrY\t5\t15\tINS",
+    ]
+    assert mei_bed.read_text(encoding="utf-8") == "chr1\t100\t300\tINS\n"
+
+
+def test_export_mouse_mei_subset_keeps_l1_sine_ltr(dl, tmp_path: Path) -> None:
+    curated = tmp_path / "curated.fa"
+    curated.write_text(
+        ">L1Md_A#LINE/L1\nACGTAAAAAAAAAAAA\n"
+        ">B1_Mus1#SINE/Alu\nTTTTTTTTTTGGGG\n"
+        ">IAP#LTR/ERVK\nAAAAACCCCCTTTTT\n"
+        ">B2_Mm1a#SINE/B2\nATGC\n"
+        ">MER20#DNA/hAT\nGGGGAAAA\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "mouse.fa"
+    stats = dl._export_mouse_mei_subset(curated, out)
+    text = out.read_text(encoding="utf-8")
+    assert stats["mei_families"] == 4
+    assert "L1Md_A#LINE/L1" in text
+    assert "B1_Mus1#SINE/Alu" in text
+    assert "IAP#LTR/ERVK" in text
+    assert "MER20" not in text
+    assert "AAAAAAAAAAAA" not in text
+    assert text.index("B1_Mus1") < text.index("GGGG")

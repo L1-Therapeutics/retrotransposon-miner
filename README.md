@@ -512,6 +512,21 @@ python3 scripts/download_public_data.py \
   --s3-cache-prefix "${RTM_S3_CACHE:-s3://l1tx-data/public}"
 ```
 
+Mouse (GRCm39 / mm39), including Hazen 2016 and Sugo 2025 FASTQs streamed to a
+separate S3 prefix so they are not mixed into the human cache:
+
+```bash
+python3 scripts/download_public_data.py \
+  --references mm39 \
+  --include-mouse-test-fastqs \
+  --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}" \
+  --s3-cache-prefix "${RTM_S3_CACHE:-s3://l1tx-data/mouse/public}"
+```
+
+`mm10` is opt-in (`--references mm10` or `--references mm39 mm10`) for the
+Sugo 2025 and Mouse Genomes Project coordinate build. Default `--references`
+stays human. Launch a dedicated instance with `scripts/ec2_mouse_public_data.sh`.
+
 Test BAMs default to a **chr22 slice** (plus discordant mates). To park the entire SEQC2 WGS pair on S3 without filling the instance disk, stream NCBI HTTP through the instance (`curl | aws s3 cp -`) — the object never lands on the local volume:
 
 ```bash

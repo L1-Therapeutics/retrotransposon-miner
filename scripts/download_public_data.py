@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from socket import timeout as SocketTimeoutError
@@ -27,6 +28,13 @@ _SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 from retro_miner.mei_panel_index import index_public_mei_remap_fastas
+from retro_miner.mouse_public_data import (
+    MOUSE_MEI_CLASS_RE,
+    MOUSE_REFERENCES,
+    ena_fastq_url,
+    mgp_insertion_bed_fields,
+    mouse_ucsc_chrom,
+)
 from retro_miner.s3_transfer import copy_s3_uri, download_s3_uri, process_local_aws_config
 
 
@@ -54,7 +62,9 @@ class MateLocus:
 BWA_INDEX_SUFFIXES = (".amb", ".ann", ".bwt", ".pac", ".sa")
 DFAM_CURATED_CONSENSUS_0_URL = "https://www.dfam.org/releases/current/families/FamDB/dfam40.curated.consensus.0.h5.gz"
 UCSC_REPEATBROWSER_HG38REPS_URL = "https://hgdownload.soe.ucsc.edu/hubs/RepeatBrowser2020/hg38reps/hg38reps.fa"
-SUPPORTED_REFERENCES = ("hg19", "hg38", "hs1")
+HUMAN_REFERENCES = ("hg19", "hg38", "hs1")
+# Mouse builds are opt-in. An empty --references still materializes the human set.
+SUPPORTED_REFERENCES = HUMAN_REFERENCES + MOUSE_REFERENCES
 TEST_DATASET_IDS = {
     "seqc2_disease_bam",
     "seqc2_control_bam",
@@ -96,7 +106,100 @@ REFERENCE_DATASET_IDS_BY_BUILD: dict[str, set[str]] = {
         "lr_1kg_ont_vienna_svan_mei_vcf",
         "lr_1kg_ont_vienna_svan_mei_vcf_tbi",
     },
+    "mm39": {
+        "mm39_reference_fasta",
+        "gencode_vm39_gtf",
+        "mm39_repeatmasker_rmsk",
+        "mm39_simple_repeat",
+        "mm39_gap",
+        "mm39_mappability_100bp_bw",
+        "ferraj2023_merged_sv_vcf_zip",
+    },
+    "mm10": {
+        "mm10_reference_fasta",
+        "gencode_vm23_gtf",
+        "mm10_repeatmasker_rmsk",
+        "mm10_simple_repeat",
+        "mm10_gap",
+        "mm10_segmental_duplications",
+        "mm10_mappability_100bp_bw",
+        "mm10_blacklist",
+        "mgp_v5_sv_insertions_bed",
+        "mgp_v5_sv_insertions_bed_tbi",
+    },
 }
+
+# Sources that are not native to mm39 but are required to build the mm39
+# polymorphism and junk tracks (MGP and segdups are published on mm10).
+MM39_PROJECTION_DATASET_IDS = {
+    "mm10_segmental_duplications",
+    "mm10_blacklist",
+    "mm10_to_mm39_chain",
+    "mm39_to_mm10_chain",
+    "mm9_to_mm39_chain",
+    "mm9_to_mm10_chain",
+    "mm10_to_mm9_chain",
+    "mgp_v5_sv_insertions_bed",
+    "mgp_v5_sv_insertions_bed_tbi",
+}
+
+# GRCm39 long-read catalog projected onto the mm10 paper build.
+MM10_PROJECTION_DATASET_IDS = {
+    "ferraj2023_merged_sv_vcf_zip",
+    "mm39_to_mm10_chain",
+    "mm10_to_mm39_chain",
+    "mm9_to_mm10_chain",
+    "mm10_to_mm9_chain",
+}
+
+def _mouse_library_description(row: dict[str, Any], mate: int) -> str:
+    bits = [
+        f"{row.get('paper', '')} {row.get('role', '')}".strip(),
+        f"donor {row.get('donor', '')}".strip(),
+        str(row.get("tissue", "")).strip(),
+        str(row.get("genotype", "")).strip(),
+        f"BioProject {row.get('bioproject', '')}".strip(),
+        f"{row.get('read_bp', '')} bp".strip(),
+        f"published build {row.get('published_build', '')}".strip(),
+        f"mate {mate}",
+    ]
+    control = str(row.get("control_accession", "")).strip()
+    if control:
+        bits.append(f"germline control {control}")
+    notes = str(row.get("notes", "")).strip()
+    if notes:
+        bits.append(notes)
+    return ". ".join(bit for bit in bits if bit)
+
+
+def _mouse_library_datasets(rows: list[Any]) -> list[Dataset]:
+    """Expand compact library records into paired ENA FASTQ datasets."""
+    items: list[Dataset] = []
+    required_fields = ("id", "accession", "paper")
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"Invalid mouse_wgs_libraries entry at index {idx}")
+        missing = [key for key in required_fields if not row.get(key)]
+        if missing:
+            raise ValueError(
+                f"mouse_wgs_libraries entry {row.get('id', idx)} missing: {', '.join(missing)}"
+            )
+        accession = str(row["accession"]).strip()
+        paper = str(row["paper"]).strip()
+        for mate in (1, 2):
+            items.append(
+                Dataset(
+                    dataset_id=f"{row['id']}_r{mate}",
+                    category="test_fastq",
+                    description=_mouse_library_description(row, mate),
+                    source="ENA",
+                    url=ena_fastq_url(accession, mate),
+                    target_path=f"test_data/mouse_wgs/{paper}/{accession}_{mate}.fastq.gz",
+                    required=bool(row.get("required", True)),
+                )
+            )
+    return items
+
 
 def _load_config(config_path: Path) -> list[Dataset]:
     with config_path.open("r", encoding="utf-8") as handle:
@@ -130,12 +233,16 @@ def _load_config(config_path: Path) -> list[Dataset]:
                 required=bool(row.get("required", True)),
             )
         )
+    libraries = cfg.get("mouse_wgs_libraries") or []
+    if not isinstance(libraries, list):
+        raise ValueError(f"mouse_wgs_libraries must be a list in {config_path}")
+    items.extend(_mouse_library_datasets(libraries))
     return items
 
 
 def _resolve_selected_references(raw_refs: list[str] | None) -> tuple[str, ...]:
     if not raw_refs:
-        return SUPPORTED_REFERENCES
+        return HUMAN_REFERENCES
     norm = []
     for ref in raw_refs:
         r = ref.strip().lower()
@@ -146,12 +253,32 @@ def _resolve_selected_references(raw_refs: list[str] | None) -> tuple[str, ...]:
     return tuple(norm)
 
 
-def _select_dataset_ids_for_references(selected_refs: tuple[str, ...]) -> set[str]:
+def _select_dataset_ids_for_references(
+    selected_refs: tuple[str, ...],
+    *,
+    include_mouse_test_fastqs: bool = False,
+    mouse_test_fastq_ids: set[str] | None = None,
+) -> set[str]:
     ids: set[str] = set()
+    human_refs = tuple(ref for ref in selected_refs if ref in HUMAN_REFERENCES)
+    mouse_refs = tuple(ref for ref in selected_refs if ref in MOUSE_REFERENCES)
 
     # Build-native datasets for selected targets.
     for ref in selected_refs:
         ids.update(REFERENCE_DATASET_IDS_BY_BUILD.get(ref, set()))
+
+    if mouse_refs:
+        # FamDB root partition. The human export and the mouse L1/SINE/ERV export share it.
+        ids.add("dfam_human_families_embl")
+        if "mm39" in mouse_refs:
+            ids.update(MM39_PROJECTION_DATASET_IDS)
+        if "mm10" in mouse_refs:
+            ids.update(MM10_PROJECTION_DATASET_IDS)
+        if include_mouse_test_fastqs:
+            ids.update(mouse_test_fastq_ids or set())
+
+    if not human_refs:
+        return ids
 
     # MEI library + benchmark/helper resources are build-agnostic in this workflow.
     ids.update(
@@ -161,7 +288,7 @@ def _select_dataset_ids_for_references(selected_refs: tuple[str, ...]) -> set[st
         }
     )
 
-    # Always include chr22-sliced SEQC2 smoke-test pair.
+    # Always include chr22-sliced SEQC2 smoke-test pair when a human build is requested.
     # These are lightweight (remote-sliced), and are required for end-to-end validation.
     ids.update(TEST_DATASET_IDS)
 
@@ -230,16 +357,20 @@ def _s3_sync(src: str, dst: str) -> dict[str, Any]:
     with process_local_aws_config() as aws_env:
         _run_cmd(
             [
-                "aws",
-                "s3",
-                "sync",
-                src,
-                dst,
-                "--exclude",
-                "test_data/full/*",
-                "--exclude",
-                "*/test_data/full/*",
-            ],
+            "aws",
+            "s3",
+            "sync",
+            src,
+            dst,
+            "--exclude",
+            "test_data/full/*",
+            "--exclude",
+            "*/test_data/full/*",
+            "--exclude",
+            "test_data/mouse_wgs/*",
+            "--exclude",
+            "*/test_data/mouse_wgs/*",
+        ],
             required=True,
             env=aws_env,
         )
@@ -1010,7 +1141,21 @@ def _download_dataset(
     is_test_alignment = ds.dataset_id in TEST_DATASET_IDS and (ds.url.endswith(".bam") or ds.url.endswith(".cram"))
     for attempt in range(1, attempts + 1):
         try:
-            if is_test_alignment and test_bam_mode == "full":
+            if ds.category == "test_fastq" and s3_cache_prefix:
+                s3_uri = f"{normalize_s3_prefix(s3_cache_prefix)}/{ds.target_path}"
+                existing = None if force else _s3_head_size(s3_uri)
+                if existing:
+                    result = {
+                        "status": "skipped_exists",
+                        "s3": s3_uri,
+                        "bytes": existing,
+                        "url": ds.url,
+                        "path": s3_uri,
+                    }
+                else:
+                    result = _http_stream_to_s3(ds.url, s3_uri)
+                    result["path"] = s3_uri
+            elif is_test_alignment and test_bam_mode == "full":
                 if not s3_cache_prefix:
                     raise RuntimeError(
                         "--test-bam-mode full requires --s3-cache-prefix or RTM_S3_CACHE "
@@ -1769,6 +1914,33 @@ def _trim_mei_consensus_terminal_polya(seq: str, *, min_run: int = _MEI_CONSENSU
     return s
 
 
+def _export_mouse_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dict[str, Any]:
+    """Keep mouse L1, SINE, and LTR/ERV consensuses and strip terminal polyA/T."""
+    class_re = re.compile(MOUSE_MEI_CLASS_RE, re.IGNORECASE)
+    mei_subset_fasta.parent.mkdir(parents=True, exist_ok=True)
+    kept = 0
+    trimmed = 0
+    with mei_subset_fasta.open("w", encoding="utf-8") as out_handle:
+        for header, seq in _iter_fasta(curated_fasta):
+            if class_re.search(header) is None:
+                continue
+            body = _trim_mei_consensus_terminal_polya(seq)
+            if body != seq:
+                trimmed += 1
+            if not body:
+                continue
+            out_handle.write(f">{header}\n")
+            for offset in range(0, len(body), 60):
+                out_handle.write(body[offset : offset + 60] + "\n")
+            kept += 1
+    return {
+        "bytes": mei_subset_fasta.stat().st_size if mei_subset_fasta.exists() else 0,
+        "mei_families": kept,
+        "polya_trimmed": trimmed,
+        "path": str(mei_subset_fasta),
+    }
+
+
 def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dict[str, Any]:
     header_re = re.compile(r"#SINE/Alu|#LINE/L1|(^|[^A-Za-z])SVA([^A-Za-z]|$)", re.IGNORECASE)
     kept = 0
@@ -1816,7 +1988,17 @@ def _export_human_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dic
     }
 
 
-def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_sec: int, force: bool) -> dict[str, Any]:
+def _prepare_dfam_mei_library(
+    outdir: Path,
+    ds_map: dict[str, Dataset],
+    timeout_sec: int,
+    force: bool,
+    *,
+    taxid: str = "9606",
+    curated_fasta_name: str = "dfam_human_curated.fasta",
+    subset_fasta_name: str = "dfam_human_mei_l1_alu_sva.fasta",
+    subset_exporter: Any = None,
+) -> dict[str, Any]:
     ds = ds_map.get("dfam_human_families_embl")
     if not ds:
         return {"status": "skipped_missing_dataset", "reason": "dfam_human_families_embl not in config"}
@@ -1848,7 +2030,7 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
     if famdb_py is None:
         return {"status": "failed", "error": tool_status, "db_dir": str(db_dir)}
 
-    curated_fasta = dfam_dir / "dfam_human_curated.fasta"
+    curated_fasta = dfam_dir / curated_fasta_name
     curated_missing_or_empty = (not curated_fasta.exists()) or (curated_fasta.stat().st_size <= 0)
     if force or curated_missing_or_empty:
         cmd = [
@@ -1862,7 +2044,7 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
             "--include-class-in-name",
             "-ad",
             "--curated",
-            "9606",
+            str(taxid),
         ]
         with curated_fasta.open("w", encoding="utf-8") as out_handle:
             proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -1876,15 +2058,17 @@ def _prepare_dfam_mei_library(outdir: Path, ds_map: dict[str, Dataset], timeout_
             "Re-run with --force and verify FamDB export output."
         )
 
-    mei_subset_fasta = dfam_dir / "dfam_human_mei_l1_alu_sva.fasta"
-    subset_stats = _export_human_mei_subset(curated_fasta, mei_subset_fasta)
+    mei_subset_fasta = dfam_dir / subset_fasta_name
+    exporter = subset_exporter or _export_human_mei_subset
+    subset_stats = exporter(curated_fasta, mei_subset_fasta)
     if int(subset_stats.get("bytes", 0)) <= 0 or int(subset_stats.get("mei_families", 0)) <= 0:
         raise RuntimeError(
             "dfam MEI subset FASTA is empty after export "
-            f"(path={mei_subset_fasta}, families={subset_stats.get('mei_families', 0)})."
+            f"(path={mei_subset_fasta}, taxid={taxid}, families={subset_stats.get('mei_families', 0)})."
         )
     return {
         "status": "prepared",
+        "taxid": str(taxid),
         "famdb_tool": tool_status,
         "db_dir": str(db_dir),
         "curated_fasta": str(curated_fasta),
@@ -2351,6 +2535,320 @@ def _build_mei_fragment_to_full_coord_map(
     }
 
 
+def _write_mgp_insertion_beds(src_gz: Path, all_bed: Path, mei_bed: Path, force: bool) -> dict[str, Any]:
+    """Prefix MGP Ensembl chromosome names and split RetroSeq MEI rows."""
+    if all_bed.exists() and mei_bed.exists() and not force:
+        return {"status": "skipped_exists", "path": str(all_bed), "mei_path": str(mei_bed)}
+    all_bed.parent.mkdir(parents=True, exist_ok=True)
+    mei_bed.parent.mkdir(parents=True, exist_ok=True)
+    all_rows = 0
+    mei_rows = 0
+    with gzip.open(src_gz, "rt", encoding="utf-8", newline="") as in_handle, all_bed.open(
+        "w", encoding="utf-8"
+    ) as all_handle, mei_bed.open("w", encoding="utf-8") as mei_handle:
+        reader = csv.reader(in_handle, delimiter="\t")
+        for row in reader:
+            parsed = mgp_insertion_bed_fields(row)
+            if parsed is None:
+                continue
+            chrom, start, end, kind, is_mei = parsed
+            line = f"{chrom}\t{start}\t{end}\t{kind}\n"
+            all_handle.write(line)
+            all_rows += 1
+            if is_mei:
+                mei_handle.write(line)
+                mei_rows += 1
+    return {
+        "status": "converted",
+        "path": str(all_bed),
+        "mei_path": str(mei_bed),
+        "rows": all_rows,
+        "mei_rows": mei_rows,
+    }
+
+
+def _vcf_is_insertion(alt: str, info: str) -> bool:
+    alt_u = (alt or "").upper()
+    info_u = (info or "").upper()
+    if "SVTYPE=INS" in info_u:
+        return True
+    return alt_u.startswith("<INS")
+
+
+def _vcf_is_te_record(line: str) -> bool:
+    low = line.lower()
+    tokens = ("line1", "line/l1", "sine", "sva", "ltr", "erv", "retro", "mobile element", "te_class", "svtype=ins:me")
+    return any(token in low for token in tokens)
+
+
+def _extract_insertion_bed_from_vcf(vcf_path: Path, ins_bed: Path, te_bed: Path, force: bool) -> dict[str, Any]:
+    if ins_bed.exists() and te_bed.exists() and not force:
+        return {"status": "skipped_exists", "path": str(ins_bed), "te_path": str(te_bed)}
+    ins_bed.parent.mkdir(parents=True, exist_ok=True)
+    opener = gzip.open if str(vcf_path).endswith(".gz") else vcf_path.open
+    ins_rows = 0
+    te_rows = 0
+    with opener(vcf_path, "rt", encoding="utf-8", errors="replace") as in_handle, ins_bed.open(
+        "w", encoding="utf-8"
+    ) as ins_handle, te_bed.open("w", encoding="utf-8") as te_handle:
+        for line in in_handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 8:
+                continue
+            chrom = mouse_ucsc_chrom(parts[0])
+            if not chrom:
+                continue
+            alt = parts[4]
+            info = parts[7]
+            if not _vcf_is_insertion(alt, info):
+                continue
+            try:
+                pos = int(parts[1])
+            except ValueError:
+                continue
+            end = _extract_vcf_end_pos(pos, parts[3], info)
+            start0 = pos - 1
+            end0 = end if end > start0 else pos
+            name = parts[2] if parts[2] and parts[2] != "." else "INS"
+            bed = f"{chrom}\t{start0}\t{end0}\t{name}\n"
+            ins_handle.write(bed)
+            ins_rows += 1
+            if _vcf_is_te_record(line):
+                te_handle.write(bed)
+                te_rows += 1
+    return {
+        "status": "extracted",
+        "path": str(ins_bed),
+        "te_path": str(te_bed),
+        "rows": ins_rows,
+        "te_rows": te_rows,
+        "source": str(vcf_path),
+    }
+
+
+def _extract_ferraj_insertion_beds(zip_path: Path, out_dir: Path, force: bool) -> dict[str, Any]:
+    ins_bed = out_dir / "ferraj2023.insertions.bed"
+    te_bed = out_dir / "ferraj2023.te_insertions.bed"
+    if ins_bed.exists() and te_bed.exists() and not force:
+        return {"status": "skipped_exists", "path": str(ins_bed), "te_path": str(te_bed)}
+    if not zip_path.exists():
+        return {"status": "skipped_missing", "path": str(zip_path)}
+    extract_dir = out_dir / "extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(extract_dir)
+    vcfs = sorted(extract_dir.rglob("*.vcf.gz")) + sorted(extract_dir.rglob("*.vcf"))
+    if not vcfs:
+        raise RuntimeError(f"No VCF found inside {zip_path}")
+    merged = next((path for path in vcfs if "merge" in path.name.lower()), vcfs[0])
+    result = _extract_insertion_bed_from_vcf(merged, ins_bed, te_bed, force=force)
+    result["vcf"] = str(merged)
+    return result
+
+
+def _postprocess_mouse(
+    outdir: Path,
+    ds_map: dict[str, Dataset],
+    force: bool,
+    timeout_sec: int,
+    selected_references: tuple[str, ...],
+    run_step,
+) -> None:
+    """Beds, liftOver, and the mouse L1/SINE/ERV consensus for mm39 and/or mm10."""
+    want_mm39 = "mm39" in selected_references
+    want_mm10 = "mm10" in selected_references
+
+    def _optional_bed(dataset_id: str, dst_rel: str, step: str) -> Path | None:
+        ds = ds_map.get(dataset_id)
+        if ds is None:
+            return None
+        src = outdir / ds.target_path
+        dst = outdir / dst_rel
+        if not src.exists():
+            return None
+        run_step(step, lambda src=src, dst=dst: _convert_ucsc_txt_to_bed(src, dst, force=force))
+        return dst
+
+    for build, rmsk_id, simple_id, gap_id in (
+        ("mm39", "mm39_repeatmasker_rmsk", "mm39_simple_repeat", "mm39_gap"),
+        ("mm10", "mm10_repeatmasker_rmsk", "mm10_simple_repeat", "mm10_gap"),
+    ):
+        if build == "mm39" and not want_mm39:
+            continue
+        if build == "mm10" and not want_mm10:
+            continue
+        _optional_bed(rmsk_id, f"annotation/{build}/repeats/rmsk.bed", f"{build}_rmsk_to_bed")
+        _optional_bed(simple_id, f"annotation/{build}/repeats/simpleRepeat.bed", f"{build}_simple_repeat_to_bed")
+        _optional_bed(gap_id, f"annotation/{build}/masks/gap.bed", f"{build}_gap_to_bed")
+
+    mm10_segdup_bed = _optional_bed(
+        "mm10_segmental_duplications",
+        "annotation/mm10/segdup/genomicSuperDups.bed",
+        "mm10_segdup_to_bed",
+    )
+    mm10_blacklist_ds = ds_map.get("mm10_blacklist")
+    mm10_blacklist_bed = outdir / "annotation/mm10/blacklist/mm10-blacklist.v2.bed"
+    if mm10_blacklist_ds is not None:
+        src = outdir / mm10_blacklist_ds.target_path
+        if src.exists():
+            run_step(
+                "mm10_blacklist_decompress",
+                lambda src=src: _decompress_gzip(src, mm10_blacklist_bed, force=force),
+            )
+
+    def _lift(step: str, in_bed: Path, chain_id: str, out_rel: str) -> Path | None:
+        chain_ds = ds_map.get(chain_id)
+        if chain_ds is None or not in_bed.exists() or in_bed.stat().st_size <= 0:
+            return None
+        out_bed = outdir / out_rel
+        unmapped = out_bed.with_name(out_bed.name.replace(".bed", ".unmapped.bed"))
+        chain = outdir / chain_ds.target_path
+        run_step(
+            step,
+            lambda in_bed=in_bed, chain=chain, out_bed=out_bed, unmapped=unmapped: _liftover_bed(
+                in_bed, chain, out_bed, unmapped, force=force
+            ),
+        )
+        return out_bed
+
+    mm39_segdup_bed = outdir / "annotation/mm39/segdup/genomicSuperDups.bed"
+    mm39_blacklist_bed = outdir / "annotation/mm39/blacklist/mm10-blacklist.v2.mm39.bed"
+    if want_mm39 and mm10_segdup_bed is not None:
+        lifted = _lift(
+            "liftover_mm10_segdup_to_mm39",
+            mm10_segdup_bed,
+            "mm10_to_mm39_chain",
+            "annotation/mm39/segdup/genomicSuperDups.bed",
+        )
+        if lifted is not None:
+            mm39_segdup_bed = lifted
+    if want_mm39 and mm10_blacklist_bed.exists():
+        lifted_bl = _lift(
+            "liftover_mm10_blacklist_to_mm39",
+            mm10_blacklist_bed,
+            "mm10_to_mm39_chain",
+            "annotation/mm39/blacklist/mm10-blacklist.v2.mm39.bed",
+        )
+        if lifted_bl is not None:
+            mm39_blacklist_bed = lifted_bl
+
+    for build in ("mm39", "mm10"):
+        if build == "mm39" and not want_mm39:
+            continue
+        if build == "mm10" and not want_mm10:
+            continue
+        bw_id = f"{build}_mappability_100bp_bw"
+        bw_ds = ds_map.get(bw_id)
+        if bw_ds is None:
+            continue
+        bw_path = outdir / bw_ds.target_path
+        if not bw_path.exists():
+            continue
+        bedgraph = outdir / f"annotation/{build}/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+        low_bed = outdir / f"annotation/{build}/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+        if not bedgraph.exists() or force:
+            run_step(
+                f"{build}_mappability_bw_to_bedgraph",
+                lambda bw_path=bw_path, bedgraph=bedgraph: {
+                    "status": "converted"
+                    if _run_cmd(["bigWigToBedGraph", str(bw_path), str(bedgraph)], required=True)[0]
+                    else "failed",
+                    "path": str(bedgraph),
+                },
+            )
+        if bedgraph.exists():
+            run_step(
+                f"{build}_mappability_low_to_bed",
+                lambda bedgraph=bedgraph, low_bed=low_bed: _derive_low_mappability_bed(
+                    src_bedgraph=bedgraph, dst_bed=low_bed, threshold=0.5, force=force
+                ),
+            )
+
+    mgp_ds = ds_map.get("mgp_v5_sv_insertions_bed")
+    mgp_all = outdir / "polymorphism/mm10/mgp/mgpv5.SV_insertions.chr.bed"
+    mgp_mei = outdir / "polymorphism/mm10/mgp/mgpv5.SV_insertions.retroseq.bed"
+    if mgp_ds is not None and (outdir / mgp_ds.target_path).exists():
+        src = outdir / mgp_ds.target_path
+        run_step(
+            "mgp_v5_insertions_to_bed",
+            lambda src=src: _write_mgp_insertion_beds(src, mgp_all, mgp_mei, force=force),
+        )
+        if want_mm39:
+            _lift(
+                "liftover_mgp_v5_insertions_to_mm39",
+                mgp_all,
+                "mm10_to_mm39_chain",
+                "polymorphism/mm39/mgp/mgpv5.SV_insertions.bed",
+            )
+            _lift(
+                "liftover_mgp_v5_retroseq_to_mm39",
+                mgp_mei,
+                "mm10_to_mm39_chain",
+                "polymorphism/mm39/mgp/mgpv5.SV_insertions.retroseq.bed",
+            )
+
+    ferraj_ds = ds_map.get("ferraj2023_merged_sv_vcf_zip")
+    if ferraj_ds is not None and (outdir / ferraj_ds.target_path).exists():
+        zip_path = outdir / ferraj_ds.target_path
+        run_step(
+            "ferraj2023_extract_insertions",
+            lambda zip_path=zip_path: _extract_ferraj_insertion_beds(
+                zip_path, outdir / "polymorphism/mm39/ferraj2023", force=force
+            ),
+        )
+        if want_mm10:
+            _lift(
+                "liftover_ferraj2023_insertions_to_mm10",
+                outdir / "polymorphism/mm39/ferraj2023/ferraj2023.insertions.bed",
+                "mm39_to_mm10_chain",
+                "polymorphism/mm10/ferraj2023/ferraj2023.insertions.bed",
+            )
+            _lift(
+                "liftover_ferraj2023_te_insertions_to_mm10",
+                outdir / "polymorphism/mm39/ferraj2023/ferraj2023.te_insertions.bed",
+                "mm39_to_mm10_chain",
+                "polymorphism/mm10/ferraj2023/ferraj2023.te_insertions.bed",
+            )
+
+    if want_mm39:
+        low_map = outdir / "annotation/mm39/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+        gap_src = outdir / "annotation/mm39/masks/gap.txt.gz"
+        if mm39_segdup_bed.exists() and low_map.exists() and gap_src.exists() and mm39_blacklist_bed.exists():
+            run_step(
+                "merge_mm39_junk_exclusion_bed",
+                lambda: _merge_junk_exclusion_bed(
+                    segdup_bed=mm39_segdup_bed,
+                    low_map_bed=low_map,
+                    gap_bed_like=gap_src,
+                    blacklist_bed_like=mm39_blacklist_bed,
+                    out_merged_bed=outdir / "annotation/mm39/junk/junk_exclusion_merged.bed",
+                    out_gap_bed=outdir / "annotation/mm39/masks/gap.from_table.bed",
+                    out_blacklist_bed=outdir / "annotation/mm39/blacklist/blacklist.mm39.bed",
+                    force=force,
+                ),
+            )
+
+    run_step(
+        "dfam_prepare_mouse_mei_fasta",
+        lambda: _prepare_dfam_mei_library(
+            outdir=outdir,
+            ds_map=ds_map,
+            timeout_sec=timeout_sec,
+            force=force,
+            taxid="10090",
+            curated_fasta_name="dfam_mouse_curated.fasta",
+            subset_fasta_name="dfam_mouse_mei_l1_sine_erv.fasta",
+            subset_exporter=_export_mouse_mei_subset,
+        ),
+    )
+    run_step(
+        "index_mouse_mei_remap_bwa",
+        lambda: index_public_mei_remap_fastas(outdir, force=force),
+    )
+
+
 def _postprocess(
     outdir: Path,
     datasets: list[Dataset],
@@ -2364,6 +2862,8 @@ def _postprocess(
     want_hg38 = "hg38" in selected_references
     want_hg19 = "hg19" in selected_references
     want_hs1 = "hs1" in selected_references
+    want_mm39 = "mm39" in selected_references
+    want_mm10 = "mm10" in selected_references
 
     def run_step(step_name: str, fn):
         print(f"[postprocess:start] {step_name}", file=sys.stderr)
@@ -2381,7 +2881,13 @@ def _postprocess(
             raise
 
     # 1) Reference FASTA prep: decompress + index files (.fai and .dict).
-    for ref_id in ("hg38_reference_fasta", "hg19_reference_fasta", "hs1_t2t_reference_fasta"):
+    for ref_id in (
+        "hg38_reference_fasta",
+        "hg19_reference_fasta",
+        "hs1_t2t_reference_fasta",
+        "mm39_reference_fasta",
+        "mm10_reference_fasta",
+    ):
         ds = ds_map.get(ref_id)
         if not ds:
             continue
@@ -2407,6 +2913,12 @@ def _postprocess(
                 ),
             },
         )
+
+    want_mouse = want_mm39 or want_mm10
+    if not (want_hg38 or want_hg19 or want_hs1):
+        if want_mouse:
+            _postprocess_mouse(outdir, ds_map, force, timeout_sec, selected_references, run_step)
+        return steps
 
     # 2) Convert hg38 annotations to BED.
     rmsk_gz = outdir / ds_map["hg38_repeatmasker_rmsk"].target_path
@@ -2887,6 +3399,9 @@ def _postprocess(
         lambda: index_public_mei_remap_fastas(outdir, force=force),
     )
 
+    if "mm39" in selected_references or "mm10" in selected_references:
+        _postprocess_mouse(outdir, ds_map, force, timeout_sec, selected_references, run_step)
+
     return steps
 
 
@@ -2919,12 +3434,25 @@ def main() -> int:
         "--references",
         nargs="+",
         default=None,
-        help="Reference builds to materialize (any of: hg19 hg38 hs1). Default: all.",
+        help=(
+            "Reference builds to materialize "
+            f"(any of: {' '.join(SUPPORTED_REFERENCES)}). "
+            "Default: hg19 hg38 hs1. Pass mm39 and/or mm10 for mouse."
+        ),
+    )
+    parser.add_argument(
+        "--include-mouse-test-fastqs",
+        action="store_true",
+        help=(
+            "With --references mm39 and/or mm10, also stream Hazen 2016 and Sugo 2025 "
+            "paired FASTQs to S3. Requires --s3-cache-prefix. The objects are not "
+            "copied onto the instance disk."
+        ),
     )
     parser.add_argument(
         "--include-optional",
         action="store_true",
-        help="Include datasets marked required: false",
+        help="Also download datasets marked required: false.",
     )
     parser.add_argument(
         "--force",
@@ -3019,7 +3547,18 @@ def main() -> int:
 
     datasets = _load_config(config_path)
     selected_references = _resolve_selected_references(args.references)
-    selected_dataset_ids = _select_dataset_ids_for_references(selected_references)
+    mouse_fastq_ids = {
+        d.dataset_id
+        for d in datasets
+        if d.category == "test_fastq" and d.target_path.startswith("test_data/mouse_wgs/")
+    }
+    if args.include_mouse_test_fastqs and not any(ref in MOUSE_REFERENCES for ref in selected_references):
+        raise SystemExit("--include-mouse-test-fastqs requires --references mm39 and/or mm10")
+    selected_dataset_ids = _select_dataset_ids_for_references(
+        selected_references,
+        include_mouse_test_fastqs=args.include_mouse_test_fastqs,
+        mouse_test_fastq_ids=mouse_fastq_ids,
+    )
     categories = set(args.categories) if args.categories else None
     dataset_ids = set(args.dataset_ids) if args.dataset_ids else None
     active_datasets = [
@@ -3039,6 +3578,11 @@ def main() -> int:
     s3_full_src = normalize_s3_prefix(args.s3_full_bam_source_prefix)
     if test_bam_mode == "full" and not s3_cache:
         raise SystemExit("--test-bam-mode full requires --s3-cache-prefix or RTM_S3_CACHE")
+    if args.include_mouse_test_fastqs and not s3_cache:
+        raise SystemExit(
+            "--include-mouse-test-fastqs requires --s3-cache-prefix or RTM_S3_CACHE "
+            "so paired FASTQs stream to S3 instead of the instance volume."
+        )
     manifest: dict[str, Any] = {
         "generated_at_unix": int(time.time()),
         "config": str(config_path),
@@ -3069,15 +3613,20 @@ def main() -> int:
 
     snpeff_script = Path(__file__).resolve().parent / "install_snpeff.sh"
     snpeff_prefix = outdir / "tools" / "snpeff"
-    print(f"[snpeff] install prefix {snpeff_prefix}", file=sys.stderr)
-    snpeff_ok, snpeff_msg = _run_cmd(["bash", str(snpeff_script), str(snpeff_prefix)], required=False)
-    manifest["postprocess"].append(
-        {
-            "step": "install_snpeff",
-            "status": "installed" if snpeff_ok else "failed",
-            "detail": snpeff_msg,
-        }
-    )
+    if any(ref in HUMAN_REFERENCES for ref in selected_references):
+        print(f"[snpeff] install prefix {snpeff_prefix}", file=sys.stderr)
+        snpeff_ok, snpeff_msg = _run_cmd(["bash", str(snpeff_script), str(snpeff_prefix)], required=False)
+        manifest["postprocess"].append(
+            {
+                "step": "install_snpeff",
+                "status": "installed" if snpeff_ok else "failed",
+                "detail": snpeff_msg,
+            }
+        )
+    else:
+        manifest["postprocess"].append(
+            {"step": "install_snpeff", "status": "skipped_mouse_only", "prefix": str(snpeff_prefix)}
+        )
 
     print(
         "Storage note: full-BAM workflows (whole disease+control remap) may require ~300GB free disk. "
@@ -3191,7 +3740,9 @@ def main() -> int:
         except Exception as err:  # noqa: BLE001
             manifest["postprocess"].append({"step": "pipeline_postprocess", "status": "failed", "error": str(err)})
 
-    downloaded = sum(1 for r in manifest["results"] if r["status"] == "downloaded")
+    downloaded = sum(
+        1 for r in manifest["results"] if r["status"] in {"downloaded", "streamed_to_s3", "s3_copied"}
+    )
     skipped = sum(1 for r in manifest["results"] if r["status"] == "skipped_exists")
     failed_required = sum(1 for r in manifest["results"] if r["status"] == "failed" and r["required"])
     failed_optional = sum(1 for r in manifest["results"] if r["status"] == "failed" and not r["required"])

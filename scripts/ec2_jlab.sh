@@ -951,6 +951,12 @@ write_ssh_config() {
   ' "${cfg}" > "${cfg}.tmp"
   mv "${cfg}.tmp" "${cfg}"
 
+  # ssh ProxyCommand does not inherit this process environment. A second
+  # instance (mouse vs human) must carry its own state file and host alias
+  # or the proxy resolves the other box.
+  local proxy_cmd
+  proxy_cmd="env INSTANCE_STATE_FILE=$(printf '%q' "${INSTANCE_STATE_FILE}") HOST_ALIAS=$(printf '%q' "${HOST_ALIAS}") JLAB_ALIAS=$(printf '%q' "${JLAB_ALIAS}") REGION=$(printf '%q' "${REGION}") ${SCRIPT_PATH} ssh-proxy %p"
+
   cat >> "${cfg}" <<EOF
 
 Host ${HOST_ALIAS}
@@ -958,7 +964,7 @@ Host ${HOST_ALIAS}
   User ${ssh_user}
   IdentityFile ${identity_file}
   IdentitiesOnly yes
-  ProxyCommand ${SCRIPT_PATH} ssh-proxy %p
+  ProxyCommand ${proxy_cmd}
   ConnectTimeout 30
   ServerAliveInterval 15
   ServerAliveCountMax 4
@@ -970,7 +976,7 @@ Host ${JLAB_ALIAS}
   User ${ssh_user}
   IdentityFile ${identity_file}
   IdentitiesOnly yes
-  ProxyCommand ${SCRIPT_PATH} ssh-proxy %p
+  ProxyCommand ${proxy_cmd}
   LocalForward ${JLAB_LOCAL_PORT} 127.0.0.1:8888
   ConnectTimeout 30
   ServerAliveInterval 15
