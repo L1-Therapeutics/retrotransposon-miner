@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run on the mouse EC2 instance after scripts/ec2_mouse_public_data.sh sync.
+# Run on the mouse EC2 instance after this repo is copied there.
 # Reference tracks are prepared before the multi-terabyte FASTQ streams start.
 set -euo pipefail
 

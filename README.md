@@ -525,8 +525,9 @@ python3 scripts/download_public_data.py \
 
 `mm10` is opt-in (`--references mm10` or `--references mm39 mm10`) for the
 Sugo 2025 and Mouse Genomes Project coordinate build. Default `--references`
-stays human. Launch with the existing EC2 helper, pointed at a separate name
-and S3 prefix from the human cache:
+stays human. From the laptop where `aws sts get-caller-identity` works, launch
+with the existing EC2 helper, pointed at a separate name and S3 prefix from
+the human cache:
 
 ```bash
 INSTANCE_NAME=retrotransposon-miner-mouse \
