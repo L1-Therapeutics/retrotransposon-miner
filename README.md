@@ -525,7 +525,23 @@ python3 scripts/download_public_data.py \
 
 `mm10` is opt-in (`--references mm10` or `--references mm39 mm10`) for the
 Sugo 2025 and Mouse Genomes Project coordinate build. Default `--references`
-stays human. Launch a dedicated instance with `scripts/ec2_mouse_public_data.sh`.
+stays human. Launch with the existing EC2 helper, pointed at a separate name
+and S3 prefix from the human cache:
+
+```bash
+INSTANCE_NAME=retrotransposon-miner-mouse \
+HOST_ALIAS=retro-ec2-mouse \
+JLAB_ALIAS=jlab-mouse \
+JLAB_LOCAL_PORT=8891 \
+INSTANCE_STATE_FILE="$PWD/.ec2-mouse.env" \
+ROOT_VOLUME_GB=500 \
+S3_BUCKET=s3://l1tx-data \
+S3_CACHE_PREFIX=s3://l1tx-data/mouse/public \
+./scripts/ec2_jlab.sh bootstrap
+```
+
+On that instance, `scripts/run_mouse_public_data_download.sh` prepares the mm39
+tracks and then streams the Hazen 2016 and Sugo 2025 FASTQs.
 
 Test BAMs default to a **chr22 slice** (plus discordant mates). To park the entire SEQC2 WGS pair on S3 without filling the instance disk, stream NCBI HTTP through the instance (`curl | aws s3 cp -`) — the object never lands on the local volume:
 
