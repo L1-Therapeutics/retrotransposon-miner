@@ -11,10 +11,11 @@ import os
 
 MOUSE_REFERENCES = ("mm10", "mm39")
 
-# Active mouse ME classes in Dfam/RepeatMasker notation. B1 is filed under
-# SINE/Alu. LTR covers IAP (ERVK), ETn (ERV1), and MaLR, which are the
-# non-classical insertion classes the human L1/Alu/SVA subset does not have.
-MOUSE_MEI_CLASS_RE = r"#(?:LINE/L1|SINE/|LTR/)"
+# Active mouse ME classes in Dfam/RepeatMasker notation: young mouse L1Md
+# subfamilies (#LINE/L1), B1/PB1 (#SINE/Alu), and B2/B3 (#SINE/B2).
+# Ancient mammalian L1M/Lx/HAL1, LTR/ERVs, MIR, B4, and BC1/ID are omitted.
+MOUSE_MEI_CLASS_RE = r"^(?:L1Md[A-Za-z_][^#]*#LINE/L1|(?:P?B1)[^#]*#SINE/Alu|(?:B2|B3)[^#]*#SINE/B2)(?:\s|$)"
+MOUSE_MEI_EXCLUDE_RE = r"#(?:LTR/|SINE/(?:MIR|B4|ID|tRNA|5S))"
 
 
 def ena_fastq_subdir(accession: str) -> str:

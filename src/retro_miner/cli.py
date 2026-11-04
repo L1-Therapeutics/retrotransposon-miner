@@ -1183,7 +1183,7 @@ def annotate_mei_support_cmd(
     type=str,
     default=None,
     help=(
-        "Genome build passed to the pipeline as --reference-build (hg38, hg19, or hs1). "
+        "Genome build passed to the pipeline as --reference-build (hg38, hg19, hs1, or mm39). "
         "When omitted, export-vcf reads pipeline_params.env next to the input table."
     ),
 )

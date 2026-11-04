@@ -31,6 +31,8 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 from matplotlib.transforms import blended_transform_factory
 
+from retro_miner.mei_families import MEI_CALL_FAMILIES, normalize_mei_family_token
+
 # L1 palette (only these four colors are used in the figure).
 COLOR_LIGHT_ORANGE = "#feb24c"
 COLOR_DARK_ORANGE = "#fd8d3c"
@@ -255,13 +257,10 @@ def _row_int(row: pd.Series, col: str, default: int = 0) -> int:
 
 
 def _target_family(target: str) -> str:
+    norm = normalize_mei_family_token(target)
+    if norm:
+        return norm
     t = (target or "").upper()
-    if "SVA" in t:
-        return "SVA"
-    if "ALU" in t:
-        return "ALU"
-    if "LINE1" in t or "LINE/L1" in t or re.search(r"(?:^|[^A-Z0-9])L1(?:[^A-Z0-9]|$)", t):
-        return "LINE1"
     if "HERV" in t or "ERV" in t:
         return "ERV"
     return "OTHER"
@@ -359,7 +358,7 @@ def _row_mei_family(row: pd.Series | None) -> str:
         "control_discordant_mei_family",
     ):
         fam = _target_family(str(row.get(col, "") or ""))
-        if fam in {"ALU", "LINE1", "SVA"}:
+        if fam in MEI_CALL_FAMILIES:
             return fam
     return ""
 
@@ -385,7 +384,7 @@ def _mei_coords_from_detail(
         src = work["mei_hit_source"].fillna("").astype(str)
         work = work.loc[~src.eq("polya_rescue")]
     fam = (family or "").upper()
-    if fam in {"ALU", "LINE1", "SVA"}:
+    if fam in MEI_CALL_FAMILIES:
         keep = pd.Series(True, index=work.index)
         for tcol in ("mei_target", "mate_mei_target", "target"):
             if tcol not in work.columns:
@@ -408,7 +407,7 @@ def _mei_coords_from_detail(
             hits = work.loc[work[hit_col].astype(bool)]
         # Per-hit family gate using the column that owns these coords.
         tcol = "mei_target" if start_col.startswith("mei_") and not start_col.startswith("mate_") else "mate_mei_target"
-        if fam in {"ALU", "LINE1", "SVA"} and tcol in hits.columns:
+        if fam in MEI_CALL_FAMILIES and tcol in hits.columns:
             tfam = hits[tcol].fillna("").astype(str).map(_target_family)
             hits = hits.loc[tfam.eq(fam)]
         starts = pd.to_numeric(hits[start_col], errors="coerce").fillna(0)
@@ -439,7 +438,7 @@ def _zero_off_family_mei_coords(detail: pd.DataFrame, family: str) -> pd.DataFra
     locus cannot stretch or paint the MEI axis.
     """
     fam = (family or "").upper()
-    if detail.empty or fam not in {"ALU", "LINE1", "SVA"}:
+    if detail.empty or fam not in MEI_CALL_FAMILIES:
         return detail
     out = detail.copy()
     for start_col, end_col, tcol in (

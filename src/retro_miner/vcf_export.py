@@ -62,6 +62,10 @@ _MEI_FAMILY_ALT_ID = {
     "ALU": "INS:ME:ALU",
     "LINE1": "INS:ME:LINE1",
     "SVA": "INS:ME:SVA",
+    "B1": "INS:ME:B1",
+    "B2": "INS:ME:B2",
+    "IAP": "INS:ME:IAP",
+    "ETN": "INS:ME:ETN",
 }
 
 #: Labels used in gold tables (ALU/LINE1/SVA) and in the classifier table
@@ -72,6 +76,10 @@ _FAMILY_ALIASES = {
     "LINE": "LINE1",
     "LINE1": "LINE1",
     "SVA": "SVA",
+    "B1": "B1",
+    "B2": "B2",
+    "IAP": "IAP",
+    "ETN": "ETN",
 }
 
 #: Extra INFO fields copied when the source column is present and non-blank.
@@ -138,7 +146,11 @@ _REFERENCE_ASSEMBLY = {
     "hg38": "GRCh38",
     "hg19": "GRCh37",
     "hs1": "T2T-CHM13v2.0",
+    "mm39": "GRCm39",
+    "mm10": "GRCm38",
 }
+_MOUSE_REFERENCE_BUILDS = frozenset({"mm39", "mm10"})
+_MOUSE_DROPPED_CONTIGS = frozenset({"chr20", "chr21", "chr22"})
 
 #: Written by the candidate pipeline next to the run directory.
 PIPELINE_PARAMS_NAME = "pipeline_params.env"
@@ -156,6 +168,10 @@ VCF_HEADER_LINES = [
     '##ALT=<ID=INS:ME:ALU,Description="Insertion of an Alu mobile element">',
     '##ALT=<ID=INS:ME:LINE1,Description="Insertion of a LINE-1 mobile element">',
     '##ALT=<ID=INS:ME:SVA,Description="Insertion of an SVA mobile element">',
+    '##ALT=<ID=INS:ME:B1,Description="Insertion of a mouse B1 mobile element">',
+    '##ALT=<ID=INS:ME:B2,Description="Insertion of a mouse B2 mobile element">',
+    '##ALT=<ID=INS:ME:IAP,Description="Insertion of a mouse IAP mobile element">',
+    '##ALT=<ID=INS:ME:ETN,Description="Insertion of a mouse ETn mobile element">',
     '##ALT=<ID=INS:ME,Description="Insertion of a mobile element of unresolved family">',
     '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">',
     '##INFO=<ID=END,Number=1,Type=Integer,Description="End position; equal to POS for a symbolic insertion, which consumes no reference bases">',
@@ -393,6 +409,20 @@ def lookup_reference_build(start: Path) -> tuple[str, str]:
     return "", ""
 
 
+def _header_lines_for_build(build: str) -> list[str]:
+    """Human headers keep chr20–chr22. Mouse builds do not have those contigs."""
+    if build not in _MOUSE_REFERENCE_BUILDS:
+        return list(VCF_HEADER_LINES)
+    kept: list[str] = []
+    for line in VCF_HEADER_LINES:
+        if line.startswith("##contig=<ID="):
+            contig = line.split("ID=", 1)[1].split(">", 1)[0]
+            if contig in _MOUSE_DROPPED_CONTIGS:
+                continue
+        kept.append(line)
+    return kept
+
+
 def vcf_header_lines(reference_build: str | None = None) -> list[str]:
     """Header lines, with ``##reference`` and one ``##assembly`` when the build is known."""
     build = (reference_build or "").strip()
@@ -400,7 +430,7 @@ def vcf_header_lines(reference_build: str | None = None) -> list[str]:
         return list(VCF_HEADER_LINES)
     assembly = _REFERENCE_ASSEMBLY.get(build, "")
     lines: list[str] = []
-    for line in VCF_HEADER_LINES:
+    for line in _header_lines_for_build(build):
         lines.append(line)
         if line.startswith("##source="):
             lines.append(f"##reference={build}")

@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-MEI_FAMILIES = frozenset({"ALU", "LINE1", "SVA"})
+from retro_miner.mei_families import MEI_CALL_FAMILIES
+
+MEI_FAMILIES = MEI_CALL_FAMILIES
 _LINE1_TOKEN = re.compile(r"(?:LINE1|L1HS|<INS:ME:L1\b|(?<![A-Z0-9])L1(?![A-Z0-9]))")
 _SCORE_COLUMNS = (
     "insertion_model_score",

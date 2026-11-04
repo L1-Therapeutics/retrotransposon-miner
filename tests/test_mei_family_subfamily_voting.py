@@ -31,6 +31,12 @@ class TestNormalizeMeiFamilyToken:
             ("SVA_E#Retroposon/SVA", "SVA"),
             ("L1HS_5end#LINE/L1", "LINE1"),
             ("L1M3_orf2#LINE/L1", "LINE1"),
+            ("L1MdA_VI#LINE/L1", "LINE1"),
+            ("B1_Mus1#SINE/Alu", "B1"),
+            ("B2_Mm1a#SINE/B2", "B2"),
+            ("IAPEz-int#LTR/ERVK", "IAP"),
+            ("ETnERV3-int#LTR/ERV1", "ETN"),
+            ("MTA_Mm#LTR/ERVL-MaLR", ""),
         ],
     )
     def test_known_tokens(self, token, expected):

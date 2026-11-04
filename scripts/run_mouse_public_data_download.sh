@@ -27,12 +27,23 @@ run python scripts/download_public_data.py \
   --download-workers 4
 
 # ENA HTTPS drops the FASTQ streams. The same reads are the public SRA object
-# in us-east-1; one CRT copy fills the disk, then fasterq-dump feeds bwa mem.
+# in us-east-1; one CRT copy fills the disk, then fasterq-dump feeds bwa-mem3.
+# The mem3 index is already built. Do not run bwa-mem3 index on a 64 GB host.
 # This run is the test batch only: Hazen clone B2, its matched thymus, and
 # two Sugo sister clones from mouse A. The rest of the catalog waits.
+MEM3="${OUT}/reference/mm39-mem3"
+mkdir -p "${MEM3}"
+aws s3 sync "${RTM_S3_BUCKET}/mouse/public/reference/mm39-mem3/" "${MEM3}/" \
+  --exclude "INDEX_COMPLETE"
+for suffix in .amb .ann .bwt.2bit.64 .pac; do
+  test -s "${MEM3}/mm39${suffix}"
+done
+if ! run bash -c 'command -v bwa-mem3 >/dev/null'; then
+  micromamba install -y -n rtm-miner -c bioconda -c conda-forge 'bwa-mem3=0.16.0'
+fi
 run python scripts/align_mouse_sra.py \
   --config resources/public_datasets.yaml \
-  --reference "${OUT}/reference/mm39/mm39.fa" \
+  --reference "${MEM3}/mm39" \
   --workdir "${HOME}/retrotransposon-workdir/mouse-align" \
   --s3-prefix "${RTM_S3_BUCKET}/mouse/align/mm39" \
   --threads 16 \

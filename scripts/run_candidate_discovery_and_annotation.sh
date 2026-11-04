@@ -32,6 +32,7 @@ REFERENCE_FASTA=""
 RMSK_TABLE=""
 G1K_MEI_VCF=""
 LR_MEI_VCF=""
+GENE_GTF=""
 REFERENCE_BUILD="hg38"
 OUTDIR=""
 REGION="chr22"
@@ -112,7 +113,17 @@ normalize_chr_token() {
   case "${t}" in
     X|x) echo "chrX" ;;
     Y|y) echo "chrY" ;;
-    [0-9]|1[0-9]|2[0-2]) echo "chr${t}" ;;
+    [0-9]|1[0-9]|2[0-2])
+      if [[ "${REFERENCE_BUILD:-}" == "mm39" || "${REFERENCE_BUILD:-}" == "mm10" ]]; then
+        case "${t}" in
+          20|21|22)
+            echo "ERROR: invalid chromosome token '${raw}' for --reference-build ${REFERENCE_BUILD}. Use 1-19,X,Y." >&2
+            return 1
+            ;;
+        esac
+      fi
+      echo "chr${t}"
+      ;;
     *)
       echo "ERROR: invalid chromosome token '${raw}' for --chr. Use 1-22,X,Y or chr1-chr22,chrX,chrY." >&2
       return 1
@@ -135,8 +146,11 @@ resolve_chr_list() {
     # instead of waiting until chr1–chr16 finish.
     echo "chrX"
     echo "chrY"
-    local i
-    for i in $(seq 1 22); do
+    local i last=22
+    if [[ "${REFERENCE_BUILD:-}" == "mm39" || "${REFERENCE_BUILD:-}" == "mm10" ]]; then
+      last=19
+    fi
+    for i in $(seq 1 "${last}"); do
       echo "chr${i}"
     done
     return 0
@@ -268,8 +282,24 @@ set_reference_build_defaults() {
       [[ -n "${BLACKLIST_BED}" ]] || BLACKLIST_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/blacklist/ENCFF356LFX.hs1.bed"
       [[ -n "${JUNK_MERGED_BED}" ]] || JUNK_MERGED_BED="${RTM_PUBLIC_DATA_DIR}/annotation/hs1/junk/junk_exclusion_merged.bed"
       ;;
+    mm39)
+      [[ -n "${REFERENCE_FASTA}" ]] || REFERENCE_FASTA="${RTM_PUBLIC_DATA_DIR}/reference/mm39/mm39.fa"
+      [[ -n "${RMSK_TABLE}" ]] || RMSK_TABLE="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/repeats/rmsk.txt.gz"
+      # RetroSeq insertions are a BED. The caller intersects that BED; it does
+      # not need a MELT-style VCF. Ferraj is a general SV VCF with no MEI family.
+      [[ -n "${G1K_MEI_VCF}" ]] || G1K_MEI_VCF="${RTM_PUBLIC_DATA_DIR}/polymorphism/mm39/mgp/mgpv5.SV_insertions.retroseq.bed"
+      [[ -n "${LR_MEI_VCF}" ]] || LR_MEI_VCF=""
+      [[ -n "${SEG_DUP_BED}" ]] || SEG_DUP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/segdup/genomicSuperDups.bed"
+      [[ -n "${MAPPABILITY_BEDGRAPH}" ]] || MAPPABILITY_BEDGRAPH="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/mappability/k100.Umap.MultiTrackMappability.bedGraph"
+      [[ -n "${MAPPABILITY_LOW_BED}" ]] || MAPPABILITY_LOW_BED="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/mappability/k100.Umap.MultiTrackMappability.low_lt0.5.bed"
+      [[ -n "${GAP_BED}" ]] || GAP_BED="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/masks/gap.txt.gz"
+      [[ -n "${BLACKLIST_BED}" ]] || BLACKLIST_BED="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/blacklist/blacklist.mm39.bed"
+      [[ -n "${JUNK_MERGED_BED}" ]] || JUNK_MERGED_BED="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/junk/junk_exclusion_merged.bed"
+      [[ -n "${GENE_GTF}" ]] || GENE_GTF="${RTM_PUBLIC_DATA_DIR}/annotation/mm39/gencode/gencode.vM39.annotation.gtf.gz"
+      [[ -n "${MEI_FASTA}" ]] || MEI_FASTA="${RTM_PUBLIC_DATA_DIR}/retrotransposon_db/dfam/dfam_mouse_mei_l1_sine_erv.fasta"
+      ;;
     *)
-      echo "ERROR: unsupported --reference-build '${REFERENCE_BUILD}'. Use hg19, hg38, or hs1." >&2
+      echo "ERROR: unsupported --reference-build '${REFERENCE_BUILD}'. Use hg19, hg38, hs1, or mm39." >&2
       exit 1
       ;;
   esac
@@ -285,20 +315,26 @@ validate_reference_path_consistency() {
   p="$(echo "${path}" | tr '[:upper:]' '[:lower:]')"
   case "${REFERENCE_BUILD}" in
     hg38)
-      if [[ "${p}" == *"/hg19/"* ]] || [[ "${p}" == *"/hs1/"* ]] || [[ "${p}" == *"grch37"* ]] || [[ "${p}" == *"chm13"* ]]; then
+      if [[ "${p}" == *"/hg19/"* ]] || [[ "${p}" == *"/hs1/"* ]] || [[ "${p}" == *"/mm39/"* ]] || [[ "${p}" == *"/mm10/"* ]] || [[ "${p}" == *"grch37"* ]] || [[ "${p}" == *"chm13"* ]] || [[ "${p}" == *"grcm"* ]]; then
         echo "ERROR: ${label} appears to target a non-hg38 build while --reference-build=hg38: ${path}" >&2
         exit 1
       fi
       ;;
     hg19)
-      if [[ "${p}" == *"/hg38/"* ]] || [[ "${p}" == *"/hs1/"* ]] || [[ "${p}" == *"grch38"* ]] || [[ "${p}" == *"assembly38"* ]] || [[ "${p}" == *"chm13"* ]]; then
+      if [[ "${p}" == *"/hg38/"* ]] || [[ "${p}" == *"/hs1/"* ]] || [[ "${p}" == *"/mm39/"* ]] || [[ "${p}" == *"/mm10/"* ]] || [[ "${p}" == *"grch38"* ]] || [[ "${p}" == *"assembly38"* ]] || [[ "${p}" == *"chm13"* ]] || [[ "${p}" == *"grcm"* ]]; then
         echo "ERROR: ${label} appears to target a non-hg19 build while --reference-build=hg19: ${path}" >&2
         exit 1
       fi
       ;;
     hs1)
-      if [[ "${p}" == *"/hg38/"* ]] || [[ "${p}" == *"/hg19/"* ]] || [[ "${p}" == *"grch38"* ]] || [[ "${p}" == *"grch37"* ]] || [[ "${p}" == *"assembly38"* ]] || [[ "${p}" == *"human_g1k_v37"* ]]; then
+      if [[ "${p}" == *"/hg38/"* ]] || [[ "${p}" == *"/hg19/"* ]] || [[ "${p}" == *"/mm39/"* ]] || [[ "${p}" == *"/mm10/"* ]] || [[ "${p}" == *"grch38"* ]] || [[ "${p}" == *"grch37"* ]] || [[ "${p}" == *"assembly38"* ]] || [[ "${p}" == *"human_g1k_v37"* ]] || [[ "${p}" == *"grcm"* ]]; then
         echo "ERROR: ${label} appears to target a non-hs1 build while --reference-build=hs1: ${path}" >&2
+        exit 1
+      fi
+      ;;
+    mm39)
+      if [[ "${p}" == *"/hg38/"* ]] || [[ "${p}" == *"/hg19/"* ]] || [[ "${p}" == *"/hs1/"* ]] || [[ "${p}" == *"/mm10/"* ]] || [[ "${p}" == *"grch38"* ]] || [[ "${p}" == *"grch37"* ]] || [[ "${p}" == *"chm13"* ]]; then
+        echo "ERROR: ${label} appears to target a non-mm39 build while --reference-build=mm39: ${path}" >&2
         exit 1
       fi
       ;;
@@ -499,8 +535,13 @@ mkdir -p "${OUTDIR}"
 {
   printf 'reference_build=%s\n' "${REFERENCE_BUILD}"
   printf 'reference_fasta=%s\n' "${REFERENCE_FASTA}"
+  printf 'gene_gtf=%s\n' "${GENE_GTF}"
 } > "${OUTDIR}/pipeline_params.env"
 echo "[candidate-pipeline] reference_build=${REFERENCE_BUILD} fasta=${REFERENCE_FASTA}"
+if [[ "${REFERENCE_BUILD}" == "mm39" ]]; then
+  echo "[candidate-pipeline] mm39 families=L1,B1,B2 known-mei=${G1K_MEI_VCF} gene_gtf=${GENE_GTF}"
+  echo "[candidate-pipeline] annotate-genes still needs a GRCm39 snpEff database; the default genome is GRCh38"
+fi
 validate_reference_path_consistency "reference FASTA" "${REFERENCE_FASTA}"
 validate_reference_path_consistency "RepeatMasker table" "${RMSK_TABLE}"
 validate_reference_path_consistency "1000G/MELT VCF" "${G1K_MEI_VCF}"
@@ -696,15 +737,21 @@ stage_remote_bams_if_needed() {
     extra+=(--control-mate-bam "${CONTROL_MATE_BAM}")
   fi
   echo "[candidate-pipeline] bam-stage dir=${BAM_STAGE_DIR} enabled=$(bam_stage_is_enabled && echo 1 || echo 0) chr_count=${ORIG_CHR_COUNT} chr_concurrency=${CHR_CONCURRENCY}"
-  run_python_module retro_miner.bam_stage \
-    --disease-bam "${DISEASE_BAM}" \
-    --control-bam "${CONTROL_BAM}" \
-    --stage-dir "${BAM_STAGE_DIR}" \
-    --chr-count "${ORIG_CHR_COUNT}" \
-    --chr-concurrency "${CHR_CONCURRENCY}" \
-    --out-env "${envf}" \
-    --apply \
-    "${extra[@]}"
+  # macOS bash 3.2 errors on an empty "${extra[@]}" under set -u.
+  local stage_cmd=(
+    retro_miner.bam_stage
+    --disease-bam "${DISEASE_BAM}"
+    --control-bam "${CONTROL_BAM}"
+    --stage-dir "${BAM_STAGE_DIR}"
+    --chr-count "${ORIG_CHR_COUNT}"
+    --chr-concurrency "${CHR_CONCURRENCY}"
+    --out-env "${envf}"
+    --apply
+  )
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    stage_cmd+=("${extra[@]}")
+  fi
+  run_python_module "${stage_cmd[@]}"
   # shellcheck disable=SC1090
   source "${envf}"
   require_alignment_readable "disease BAM" "${DISEASE_BAM}"
@@ -884,17 +931,25 @@ run_single_pipeline() {
     echo "[candidate-pipeline] germline single-pass: disease and control BAM are the same file"
   fi
   echo "[candidate-pipeline] stage=extract-split-evidence region=${run_region} outdir=${run_outdir} (sample_workers=${sample_workers}; no-fetch-mate-seq)"
-  run_cli extract-split-evidence \
-    --disease-bam "${DISEASE_BAM}" \
-    --control-bam "${CONTROL_BAM}" \
-    "${_mate_bam_args[@]}" \
-    --outdir "${run_outdir}" \
-    --region "${run_region}" \
-    --min-mapq 20 \
-    --min-mapq-discordant 20 \
-    --min-clip-len 20 \
-    --sample-workers "${sample_workers}" \
+  # macOS bash 3.2 errors on an empty "${_mate_bam_args[@]}" under set -u.
+  local extract_cmd=(
+    extract-split-evidence
+    --disease-bam "${DISEASE_BAM}"
+    --control-bam "${CONTROL_BAM}"
+  )
+  if [[ ${#_mate_bam_args[@]} -gt 0 ]]; then
+    extract_cmd+=("${_mate_bam_args[@]}")
+  fi
+  extract_cmd+=(
+    --outdir "${run_outdir}"
+    --region "${run_region}"
+    --min-mapq 20
+    --min-mapq-discordant 20
+    --min-clip-len 20
+    --sample-workers "${sample_workers}"
     --no-fetch-mate-seq
+  )
+  run_cli "${extract_cmd[@]}"
   echo "[candidate-pipeline] stage=extract-split-evidence done region=${run_region} elapsed=$(( $(now_epoch) - stage_t0 ))s"
 
   stage_t0=$(now_epoch)

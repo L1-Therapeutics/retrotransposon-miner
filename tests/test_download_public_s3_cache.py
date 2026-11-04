@@ -436,23 +436,30 @@ def test_write_mgp_insertion_beds_splits_retroseq(dl, tmp_path: Path) -> None:
     assert mei_bed.read_text(encoding="utf-8") == "chr1\t100\t300\tINS\n"
 
 
-def test_export_mouse_mei_subset_keeps_l1_sine_ltr(dl, tmp_path: Path) -> None:
+def test_export_mouse_mei_subset_keeps_l1_and_sine(dl, tmp_path: Path) -> None:
     curated = tmp_path / "curated.fa"
     curated.write_text(
         ">L1Md_A#LINE/L1\nACGTAAAAAAAAAAAA\n"
         ">B1_Mus1#SINE/Alu\nTTTTTTTTTTGGGG\n"
         ">IAP#LTR/ERVK\nAAAAACCCCCTTTTT\n"
         ">B2_Mm1a#SINE/B2\nATGC\n"
+        ">L1MB4_5end#LINE/L1\nACGTACGT\n"
+        ">BC1_Mm#SINE/ID\nACGTACGT\n"
+        ">MIR3#SINE/MIR\nACGTACGT\n"
         ">MER20#DNA/hAT\nGGGGAAAA\n",
         encoding="utf-8",
     )
     out = tmp_path / "mouse.fa"
     stats = dl._export_mouse_mei_subset(curated, out)
     text = out.read_text(encoding="utf-8")
-    assert stats["mei_families"] == 4
+    assert stats["mei_families"] == 3
     assert "L1Md_A#LINE/L1" in text
     assert "B1_Mus1#SINE/Alu" in text
-    assert "IAP#LTR/ERVK" in text
+    assert "B2_Mm1a#SINE/B2" in text
+    assert "IAP#LTR/ERVK" not in text
+    assert "L1MB4_5end#LINE/L1" not in text
+    assert "BC1_Mm#SINE/ID" not in text
+    assert "MIR3#SINE/MIR" not in text
     assert "MER20" not in text
     assert "AAAAAAAAAAAA" not in text
     assert text.index("B1_Mus1") < text.index("GGGG")

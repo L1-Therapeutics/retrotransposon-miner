@@ -30,6 +30,7 @@ if str(_SRC_ROOT) not in sys.path:
 from retro_miner.mei_panel_index import index_public_mei_remap_fastas
 from retro_miner.mouse_public_data import (
     MOUSE_MEI_CLASS_RE,
+    MOUSE_MEI_EXCLUDE_RE,
     MOUSE_REFERENCES,
     ena_fastq_url,
     mgp_insertion_bed_fields,
@@ -1915,14 +1916,15 @@ def _trim_mei_consensus_terminal_polya(seq: str, *, min_run: int = _MEI_CONSENSU
 
 
 def _export_mouse_mei_subset(curated_fasta: Path, mei_subset_fasta: Path) -> dict[str, Any]:
-    """Keep mouse L1, SINE, and LTR/ERV consensuses and strip terminal polyA/T."""
-    class_re = re.compile(MOUSE_MEI_CLASS_RE, re.IGNORECASE)
+    """Keep active mouse L1Md, B1, and B2 consensuses and strip terminal polyA/T."""
+    class_re = re.compile(MOUSE_MEI_CLASS_RE)
+    exclude_re = re.compile(MOUSE_MEI_EXCLUDE_RE, re.IGNORECASE)
     mei_subset_fasta.parent.mkdir(parents=True, exist_ok=True)
     kept = 0
     trimmed = 0
     with mei_subset_fasta.open("w", encoding="utf-8") as out_handle:
         for header, seq in _iter_fasta(curated_fasta):
-            if class_re.search(header) is None:
+            if class_re.search(header) is None or exclude_re.search(header):
                 continue
             body = _trim_mei_consensus_terminal_polya(seq)
             if body != seq:
@@ -2628,6 +2630,28 @@ def _extract_insertion_bed_from_vcf(vcf_path: Path, ins_bed: Path, te_bed: Path,
     }
 
 
+def _select_ferraj_vcf(paths: list[Path]) -> Path:
+    """Pick the Ferraj insertion VCF, skipping AppleDouble resource forks.
+
+    A macOS zip nests ``__MACOSX/._*.vcf.gz`` beside the real VCFs. Those
+    names sort first and are not variant files. The symbolic insertion VCF
+    is the catalog; it has no MEI family field, so the TE bed stays empty
+    until insertions are classified.
+    """
+    real = [
+        path
+        for path in paths
+        if not path.name.startswith("._") and "__MACOSX" not in path.parts
+    ]
+    if not real:
+        raise RuntimeError("No VCF found inside the Ferraj archive")
+    for needle in ("insdel_sym", "insdel_alt", "insdel"):
+        for path in real:
+            if needle in path.name.lower():
+                return path
+    return real[0]
+
+
 def _extract_ferraj_insertion_beds(zip_path: Path, out_dir: Path, force: bool) -> dict[str, Any]:
     ins_bed = out_dir / "ferraj2023.insertions.bed"
     te_bed = out_dir / "ferraj2023.te_insertions.bed"
@@ -2640,9 +2664,7 @@ def _extract_ferraj_insertion_beds(zip_path: Path, out_dir: Path, force: bool) -
     with zipfile.ZipFile(zip_path) as archive:
         archive.extractall(extract_dir)
     vcfs = sorted(extract_dir.rglob("*.vcf.gz")) + sorted(extract_dir.rglob("*.vcf"))
-    if not vcfs:
-        raise RuntimeError(f"No VCF found inside {zip_path}")
-    merged = next((path for path in vcfs if "merge" in path.name.lower()), vcfs[0])
+    merged = _select_ferraj_vcf(vcfs)
     result = _extract_insertion_bed_from_vcf(merged, ins_bed, te_bed, force=force)
     result["vcf"] = str(merged)
     return result
