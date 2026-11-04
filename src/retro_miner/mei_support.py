@@ -14924,6 +14924,12 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         "discovery_window_end",
         "control_supporting_reads",
         "disease_supporting_reads",
+        # Raw window totals, including reads that did not remap to an MEI.
+        # The support strings above count only MEI-mapped reads.
+        "split_disease_unique_reads",
+        "split_control_unique_reads",
+        "discordant_disease_unique_reads",
+        "discordant_control_unique_reads",
         "sample_status_label",
         "consensus_tsd_seq",
         "consensus_poly_at_min_bp",
@@ -15059,6 +15065,13 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
         if col not in out.columns:
             out[col] = ""
     review = out.loc[:, selected_cols].copy()
+    for col in (
+        "split_disease_unique_reads",
+        "split_control_unique_reads",
+        "discordant_disease_unique_reads",
+        "discordant_control_unique_reads",
+    ):
+        review[col] = pd.to_numeric(review[col], errors="coerce").fillna(0).astype(int)
     if "consensus_insertion_mei_span" in review.columns:
         span = pd.to_numeric(review["consensus_insertion_mei_span"], errors="coerce")
         review["consensus_insertion_mei_span"] = span.round().fillna(-1).astype(int)

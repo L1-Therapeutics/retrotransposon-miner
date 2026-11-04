@@ -150,3 +150,23 @@ def test_build_gold_review_table_recomputes_sample_status_label() -> None:
     review = _build_gold_review_table(base, empirical_stage=False)
     assert review["sample_status_label"].tolist() == ["shared", "shared"]
 
+
+def test_build_gold_review_table_keeps_raw_split_and_discordant_totals() -> None:
+    """Gold review keeps window-wide split and discordant counts for both samples."""
+    from retro_miner.mei_support import _build_gold_review_table
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "loci" / "rank010_chr19_3989864" / "gold_locus.tsv"
+    base = pd.read_csv(fixture, sep="\t")
+    review = _build_gold_review_table(base, empirical_stage=False)
+    assert review["chrom"].tolist() == ["chr19"]
+    assert int(review["consensus_insertion_breakpoint_pos"].iloc[0]) == 3989878
+    for col in (
+        "split_disease_unique_reads",
+        "split_control_unique_reads",
+        "discordant_disease_unique_reads",
+        "discordant_control_unique_reads",
+    ):
+        assert int(review[col].iloc[0]) == int(base[col].iloc[0])
+    header = list(review.columns)
+    assert header.index("split_disease_unique_reads") == header.index("disease_supporting_reads") + 1
+
