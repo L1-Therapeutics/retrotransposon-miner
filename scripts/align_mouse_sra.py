@@ -314,8 +314,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    if not args.reference.exists():
-        raise SystemExit(f"Reference FASTA is missing: {args.reference}")
+    index_marker = Path(str(args.reference) + ".bwt.2bit.64")
+    if not args.reference.exists() and not index_marker.is_file():
+        raise SystemExit(f"bwa-mem3 index prefix is missing: {args.reference}")
     libraries = load_mouse_libraries(args.config)
     wanted = {validate_run_accession(acc) for acc in args.accession}
     if wanted:
