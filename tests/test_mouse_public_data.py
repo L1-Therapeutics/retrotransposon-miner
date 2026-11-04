@@ -60,10 +60,37 @@ def test_s3_copy_targets_one_file_at_disk_speed() -> None:
 
 
 def test_dump_and_align_commands_match_the_ena_reads() -> None:
-    dump = fasterq_dump_command("/tmp/SRR3184315", "/tmp/fq", "/tmp/scratch", 16)
+    dump = fasterq_dump_command(
+        "/tmp/SRR3184315",
+        "/tmp/fq",
+        "/tmp/scratch",
+        16,
+        total_ram_bytes=64 * 1024**3,
+    )
     assert ENA_MATCHING_SEQ_DEFLINE in dump
     assert ENA_MATCHING_QUAL_DEFLINE in dump
     assert dump[dump.index("--threads") + 1] == "16"
+    assert dump[dump.index("--mem") + 1] == "2G"
+    assert dump[dump.index("--bufsize") + 1] == "8M"
+    wider = fasterq_dump_command(
+        "/tmp/SRR3184315",
+        "/tmp/fq",
+        "/tmp/scratch",
+        16,
+        total_ram_bytes=128 * 1024**3,
+    )
+    assert wider[wider.index("--mem") + 1] == "4G"
+    assert wider[wider.index("--bufsize") + 1] == "16M"
+    # MemTotal on the 16-thread align host, in kB from /proc/meminfo.
+    this_host = fasterq_dump_command(
+        "/tmp/SRR3184315",
+        "/tmp/fq",
+        "/tmp/scratch",
+        16,
+        total_ram_bytes=64776600 * 1024,
+    )
+    assert this_host[this_host.index("--mem") + 1] == "1976M"
+    assert this_host[this_host.index("--bufsize") + 1] == "7M"
     align = bwa_mem_command("/ref/mm39-mem3/mm39", "/tmp/r1.fq", "/tmp/r2.fq", 14, "hazen2016_b2")
     assert align[:4] == [BWA_MEM3_BIN, "mem", "-t", "14"]
     assert BWA_MEM3_INDEX_SUFFIXES == (".amb", ".ann", ".bwt.2bit.64", ".pac")

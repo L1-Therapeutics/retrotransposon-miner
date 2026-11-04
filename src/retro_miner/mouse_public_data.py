@@ -65,6 +65,15 @@ ENA_MATCHING_QUAL_DEFLINE = "+"
 # expands to about four times the archive size per copy.
 FASTERQ_SRA_SCRATCH_FACTOR = 9
 BAM_SORT_HEADROOM_BYTES = 80 * 1024**3
+# fasterq-dump gives --mem to every worker thread. sra-tools 3.4.1 defaults
+# that to 50MB, so a 16-thread dump sorts in under 1GB and the join spills.
+# Half of physical RAM, split across the threads, leaves the rest for the
+# archive cache. The write buffer is 1/256 of that per-thread budget.
+FASTERQ_SORT_RAM_DIVISOR = 2
+FASTERQ_BUF_DIVISOR = 256
+# sra-tools refuses a sort budget under 5MB and a file buffer over 1GB.
+FASTERQ_MIN_SORT_BYTES = 5 * 1024 * 1024
+FASTERQ_MAX_BUF_BYTES = 1024 * 1024 * 1024
 
 
 def validate_run_accession(accession: str) -> str:
@@ -109,13 +118,50 @@ def s3_cp_command(src: str, dest: str, *, anonymous: bool) -> list[str]:
     return cmd
 
 
+def physical_ram_bytes() -> int:
+    """Physical RAM reported by the host running this process."""
+    return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
+
+def fasterq_sort_bytes_per_thread(threads: int, total_ram_bytes: int) -> int:
+    """Sort budget for one fasterq-dump worker on this host."""
+    if threads < 1:
+        raise ValueError(f"fasterq-dump threads must be >= 1, got {threads}")
+    if total_ram_bytes < 1:
+        raise ValueError(f"RAM must be >= 1 byte, got {total_ram_bytes}")
+    per_thread = (total_ram_bytes // FASTERQ_SORT_RAM_DIVISOR) // threads
+    return max(per_thread, FASTERQ_MIN_SORT_BYTES)
+
+
+def fasterq_buf_bytes(sort_bytes_per_thread: int) -> int:
+    """Write-buffer size that follows the per-thread sort budget."""
+    buf = sort_bytes_per_thread // FASTERQ_BUF_DIVISOR
+    return min(max(buf, 1024 * 1024), FASTERQ_MAX_BUF_BYTES)
+
+
+def _fasterq_size_flag(num_bytes: int) -> str:
+    """Size token accepted by fasterq-dump. The suffix is an integer unit."""
+    gib = 1024**3
+    if num_bytes >= gib and num_bytes % gib == 0:
+        return f"{num_bytes // gib}G"
+    return f"{num_bytes // (1024**2)}M"
+
+
 def fasterq_dump_command(
     sra_path: str,
     outdir: str,
     tempdir: str,
     threads: int,
+    total_ram_bytes: int | None = None,
 ) -> list[str]:
-    """Dump paired FASTQ with the ENA read names."""
+    """Dump paired FASTQ with the ENA read names.
+
+    ``--mem`` is per thread. The budget is half of ``total_ram_bytes`` split
+    across ``threads``. When ``total_ram_bytes`` is omitted, the host's
+    physical RAM is used.
+    """
+    ram = physical_ram_bytes() if total_ram_bytes is None else total_ram_bytes
+    sort_bytes = fasterq_sort_bytes_per_thread(threads, ram)
     return [
         "fasterq-dump",
         "--split-files",
@@ -127,6 +173,10 @@ def fasterq_dump_command(
         ENA_MATCHING_QUAL_DEFLINE,
         "--threads",
         str(threads),
+        "--mem",
+        _fasterq_size_flag(sort_bytes),
+        "--bufsize",
+        _fasterq_size_flag(fasterq_buf_bytes(sort_bytes)),
         "--temp",
         tempdir,
         "--outdir",
