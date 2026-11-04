@@ -20,6 +20,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 aws s3 cp "${BOOT}/rtm-miner-env.tar" - | tar -C "${HOME}/.local" -xf -
 aws s3 cp "${BOOT}/align_mouse_sra.py" "${REPO}/scripts/align_mouse_sra.py"
+aws s3 cp "${BOOT}/shutdown_when_aligned.sh" "${REPO}/scripts/shutdown_when_aligned.sh"
+chmod +x "${REPO}/scripts/shutdown_when_aligned.sh"
 aws s3 cp "${BOOT}/mouse_public_data.py" "${REPO}/src/retro_miner/mouse_public_data.py"
 aws s3 cp "${BOOT}/retro_miner_init.py" "${REPO}/src/retro_miner/__init__.py"
 aws s3 cp "${BOOT}/public_datasets.yaml" "${REPO}/resources/public_datasets.yaml"
