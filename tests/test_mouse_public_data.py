@@ -7,6 +7,10 @@ import pytest
 from retro_miner.mouse_public_data import (
     ENA_MATCHING_QUAL_DEFLINE,
     ENA_MATCHING_SEQ_DEFLINE,
+    BWA_MEM3_BIN,
+    BWA_MEM3_INDEX_SUFFIXES,
+    BWA_MEM3_MIMALLOC_PURGE_DELAY_MS,
+    bwa_mem3_env,
     bwa_mem_command,
     ena_fastq_subdir,
     ena_fastq_url,
@@ -60,10 +64,18 @@ def test_dump_and_align_commands_match_the_ena_reads() -> None:
     assert ENA_MATCHING_SEQ_DEFLINE in dump
     assert ENA_MATCHING_QUAL_DEFLINE in dump
     assert dump[dump.index("--threads") + 1] == "16"
-    align = bwa_mem_command("/ref/mm39.fa", "/tmp/r1.fq", "/tmp/r2.fq", 14, "hazen2016_b2")
-    assert align[:4] == ["bwa", "mem", "-t", "14"]
-    assert "ID:hazen2016_b2" in align[align.index("-R") + 1]
+    align = bwa_mem_command("/ref/mm39-mem3/mm39", "/tmp/r1.fq", "/tmp/r2.fq", 14, "hazen2016_b2")
+    assert align[:4] == [BWA_MEM3_BIN, "mem", "-t", "14"]
+    assert BWA_MEM3_INDEX_SUFFIXES == (".amb", ".ann", ".bwt.2bit.64", ".pac")
+    read_group = align[align.index("-R") + 1]
+    assert read_group == "@RG\\tID:hazen2016_b2\\tSM:hazen2016_b2\\tPL:ILLUMINA"
+    assert "\t" not in read_group
     assert align[-2:] == ["/tmp/r1.fq", "/tmp/r2.fq"]
+    assert bwa_mem3_env({"PATH": "/usr/bin"}) == {
+        "PATH": "/usr/bin",
+        "MIMALLOC_PURGE_DELAY": BWA_MEM3_MIMALLOC_PURGE_DELAY_MS,
+    }
+    assert BWA_MEM3_MIMALLOC_PURGE_DELAY_MS == "100"
 
 
 def test_scratch_reserves_dump_temp_and_sort_room() -> None:

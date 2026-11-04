@@ -8,7 +8,7 @@ alwaysApply: false
 
 Do not stream the Hazen or Sugo FASTQs from ftp.sra.ebi.ac.uk. Those HTTPS connections drop within minutes, and a short object is then treated as finished.
 
-Copy `s3://sra-pub-run-odp/sra/<ACC>/<ACC>` with the AWS CRT client, `target_bandwidth` 10Gb/s, one file at a time. That is the free us-east-1 object. The requester-pays sralite copies stay unused. `scripts/align_mouse_sra.py` dumps with the ENA defline and aligns to mm39.
+Copy `s3://sra-pub-run-odp/sra/<ACC>/<ACC>` with the AWS CRT client, `target_bandwidth` 10Gb/s, one file at a time. That is the free us-east-1 object. The requester-pays sralite copies stay unused. `scripts/align_mouse_sra.py` dumps with the ENA defline and aligns with `bwa-mem3` 0.16.0. The align subprocess sets `MIMALLOC_PURGE_DELAY=100`. The binary's default is `-1` (never return pages); on a 64 GB host that grew until the OOM killer cut the SAM stream. The index is `s3://l1tx-data/mouse/public/reference/mm39-mem3/` (prefix `mm39`, about 9 GB). Do not rebuild it on a 64 GB instance, and do not point this aligner at the classic `bwa` index under `reference/mm39/`.
 
 The instance runner aligns four libraries: Hazen B2 `SRR3184315`, its thymus `SRR3184314`, and Sugo sisters `DRR697908` and `DRR697909`. Do not start the other 30 on that disk.
 

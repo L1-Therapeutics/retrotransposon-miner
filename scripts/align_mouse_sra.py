@@ -3,8 +3,9 @@
 
 The FASTQs on ENA are the same reads as ``s3://sra-pub-run-odp``. The dump
 uses the ENA defline, so the BAM QNAME, sequence, and quality match an
-alignment of those FASTQs. Read order in the sorted BAM still follows
-whichever order ``bwa mem`` emitted.
+alignment of those FASTQs. Alignment is ``bwa-mem3`` against the mm39-mem3
+index. Read order in the sorted BAM still follows whichever order that
+emitted.
 """
 
 from __future__ import annotations
@@ -23,7 +24,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from retro_miner.mouse_public_data import (  # noqa: E402
+    BWA_MEM3_BIN,
+    BWA_MEM3_INDEX_SUFFIXES,
     NCBI_SRA_BUCKET,
+    bwa_mem3_env,
     bwa_mem_command,
     fasterq_dump_command,
     ncbi_sra_s3_uri,
@@ -204,10 +208,12 @@ def align_pair(
     threads: int,
     sample: str,
 ) -> None:
-    for suffix in (".amb", ".ann", ".bwt", ".pac", ".sa"):
+    if shutil.which(BWA_MEM3_BIN) is None:
+        raise SystemExit(f"{BWA_MEM3_BIN} is not on PATH")
+    for suffix in BWA_MEM3_INDEX_SUFFIXES:
         index = Path(str(reference) + suffix)
-        if not index.exists():
-            raise SystemExit(f"BWA index file is missing: {index}")
+        if not index.is_file() or index.stat().st_size == 0:
+            raise SystemExit(f"bwa-mem3 index file is missing: {index}")
     bam_path.parent.mkdir(parents=True, exist_ok=True)
     bwa_cmd = bwa_mem_command(str(reference), str(read1), str(read2), threads, sample)
     sort_threads = max(2, min(4, threads))
@@ -223,7 +229,7 @@ def align_pair(
         "-",
     ]
     log("+ " + " ".join(bwa_cmd) + " | " + " ".join(sort_cmd))
-    bwa = subprocess.Popen(bwa_cmd, stdout=subprocess.PIPE)
+    bwa = subprocess.Popen(bwa_cmd, stdout=subprocess.PIPE, env=bwa_mem3_env())
     assert bwa.stdout is not None
     sort = subprocess.Popen(sort_cmd, stdin=bwa.stdout)
     bwa.stdout.close()
@@ -271,16 +277,16 @@ def align_library(
     read1 = fastq_dir / f"{accession}_1.fastq"
     read2 = fastq_dir / f"{accession}_2.fastq"
     bam_path = library_dir / f"{accession}.mm39.bam"
-    ensure_local_sra(accession, sra_path, env, pidfile)
     stamp = fastq_dir / "dump.complete"
     if stamp.exists() and read1.exists() and read2.exists():
         log(f"FASTQs already present for {accession}")
     else:
+        ensure_local_sra(accession, sra_path, env, pidfile)
         read1, read2 = dump_fastqs(accession, sra_path, fastq_dir, threads)
         stamp.write_text(accession + "\n", encoding="utf-8")
-    if sra_path.exists():
-        sra_path.unlink()
-        log(f"removed {sra_path}")
+        if sra_path.exists():
+            sra_path.unlink()
+            log(f"removed {sra_path}")
     if not bam_path.exists():
         align_pair(reference, read1, read2, bam_path, threads, library["id"])
     upload_bam(bam_path, dest_uri, env)

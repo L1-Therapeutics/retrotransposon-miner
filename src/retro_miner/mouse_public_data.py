@@ -7,6 +7,8 @@ Mouse Genomes Project insertion table. The dataset catalog lives in
 
 from __future__ import annotations
 
+import os
+
 MOUSE_REFERENCES = ("mm10", "mm39")
 
 # Active mouse ME classes in Dfam/RepeatMasker notation. B1 is filed under
@@ -132,6 +134,17 @@ def fasterq_dump_command(
     ]
 
 
+# Pinned to the build under test. The mm39 index for this binary is
+# s3://l1tx-data/mouse/public/reference/mm39-mem3/ and is not a bwa index.
+BWA_MEM3_BIN = "bwa-mem3"
+BWA_MEM3_VERSION = "0.16.0"
+BWA_MEM3_INDEX_SUFFIXES = (".amb", ".ann", ".bwt.2bit.64", ".pac")
+# bwa-mem3 ships mimalloc with purge disabled (-1 = never return pages).
+# On a 64 GB align host the resident set grows for the whole run and the
+# OOM killer cuts the SAM stream. 100 ms is mimalloc's usual purge delay.
+BWA_MEM3_MIMALLOC_PURGE_DELAY_MS = "100"
+
+
 def bwa_mem_command(
     reference: str,
     read1: str,
@@ -139,10 +152,14 @@ def bwa_mem_command(
     threads: int,
     sample: str,
 ) -> list[str]:
-    """Align a pair. The read group does not change the alignment."""
-    read_group = f"@RG\tID:{sample}\tSM:{sample}\tPL:ILLUMINA"
+    """Align a pair with ``bwa-mem3``. The read group does not change coordinates.
+
+    ``bwa-mem3`` rejects a real tab in ``-R`` and wants the two-character ``\\t`` escape.
+    ``reference`` is the mem3 index prefix (``mm39``), not ``mm39.fa``.
+    """
+    read_group = f"@RG\\tID:{sample}\\tSM:{sample}\\tPL:ILLUMINA"
     return [
-        "bwa",
+        BWA_MEM3_BIN,
         "mem",
         "-t",
         str(threads),
@@ -152,6 +169,13 @@ def bwa_mem_command(
         read1,
         read2,
     ]
+
+
+def bwa_mem3_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for a ``bwa-mem3`` subprocess, with mimalloc purge enabled."""
+    env = dict(os.environ if base is None else base)
+    env["MIMALLOC_PURGE_DELAY"] = BWA_MEM3_MIMALLOC_PURGE_DELAY_MS
+    return env
 
 
 def mouse_ucsc_chrom(token: str) -> str:
