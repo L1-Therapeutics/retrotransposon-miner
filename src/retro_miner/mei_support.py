@@ -11536,22 +11536,69 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out.loc[complex_ins, "insertion_event_class"] = "COMPLEX_INS"
     out.loc[complex_ins, "insertion_call_tier"] = "complex_ins"
 
-    # Sample presence: genotype on MEI_MAPPED (not SR/DPE). Soft-clip / discordant
-    # pileup without MEI mate mapping is not treated as sample presence.
-    #
-    # Extreme imbalance (≥90% of total MEI_MAPPED in one sample) is also labeled
-    # disease_only / control_only. Tumor/normal pairs often show a few bleed-
-    # through MEI-mapped reads from contamination, adjacent tissue, or noise;
-    # true shared germline events are usually much closer to balanced. Mosaic
-    # intermediate cases stay shared when neither side reaches 90%.
+    return _assign_sample_status_labels(out)
+
+
+def _support_token_int(series: pd.Series, token: str) -> pd.Series:
+    text = series.fillna("").astype(str)
+    return (
+        pd.to_numeric(text.str.extract(rf"(?:^|,){token}=([0-9]+)", expand=False), errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+
+
+def _assign_sample_status_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Assign ``sample_status_label`` and ``likely_false_positive_control_only``.
+
+    Uses ``max(MEI_MAPPED token, {sample}_mei_supported_reads)`` per sample.
+    When one sample has MEI support and the other has ``MEI_MAPPED == 0`` but
+    carries multiple junction/discordant reads plus polyA support at the same
+    locus (``SR+DPE >= 2`` and ``polyA_MAPPED >= 2``), count ``min(SR+DPE, polyA)``
+    so shared insertions whose second-sample mates landed in the polyA tail are
+    not mislabeled ``disease_only`` / ``control_only``.
+    """
+    out = df.copy()
     _mei_status_enrichment_frac = 0.90
-    disease_mei = _mei_mapped_from_support_string(s("disease_supporting_reads", ""))
-    control_mei = _mei_mapped_from_support_string(s("control_supporting_reads", ""))
-    mei_total = (disease_mei + control_mei).astype(float)
-    disease_present = disease_mei.ge(1)
-    control_present = control_mei.ge(1)
-    disease_frac = disease_mei.astype(float) / mei_total.clip(lower=1.0)
-    control_frac = control_mei.astype(float) / mei_total.clip(lower=1.0)
+
+    d_str = _df_col_series(out, "disease_supporting_reads", "").fillna("").astype(str)
+    c_str = _df_col_series(out, "control_supporting_reads", "").fillna("").astype(str)
+
+    d_token = _mei_mapped_from_support_string(d_str)
+    c_token = _mei_mapped_from_support_string(c_str)
+    d_col = pd.to_numeric(_df_col_series(out, "disease_mei_supported_reads", 0), errors="coerce").fillna(0).astype(int)
+    c_col = pd.to_numeric(_df_col_series(out, "control_mei_supported_reads", 0), errors="coerce").fillna(0).astype(int)
+
+    disease_mei = pd.concat([d_token, d_col], axis=1).max(axis=1).astype(int)
+    control_mei = pd.concat([c_token, c_col], axis=1).max(axis=1).astype(int)
+
+    d_sr_dpe = (
+        _support_token_int(d_str, "SR_L")
+        + _support_token_int(d_str, "SR_R")
+        + _support_token_int(d_str, "DPE_L")
+        + _support_token_int(d_str, "DPE_R")
+    )
+    c_sr_dpe = (
+        _support_token_int(c_str, "SR_L")
+        + _support_token_int(c_str, "SR_R")
+        + _support_token_int(c_str, "DPE_L")
+        + _support_token_int(c_str, "DPE_R")
+    )
+    d_polya = _support_token_int(d_str, "polyA_MAPPED")
+    c_polya = _support_token_int(c_str, "polyA_MAPPED")
+
+    any_mei = (disease_mei >= 1) | (control_mei >= 1)
+    d_rescue = pd.concat([d_sr_dpe, d_polya], axis=1).min(axis=1).where(any_mei & (d_sr_dpe >= 2) & (d_polya >= 2), 0)
+    c_rescue = pd.concat([c_sr_dpe, c_polya], axis=1).min(axis=1).where(any_mei & (c_sr_dpe >= 2) & (c_polya >= 2), 0)
+
+    disease_eff = disease_mei.where(disease_mei > 0, d_rescue).astype(int)
+    control_eff = control_mei.where(control_mei > 0, c_rescue).astype(int)
+
+    mei_total = (disease_eff + control_eff).astype(float)
+    disease_present = disease_eff.ge(1)
+    control_present = control_eff.ge(1)
+    disease_frac = disease_eff.astype(float) / mei_total.clip(lower=1.0)
+    control_frac = control_eff.astype(float) / mei_total.clip(lower=1.0)
     disease_enriched = disease_present & control_present & disease_frac.ge(_mei_status_enrichment_frac)
     control_enriched = disease_present & control_present & control_frac.ge(_mei_status_enrichment_frac)
 
@@ -11562,7 +11609,6 @@ def _compute_insertion_model_scores(candidates: pd.DataFrame) -> pd.DataFrame:
     out.loc[disease_enriched, "sample_status_label"] = "disease_only"
     out.loc[control_enriched, "sample_status_label"] = "control_only"
 
-    # Explicit convenience flag for downstream filtering.
     out["likely_false_positive_control_only"] = out["sample_status_label"] == "control_only"
     return out
 
@@ -13839,9 +13885,9 @@ def _tighten_windows_to_breakpoint_interval(
 
     ws = pd.to_numeric(out["discovery_window_start"], errors="coerce")
     we = pd.to_numeric(out["discovery_window_end"], errors="coerce")
-    bp = pd.to_numeric(out.get(breakpoint_pos_col, 0), errors="coerce")
-    lo = pd.to_numeric(out.get(interval_start_col, float("nan")), errors="coerce")
-    hi = pd.to_numeric(out.get(interval_end_col, float("nan")), errors="coerce")
+    bp = pd.to_numeric(_df_col_series(out, breakpoint_pos_col, 0), errors="coerce")
+    lo = pd.to_numeric(_df_col_series(out, interval_start_col, float("nan")), errors="coerce")
+    hi = pd.to_numeric(_df_col_series(out, interval_end_col, float("nan")), errors="coerce")
 
     # Prefer explicit interval when valid.
     valid_interval = lo.notna() & hi.notna() & lo.gt(0) & hi.gt(0) & hi.ge(lo)
@@ -13856,8 +13902,8 @@ def _tighten_windows_to_breakpoint_interval(
     new_we = new_we.where(~point, bp)
 
     # One-sided / unresolved DPE: shrink to observed junction-tip span on that side.
-    side_lo = pd.to_numeric(out.get("dpe_side_window_start", float("nan")), errors="coerce")
-    side_hi = pd.to_numeric(out.get("dpe_side_window_end", float("nan")), errors="coerce")
+    side_lo = pd.to_numeric(_df_col_series(out, "dpe_side_window_start", float("nan")), errors="coerce")
+    side_hi = pd.to_numeric(_df_col_series(out, "dpe_side_window_end", float("nan")), errors="coerce")
     unresolved = (~valid_interval) & (bp.isna() | bp.le(0))
     use_side = unresolved & side_lo.notna() & side_hi.notna() & side_lo.gt(0) & side_hi.ge(side_lo)
     new_ws = new_ws.where(~use_side, side_lo)
@@ -14834,6 +14880,7 @@ def _build_gold_review_table(candidates: pd.DataFrame, empirical_stage: bool = F
 
     out["disease_supporting_reads"] = _with_mei_mapped(out["disease_supporting_reads"], "disease")
     out["control_supporting_reads"] = _with_mei_mapped(out["control_supporting_reads"], "control")
+    out = _assign_sample_status_labels(out)
     out["nested_in_same_MEI"] = _series_or_default("nested_same_class_orientation", "").fillna("").astype(str)
     span_numeric = pd.to_numeric(out["consensus_insertion_mei_span"], errors="coerce")
     out["consensus_insertion_mei_span"] = span_numeric.round().where(span_numeric.notna(), span_numeric)

@@ -124,3 +124,29 @@ def test_aggregated_gold_table_writes_vcf_from_pipeline_params(tmp_path: Path) -
     assert "L1TX-chr4-66240893-ALU" in text
     assert "L1TX-chr4-102422592-LINE1" in text
     assert "L1TX-chr10-3041566-SVA" in text
+
+
+def test_build_gold_review_table_recomputes_sample_status_label() -> None:
+    """Gold review must recompute sample_status_label after finalizing MEI_MAPPED."""
+    from retro_miner.mei_support import _assign_sample_status_labels, _build_gold_review_table
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "loci" / "rank010_chr19_3989864" / "gold_locus.tsv"
+    base = pd.read_csv(fixture, sep="\t").iloc[[0, 0]].reset_index(drop=True)
+    # Row 0: pre-review token had MEI_MAPPED=0 in disease, causing stale control_only.
+    base.loc[0, "disease_supporting_reads"] = "SR_L=0,SR_R=0,DPE_L=7,DPE_R=0,MEI_MAPPED=0,polyA_MAPPED=8,polyA_side=R"
+    base.loc[0, "control_supporting_reads"] = "SR_L=0,SR_R=1,DPE_L=13,DPE_R=10,MEI_MAPPED=3,polyA_MAPPED=19,polyA_side=L"
+    base.loc[0, "disease_mei_supported_reads"] = 8
+    base.loc[0, "control_mei_supported_reads"] = 14
+    base.loc[0, "sample_status_label"] = "control_only"
+    # Row 1: second sample has DPE+polyA support at the same confirmed MEI breakpoint.
+    base.loc[1, "disease_supporting_reads"] = "SR_L=0,SR_R=0,DPE_L=11,DPE_R=0,MEI_MAPPED=0,polyA_MAPPED=12,polyA_side=L"
+    base.loc[1, "control_supporting_reads"] = "SR_L=0,SR_R=0,DPE_L=11,DPE_R=8,MEI_MAPPED=3,polyA_MAPPED=12,polyA_side=L"
+    base.loc[1, "disease_mei_supported_reads"] = 0
+    base.loc[1, "control_mei_supported_reads"] = 3
+    base.loc[1, "sample_status_label"] = "control_only"
+
+    relabeled = _assign_sample_status_labels(base)
+    assert relabeled["sample_status_label"].tolist() == ["shared", "shared"]
+    review = _build_gold_review_table(base, empirical_stage=False)
+    assert review["sample_status_label"].tolist() == ["shared", "shared"]
+
