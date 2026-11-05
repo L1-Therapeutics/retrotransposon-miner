@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pull the shared bwa-mem3 mm39 index from S3 and align one accession.
-# Does not build the index. A 64 GB host cannot.
+# Does not build the index. It is already on S3. The default mouse host is
+# m7i.16xlarge (256 GiB). Do not rebuild the index on a smaller host either.
 set -euo pipefail
 
 export PATH="${HOME}/.local/bin:${PATH}"

@@ -528,7 +528,11 @@ python3 scripts/download_public_data.py \
 Sugo 2025 and Mouse Genomes Project coordinate build. Default `--references`
 stays human. From the laptop where `aws sts get-caller-identity` works, launch
 with the existing EC2 helper, pointed at a separate name and S3 prefix from
-the human cache:
+the human cache. Mouse alignment and whole-genome calling use an on-demand
+`m7i.16xlarge` (64 vCPU, 256 GiB), the same shape as a human full genome.
+The helper selects that type when the name, state file, cache prefix, or
+host alias contains `mouse`. A 16 vCPU / 64 GiB host ran out of memory past
+four chromosomes. Call a sample pair with `--chr_concurrency 12`.
 
 ```bash
 INSTANCE_NAME=retrotransposon-miner-mouse \
@@ -536,6 +540,7 @@ HOST_ALIAS=retro-ec2-mouse \
 JLAB_ALIAS=jlab-mouse \
 JLAB_LOCAL_PORT=8891 \
 INSTANCE_STATE_FILE="$PWD/.ec2-mouse.env" \
+INSTANCE_TYPE=m7i.16xlarge \
 ROOT_VOLUME_GB=500 \
 S3_BUCKET=s3://l1tx-data \
 S3_CACHE_PREFIX=s3://l1tx-data/mouse/public \
