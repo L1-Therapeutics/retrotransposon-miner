@@ -3635,19 +3635,25 @@ def main() -> int:
 
     snpeff_script = Path(__file__).resolve().parent / "install_snpeff.sh"
     snpeff_prefix = outdir / "tools" / "snpeff"
+    snpeff_genomes: list[tuple[str, str]] = []
     if any(ref in HUMAN_REFERENCES for ref in selected_references):
-        print(f"[snpeff] install prefix {snpeff_prefix}", file=sys.stderr)
-        snpeff_ok, snpeff_msg = _run_cmd(["bash", str(snpeff_script), str(snpeff_prefix)], required=False)
+        snpeff_genomes.append(("GRCh38.115", "s3://l1tx-data/public/tools/snpeff/snpeff-5.4.0c-GRCh38.115.tar.gz"))
+    if any(ref in MOUSE_REFERENCES for ref in selected_references):
+        mouse_s3 = f"{s3_cache}/tools/snpeff/snpeff-5.4.0c-GRCm39.115.tar.gz" if s3_cache else "s3://l1tx-data/mouse/public/tools/snpeff/snpeff-5.4.0c-GRCm39.115.tar.gz"
+        snpeff_genomes.append(("GRCm39.115", mouse_s3))
+    for snpeff_genome, snpeff_s3_uri in snpeff_genomes:
+        print(f"[snpeff] install prefix {snpeff_prefix} ({snpeff_genome})", file=sys.stderr)
+        snpeff_ok, snpeff_msg = _run_cmd(
+            ["env", f"SNPEFF_GENOME={snpeff_genome}", f"SNPEFF_S3_URI={snpeff_s3_uri}", "bash", str(snpeff_script), str(snpeff_prefix)],
+            required=False,
+        )
         manifest["postprocess"].append(
             {
                 "step": "install_snpeff",
+                "genome": snpeff_genome,
                 "status": "installed" if snpeff_ok else "failed",
                 "detail": snpeff_msg,
             }
-        )
-    else:
-        manifest["postprocess"].append(
-            {"step": "install_snpeff", "status": "skipped_mouse_only", "prefix": str(snpeff_prefix)}
         )
 
     print(

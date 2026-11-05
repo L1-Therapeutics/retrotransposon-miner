@@ -15,11 +15,12 @@
 set -euo pipefail
 
 PREFIX="${1:-${SNPEFF_PREFIX:-${HOME}/snpEff}}"
-S3_URI="${SNPEFF_S3_URI:-s3://l1tx-data/public/tools/snpeff/snpeff-5.4.0c-GRCh38.115.tar.gz}"
-ARCHIVE_NAME="snpeff-5.4.0c-GRCh38.115.tar.gz"
+GENOME="${SNPEFF_GENOME:-GRCh38.115}"
+S3_URI="${SNPEFF_S3_URI:-s3://l1tx-data/public/tools/snpeff/snpeff-5.4.0c-${GENOME}.tar.gz}"
+ARCHIVE_NAME="snpeff-5.4.0c-${GENOME}.tar.gz"
 LOCAL_ARCHIVE="${PREFIX}/${ARCHIVE_NAME}"
 BIOCONDA_URL="${SNPEFF_BIOCONDA_URL:-https://conda.anaconda.org/bioconda/noarch/snpeff-5.4.0c-hdfd78af_0.conda}"
-DATABASE_URL="${SNPEFF_DATABASE_URL:-https://snpeff-public.s3.amazonaws.com/databases/v5_4/snpEff_v5_4_GRCh38.115.zip}"
+DATABASE_URL="${SNPEFF_DATABASE_URL:-https://snpeff-public.s3.amazonaws.com/databases/v5_4/snpEff_v5_4_${GENOME}.zip}"
 
 require_java21() {
   if ! command -v java >/dev/null 2>&1; then
@@ -66,7 +67,7 @@ build_upstream_bundle() {
   local work conda_pkg db_zip
   work="$(mktemp -d)"
   conda_pkg="${work}/snpeff.conda"
-  db_zip="${work}/GRCh38.115.zip"
+  db_zip="${work}/${GENOME}.zip"
   curl -fsSL -o "${conda_pkg}" "${BIOCONDA_URL}"
   curl -fsSL -o "${db_zip}" "${DATABASE_URL}"
   if ! command -v zstd >/dev/null 2>&1; then
@@ -101,8 +102,8 @@ PY
 require_java21
 mkdir -p "${PREFIX}"
 
-if [[ -f "${PREFIX}/snpEff.jar" && -d "${PREFIX}/data/GRCh38.115" ]]; then
-  echo "[snpeff] already installed at ${PREFIX}"
+if [[ -f "${PREFIX}/snpEff.jar" && -d "${PREFIX}/data/${GENOME}" ]]; then
+  echo "[snpeff] already installed at ${PREFIX} (${GENOME})"
 elif [[ -s "${LOCAL_ARCHIVE}" ]]; then
   unpack_archive "${LOCAL_ARCHIVE}"
 elif s3_object_exists; then
@@ -113,7 +114,7 @@ else
   build_upstream_bundle
 fi
 
-if [[ ! -f "${PREFIX}/snpEff.jar" || ! -d "${PREFIX}/data/GRCh38.115" ]]; then
+if [[ ! -f "${PREFIX}/snpEff.jar" || ! -d "${PREFIX}/data/${GENOME}" ]]; then
   echo "ERROR: snpEff install incomplete under ${PREFIX}" >&2
   exit 1
 fi

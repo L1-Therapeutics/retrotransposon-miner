@@ -174,6 +174,44 @@ def test_bundled_gene_strands_match_chr22_genes():
     assert strands["ENSG00000093072"] == "-"  # ADA2
     assert strands["ENSG00000182902"] == "+"  # SLC25A18
     assert strands["ENSG00000286195"] == "-"
+    # Mouse Ensembl GRCm39.115 gene IDs are also bundled so mm39 VCFs resolve GENE_STRAND out of the box.
+    assert strands["ENSMUSG00000104478"] == "+"
+    assert strands["ENSMUSG00000101231"] == "-"
+
+
+def test_resolve_snpeff_genome_auto_selects_and_guards_species(tmp_path):
+    import subprocess
+
+    mouse_headers = ["##fileformat=VCFv4.3", "##reference=mm39", "##assembly=GRCm39", "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"]
+    human_headers = ["##fileformat=VCFv4.3", "##reference=hg38", "##assembly=GRCh38", "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"]
+    assert ga.resolve_snpeff_genome(mouse_headers, None) == "GRCm39.115"
+    assert ga.resolve_snpeff_genome(human_headers, None) == "GRCh38.99"
+    with pytest.raises(ValueError, match="mouse reference"):
+        ga.resolve_snpeff_genome(mouse_headers, "GRCh38.99")
+    with pytest.raises(ValueError, match="human reference"):
+        ga.resolve_snpeff_genome(human_headers, "GRCm39.115")
+
+    mouse_vcf = tmp_path / "mouse.vcf"
+    rec = ga.VcfRecord("chr1", 100, "L1TX-chr1-100-B1", "N", "<INS:ME:B1>", ".", "PASS", {"SVTYPE": "INS"})
+    ga.write_vcf(mouse_vcf, mouse_headers, [rec])
+    canned_ann = "T|intron_variant|MODIFIER|Gm37180|ENSMUSG00000104478|transcript|ENSMUST00000193812|lncRNA||1/2||||||"
+    canned_rec = ga.VcfRecord("chr1", 100, "L1TX-chr1-100-B1", "N", "<INS:ME:B1>", ".", "PASS", {"SVTYPE": "INS", "ANN": canned_ann})
+    canned_vcf = tmp_path / "canned.vcf"
+    ga.write_vcf(canned_vcf, mouse_headers, [canned_rec])
+    seen_cmds = []
+
+    def fake_run(cmd, **kw):
+        seen_cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=canned_vcf.read_text(), stderr="")
+
+    out_vcf = tmp_path / "out.vcf"
+    stats = ga.annotate_vcf(mouse_vcf, out_vcf, run=fake_run)
+    assert stats.n_annotated == 1 and stats.n_with_gene == 1
+    assert "GRCm39.115" in seen_cmds[0]
+    _, out_recs = ga.read_vcf(out_vcf)
+    assert out_recs[0].info["GENE"] == "Gm37180"
+    assert out_recs[0].info["GENEID"] == "ENSMUSG00000104478"
+    assert out_recs[0].info["GENE_STRAND"] == "+"
 
 
 def test_snpeff_command_shape():

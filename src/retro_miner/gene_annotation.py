@@ -258,10 +258,57 @@ SNPEFF_TERM_ALIASES: dict[str, str] = {
 
 ANN_ANNOTATION, ANN_GENE_NAME, ANN_GENE_ID, ANN_FEATURE_TYPE = 1, 3, 4, 5
 
-# snpEff ANN has no strand column. This table is Ensembl GRCh38.115 gene
-# features (gene_id, transcribed strand), bundled so annotate-genes writes
-# GENE_STRAND without a second database load.
+# snpEff ANN has no strand column. These tables are Ensembl release 115 gene
+# features (gene_id, transcribed strand) for human (GRCh38.115) and mouse
+# (GRCm39.115), bundled so annotate-genes writes GENE_STRAND without a second
+# database load.
 _BUNDLED_GENE_STRANDS = Path(__file__).resolve().parent / "data" / "grch38.115.gene_strand.tsv.gz"
+_BUNDLED_MOUSE_GENE_STRANDS = Path(__file__).resolve().parent / "data" / "grcm39.115.gene_strand.tsv.gz"
+
+_MOUSE_SNPEFF_DEFAULT_GENOME = "GRCm39.115"
+_HUMAN_SNPEFF_DEFAULT_GENOME = "GRCh38.99"
+
+
+def _is_mouse_genome_token(token: str | None) -> bool:
+    t = (token or "").strip().lower()
+    return any(k in t for k in ("mm39", "mm10", "grcm39", "grcm38"))
+
+
+def _is_human_genome_token(token: str | None) -> bool:
+    t = (token or "").strip().lower()
+    return any(k in t for k in ("hg38", "hg19", "hs1", "grch38", "grch37", "chm13"))
+
+
+def vcf_header_species(headers: Sequence[str]) -> str | None:
+    """Return ``'mouse'`` or ``'human'`` from ``##reference=`` / ``##assembly=`` VCF headers, or ``None``."""
+    for h in headers:
+        if h.startswith("##reference=") or h.startswith("##assembly="):
+            val = h.split("=", 1)[1].strip()
+            if _is_mouse_genome_token(val):
+                return "mouse"
+            if _is_human_genome_token(val):
+                return "human"
+    return None
+
+
+def resolve_snpeff_genome(headers: Sequence[str], genome: str | None = None) -> str:
+    """Pick or validate the snpEff genome database against the VCF header species."""
+    header_species = vcf_header_species(headers)
+    if genome is None or not str(genome).strip() or str(genome).strip().lower() == "auto":
+        if header_species == "mouse":
+            return _MOUSE_SNPEFF_DEFAULT_GENOME
+        return _HUMAN_SNPEFF_DEFAULT_GENOME
+    chosen = str(genome).strip()
+    if header_species == "mouse" and _is_human_genome_token(chosen):
+        raise ValueError(
+            f"VCF header declares a mouse reference, but snpEff genome {chosen!r} is human; "
+            f"use {_MOUSE_SNPEFF_DEFAULT_GENOME!r} (or omit --snpeff-genome to auto-select)."
+        )
+    if header_species == "human" and _is_mouse_genome_token(chosen):
+        raise ValueError(
+            f"VCF header declares a human reference, but snpEff genome {chosen!r} is mouse."
+        )
+    return chosen
 
 
 def _gene_id_key(gene_id: str) -> str:
@@ -302,10 +349,13 @@ def load_gene_strands(path: str | Path) -> dict[str, str]:
 
 @lru_cache(maxsize=1)
 def bundled_gene_strands() -> dict[str, str]:
-    """Ensembl GRCh38.115 transcribed strand for each gene ID."""
+    """Ensembl GRCh38.115 + GRCm39.115 transcribed strand for each gene ID."""
     if not _BUNDLED_GENE_STRANDS.is_file():
         raise FileNotFoundError(f"bundled gene-strand table missing: {_BUNDLED_GENE_STRANDS}")
-    return load_gene_strands(_BUNDLED_GENE_STRANDS)
+    strands = load_gene_strands(_BUNDLED_GENE_STRANDS)
+    if _BUNDLED_MOUSE_GENE_STRANDS.is_file():
+        strands.update(load_gene_strands(_BUNDLED_MOUSE_GENE_STRANDS))
+    return strands
 
 
 def _resolve_gene_strands(
@@ -374,7 +424,7 @@ def snpeff_command(
 def annotate_records(
     records: Sequence[VcfRecord],
     headers: Sequence[str],
-    genome: str,
+    genome: str | None = None,
     *,
     snpeff_bin: str = "snpEff",
     config: str | Path | None = None,
@@ -388,15 +438,16 @@ def annotate_records(
     ``run`` is injectable (defaults to ``subprocess.run``) so tests can substitute
     a canned snpEff output. The raw ``ANN`` field is dropped; run snpEff directly
     for the full per-transcript table. ``GENE_STRAND`` is filled from the bundled
-    Ensembl GRCh38.115 table unless ``gene_strands`` or ``gene_gtf`` is passed.
+    Ensembl GRCh38.115 + GRCm39.115 tables unless ``gene_strands`` or ``gene_gtf`` is passed.
     """
+    resolved_genome = resolve_snpeff_genome(headers, genome)
     if run is subprocess.run and shutil.which(snpeff_bin) is None:
         raise FileNotFoundError(f"snpEff launcher {snpeff_bin!r} not found on PATH")
     t0 = time.time()
     with tempfile.TemporaryDirectory(prefix="rtm_snpeff_") as td:
         tmp_in = Path(td) / "in.vcf"
         write_vcf(tmp_in, headers, records)
-        proc = run(snpeff_command(tmp_in, genome, snpeff_bin=snpeff_bin, config=config, xmx=xmx),
+        proc = run(snpeff_command(tmp_in, resolved_genome, snpeff_bin=snpeff_bin, config=config, xmx=xmx),
                    capture_output=True, text=True, cwd=td)
         if proc.returncode != 0:
             raise RuntimeError(f"snpEff exited {proc.returncode}: {proc.stderr[-2000:]}")
@@ -434,7 +485,7 @@ def _read_vcf_text(text: str) -> tuple[list[str], list[VcfRecord]]:
 def annotate_vcf(
     in_path: str | Path,
     out_path: str | Path,
-    genome: str,
+    genome: str | None = None,
     *,
     tsv_path: str | Path | None = None,
     snpeff_bin: str = "snpEff",

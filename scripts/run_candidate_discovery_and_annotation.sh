@@ -540,7 +540,6 @@ mkdir -p "${OUTDIR}"
 echo "[candidate-pipeline] reference_build=${REFERENCE_BUILD} fasta=${REFERENCE_FASTA}"
 if [[ "${REFERENCE_BUILD}" == "mm39" ]]; then
   echo "[candidate-pipeline] mm39 families=L1,B1,B2 known-mei=${G1K_MEI_VCF} gene_gtf=${GENE_GTF}"
-  echo "[candidate-pipeline] annotate-genes still needs a GRCm39 snpEff database; the default genome is GRCh38"
 fi
 validate_reference_path_consistency "reference FASTA" "${REFERENCE_FASTA}"
 validate_reference_path_consistency "RepeatMasker table" "${RMSK_TABLE}"
