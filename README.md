@@ -2,7 +2,7 @@
 
 Short-read mobile element insertion (MEI) detection and annotation pipeline for LINE-1, Alu, and SVA.
 
-`retrotransposon-miner` searches next-generation sequencing data for retrotransposon (mobile element insertion, MEI) events in the human genome.
+`retrotransposon-miner` searches next-generation sequencing data for retrotransposon (mobile element insertion, MEI) events in human genomes and in the mouse genome (GRCm39 / mm39).
 Retrotransposons are virus-like elements that can activate under stress and are implicated in disease biology.
 
 The pipeline detects multiple MEI classes and outputs a candidate insertion table annotated with evidence and context useful for triage.
@@ -36,6 +36,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 | Paired disease/control analysis | ✅ | ✅ | ➖ | ➖ | ➖ | ✅ | ✅ | ➖ |
 | Alu / SVA / LINE-1 | ✅ | ✅ | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | hg19 / GRCh38 / hs1 support | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| GRCm39 (mm39) support | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
 | Target site duplication (TSD) detection | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
 | PolyA/polyT characterization | ✅ | ✅ | ✅ | ➖ | ✅ | ✅ | ✅ | ➖ |
 | Annotation of known variant catalogs | ✅ | ➖ | ➖ | ✅ | ➖ | ➖ | ➖ | ➖ |
@@ -50,7 +51,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 - Artificial intelligence/machine learning (AI/ML) genotyping confidence models are still under active development.
 - Genotyping is not supported: VCF output leaves `GT`/`GQ` blank. Calls are pooled disease-vs-control read support, not per-individual diploid genotypes, and a simple alt/ref read-ratio model is not valid here — split/discordant "alt" evidence and proper-pair "ref" evidence are structurally different read populations, and ploidy varies with chromosome (chrX), somatic copy-number context, and mosaicism. Reliable MEI genotyping would need haplotype-resolved/pangenome references or long reads.
 - Reverse-transcribed pseudogene insertion support is not yet added.
-- Support for species other than *Homo sapiens* (for example, *Mus musculus*) is not yet implemented.
+- *Mus musculus* is supported on GRCm39 (mm39). mm10 is opt-in for call sets on that coordinate build. Other species are not yet implemented.
 - Long-read native calling is not yet supported.
 - Single-cell sequencing data is not yet supported.
 - Other short-read platforms (for example, Ultima Genomics) are not yet validated/supported.
