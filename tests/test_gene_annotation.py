@@ -194,7 +194,8 @@ def test_resolve_snpeff_genome_auto_selects_and_guards_species(tmp_path):
     mouse_vcf = tmp_path / "mouse.vcf"
     rec = ga.VcfRecord("chr1", 100, "L1TX-chr1-100-B1", "N", "<INS:ME:B1>", ".", "PASS", {"SVTYPE": "INS"})
     ga.write_vcf(mouse_vcf, mouse_headers, [rec])
-    canned_ann = "T|intron_variant|MODIFIER|Gm37180|ENSMUSG00000104478|transcript|ENSMUST00000193812|lncRNA||1/2||||||"
+    # Ensembl GRCm39.115: ENSMUSG00000104478 is Gm38212, chr1:108344807-108347562 (+).
+    canned_ann = "T|intron_variant|MODIFIER|Gm38212|ENSMUSG00000104478|transcript|ENSMUST00000193812|TEC||1/2||||||"
     canned_rec = ga.VcfRecord("chr1", 100, "L1TX-chr1-100-B1", "N", "<INS:ME:B1>", ".", "PASS", {"SVTYPE": "INS", "ANN": canned_ann})
     canned_vcf = tmp_path / "canned.vcf"
     ga.write_vcf(canned_vcf, mouse_headers, [canned_rec])
@@ -209,7 +210,7 @@ def test_resolve_snpeff_genome_auto_selects_and_guards_species(tmp_path):
     assert stats.n_annotated == 1 and stats.n_with_gene == 1
     assert "GRCm39.115" in seen_cmds[0]
     _, out_recs = ga.read_vcf(out_vcf)
-    assert out_recs[0].info["GENE"] == "Gm37180"
+    assert out_recs[0].info["GENE"] == "Gm38212"
     assert out_recs[0].info["GENEID"] == "ENSMUSG00000104478"
     assert out_recs[0].info["GENE_STRAND"] == "+"
 
