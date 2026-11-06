@@ -1,6 +1,7 @@
 """Unit tests for retro_miner.gene_annotation.
 
-Set RTM_LIVE_SNPEFF=1 to additionally run snpEff against the chr22 fixture.
+Set RTM_LIVE_SNPEFF=1 to additionally run snpEff against the human chr22 and
+mouse chr19 fixtures (needs the GRCh38.115 and GRCm39.115 databases).
 """
 
 from __future__ import annotations
@@ -179,40 +180,121 @@ def test_bundled_gene_strands_match_chr22_genes():
     assert strands["ENSMUSG00000101231"] == "-"
 
 
-def test_resolve_snpeff_genome_auto_selects_and_guards_species(tmp_path):
-    import subprocess
+# ----------------------------------------------------------------- mouse (mm39 / GRCm39.115)
 
-    mouse_headers = ["##fileformat=VCFv4.3", "##reference=mm39", "##assembly=GRCm39", "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"]
-    human_headers = ["##fileformat=VCFv4.3", "##reference=hg38", "##assembly=GRCh38", "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"]
-    assert ga.resolve_snpeff_genome(mouse_headers, None) == "GRCm39.115"
+MOUSE_FIXTURE = Path(__file__).parent / "data" / "chr19_mouse_mei.vcf"
+MOUSE_SNPEFF_FIXTURE = Path(__file__).parent / "data" / "chr19_mouse_mei.snpeff.vcf"
+
+# 30 gold chr19 calls from s3://l1tx-data/mouse/results/hazen2016_b2_vs_thymus_chr19/
+# candidate_loci.mei.gold_review.tsv (rtm export-vcf --reference-build mm39), and the
+# recorded snpEff 5.4c GRCm39.115 run of them with the snpeff_command() flags.
+# Values: (GENE, CSQ, GENE_STRAND) as annotate_vcf writes them.
+CHR19_MOUSE_SNPEFF: dict[int, tuple[str, str, str]] = {
+    3977507: ("Gm59305,Gm50327,Aldh3b1", "intron_variant", "-,-,-"),
+    4775325: ("Gm59018,Sptbn2", "intron_variant", "-,+"),
+    6107110: ("Fau,Znhit2,Mrpl49,Syvn1,Gm52998,Gm56670", "non_coding_transcript_exon_variant", "+,+,-,+,+,-"),
+    6245682: ("Majin", "intron_variant", "+"),
+    6401894: ("Map4k2,Gm14966", "non_coding_transcript_exon_variant", "+,-"),
+    7262557: ("Mark2", "intron_variant", "-"),
+    7838242: ("Slc22a27", "downstream_gene_variant", "-"),
+    8407890: ("", "intergenic_variant", ""),
+    8520633: ("Gm8189", "upstream_gene_variant", "-"),
+    9125748: ("Gm9750", "intron_variant", "+"),
+    9835247: ("Gm54995", "downstream_gene_variant", "+"),
+    13473506: ("Or5b120", "upstream_gene_variant", "+"),
+    17821268: ("", "intergenic_variant", ""),
+    18843274: ("Trpm6", "intron_variant", "+"),
+    20468640: ("Aldh1a1,C730002L08Rik", "intron_variant", "+,-"),
+    22986035: ("C330002G04Rik", "non_coding_transcript_exon_variant", "-"),
+    24072174: ("Tjp2,Gm41824", "3_prime_UTR_variant", "-,+"),
+    28208847: ("", "intergenic_variant", ""),
+    38776704: ("Noc3l,Plce1", "3_prime_UTR_variant", "-,+"),
+    38810626: ("Noc3l", "upstream_gene_variant", "-"),
+    38962677: ("Cyp2c52-ps,Hells", "upstream_gene_variant", "+,+"),
+    40740574: ("Cc2d2b", "intron_variant", "+"),
+    41908570: ("Pgam1,Exosc1", "downstream_gene_variant", "+,-"),
+    43934594: ("", "intergenic_variant", ""),
+    45169757: ("", "intergenic_variant", ""),
+    45509186: ("Btrc", "non_coding_transcript_exon_variant", "+"),
+    46745048: ("Cnnm2,Gm59200,Gm59203", "upstream_gene_variant", "+,+,-"),
+    47550374: ("Gm59192", "upstream_gene_variant", "+"),
+    47558300: ("Gm59192", "downstream_gene_variant", "+"),
+    60509819: ("Cacul1", "downstream_gene_variant", "-"),
+}
+
+
+def _mouse_calls(records: list[ga.VcfRecord]) -> dict[int, tuple[str, str, str]]:
+    return {r.pos: (r.info.get("GENE") or "", r.info["CSQ"], r.info.get("GENE_STRAND") or "") for r in records}
+
+
+def test_mouse_snpeff_fixture_is_real_output_for_same_30_loci():
+    headers, source = ga.read_vcf(MOUSE_FIXTURE)
+    _, snp_out = ga.read_vcf(MOUSE_SNPEFF_FIXTURE)
+    assert "##reference=mm39" in headers and "##assembly=GRCm39" in headers
+    assert len(source) == 30
+    assert [(r.chrom, r.pos, r.alt) for r in snp_out] == [(r.chrom, r.pos, r.alt) for r in source]
+    assert {r.alt for r in source} == {"<INS:ME:B1>", "<INS:ME:B2>", "<INS:ME:LINE1>", "<INS:ME>"}
+    assert all("ANN" in r.info for r in snp_out)
+    assert all("ENSMUSG" in r.info["ANN"] and "ENSG0" not in r.info["ANN"] for r in snp_out)
+
+
+def test_resolve_snpeff_genome_auto_selects_and_guards_species():
+    from retro_miner.vcf_export import vcf_header_lines
+
+    mouse_headers, _ = ga.read_vcf(MOUSE_FIXTURE)
+    assert ga.vcf_header_species(mouse_headers) == "mouse"
+    assert [h for h in vcf_header_lines("mm39") if h.startswith(("##reference=", "##assembly="))] == [
+        h for h in mouse_headers if h.startswith(("##reference=", "##assembly="))
+    ]
+    human_headers = vcf_header_lines("hg38")
+    assert ga.vcf_header_species(human_headers) == "human"
     assert ga.resolve_snpeff_genome(human_headers, None) == "GRCh38.99"
-    with pytest.raises(ValueError, match="mouse reference"):
-        ga.resolve_snpeff_genome(mouse_headers, "GRCh38.99")
     with pytest.raises(ValueError, match="human reference"):
         ga.resolve_snpeff_genome(human_headers, "GRCm39.115")
+    # The chr22 fixture predates ##reference headers; it keeps the human default.
+    chr22_headers, _ = ga.read_vcf(FIXTURE)
+    assert ga.vcf_header_species(chr22_headers) is None
+    assert ga.resolve_snpeff_genome(chr22_headers, None) == "GRCh38.99"
+    assert ga.resolve_snpeff_genome(mouse_headers, None) == "GRCm39.115"
+    assert ga.resolve_snpeff_genome(mouse_headers, "GRCm39.115") == "GRCm39.115"
+    with pytest.raises(ValueError, match="mouse reference"):
+        ga.resolve_snpeff_genome(mouse_headers, "GRCh38.99")
+    with pytest.raises(ValueError, match="mouse reference"):
+        ga.resolve_snpeff_genome(mouse_headers, "GRCh38.115")
 
-    mouse_vcf = tmp_path / "mouse.vcf"
-    rec = ga.VcfRecord("chr1", 100, "L1TX-chr1-100-B1", "N", "<INS:ME:B1>", ".", "PASS", {"SVTYPE": "INS"})
-    ga.write_vcf(mouse_vcf, mouse_headers, [rec])
-    # Ensembl GRCm39.115: ENSMUSG00000104478 is Gm38212, chr1:108344807-108347562 (+).
-    canned_ann = "T|intron_variant|MODIFIER|Gm38212|ENSMUSG00000104478|transcript|ENSMUST00000193812|TEC||1/2||||||"
-    canned_rec = ga.VcfRecord("chr1", 100, "L1TX-chr1-100-B1", "N", "<INS:ME:B1>", ".", "PASS", {"SVTYPE": "INS", "ANN": canned_ann})
-    canned_vcf = tmp_path / "canned.vcf"
-    ga.write_vcf(canned_vcf, mouse_headers, [canned_rec])
-    seen_cmds = []
 
-    def fake_run(cmd, **kw):
-        seen_cmds.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout=canned_vcf.read_text(), stderr="")
+def test_annotate_vcf_mouse_replays_recorded_grcm39_run(tmp_path):
+    import subprocess
 
-    out_vcf = tmp_path / "out.vcf"
-    stats = ga.annotate_vcf(mouse_vcf, out_vcf, run=fake_run)
-    assert stats.n_annotated == 1 and stats.n_with_gene == 1
-    assert "GRCm39.115" in seen_cmds[0]
-    _, out_recs = ga.read_vcf(out_vcf)
-    assert out_recs[0].info["GENE"] == "Gm38212"
-    assert out_recs[0].info["GENEID"] == "ENSMUSG00000104478"
-    assert out_recs[0].info["GENE_STRAND"] == "+"
+    recorded = MOUSE_SNPEFF_FIXTURE.read_text()
+    calls = []
+
+    def replay_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=recorded, stderr="")
+
+    out = tmp_path / "m.vcf"
+    stats = ga.annotate_vcf(MOUSE_FIXTURE, out, run=replay_run)
+    assert calls and "GRCm39.115" in calls[0]
+    assert stats.n_records == 30 and stats.n_annotated == 30 and stats.n_unmatched == 0
+    assert stats.n_with_gene == 25
+    _, recs = ga.read_vcf(out)
+    assert _mouse_calls(recs) == CHR19_MOUSE_SNPEFF
+    sptbn2 = next(r for r in recs if r.pos == 4775325)
+    assert sptbn2.info["GENEID"] == "ENSMUSG00000126466,ENSMUSG00000067889"
+
+
+@pytest.mark.skipif(os.environ.get("RTM_LIVE_SNPEFF") != "1", reason="set RTM_LIVE_SNPEFF=1 (and have snpEff with GRCm39.115 on PATH) to run snpEff for real")
+def test_live_snpeff_mouse_chr19_matches_recorded_run(tmp_path):
+    out = tmp_path / "m.vcf"
+    stats = ga.annotate_vcf(
+        MOUSE_FIXTURE, out,
+        config=os.environ.get("RTM_SNPEFF_CONFIG"),
+        xmx=os.environ.get("RTM_SNPEFF_XMX", "4g"),
+    )
+    assert stats.n_annotated == 30 and stats.n_unmatched == 0
+    _, recs = ga.read_vcf(out)
+    assert _mouse_calls(recs) == CHR19_MOUSE_SNPEFF
 
 
 def test_snpeff_command_shape():

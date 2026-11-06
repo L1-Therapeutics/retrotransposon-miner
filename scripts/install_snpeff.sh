@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Install snpEff 5.4c and the GRCh38.115 database.
+# Install snpEff 5.4c and one genome database (SNPEFF_GENOME, default GRCh38.115).
 #
 # Order:
 #   1. Already unpacked under the prefix: write the launcher and stop.
 #   2. A local tarball (for example after the public-data S3 sync): unpack it.
 #   3. The project S3 object, if it exists: download that, do not hit upstream.
-#   4. Otherwise build the bundle from bioconda + snpeff-public and upload it.
+#   4. Otherwise download the database from snpeff-public (and the snpEff
+#      program from bioconda only when the prefix does not have it) and upload
+#      a one-genome bundle.
 #
 #   s3://l1tx-data/public/tools/snpeff/snpeff-5.4.0c-GRCh38.115.tar.gz
 #
 # Requires Java 21. The rtm-miner conda env provides it.
 #   bash scripts/install_snpeff.sh
 #   bash scripts/install_snpeff.sh /path/to/prefix
+#   SNPEFF_GENOME=GRCm39.115 bash scripts/install_snpeff.sh /path/to/prefix
 set -euo pipefail
 
 PREFIX="${1:-${SNPEFF_PREFIX:-${HOME}/snpEff}}"
@@ -62,14 +65,10 @@ unpack_archive() {
   tar -C "${PREFIX}" -xzf "${1}"
 }
 
-build_upstream_bundle() {
-  echo "[snpeff] S3 cache miss ${S3_URI}; building from bioconda and snpeff-public"
-  local work conda_pkg db_zip
-  work="$(mktemp -d)"
-  conda_pkg="${work}/snpeff.conda"
-  db_zip="${work}/${GENOME}.zip"
+fetch_snpeff_jar() {
+  local work="$1" conda_pkg="$1/snpeff.conda"
+  echo "[snpeff] fetching snpEff 5.4c from bioconda"
   curl -fsSL -o "${conda_pkg}" "${BIOCONDA_URL}"
-  curl -fsSL -o "${db_zip}" "${DATABASE_URL}"
   if ! command -v zstd >/dev/null 2>&1; then
     echo "ERROR: zstd is required to unpack the bioconda snpEff package on a cache miss." >&2
     exit 1
@@ -87,9 +86,24 @@ PY
   tar -C "${work}/pkg" -xf "${work}/pkg.tar"
   mkdir -p "${PREFIX}"
   cp "${work}/pkg/share/snpeff-5.4.0c-0/snpEff.jar" "${work}/pkg/share/snpeff-5.4.0c-0/snpEff.config" "${PREFIX}/"
+}
+
+build_upstream_bundle() {
+  echo "[snpeff] S3 cache miss ${S3_URI}; building ${GENOME} from snpeff-public"
+  local work db_zip
+  work="$(mktemp -d)"
+  db_zip="${work}/${GENOME}.zip"
+  # A second genome reuses the snpEff program already under the prefix.
+  if [[ -f "${PREFIX}/snpEff.jar" && -f "${PREFIX}/snpEff.config" ]]; then
+    echo "[snpeff] reusing ${PREFIX}/snpEff.jar"
+  else
+    fetch_snpeff_jar "${work}"
+  fi
+  curl -fsSL -o "${db_zip}" "${DATABASE_URL}"
   mkdir -p "${PREFIX}/data"
   unzip -q -o "${db_zip}" -d "${PREFIX}"
-  tar -C "${PREFIX}" -czf "${LOCAL_ARCHIVE}" snpEff.jar snpEff.config data
+  # One genome per archive, so a mouse bundle does not carry the human database.
+  tar -C "${PREFIX}" -czf "${LOCAL_ARCHIVE}" snpEff.jar snpEff.config "data/${GENOME}"
   rm -rf "${work}"
   if command -v aws >/dev/null 2>&1; then
     echo "[snpeff] uploading ${S3_URI}"
