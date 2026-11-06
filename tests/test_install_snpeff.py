@@ -88,3 +88,42 @@ exit 1
     assert "s3 cp" in calls
     assert "curl" not in calls
     assert (prefix / "data" / "GRCh38.115").is_dir()
+
+
+def test_second_genome_reuses_the_installed_program(tmp_path: Path) -> None:
+    import zipfile
+
+    prefix = tmp_path / "snpeff"
+    (prefix / "data" / "GRCh38.115").mkdir(parents=True)
+    (prefix / "data" / "GRCh38.115" / "snpEffectPredictor.bin").write_bytes(b"human")
+    (prefix / "snpEff.jar").write_bytes(b"jar")
+    (prefix / "snpEff.config").write_text("db\n")
+    db_zip = tmp_path / "GRCm39.115.zip"
+    with zipfile.ZipFile(db_zip, "w") as zf:
+        zf.writestr("data/GRCm39.115/snpEffectPredictor.bin", b"mouse")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _java(bin_dir)
+    log = tmp_path / "calls.log"
+    _exe(
+        bin_dir / "aws",
+        f"""#!/bin/sh
+echo "aws $@" >> {log}
+if [ "$1" = s3 ] && [ "$2" = ls ]; then
+  exit 1
+fi
+exit 0
+""",
+    )
+    _exe(bin_dir / "curl", f'#!/bin/sh\necho "curl $4" >> {log}\ncp {db_zip} "$3"\n')
+    result = _run(prefix, bin_dir, {"SNPEFF_GENOME": "GRCm39.115"})
+    assert result.returncode == 0, result.stderr + result.stdout
+    calls = log.read_text()
+    assert "snpEff_v5_4_GRCm39.115.zip" in calls
+    assert "bioconda" not in calls
+    assert (prefix / "data" / "GRCm39.115" / "snpEffectPredictor.bin").read_bytes() == b"mouse"
+    with tarfile.open(prefix / "snpeff-5.4.0c-GRCm39.115.tar.gz") as tar:
+        names = tar.getnames()
+    assert "data/GRCm39.115/snpEffectPredictor.bin" in names
+    assert not any(n.startswith("data/GRCh38.115") for n in names)
+    assert "s3 cp" in calls

@@ -2,7 +2,7 @@
 
 Short-read mobile element insertion (MEI) detection and annotation pipeline for LINE-1, Alu, and SVA.
 
-`retrotransposon-miner` searches next-generation sequencing data for retrotransposon (mobile element insertion, MEI) events in the human genome.
+`retrotransposon-miner` searches next-generation sequencing data for retrotransposon (mobile element insertion, MEI) events in human genomes and in the mouse genome (GRCm39 / mm39).
 Retrotransposons are virus-like elements that can activate under stress and are implicated in disease biology.
 
 The pipeline detects multiple MEI classes and outputs a candidate insertion table annotated with evidence and context useful for triage.
@@ -36,6 +36,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 | Paired disease/control analysis | ✅ | ✅ | ➖ | ➖ | ➖ | ✅ | ✅ | ➖ |
 | Alu / SVA / LINE-1 | ✅ | ✅ | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | hg19 / GRCh38 / hs1 support | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| GRCm39 (mm39) support | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
 | Target site duplication (TSD) detection | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
 | PolyA/polyT characterization | ✅ | ✅ | ✅ | ➖ | ✅ | ✅ | ✅ | ➖ |
 | Annotation of known variant catalogs | ✅ | ➖ | ➖ | ✅ | ➖ | ➖ | ➖ | ➖ |
@@ -50,7 +51,7 @@ Legend: `✅` yes, `❌` no, `➖` limited/partial/not definitive.
 - Artificial intelligence/machine learning (AI/ML) genotyping confidence models are still under active development.
 - Genotyping is not supported: VCF output leaves `GT`/`GQ` blank. Calls are pooled disease-vs-control read support, not per-individual diploid genotypes, and a simple alt/ref read-ratio model is not valid here — split/discordant "alt" evidence and proper-pair "ref" evidence are structurally different read populations, and ploidy varies with chromosome (chrX), somatic copy-number context, and mosaicism. Reliable MEI genotyping would need haplotype-resolved/pangenome references or long reads.
 - Reverse-transcribed pseudogene insertion support is not yet added.
-- Support for species other than *Homo sapiens* (for example, *Mus musculus*) is not yet implemented.
+- *Mus musculus* is supported on GRCm39 (mm39). mm10 is opt-in for call sets on that coordinate build. Other species are not yet implemented.
 - Long-read native calling is not yet supported.
 - Single-cell sequencing data is not yet supported.
 - Other short-read platforms (for example, Ultima Genomics) are not yet validated/supported.
@@ -125,7 +126,7 @@ Soft-clips and discordant clipped ends remap to the Dfam Alu/LINE-1/SVA panel wi
 
 ## Gene annotation (snpEff)
 
-`rtm annotate-genes` adds gene-level consequence fields to an MEI VCF (symbolic `<INS:ME:ALU|LINE1|SVA>` ALT alleles) with local snpEff. Each record gains `GENE` (symbols), `GENEID` (Ensembl IDs), `GENE_STRAND` (transcribed strand of each `GENEID`, same order), `CSQ` (most severe Sequence Ontology term), `CSQ_TERMS` (all distinct terms), and `CSQ_NTX` (overlapping transcripts); `--tsv` also writes a flat table. An insertion is sense when `ORIENT` matches `GENE_STRAND`. snpEff `ANN` has no strand column, so the strand comes from a bundled Ensembl GRCh38.115 gene table (`--gene-gtf` overrides it). snpEff does not order `ANN` by Ensembl severity, so the parser applies that ranking itself.
+`rtm annotate-genes` adds gene-level consequence fields to an MEI VCF (symbolic `<INS:ME:*>` ALT alleles) with local snpEff. Each record gains `GENE` (symbols), `GENEID` (Ensembl IDs), `GENE_STRAND` (transcribed strand of each `GENEID`, same order), `CSQ` (most severe Sequence Ontology term), `CSQ_TERMS` (all distinct terms), and `CSQ_NTX` (overlapping transcripts); `--tsv` also writes a flat table. An insertion is sense when `ORIENT` matches `GENE_STRAND`. snpEff `ANN` has no strand column, so the strand comes from bundled Ensembl release 115 gene tables (`grch38.115` for human and `grcm39.115` for mouse; `--gene-gtf` overrides them). When `--snpeff-genome` is omitted, `annotate-genes` inspects `##reference` / `##assembly` in the VCF header (`GRCm39.115` for mouse `mm39`, `GRCh38.99` for human) and refuses to cross-annotate human genes onto a mouse VCF. snpEff does not order `ANN` by Ensembl severity, so the parser applies that ranking itself.
 
 ```bash
 conda install -c bioconda -c conda-forge snpeff openjdk
@@ -511,6 +512,43 @@ python3 scripts/download_public_data.py \
   --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}" \
   --s3-cache-prefix "${RTM_S3_CACHE:-s3://l1tx-data/public}"
 ```
+
+Mouse (GRCm39 / mm39), including Hazen 2016 and Sugo 2025 FASTQs streamed to a
+separate S3 prefix so they are not mixed into the human cache:
+
+```bash
+python3 scripts/download_public_data.py \
+  --references mm39 \
+  --include-mouse-test-fastqs \
+  --outdir "${RTM_PUBLIC_DATA_DIR:-$HOME/retrotransposon-workdir/data/public}" \
+  --s3-cache-prefix "${RTM_S3_CACHE:-s3://l1tx-data/mouse/public}"
+```
+
+`mm10` is opt-in (`--references mm10` or `--references mm39 mm10`) for the
+Sugo 2025 and Mouse Genomes Project coordinate build. Default `--references`
+stays human. From the laptop where `aws sts get-caller-identity` works, launch
+with the existing EC2 helper, pointed at a separate name and S3 prefix from
+the human cache. Mouse alignment and whole-genome calling use an on-demand
+`m7i.16xlarge` (64 vCPU, 256 GiB), the same shape as a human full genome.
+The helper selects that type when the name, state file, cache prefix, or
+host alias contains `mouse`. A 16 vCPU / 64 GiB host ran out of memory past
+four chromosomes. Call a sample pair with `--chr_concurrency 12`.
+
+```bash
+INSTANCE_NAME=retrotransposon-miner-mouse \
+HOST_ALIAS=retro-ec2-mouse \
+JLAB_ALIAS=jlab-mouse \
+JLAB_LOCAL_PORT=8891 \
+INSTANCE_STATE_FILE="$PWD/.ec2-mouse.env" \
+INSTANCE_TYPE=m7i.16xlarge \
+ROOT_VOLUME_GB=500 \
+S3_BUCKET=s3://l1tx-data \
+S3_CACHE_PREFIX=s3://l1tx-data/mouse/public \
+./scripts/ec2_jlab.sh bootstrap
+```
+
+On that instance, `scripts/run_mouse_public_data_download.sh` prepares the mm39
+tracks and then streams the Hazen 2016 and Sugo 2025 FASTQs.
 
 Test BAMs default to a **chr22 slice** (plus discordant mates). To park the entire SEQC2 WGS pair on S3 without filling the instance disk, stream NCBI HTTP through the instance (`curl | aws s3 cp -`) — the object never lands on the local volume:
 

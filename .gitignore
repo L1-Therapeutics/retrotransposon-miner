@@ -15,6 +15,7 @@ build/
 venv/
 .env
 .ec2-instance.env
+.ec2-mouse.env
 
 # Data and temporary outputs
 data/

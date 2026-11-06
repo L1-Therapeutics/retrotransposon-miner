@@ -366,3 +366,558 @@ datasets:
     region: chr22
     include_discordant_mates: true
     required: true
+
+  # -------------------------------------------------------------------------
+  # Mouse (Mus musculus). Selected with --references mm39 and/or mm10.
+  # Default --references still materializes only hg19, hg38, and hs1.
+  # mm39 / GRCm39 is the current reference. mm10 is the Sugo 2025 and
+  # Mouse Genomes Project coordinate system. Chains place mm9 (Hazen 2016)
+  # and mm10 calls onto mm39.
+  # -------------------------------------------------------------------------
+  - id: mm39_reference_fasta
+    category: reference
+    description: UCSC GRCm39/mm39 analysis FASTA (chr names, soft-masked)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.fa.gz
+    target_path: reference/mm39/mm39.fa.gz
+    required: true
+
+  - id: mm10_reference_fasta
+    category: reference
+    description: UCSC GRCm38/mm10 analysis FASTA (Sugo 2025 and MGP coordinate build)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.fa.gz
+    target_path: reference/mm10/mm10.fa.gz
+    required: true
+
+  - id: gencode_vm39_gtf
+    category: annotation
+    description: GENCODE M39 comprehensive gene annotation (GRCm39, chr names)
+    source: GENCODE
+    url: https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M39/gencode.vM39.annotation.gtf.gz
+    target_path: annotation/mm39/gencode/gencode.vM39.annotation.gtf.gz
+    required: true
+
+  - id: gencode_vm23_gtf
+    category: annotation
+    description: GENCODE M23 comprehensive gene annotation (GRCm38/mm10, current for that build)
+    source: GENCODE
+    url: https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M23/gencode.vM23.annotation.gtf.gz
+    target_path: annotation/mm10/gencode/gencode.vM23.annotation.gtf.gz
+    required: true
+
+  - id: mm39_repeatmasker_rmsk
+    category: annotation
+    description: UCSC mm39 RepeatMasker table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/rmsk.txt.gz
+    target_path: annotation/mm39/repeats/rmsk.txt.gz
+    required: true
+
+  - id: mm10_repeatmasker_rmsk
+    category: annotation
+    description: UCSC mm10 RepeatMasker table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/rmsk.txt.gz
+    target_path: annotation/mm10/repeats/rmsk.txt.gz
+    required: true
+
+  - id: mm39_simple_repeat
+    category: annotation
+    description: UCSC mm39 simpleRepeat table dump (TRF-based)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/simpleRepeat.txt.gz
+    target_path: annotation/mm39/repeats/simpleRepeat.txt.gz
+    required: true
+
+  - id: mm10_simple_repeat
+    category: annotation
+    description: UCSC mm10 simpleRepeat table dump (TRF-based)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/simpleRepeat.txt.gz
+    target_path: annotation/mm10/repeats/simpleRepeat.txt.gz
+    required: true
+
+  - id: mm39_gap
+    category: annotation
+    description: UCSC mm39 gap table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/gap.txt.gz
+    target_path: annotation/mm39/masks/gap.txt.gz
+    required: true
+
+  - id: mm10_gap
+    category: annotation
+    description: UCSC mm10 gap table dump
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/gap.txt.gz
+    target_path: annotation/mm10/masks/gap.txt.gz
+    required: true
+
+  - id: mm10_segmental_duplications
+    category: annotation
+    description: UCSC mm10 genomicSuperDups table dump (mm39 has no equivalent table; lift to mm39)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/genomicSuperDups.txt.gz
+    target_path: annotation/mm10/segdup/genomicSuperDups.txt.gz
+    required: true
+
+  - id: mm39_mappability_100bp_bw
+    category: annotation
+    description: Hoffman Umap k100 multi-read mappability bigWig for GRCm39
+    source: Hoffman lab Umap
+    url: https://bismap.hoffmanlab.org/raw/mm39/umap/bigWigFiles/k100.merged.GRCm39_umap.MultiReadMappability.bigWig
+    target_path: annotation/mm39/mappability/k100.merged.GRCm39_umap.MultiReadMappability.bigWig
+    required: true
+
+  - id: mm10_mappability_100bp_bw
+    category: annotation
+    description: Hoffman Umap k100 multi-read mappability bigWig for GRCm38/mm10
+    source: Hoffman lab Umap
+    url: https://bismap.hoffmanlab.org/trackhub/mm10/k100.Umap.MultiTrackMappability.bw
+    target_path: annotation/mm10/mappability/k100.Umap.MultiTrackMappability.bw
+    required: true
+
+  - id: mm10_blacklist
+    category: annotation
+    description: Boyle lab mm10 ENCODE blacklist v2 (lift to mm39; no native mm39 blacklist is published)
+    source: Boyle lab
+    url: https://raw.githubusercontent.com/Boyle-Lab/Blacklist/master/lists/mm10-blacklist.v2.bed.gz
+    target_path: annotation/mm10/blacklist/mm10-blacklist.v2.bed.gz
+    required: true
+
+  - id: mm10_to_mm39_chain
+    category: liftover
+    description: liftOver chain mm10 -> mm39
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm10/liftOver/mm10ToMm39.over.chain.gz
+    target_path: liftover/mm10ToMm39.over.chain.gz
+    required: true
+
+  - id: mm39_to_mm10_chain
+    category: liftover
+    description: liftOver chain mm39 -> mm10
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm39/liftOver/mm39ToMm10.over.chain.gz
+    target_path: liftover/mm39ToMm10.over.chain.gz
+    required: true
+
+  - id: mm9_to_mm39_chain
+    category: liftover
+    description: liftOver chain mm9 -> mm39 (Hazen 2016 coordinates onto the current reference)
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm9/liftOver/mm9ToMm39.over.chain.gz
+    target_path: liftover/mm9ToMm39.over.chain.gz
+    required: true
+
+  - id: mm9_to_mm10_chain
+    category: liftover
+    description: liftOver chain mm9 -> mm10
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm9/liftOver/mm9ToMm10.over.chain.gz
+    target_path: liftover/mm9ToMm10.over.chain.gz
+    required: true
+
+  - id: mm10_to_mm9_chain
+    category: liftover
+    description: liftOver chain mm10 -> mm9
+    source: UCSC
+    url: https://hgdownload.soe.ucsc.edu/goldenPath/mm10/liftOver/mm10ToMm9.over.chain.gz
+    target_path: liftover/mm10ToMm9.over.chain.gz
+    required: true
+
+  - id: mgp_v5_sv_insertions_bed
+    category: mei_polymorphism
+    description: >
+      Mouse Genomes Project SV release v5 insertions (GRCm38). This is the
+      germline insertion catalog Hazen 2016 subtracted. Chromosome names in the
+      file are Ensembl-style; postprocess prefixes chr and lifts the table to mm39.
+      RetroSeq rows are written as the MEI subset.
+    source: Mouse Genomes Project
+    url: https://ftp.ebi.ac.uk/pub/databases/mousegenomes/REL-1606-SV/REL-1606-SV/mgpv5.SV_insertions.bed.gz
+    target_path: polymorphism/mm10/mgp/mgpv5.SV_insertions.bed.gz
+    required: true
+
+  - id: mgp_v5_sv_insertions_bed_tbi
+    category: mei_polymorphism
+    description: Tabix index for Mouse Genomes Project v5 insertions
+    source: Mouse Genomes Project
+    url: https://ftp.ebi.ac.uk/pub/databases/mousegenomes/REL-1606-SV/REL-1606-SV/mgpv5.SV_insertions.bed.gz.tbi
+    target_path: polymorphism/mm10/mgp/mgpv5.SV_insertions.bed.gz.tbi
+    required: true
+
+  - id: ferraj2023_merged_sv_vcf_zip
+    category: mei_polymorphism
+    description: >
+      Ferraj et al. Cell Genomics 2023 merged long-read SV VCF for diverse
+      mouse strains (GRCm39), including transposable-element insertions.
+      Zenodo 10.5281/zenodo.7644286.
+    source: Ferraj 2023 / Zenodo
+    url: https://zenodo.org/records/7644286/files/merged_SV_VCF.zip
+    target_path: polymorphism/mm39/ferraj2023/merged_SV_VCF.zip
+    required: true
+
+# Paired ENA FASTQs for the two somatic-neuron cloning papers.
+# Expanded to category test_fastq (_r1/_r2). Omitted from --references mm39
+# unless --include-mouse-test-fastqs is set, then streamed to S3
+# (test_data/mouse_wgs is excluded from the local cache sync).
+#
+# Hazen et al. Neuron 2016, BioProject PRJNA312530. HiSeq 2000, 100 bp,
+# authors aligned to mm9. Germline controls are matched thymus or spleen,
+# not test genomes. C1 was sequenced but left out of the paper mutation table.
+# Validated somatic L1 insertions are in supplemental Table S8 (mm9). The
+# smallest autosome for a later chromosome smoke test is chr19; pick the
+# clone Table S8 places an insertion on.
+#
+# Sugo et al. PNAS 2025, BioProject PRJDB20767. PCR-free NovaSeq, 150 bp,
+# ~350 bp insert, authors aligned to mm10. No donor-tissue genome: sister
+# clones from the same mouse are the control for one another. Reported
+# about 1.4 LINE/SINE insertions per wild-type cell.
+mouse_wgs_libraries:
+  - id: hazen2016_b2
+    accession: SRR3184315
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: clone
+    donor: B
+    tissue: olfactory-bulb MT neuron clone
+    control_accession: SRR3184314
+    read_bp: 100
+    published_build: mm9
+  - id: hazen2016_b3
+    accession: SRR3184320
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: clone
+    donor: B
+    tissue: olfactory-bulb MT neuron clone
+    control_accession: SRR3184314
+    read_bp: 100
+    published_build: mm9
+  - id: hazen2016_b4
+    accession: SRR3184323
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: clone
+    donor: B
+    tissue: olfactory-bulb MT neuron clone
+    control_accession: SRR3184314
+    read_bp: 100
+    published_build: mm9
+  - id: hazen2016_c1
+    accession: SRR3184308
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: clone
+    donor: C
+    tissue: olfactory-bulb MT neuron clone
+    control_accession: SRR3184307
+    read_bp: 100
+    published_build: mm9
+    notes: Sequenced clone omitted from the paper mutation table.
+  - id: hazen2016_c5
+    accession: SRR3184309
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: clone
+    donor: C
+    tissue: olfactory-bulb MT neuron clone
+    control_accession: SRR3184307
+    read_bp: 100
+    published_build: mm9
+  - id: hazen2016_d4
+    accession: SRR3184313
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: clone
+    donor: D
+    tissue: olfactory-bulb MT neuron clone
+    control_accession: SRR3184310
+    read_bp: 100
+    published_build: mm9
+  - id: hazen2016_e1
+    accession: SRR3184375
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: clone
+    donor: E
+    tissue: olfactory-bulb MT neuron clone
+    control_accession: SRR3184327
+    read_bp: 100
+    published_build: mm9
+  - id: hazen2016_b_thymus
+    accession: SRR3184314
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: germline_control
+    donor: B
+    tissue: thymus
+    read_bp: 100
+    published_build: mm9
+    notes: Germline control for clones B2, B3, and B4. Not a test genome.
+  - id: hazen2016_c_spleen
+    accession: SRR3184307
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: germline_control
+    donor: C
+    tissue: spleen
+    read_bp: 100
+    published_build: mm9
+    notes: Germline control for clones C1 and C5. Not a test genome.
+  - id: hazen2016_d_spleen
+    accession: SRR3184310
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: germline_control
+    donor: D
+    tissue: spleen
+    read_bp: 100
+    published_build: mm9
+    notes: Germline control for clone D4. Not a test genome.
+  - id: hazen2016_e_thymus
+    accession: SRR3184327
+    paper: Hazen2016
+    bioproject: PRJNA312530
+    role: germline_control
+    donor: E
+    tissue: thymus
+    read_bp: 100
+    published_build: mm9
+    notes: Germline control for clone E1. Not a test genome.
+  - id: sugo2025_a1
+    accession: DRR697908
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: A
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+    notes: Sister clones A1-A3 are controls for one another.
+  - id: sugo2025_a2
+    accession: DRR697909
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: A
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_a3
+    accession: DRR697910
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: A
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_b1
+    accession: DRR697911
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: B
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+    notes: Sister clones B1-B4 are controls for one another.
+  - id: sugo2025_b2
+    accession: DRR697912
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: B
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_b3
+    accession: DRR697913
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: B
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_b4
+    accession: DRR697914
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: B
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_c1
+    accession: DRR697915
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: C
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+    notes: Sister clones C1-C4 are controls for one another.
+  - id: sugo2025_c2
+    accession: DRR697916
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: C
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_c3
+    accession: DRR697917
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: C
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_c4
+    accession: DRR697918
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: C
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_d1
+    accession: DRR697919
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: D
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+    notes: Sister clones D1-D4 are controls for one another.
+  - id: sugo2025_d2
+    accession: DRR697920
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: D
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_d3
+    accession: DRR697921
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: D
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_d4
+    accession: DRR697922
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: D
+    genotype: Emx1-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_e1
+    accession: DRR697923
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: E
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+    notes: Wild-type cohort used as the control set for Nex-Cre mouse F.
+  - id: sugo2025_e2
+    accession: DRR697924
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: E
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_e3
+    accession: DRR697925
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: E
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_e4
+    accession: DRR697926
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: E
+    genotype: wild-type Polb-floxed
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_f1
+    accession: DRR697927
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: F
+    genotype: Nex-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+    notes: Sister clones F1-F4 are controls for one another. Mouse E is the wild-type cohort.
+  - id: sugo2025_f2
+    accession: DRR697928
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: F
+    genotype: Nex-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_f3
+    accession: DRR697929
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: F
+    genotype: Nex-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10
+  - id: sugo2025_f4
+    accession: DRR697930
+    paper: Sugo2025
+    bioproject: PRJDB20767
+    role: clone
+    donor: F
+    genotype: Nex-Cre Polb knockout
+    tissue: E18.5 cortical neuron clone
+    read_bp: 150
+    published_build: mm10

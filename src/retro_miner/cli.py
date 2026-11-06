@@ -1183,7 +1183,7 @@ def annotate_mei_support_cmd(
     type=str,
     default=None,
     help=(
-        "Genome build passed to the pipeline as --reference-build (hg38, hg19, or hs1). "
+        "Genome build passed to the pipeline as --reference-build (hg38, hg19, hs1, or mm39). "
         "When omitted, export-vcf reads pipeline_params.env next to the input table."
     ),
 )
@@ -1238,9 +1238,9 @@ def export_vcf_cmd(
 @click.option("--tsv", "tsv_path", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Optional flat TSV (one row per record) alongside the VCF.")
 @click.option("--gene-gtf", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Override the bundled Ensembl GRCh38.115 gene-strand table (GTF gene features or gene_id/strand TSV).")
-@click.option("--snpeff-genome", default="GRCh38.99", show_default=True,
-              help="Database name as listed by `snpEff databases` (e.g. GRCh38.99, GRCh38.115, GRCh38.mane.1.2.ensembl).")
+              help="Override the bundled Ensembl GRCh38.115 / GRCm39.115 gene-strand tables (GTF gene features or gene_id/strand TSV).")
+@click.option("--snpeff-genome", default=None,
+              help="Database name as listed by `snpEff databases` (auto-selects GRCh38.99 for human VCFs and GRCm39.115 for mouse mm39/GRCm39 VCFs).")
 @click.option("--snpeff-bin", default="snpEff", show_default=True, help="snpEff launcher on PATH or full path.")
 @click.option("--snpeff-config", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="snpEff.config path (conda installs: <env>/share/snpeff-<ver>/snpEff.config).")
@@ -1248,14 +1248,17 @@ def export_vcf_cmd(
               help="JVM heap. Default heap runs out of memory building the GRCh38 interval forest.")
 def annotate_genes_cmd(
     vcf_path: Path, out_path: Path, tsv_path: Path | None, gene_gtf: Path | None,
-    snpeff_genome: str, snpeff_bin: str, snpeff_config: Path | None, snpeff_xmx: str,
+    snpeff_genome: str | None, snpeff_bin: str, snpeff_config: Path | None, snpeff_xmx: str,
 ) -> None:
     """Add gene / consequence annotation to an MEI VCF with local snpEff."""
     from retro_miner.gene_annotation import annotate_vcf
 
     t0 = time.monotonic()
-    stats = annotate_vcf(vcf_path, out_path, snpeff_genome, tsv_path=tsv_path, gene_gtf=gene_gtf,
-                         snpeff_bin=snpeff_bin, config=snpeff_config, xmx=snpeff_xmx)
+    try:
+        stats = annotate_vcf(vcf_path, out_path, snpeff_genome, tsv_path=tsv_path, gene_gtf=gene_gtf,
+                             snpeff_bin=snpeff_bin, config=snpeff_config, xmx=snpeff_xmx)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(
         f"[annotate-genes] records={stats.n_records} annotated={stats.n_annotated} "
         f"with_gene={stats.n_with_gene} unmatched={stats.n_unmatched} "

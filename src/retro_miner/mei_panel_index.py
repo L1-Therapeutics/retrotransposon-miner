@@ -19,6 +19,7 @@ PUBLIC_MEI_REMAP_FASTA_RELPATHS = (
     "retrotransposon_db/dfam/dfam_human_mei_l1_alu_sva.fasta",
     "retrotransposon_db/full_consensus/mei_full_canonical.panel.fa",
     "retrotransposon_db/full_consensus/mei_full_canonical.ucsc_repeatbrowser.fa",
+    "retrotransposon_db/dfam/dfam_mouse_mei_l1_sine_erv.fasta",
 )
 
 

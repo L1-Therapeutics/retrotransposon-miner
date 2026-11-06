@@ -4,7 +4,8 @@ set -euo pipefail
 APP_NAME="retrotransposon-miner"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 INSTANCE_ID="${INSTANCE_ID:-}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-m7i.4xlarge}"
+# Filled in after the mouse-vs-human launch signals are known.
+INSTANCE_TYPE="${INSTANCE_TYPE:-}"
 # On-demand by default (stable first-run). SPOT=1 launches cheaper Spot instead.
 SPOT="${SPOT:-0}"
 ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-200}"
@@ -26,6 +27,20 @@ REGION="${REGION:-us-east-1}"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTANCE_STATE_FILE="${INSTANCE_STATE_FILE:-${REPO_ROOT}/.ec2-instance.env}"
+
+# Mouse whole-genome hosts match a human full genome: m7i.16xlarge is
+# 64 vCPU / 256 GiB. m7i.4xlarge (16 vCPU / 64 GiB) ran out of memory
+# past four chromosomes. An explicit INSTANCE_TYPE still wins.
+if [[ -z "${INSTANCE_TYPE}" ]]; then
+  if [[ "${INSTANCE_NAME}" == *mouse* ]] \
+    || [[ "${INSTANCE_STATE_FILE}" == *mouse* ]] \
+    || [[ "${S3_CACHE_PREFIX}" == *"/mouse"* ]] \
+    || [[ "${HOST_ALIAS}" == *mouse* ]]; then
+    INSTANCE_TYPE="m7i.16xlarge"
+  else
+    INSTANCE_TYPE="m7i.4xlarge"
+  fi
+fi
 
 mkdir -p "${HOME}/.ssh"
 KEY_NAME="${KEY_NAME:-}"
@@ -951,6 +966,12 @@ write_ssh_config() {
   ' "${cfg}" > "${cfg}.tmp"
   mv "${cfg}.tmp" "${cfg}"
 
+  # ssh ProxyCommand does not inherit this process environment. A second
+  # instance (mouse vs human) must carry its own state file and host alias
+  # or the proxy resolves the other box.
+  local proxy_cmd
+  proxy_cmd="env INSTANCE_STATE_FILE=$(printf '%q' "${INSTANCE_STATE_FILE}") HOST_ALIAS=$(printf '%q' "${HOST_ALIAS}") JLAB_ALIAS=$(printf '%q' "${JLAB_ALIAS}") REGION=$(printf '%q' "${REGION}") ${SCRIPT_PATH} ssh-proxy %p"
+
   cat >> "${cfg}" <<EOF
 
 Host ${HOST_ALIAS}
@@ -958,7 +979,7 @@ Host ${HOST_ALIAS}
   User ${ssh_user}
   IdentityFile ${identity_file}
   IdentitiesOnly yes
-  ProxyCommand ${SCRIPT_PATH} ssh-proxy %p
+  ProxyCommand ${proxy_cmd}
   ConnectTimeout 30
   ServerAliveInterval 15
   ServerAliveCountMax 4
@@ -970,7 +991,7 @@ Host ${JLAB_ALIAS}
   User ${ssh_user}
   IdentityFile ${identity_file}
   IdentitiesOnly yes
-  ProxyCommand ${SCRIPT_PATH} ssh-proxy %p
+  ProxyCommand ${proxy_cmd}
   LocalForward ${JLAB_LOCAL_PORT} 127.0.0.1:8888
   ConnectTimeout 30
   ServerAliveInterval 15
@@ -1098,7 +1119,8 @@ Lifecycle:
 JupyterLab:
   start-jlab | stop-jlab | start-tunnel
 
-Create a new EC2 for this project (on-demand m7i.4xlarge by default):
+Create a new EC2 for this project (on-demand m7i.4xlarge by default;
+a mouse launch defaults to m7i.16xlarge, 64 vCPU / 256 GiB):
   bootstrap
   S3_BUCKET=s3://<your-bucket> $0 bootstrap
   SPOT=1 $0 bootstrap
@@ -1111,7 +1133,8 @@ If you can reach the instance via Instance Connect but not SSH:
 Optional env vars:
   REGION, INSTANCE_ID, INSTANCE_NAME, HOST_ALIAS, SSH_USER, KEY_PATH
   KEY_NAME, KEY_OWNER (bootstrap key pair is per IAM user, not account-wide)
-  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.4xlarge / 200)
+  INSTANCE_TYPE, ROOT_VOLUME_GB (bootstrap only; default m7i.4xlarge / 200;
+    mouse name, state file, cache prefix, or host alias -> m7i.16xlarge)
   SPOT (bootstrap only; default 0 = on-demand; 1 = Spot)
   SUBNET_ID (bootstrap only; pin one subnet/AZ. Default: AWS chooses AZ)
   ROOT_VOLUME_IOPS, ROOT_VOLUME_THROUGHPUT_MB (bootstrap only; default 4000 / 1000)

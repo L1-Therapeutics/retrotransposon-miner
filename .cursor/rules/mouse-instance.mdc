@@ -1,0 +1,12 @@
+---
+description: Mouse EC2 hosts are m7i.16xlarge (64 vCPU, 256 GiB)
+alwaysApply: true
+---
+
+# Mouse instance size
+
+Launch mouse alignment and whole-genome calling on `m7i.16xlarge` (64 vCPU, 256 GiB). That is the same shape as a human full genome. `m7i.4xlarge` (16 vCPU, 64 GiB) ran out of memory past four chromosomes.
+
+`scripts/ec2_jlab.sh` selects `m7i.16xlarge` when the instance name, state file, S3 cache prefix, or host alias contains `mouse`. A sample pair uses `--chr_concurrency 12`.
+
+Do not resize or replace an instance that already has a job running.

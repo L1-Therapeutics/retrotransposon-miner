@@ -52,3 +52,22 @@ def test_best_hits_skips_supplementary_hardclip_fake_qcov():
     row = hits.iloc[0]
     assert int(row.alnlen) == 13
     assert abs(float(row.qcov) - (13 / 55)) < 1e-6
+
+
+def test_best_hits_rejects_low_complexity_and_unknown_family():
+    sam = "\n".join(
+        [
+            "@SQ\tSN:L1MdA_I_3end#LINE/L1\tLN:1000",
+            "@SQ\tSN:BC1_Mm#SINE/ID\tLN:150",
+            # Low-complexity G-run alignment should be rejected when reject_low_complexity=True.
+            "q_low\t0\tL1MdA_I_3end#LINE/L1\t900\t0\t22M\t*\t0\t0\tGGGGAGGGGGGGGGGGGGGACT\t*\tNM:i:0",
+            # Unknown family (SINE/ID) must be rejected even with high-complexity sequence.
+            "q_bc1\t0\tBC1_Mm#SINE/ID\t1\t0\t20M\t*\t0\t0\tGGCCGGGCGCGGTGGCTCAC\t*\tNM:i:0",
+            # Valid complex L1Md alignment must be kept.
+            "q_ok\t0\tL1MdA_I_3end#LINE/L1\t10\t0\t20M\t*\t0\t0\tGGAGGATCCCGCAATACCTC\t*\tNM:i:0",
+        ]
+    )
+    hits = _best_hits_from_sam(sam, reject_low_complexity=True)
+    assert list(hits["qname"]) == ["q_ok"]
+    assert hits.iloc[0].family == "LINE1"
+
