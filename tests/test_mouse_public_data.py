@@ -7,16 +7,20 @@ import pytest
 from retro_miner.mouse_public_data import (
     ENA_MATCHING_QUAL_DEFLINE,
     ENA_MATCHING_SEQ_DEFLINE,
+    ALIGN_CHUNK_READS,
     BWA_MEM3_BIN,
     BWA_MEM3_INDEX_SUFFIXES,
     BWA_MEM3_MIMALLOC_PURGE_DELAY_MS,
     bwa_mem3_env,
     bwa_mem_command,
+    copy_fastq_records,
     ena_fastq_subdir,
     ena_fastq_url,
     fasterq_dump_command,
+    format_chunk_done,
     mgp_insertion_bed_fields,
     mouse_ucsc_chrom,
+    parse_chunk_done,
     ncbi_sra_s3_uri,
     s3_cp_command,
     s3_single_file_config_text,
@@ -70,27 +74,18 @@ def test_dump_and_align_commands_match_the_ena_reads() -> None:
     assert ENA_MATCHING_SEQ_DEFLINE in dump
     assert ENA_MATCHING_QUAL_DEFLINE in dump
     assert dump[dump.index("--threads") + 1] == "16"
-    assert dump[dump.index("--mem") + 1] == "2G"
-    assert dump[dump.index("--bufsize") + 1] == "8M"
-    wider = fasterq_dump_command(
+    assert dump[dump.index("--mem") + 1] == "128M"
+    assert dump[dump.index("--bufsize") + 1] == "1M"
+    # A quarter of this RAM is under the 128MB ceiling, so the host size still applies.
+    small = fasterq_dump_command(
         "/tmp/SRR3184315",
         "/tmp/fq",
         "/tmp/scratch",
         16,
-        total_ram_bytes=128 * 1024**3,
+        total_ram_bytes=2 * 1024**3,
     )
-    assert wider[wider.index("--mem") + 1] == "4G"
-    assert wider[wider.index("--bufsize") + 1] == "16M"
-    # MemTotal on the 16-thread align host, in kB from /proc/meminfo.
-    this_host = fasterq_dump_command(
-        "/tmp/SRR3184315",
-        "/tmp/fq",
-        "/tmp/scratch",
-        16,
-        total_ram_bytes=64776600 * 1024,
-    )
-    assert this_host[this_host.index("--mem") + 1] == "1976M"
-    assert this_host[this_host.index("--bufsize") + 1] == "7M"
+    assert small[small.index("--mem") + 1] == "32M"
+    assert small[small.index("--bufsize") + 1] == "1M"
     align = bwa_mem_command("/ref/mm39-mem3/mm39", "/tmp/r1.fq", "/tmp/r2.fq", 14, "hazen2016_b2")
     assert align[:4] == [BWA_MEM3_BIN, "mem", "-t", "14"]
     assert BWA_MEM3_INDEX_SUFFIXES == (".amb", ".ann", ".bwt.2bit.64", ".pac")
@@ -103,6 +98,40 @@ def test_dump_and_align_commands_match_the_ena_reads() -> None:
         "MIMALLOC_PURGE_DELAY": BWA_MEM3_MIMALLOC_PURGE_DELAY_MS,
     }
     assert BWA_MEM3_MIMALLOC_PURGE_DELAY_MS == "100"
+
+
+def _record(name: str, seq: str) -> bytes:
+    return f"@{name}\n{seq}\n+\n{'I' * len(seq)}\n".encode()
+
+
+def test_fastq_chunks_resume_at_the_next_record(tmp_path, monkeypatch) -> None:
+    import retro_miner.mouse_public_data as mouse_data
+
+    monkeypatch.setattr(mouse_data, "_FASTQ_COPY_BLOCK", 16)
+    raw = b"".join(_record(f"r{i}", "ACGT" * 3) for i in range(5))
+    src = tmp_path / "reads.fastq"
+    src.write_bytes(raw)
+    first = tmp_path / "first.fastq"
+    end, count = copy_fastq_records(src, first, 0, 2)
+    assert count == 2
+    assert first.read_bytes() == raw[: len(_record("r0", "ACGT" * 3)) * 2]
+    second = tmp_path / "second.fastq"
+    end2, count2 = copy_fastq_records(src, second, end, 10)
+    assert count2 == 3
+    assert first.read_bytes() + second.read_bytes() == raw
+    assert end2 == len(raw)
+    assert copy_fastq_records(src, tmp_path / "past_end.fastq", end2, 10) == (end2, 0)
+    marker = format_chunk_done(0, end, 0, end, count)
+    assert parse_chunk_done(marker) == (0, end, 0, end, count)
+    assert ALIGN_CHUNK_READS == 80_000_000
+
+
+def test_fastq_chunk_refuses_a_truncated_record(tmp_path) -> None:
+    raw = _record("r0", "ACGT") + b"@r1\nACGT\n"
+    src = tmp_path / "cut.fastq"
+    src.write_bytes(raw)
+    with pytest.raises(ValueError, match="ends inside a FASTQ record"):
+        copy_fastq_records(src, tmp_path / "out.fastq", 0, 5)
 
 
 def test_scratch_reserves_dump_temp_and_sort_room() -> None:

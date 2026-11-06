@@ -66,10 +66,13 @@ ENA_MATCHING_QUAL_DEFLINE = "+"
 FASTERQ_SRA_SCRATCH_FACTOR = 9
 BAM_SORT_HEADROOM_BYTES = 80 * 1024**3
 # fasterq-dump gives --mem to every worker thread. sra-tools 3.4.1 defaults
-# that to 50MB, so a 16-thread dump sorts in under 1GB and the join spills.
-# Half of physical RAM, split across the threads, leaves the rest for the
-# archive cache. The write buffer is 1/256 of that per-thread budget.
-FASTERQ_SORT_RAM_DIVISOR = 2
+# that to 50MB. A larger budget does not stay capped: on the 64GB align host,
+# 2G per thread was killed at 64GB RSS, and 1G per thread was still climbing
+# through 51GB. 128MB per thread is the ceiling that keeps the sort spilling
+# to disk. Smaller hosts use a quarter of RAM when that is under the ceiling.
+# The write buffer is 1/256 of the per-thread budget, and at least 1MB.
+FASTERQ_SORT_RAM_DIVISOR = 4
+FASTERQ_MAX_SORT_BYTES_PER_THREAD = 128 * 1024 * 1024
 FASTERQ_BUF_DIVISOR = 256
 # sra-tools refuses a sort budget under 5MB and a file buffer over 1GB.
 FASTERQ_MIN_SORT_BYTES = 5 * 1024 * 1024
@@ -130,6 +133,7 @@ def fasterq_sort_bytes_per_thread(threads: int, total_ram_bytes: int) -> int:
     if total_ram_bytes < 1:
         raise ValueError(f"RAM must be >= 1 byte, got {total_ram_bytes}")
     per_thread = (total_ram_bytes // FASTERQ_SORT_RAM_DIVISOR) // threads
+    per_thread = min(per_thread, FASTERQ_MAX_SORT_BYTES_PER_THREAD)
     return max(per_thread, FASTERQ_MIN_SORT_BYTES)
 
 
@@ -156,9 +160,9 @@ def fasterq_dump_command(
 ) -> list[str]:
     """Dump paired FASTQ with the ENA read names.
 
-    ``--mem`` is per thread. The budget is half of ``total_ram_bytes`` split
-    across ``threads``. When ``total_ram_bytes`` is omitted, the host's
-    physical RAM is used.
+    ``--mem`` is per thread. The budget is a quarter of ``total_ram_bytes``
+    split across ``threads``, and never above 128MB. When ``total_ram_bytes``
+    is omitted, the host's physical RAM is used.
     """
     ram = physical_ram_bytes() if total_ram_bytes is None else total_ram_bytes
     sort_bytes = fasterq_sort_bytes_per_thread(threads, ram)
@@ -227,6 +231,81 @@ def bwa_mem3_env(base: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base is None else base)
     env["MIMALLOC_PURGE_DELAY"] = BWA_MEM3_MIMALLOC_PURGE_DELAY_MS
     return env
+
+
+# A fresh bwa-mem3 process per chunk. Finished chunks stay on disk, so a killed
+# aligner is restarted after the last complete chunk instead of from read 1.
+# 80 million reads is short of the resident set that filled a 64 GB host.
+ALIGN_CHUNK_READS = 80_000_000
+_FASTQ_COPY_BLOCK = 8 * 1024 * 1024
+
+
+def _prefix_newlines(data: bytes, n_lines: int) -> bytes:
+    """Return the prefix of ``data`` that contains exactly ``n_lines`` newlines."""
+    end = -1
+    for _ in range(n_lines):
+        end = data.find(b"\n", end + 1)
+        if end < 0:
+            raise ValueError("not enough newlines")
+    return data[: end + 1]
+
+
+def copy_fastq_records(src: Path, dest: Path, start: int, n_records: int) -> tuple[int, int]:
+    """Copy up to ``n_records`` 4-line FASTQ records starting at byte ``start``.
+
+    The integer returned with the count is the next unread byte. A later call
+    from that byte continues the file without rereading earlier reads.
+    Records stream to ``dest`` one block at a time; a chunk is tens of GB.
+    A file that ends inside a record raises instead of dropping reads.
+    """
+    if n_records < 0:
+        raise ValueError("n_records must be >= 0")
+    lines_left = n_records * 4
+    pos = start
+    pending = b""
+    with src.open("rb") as inp, dest.open("wb") as out:
+        inp.seek(start)
+        while lines_left > 0:
+            block = inp.read(_FASTQ_COPY_BLOCK)
+            if not block:
+                break
+            data = pending + block
+            available = data.count(b"\n")
+            if available == 0:
+                pending = data
+                continue
+            if available <= lines_left:
+                cut = data.rfind(b"\n") + 1
+            else:
+                cut = len(_prefix_newlines(data, lines_left))
+            out.write(data[:cut])
+            lines_left -= data.count(b"\n", 0, cut)
+            pos += cut
+            pending = data[cut:]
+    copied_lines = n_records * 4 - lines_left
+    if copied_lines % 4 or (lines_left > 0 and pending):
+        raise ValueError(f"{src} ends inside a FASTQ record after byte {pos}")
+    return pos, copied_lines // 4
+
+
+def format_chunk_done(
+    r1_start: int,
+    r1_end: int,
+    r2_start: int,
+    r2_end: int,
+    records: int,
+) -> str:
+    """Text marker for one finished alignment chunk."""
+    return f"{r1_start}\t{r1_end}\t{r2_start}\t{r2_end}\t{records}\n"
+
+
+def parse_chunk_done(text: str) -> tuple[int, int, int, int, int]:
+    """Read the marker written by :func:`format_chunk_done`."""
+    parts = text.strip().split("\t")
+    if len(parts) != 5:
+        raise ValueError(f"chunk marker has {len(parts)} fields")
+    r1_start, r1_end, r2_start, r2_end, records = (int(part) for part in parts)
+    return r1_start, r1_end, r2_start, r2_end, records
 
 
 def mouse_ucsc_chrom(token: str) -> str:

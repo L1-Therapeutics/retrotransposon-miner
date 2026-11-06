@@ -24,13 +24,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from retro_miner.mouse_public_data import (  # noqa: E402
+    ALIGN_CHUNK_READS,
     BWA_MEM3_BIN,
     BWA_MEM3_INDEX_SUFFIXES,
     NCBI_SRA_BUCKET,
     bwa_mem3_env,
     bwa_mem_command,
+    copy_fastq_records,
     fasterq_dump_command,
+    format_chunk_done,
     ncbi_sra_s3_uri,
+    parse_chunk_done,
     s3_cp_command,
     s3_single_file_config_text,
     scratch_bytes_for_sra,
@@ -200,7 +204,17 @@ def dump_fastqs(accession: str, sra_path: Path, outdir: Path, threads: int) -> t
     return read1, read2
 
 
-def align_pair(
+def _bam_ok(bam_path: Path) -> bool:
+    if not bam_path.is_file() or bam_path.stat().st_size == 0:
+        return False
+    check = subprocess.run(
+        ["samtools", "quickcheck", "-v", str(bam_path)],
+        check=False,
+    )
+    return check.returncode == 0
+
+
+def _align_one_chunk(
     reference: Path,
     read1: Path,
     read2: Path,
@@ -208,13 +222,7 @@ def align_pair(
     threads: int,
     sample: str,
 ) -> None:
-    if shutil.which(BWA_MEM3_BIN) is None:
-        raise SystemExit(f"{BWA_MEM3_BIN} is not on PATH")
-    for suffix in BWA_MEM3_INDEX_SUFFIXES:
-        index = Path(str(reference) + suffix)
-        if not index.is_file() or index.stat().st_size == 0:
-            raise SystemExit(f"bwa-mem3 index file is missing: {index}")
-    bam_path.parent.mkdir(parents=True, exist_ok=True)
+    """Align one FASTQ slice and sort it. A failure deletes only this BAM."""
     bwa_cmd = bwa_mem_command(str(reference), str(read1), str(read2), threads, sample)
     sort_threads = max(2, min(4, threads))
     sort_cmd = [
@@ -235,11 +243,90 @@ def align_pair(
     bwa.stdout.close()
     sort_rc = sort.wait()
     bwa_rc = bwa.wait()
-    if bwa_rc != 0 or sort_rc != 0:
+    if bwa_rc != 0 or sort_rc != 0 or not _bam_ok(bam_path):
         bam_path.unlink(missing_ok=True)
         raise SystemExit(f"alignment failed bwa={bwa_rc} samtools={sort_rc}")
+
+
+def align_pair(
+    reference: Path,
+    read1: Path,
+    read2: Path,
+    bam_path: Path,
+    threads: int,
+    sample: str,
+) -> None:
+    """Align in chunks. A finished chunk is kept and skipped on the next start."""
+    if shutil.which(BWA_MEM3_BIN) is None:
+        raise SystemExit(f"{BWA_MEM3_BIN} is not on PATH")
+    for suffix in BWA_MEM3_INDEX_SUFFIXES:
+        index = Path(str(reference) + suffix)
+        if not index.is_file() or index.stat().st_size == 0:
+            raise SystemExit(f"bwa-mem3 index file is missing: {index}")
+    bam_path.parent.mkdir(parents=True, exist_ok=True)
+    if _bam_ok(bam_path):
+        log(f"alignment already complete: {bam_path}")
+        return
+    bam_path.unlink(missing_ok=True)
+    chunk_dir = bam_path.parent / f"{bam_path.stem}.chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    sort_threads = max(2, min(4, threads))
+    r1_offset = 0
+    r2_offset = 0
+    index_i = 0
+    while True:
+        marker = chunk_dir / f"chunk_{index_i:04d}.done"
+        chunk_bam = chunk_dir / f"chunk_{index_i:04d}.bam"
+        if marker.is_file() and _bam_ok(chunk_bam):
+            _, r1_offset, _, r2_offset, records = parse_chunk_done(marker.read_text(encoding="utf-8"))
+            log(f"keep chunk {index_i:04d} records={records}")
+            index_i += 1
+            continue
+        marker.unlink(missing_ok=True)
+        chunk_bam.unlink(missing_ok=True)
+        slice1 = chunk_dir / "current_1.fastq"
+        slice2 = chunk_dir / "current_2.fastq"
+        r1_end, n1 = copy_fastq_records(read1, slice1, r1_offset, ALIGN_CHUNK_READS)
+        r2_end, n2 = copy_fastq_records(read2, slice2, r2_offset, ALIGN_CHUNK_READS)
+        if n1 == 0 and n2 == 0:
+            slice1.unlink(missing_ok=True)
+            slice2.unlink(missing_ok=True)
+            break
+        if n1 != n2:
+            raise SystemExit(f"FASTQ pair lengths differ at chunk {index_i}: {n1} vs {n2}")
+        log(f"chunk {index_i:04d} records={n1}")
+        try:
+            _align_one_chunk(reference, slice1, slice2, chunk_bam, threads, sample)
+        finally:
+            slice1.unlink(missing_ok=True)
+            slice2.unlink(missing_ok=True)
+        marker.write_text(
+            format_chunk_done(r1_offset, r1_end, r2_offset, r2_end, n1),
+            encoding="utf-8",
+        )
+        r1_offset, r2_offset = r1_end, r2_end
+        index_i += 1
+    parts = sorted(chunk_dir.glob("chunk_*.bam"))
+    if not parts:
+        raise SystemExit(f"no alignment chunks for {bam_path.name}")
+    if len(parts) == 1:
+        parts[0].replace(bam_path)
+    else:
+        run_cmd(
+            [
+                "samtools",
+                "merge",
+                "-@",
+                str(sort_threads),
+                "-f",
+                "-o",
+                str(bam_path),
+                *[str(part) for part in parts],
+            ]
+        )
     run_cmd(["samtools", "index", "-@", str(sort_threads), str(bam_path)])
     run_cmd(["samtools", "quickcheck", "-v", str(bam_path)])
+    shutil.rmtree(chunk_dir)
 
 
 def upload_bam(bam_path: Path, dest_uri: str, env: dict[str, str]) -> None:
